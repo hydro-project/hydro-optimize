@@ -774,6 +774,7 @@ impl Visit<'_> for AnalyzeClosure {
 }
 
 #[cfg(test)]
+#[allow(clippy::let_and_return, reason = "explicitly testing binding analysis")]
 mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
