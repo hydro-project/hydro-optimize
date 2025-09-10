@@ -4,24 +4,19 @@ publish = true
 version = "0.13.0"
 documentation = "https://docs.rs/hydro_optimize/"
 description = "Automatic decoupling and partitioning"
-edition = { workspace = true }
-repository = { workspace = true }
-license = { workspace = true }
-
-[lints]
-workspace = true
+edition = "2024"
 
 [package.metadata.docs.rs]
 all-features = true
 
 [dependencies]
 good_lp = { version = "1.14.0", features = ["microlp"], default-features = false }
-hydro_deploy = { path = "../hydro_deploy/core", version = "^0.14.0" }
-hydro_lang = { path = "../hydro_lang", version = "^0.14.0", features = ["deploy"] }
+hydro_deploy = { git = "https://github.com/hydro-project/hydro.git" }
+hydro_lang = { git = "https://github.com/hydro-project/hydro.git", features = ["deploy"] }
 proc-macro2 = "1.0.95"
 regex = "1.11.1"
 serde = { version = "1.0.197", features = ["derive"] }
-stageleft.workspace = true
+stageleft = "0.9.7"
 syn = { version = "2.0.46", features = [
     "parsing",
     "extra-traits",
@@ -31,12 +26,12 @@ tokio = { version = "1.29.0", features = ["full"] }
 
 [dev-dependencies]
 ctor = "0.2"
-hydro_build_utils = { path = "../hydro_build_utils", version = "0.0.1" }
-hydro_lang = { path = "../hydro_lang", version = "^0.14.0", features = ["viz"] }
-hydro_test = { path = "../hydro_test", version = "^0.0.0" }
-hydro_std = { path = "../hydro_std", version = "^0.14.0" }
+hydro_build_utils = { git = "https://github.com/hydro-project/hydro.git", version = "0.0.1" }
+hydro_lang = { git = "https://github.com/hydro-project/hydro.git", version = "^0.14.0", features = ["viz"] }
+hydro_test = { git = "https://github.com/hydro-project/hydro.git", version = "^0.0.0" }
+hydro_std = { git = "https://github.com/hydro-project/hydro.git", version = "^0.14.0" }
 clap = { version = "4.4", features = ["derive"] }
-include_mdtests = { path = "../include_mdtests", version = "^0.0.0" }
+include_mdtests = { git = "https://github.com/hydro-project/hydro.git", version = "^0.0.0" }
 
 [build-dependencies]
-hydro_build_utils = { path = "../hydro_build_utils", version = "0.0.1" }
+hydro_build_utils = { git = "https://github.com/hydro-project/hydro.git", version = "0.0.1" }
