@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::hash::Hash;
 
 use hydro_lang::compile::deploy::DeployResult;
 use hydro_lang::compile::ir::{
@@ -421,14 +420,9 @@ fn sender_location_if_network(run_metadata: &RunMetadata, op_id: usize) -> &Loca
             parent.len() == 1,
             "Network operator should have exactly one input"
         );
-        run_metadata
-            .op_id_to_location
-            .get(&parent[0])
-            .unwrap()
+        run_metadata.op_id_to_location.get(&parent[0]).unwrap()
     } else {
-        run_metadata.op_id_to_location
-            .get(&op_id)
-            .unwrap()
+        run_metadata.op_id_to_location.get(&op_id).unwrap()
     }
 }
 
@@ -474,19 +468,24 @@ pub fn compare_expected_performance(
         let old_location = prev_run_metadata.op_id_to_location.get(prev_id).unwrap();
 
         // Compare CPU usage
-        if let Some(cpu_usage) = run_metadata.op_id_to_cpu_usage.get(op_id) && let Some(prev_cpu_usage) = prev_run_metadata.op_id_to_cpu_usage.get(prev_id) {
-                compare_expected_values(
-                    *cpu_usage,
-                    *prev_cpu_usage,
-                    sender_location_if_network(run_metadata, *op_id),
-                    sender_location_if_network(prev_run_metadata, *prev_id),
-                    orig_id,
-                    "CPU usage",
-                );
+        if let Some(cpu_usage) = run_metadata.op_id_to_cpu_usage.get(op_id)
+            && let Some(prev_cpu_usage) = prev_run_metadata.op_id_to_cpu_usage.get(prev_id)
+        {
+            compare_expected_values(
+                *cpu_usage,
+                *prev_cpu_usage,
+                sender_location_if_network(run_metadata, *op_id),
+                sender_location_if_network(prev_run_metadata, *prev_id),
+                orig_id,
+                "CPU usage",
+            );
         }
 
         // Compare recv CPU usage
-        if let Some(network_recv_cpu_usage) = run_metadata.op_id_to_recv_cpu_usage.get(op_id) && let Some(prev_network_recv_cpu_usage) = prev_run_metadata.op_id_to_recv_cpu_usage.get(prev_id) {
+        if let Some(network_recv_cpu_usage) = run_metadata.op_id_to_recv_cpu_usage.get(op_id)
+            && let Some(prev_network_recv_cpu_usage) =
+                prev_run_metadata.op_id_to_recv_cpu_usage.get(prev_id)
+        {
             compare_expected_values(
                 *network_recv_cpu_usage,
                 *prev_network_recv_cpu_usage,
@@ -498,7 +497,9 @@ pub fn compare_expected_performance(
         }
 
         // Compare cardinality
-        if let Some(cardinality) = run_metadata.op_id_to_cardinality.get(op_id) && let Some(prev_cardinality) = prev_run_metadata.op_id_to_cardinality.get(prev_id) {
+        if let Some(cardinality) = run_metadata.op_id_to_cardinality.get(op_id)
+            && let Some(prev_cardinality) = prev_run_metadata.op_id_to_cardinality.get(prev_id)
+        {
             compare_expected_values(
                 *cardinality as f64,
                 *prev_cardinality as f64,
@@ -544,8 +545,11 @@ pub fn compare_expected_performance(
         }
 
         // B. Add this operator's usages
-        let parent_location = run_metadata.op_id_to_location.get(&parent_id.unwrap()).unwrap();
-        let is_network = run_metadata.network_op_id.contains(&id);
+        let parent_location = run_metadata
+            .op_id_to_location
+            .get(&parent_id.unwrap())
+            .unwrap();
+        let is_network = run_metadata.network_op_id.contains(id);
 
         if parent_location == location || is_network {
             // This operator is on the sender
@@ -553,12 +557,12 @@ pub fn compare_expected_performance(
                 prev_id_and_loc_to_send_usage
                     .entry((
                         parent_prev_id.unwrap(),
-                    sender_location_if_network(run_metadata, *id),
-                ))
-                .and_modify(|usage| {
-                    *usage += *cpu_usage;
-                })
-                .or_insert_with(|| *cpu_usage);
+                        sender_location_if_network(run_metadata, *id),
+                    ))
+                    .and_modify(|usage| {
+                        *usage += *cpu_usage;
+                    })
+                    .or_insert_with(|| *cpu_usage);
             }
         }
         if parent_location != location || is_network {
@@ -581,12 +585,14 @@ pub fn compare_expected_performance(
     }
     // C. Compare changes in send CPU usage
     for ((prev_id, location), cpu_usage) in prev_id_and_loc_to_send_usage {
-        if let Some(prev_cardinality) = prev_run_metadata.op_id_to_cardinality.get(&prev_id) && let Some(prev_location) = prev_run_metadata.op_id_to_location.get(&prev_id) {
+        if let Some(prev_cardinality) = prev_run_metadata.op_id_to_cardinality.get(&prev_id)
+            && let Some(prev_location) = prev_run_metadata.op_id_to_location.get(&prev_id)
+        {
             compare_expected_values(
                 cpu_usage,
                 prev_run_metadata.send_overhead.get(prev_location).unwrap()
                     * *prev_cardinality as f64,
-                &location,
+                location,
                 prev_location,
                 op_id_to_orig_id(prev_id, multi_run_metadata, iteration - 1).unwrap(),
                 "decoupled send CPU usage",
@@ -595,7 +601,9 @@ pub fn compare_expected_performance(
     }
     // D. Compare changes in recv CPU usage
     for ((prev_id, location), cpu_usage) in prev_id_and_loc_to_recv_usage {
-         if let Some(prev_cardinality) = prev_run_metadata.op_id_to_cardinality.get(&prev_id) && let Some(prev_location) = prev_run_metadata.op_id_to_location.get(&prev_id) {
+        if let Some(prev_cardinality) = prev_run_metadata.op_id_to_cardinality.get(&prev_id)
+            && let Some(prev_location) = prev_run_metadata.op_id_to_location.get(&prev_id)
+        {
             compare_expected_values(
                 cpu_usage,
                 prev_run_metadata.recv_overhead.get(prev_location).unwrap()

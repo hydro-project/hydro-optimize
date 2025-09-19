@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use hydro_lang::compile::builder::{FlowBuilder, RewriteIrFlowBuilder};
-use hydro_lang::compile::ir::{deep_clone, traverse_dfir, HydroIrMetadata, HydroNode, HydroRoot};
+use hydro_lang::compile::ir::{HydroIrMetadata, HydroNode, HydroRoot, deep_clone, traverse_dfir};
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::location::{Cluster, Location};
 use serde::{Deserialize, Serialize};
@@ -126,10 +126,11 @@ pub fn relevant_inputs(
     input_metadatas
         .iter()
         .filter_map(|input_metadata| {
-            if let Some(location) = location && input_metadata.location_kind.root() != location {
+            if let Some(location) = location
+                && input_metadata.location_kind.root() != location
+            {
                 None
-            }
-            else {
+            } else {
                 Some(input_metadata.op.id.unwrap())
             }
         })

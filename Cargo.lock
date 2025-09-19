@@ -1825,6 +1825,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "hydro_optimize_examples"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "ctor 0.2.9",
+ "hydro_deploy",
+ "hydro_lang",
+ "hydro_optimize",
+ "hydro_std",
+ "hydro_test",
+ "stageleft",
+ "stageleft_tool",
+ "tokio",
+]
+
+[[package]]
 name = "hydro_std"
 version = "0.14.0"
 source = "git+https://github.com/hydro-project/hydro.git#c01575c6f8d249cb0f96e0bc92761bae309e294b"

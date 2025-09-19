@@ -1959,10 +1959,11 @@ mod tests {
         let (complete_cycle2, cycle2) =
             cluster2_tick.cycle::<Stream<(usize, usize), _, Bounded, NoOrder>>();
         let chained = {
-            cycle1.ir_node_named("teed chain 1 cycled")
+            cycle1
+                .ir_node_named("teed chain 1 cycled")
                 .join(input.batch(&cluster2_tick, nondet!(/** test */)))
                 .ir_node_named("join")
-                .map(q!(|(_, (b1,b2))| (b1,b2))) // Both values are influenced by the join with cycle2_out
+                .map(q!(|(_, (b1, b2))| (b1, b2))) // Both values are influenced by the join with cycle2_out
                 .ir_node_named("map (x,(a,b)) to (a,b)")
                 .chain(cycle2.ir_node_named("teed map (a,b) to (b,b) 1 cycled"))
         };
@@ -2119,8 +2120,9 @@ mod tests {
         let (complete_cycle2, cycle2) =
             cluster2_tick.cycle::<Stream<(usize, usize), _, Bounded, NoOrder>>();
         let chained = {
-            cycle1.join(input.batch(&cluster2_tick, nondet!(/** test */)))
-                .map(q!(|(_, (b1,b2))| (b1,b2))) // Both values are influenced by the join with cycle2_out
+            cycle1
+                .join(input.batch(&cluster2_tick, nondet!(/** test */)))
+                .map(q!(|(_, (b1, b2))| (b1, b2))) // Both values are influenced by the join with cycle2_out
                 .chain(cycle2)
         };
         complete_cycle1.complete_next_tick(chained.clone());

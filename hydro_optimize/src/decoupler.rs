@@ -284,6 +284,7 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::HashSet;
 
+    use hydro_build_utils::insta;
     use hydro_deploy::Deployment;
     use hydro_lang::compile::builder::FlowBuilder;
     use hydro_lang::compile::ir;
@@ -411,7 +412,7 @@ mod tests {
         .3;
 
         ir::dbg_dedup_tee(|| {
-            hydro_build_utils::assert_debug_snapshot!(built.ir());
+            insta::assert_debug_snapshot!(built.ir());
         });
     }
 
@@ -446,7 +447,7 @@ mod tests {
         .3;
 
         ir::dbg_dedup_tee(|| {
-            hydro_build_utils::assert_debug_snapshot!(built.ir());
+            insta::assert_debug_snapshot!(built.ir());
         });
     }
 

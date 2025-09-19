@@ -12,7 +12,7 @@ fn inject_id_metadata(
     new_id: usize,
     new_id_to_old_id: &RefCell<HashMap<usize, usize>>,
 ) {
-    let old_id = std::mem::replace(&mut metadata.id, Some(new_id));
+    let old_id = metadata.id.replace(new_id);
     if let Some(old_id) = old_id {
         new_id_to_old_id.borrow_mut().insert(new_id, old_id);
     }

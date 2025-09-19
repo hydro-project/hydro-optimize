@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
+use hydro_build_utils::insta;
 use hydro_lang::compile::ir::deep_clone;
 use hydro_lang::compile::rewrites::persist_pullup::persist_pullup;
 use hydro_lang::deploy::HydroDeploy;
@@ -85,7 +86,7 @@ fn two_pc_partition_coordinator() {
     };
     partition(&mut ir, &coordinator_partitioner);
 
-    hydro_build_utils::assert_debug_snapshot!(&ir);
+    insta::assert_debug_snapshot!(&ir);
 }
 
 #[test]
@@ -136,5 +137,5 @@ fn two_pc_partition_participant() {
     };
     partition(&mut ir, &participant_partitioner);
 
-    hydro_build_utils::assert_debug_snapshot!(&ir);
+    insta::assert_debug_snapshot!(&ir);
 }

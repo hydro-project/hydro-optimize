@@ -16,7 +16,8 @@ use crate::decouple_analysis::decouple_analysis;
 use crate::decoupler::Decoupler;
 use crate::deploy::ReusableHosts;
 use crate::parse_results::{
-    analyze_cluster_results, analyze_send_recv_overheads, compare_expected_performance, get_or_append_run_metadata, MultiRunMetadata, RunMetadata
+    MultiRunMetadata, analyze_cluster_results, analyze_send_recv_overheads,
+    compare_expected_performance, get_or_append_run_metadata,
 };
 use crate::repair::{cycle_source_to_sink_input, inject_id, remove_counter};
 
@@ -127,6 +128,7 @@ async fn track_cluster_usage_cardinality(
 
 /// TODO: Return type should be changed to also include Partitioner
 #[expect(clippy::too_many_arguments, reason = "Optimizer internal function")]
+#[expect(clippy::await_holding_refcell_ref, reason = "Await function needs to write to data in RefCell")]
 pub async fn deploy_and_analyze<'a>(
     reusable_hosts: &mut ReusableHosts,
     deployment: &mut Deployment,
@@ -197,13 +199,13 @@ pub async fn deploy_and_analyze<'a>(
 
     // Add metadata for this run
     let mut mut_multi_run_metadata = multi_run_metadata.borrow_mut();
-    let mut run_metadata = get_or_append_run_metadata(&mut mut_multi_run_metadata, iteration);
+    let run_metadata = get_or_append_run_metadata(&mut mut_multi_run_metadata, iteration);
     let (bottleneck, bottleneck_name, bottleneck_num_nodes) = analyze_cluster_results(
         &nodes,
         &mut ir,
         &mut usage_out,
         &mut cardinality_out,
-        &mut run_metadata,
+        run_metadata,
         exclude_from_decoupling,
     )
     .await;
@@ -212,7 +214,7 @@ pub async fn deploy_and_analyze<'a>(
 
     // Create a mapping from each CycleSink to its corresponding CycleSource
     let cycle_source_to_sink_input = cycle_source_to_sink_input(&mut ir);
-    analyze_send_recv_overheads(&mut ir, &mut run_metadata);
+    analyze_send_recv_overheads(&mut ir, run_metadata);
     let send_overhead = *run_metadata.send_overhead.get(&bottleneck).unwrap();
     let recv_overhead = *run_metadata.recv_overhead.get(&bottleneck).unwrap();
 

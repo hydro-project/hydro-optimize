@@ -1,0 +1,25 @@
+[package]
+name = "hydro_optimize_examples"
+publish = false
+version = "0.0.0"
+edition = "2024"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+hydro_lang = { git = "https://github.com/hydro-project/hydro.git" }
+hydro_std = { git = "https://github.com/hydro-project/hydro.git" }
+hydro_test = { git = "https://github.com/hydro-project/hydro.git" }
+stageleft = "0.9.7"
+tokio = { version = "1.29.0", features = ["full"] }
+
+[dev-dependencies]
+ctor = "0.2"
+clap = { version = "4.4", features = ["derive"] }
+hydro_deploy = { git = "https://github.com/hydro-project/hydro.git" }
+hydro_lang = { git = "https://github.com/hydro-project/hydro.git", features = ["deploy"] }
+hydro_optimize = { path = "../hydro_optimize" }
+
+[build-dependencies]
+stageleft_tool = "0.9.7"
