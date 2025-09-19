@@ -45,8 +45,8 @@ fn two_pc_partition_coordinator() {
     let mut cycle_data = HashMap::new();
     let built = builder
         .optimize_with(persist_pullup)
-        .optimize_with(inject_id)
         .optimize_with(|ir| {
+            inject_id(ir);
             cycle_data = cycle_source_to_sink_input(ir);
             inject_location(ir, &cycle_data);
         })
@@ -101,8 +101,8 @@ fn two_pc_partition_participant() {
     let mut cycle_data = HashMap::new();
     let built = builder
         .optimize_with(persist_pullup)
-        .optimize_with(inject_id)
         .optimize_with(|ir| {
+            inject_id(ir);
             cycle_data = cycle_source_to_sink_input(ir);
             inject_location(ir, &cycle_data);
         })

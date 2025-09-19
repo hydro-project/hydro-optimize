@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -14,7 +15,9 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use crate::decouple_analysis::decouple_analysis;
 use crate::decoupler::Decoupler;
 use crate::deploy::ReusableHosts;
-use crate::parse_results::{analyze_cluster_results, analyze_send_recv_overheads};
+use crate::parse_results::{
+    analyze_cluster_results, analyze_send_recv_overheads, compare_expected_performance, get_or_append_run_metadata, MultiRunMetadata, RunMetadata
+};
 use crate::repair::{cycle_source_to_sink_input, inject_id, remove_counter};
 
 const COUNTER_PREFIX: &str = "_optimize_counter";
@@ -123,6 +126,7 @@ async fn track_cluster_usage_cardinality(
 }
 
 /// TODO: Return type should be changed to also include Partitioner
+#[expect(clippy::too_many_arguments, reason = "Optimizer internal function")]
 pub async fn deploy_and_analyze<'a>(
     reusable_hosts: &mut ReusableHosts,
     deployment: &mut Deployment,
@@ -131,6 +135,8 @@ pub async fn deploy_and_analyze<'a>(
     processes: &Vec<(usize, String)>,
     exclude_from_decoupling: Vec<String>,
     num_seconds: Option<usize>,
+    multi_run_metadata: &RefCell<MultiRunMetadata>,
+    iteration: usize, // Starts at 0, how many times this function has been called
 ) -> (
     RewriteIrFlowBuilder<'a>,
     Vec<HydroRoot>,
@@ -143,6 +149,7 @@ pub async fn deploy_and_analyze<'a>(
     // Rewrite with counter tracking
     let rewritten_ir_builder = builder.rewritten_ir_builder();
     let optimized = builder.optimize_with(persist_pullup).optimize_with(|leaf| {
+        inject_id(leaf);
         insert_counter(leaf, counter_output_duration);
     });
     let mut ir = deep_clone(optimized.ir());
@@ -188,22 +195,31 @@ pub async fn deploy_and_analyze<'a>(
         .await
         .unwrap();
 
+    // Add metadata for this run
+    let mut mut_multi_run_metadata = multi_run_metadata.borrow_mut();
+    let mut run_metadata = get_or_append_run_metadata(&mut mut_multi_run_metadata, iteration);
     let (bottleneck, bottleneck_name, bottleneck_num_nodes) = analyze_cluster_results(
         &nodes,
         &mut ir,
         &mut usage_out,
         &mut cardinality_out,
+        &mut run_metadata,
         exclude_from_decoupling,
     )
     .await;
     // Remove HydroNode::Counter (since we don't want to consider decoupling those)
     remove_counter(&mut ir);
-    // Inject new next_stmt_id into metadata (old ones are invalid after removing the counter)
-    inject_id(&mut ir);
 
     // Create a mapping from each CycleSink to its corresponding CycleSource
     let cycle_source_to_sink_input = cycle_source_to_sink_input(&mut ir);
-    let (send_overhead, recv_overhead) = analyze_send_recv_overheads(&mut ir, &bottleneck);
+    analyze_send_recv_overheads(&mut ir, &mut run_metadata);
+    let send_overhead = *run_metadata.send_overhead.get(&bottleneck).unwrap();
+    let recv_overhead = *run_metadata.recv_overhead.get(&bottleneck).unwrap();
+
+    // Check the expected/actual CPU usages before/after rewrites
+    std::mem::drop(mut_multi_run_metadata); // Release borrow
+    compare_expected_performance(&mut ir, multi_run_metadata, iteration);
+
     let (orig_to_decoupled, decoupled_to_orig, place_on_decoupled) = decouple_analysis(
         &mut ir,
         &bottleneck,

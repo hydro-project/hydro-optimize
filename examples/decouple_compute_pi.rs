@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -79,9 +80,10 @@ async fn main() {
     // Generate graphs if requested
     let _ = built.generate_graph_with_config(&args.graph, None);
 
+    let multi_run_metadata = RefCell::new(vec![]);
     let _nodes = built
         .optimize_with(persist_pullup::persist_pullup)
-        .optimize_with(|roots| decoupler::decouple(roots, &decoupler))
+        .optimize_with(|roots| decoupler::decouple(roots, &decoupler, &multi_run_metadata, 0))
         .optimize_with(debug::print_id)
         .with_process(
             &leader,

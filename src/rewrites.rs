@@ -1,5 +1,8 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use hydro_lang::compile::builder::{FlowBuilder, RewriteIrFlowBuilder};
-use hydro_lang::compile::ir::{HydroIrMetadata, HydroNode, HydroRoot, deep_clone};
+use hydro_lang::compile::ir::{deep_clone, traverse_dfir, HydroIrMetadata, HydroNode, HydroRoot};
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::location::{Cluster, Location};
 use serde::{Deserialize, Serialize};
@@ -32,6 +35,7 @@ pub fn replay<'a>(
 ) -> (Vec<(Cluster<'a, ()>, usize)>, FlowBuilder<'a>) {
     let mut new_clusters = vec![];
 
+    let multi_run_metadata = RefCell::new(vec![]);
     let new_builder = builder.build_with(|builder| {
         let mut ir = deep_clone(ir);
 
@@ -41,7 +45,7 @@ pub fn replay<'a>(
             match &mut rewrite_metadata.rewrite {
                 Rewrite::Decouple(decoupler) => {
                     decoupler.decoupled_location = new_cluster.id().clone();
-                    decoupler::decouple(&mut ir, decoupler);
+                    decoupler::decouple(&mut ir, decoupler, &multi_run_metadata, 0);
                 }
                 Rewrite::Partition(_partitioner) => {
                     panic!("Partitioning is not yet replayable");
@@ -114,20 +118,54 @@ impl VisitMut for ClusterSelfIdReplace {
     }
 }
 
+/// Converts input metadata to IDs, filtering by location if provided
 pub fn relevant_inputs(
     input_metadatas: Vec<&HydroIrMetadata>,
-    cluster_to_decouple: &LocationId,
+    location: Option<&LocationId>,
 ) -> Vec<usize> {
     input_metadatas
         .iter()
         .filter_map(|input_metadata| {
-            if cluster_to_decouple == input_metadata.location_kind.root() {
-                Some(input_metadata.op.id.unwrap())
-            } else {
+            if let Some(location) = location && input_metadata.location_kind.root() != location {
                 None
+            }
+            else {
+                Some(input_metadata.op.id.unwrap())
             }
         })
         .collect()
+}
+
+/// Creates a mapping from op_id to its input op_ids, filtered by location if provided
+pub fn op_id_to_inputs(
+    ir: &mut [HydroRoot],
+    location: Option<&LocationId>,
+    cycle_source_to_sink_input: &HashMap<usize, usize>,
+) -> HashMap<usize, Vec<usize>> {
+    let mapping = RefCell::new(HashMap::new());
+
+    traverse_dfir(
+        ir,
+        |leaf, op_id| {
+            let relevant_input_ids = relevant_inputs(leaf.input_metadata(), location);
+            mapping.borrow_mut().insert(*op_id, relevant_input_ids);
+        },
+        |node, op_id| {
+            let input_ids = match node {
+                HydroNode::CycleSource { .. } => {
+                    // For CycleSource, its input is its CycleSink's input. Note: assumes the CycleSink is on the same cluster
+                    vec![*cycle_source_to_sink_input.get(op_id).unwrap()]
+                }
+                HydroNode::Tee { inner, .. } => {
+                    vec![inner.0.borrow().op_metadata().id.unwrap()]
+                }
+                _ => relevant_inputs(node.input_metadata(), location),
+            };
+            mapping.borrow_mut().insert(*op_id, input_ids);
+        },
+    );
+
+    mapping.take()
 }
 
 #[derive(Clone, PartialEq, Eq)]

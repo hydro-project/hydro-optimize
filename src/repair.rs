@@ -1,22 +1,38 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use hydro_lang::compile::ir::{HydroNode, HydroRoot, transform_bottom_up, traverse_dfir};
+use hydro_lang::compile::ir::{
+    HydroIrOpMetadata, HydroNode, HydroRoot, transform_bottom_up, traverse_dfir,
+};
 use hydro_lang::location::dynamic::LocationId;
 use syn::Ident;
 
-fn inject_id_root(root: &mut HydroRoot, next_stmt_id: &mut usize) {
-    let metadata = root.op_metadata_mut();
-    metadata.id = Some(*next_stmt_id);
+fn inject_id_metadata(
+    metadata: &mut HydroIrOpMetadata,
+    new_id: usize,
+    new_id_to_old_id: &RefCell<HashMap<usize, usize>>,
+) {
+    let old_id = std::mem::replace(&mut metadata.id, Some(new_id));
+    if let Some(old_id) = old_id {
+        new_id_to_old_id.borrow_mut().insert(new_id, old_id);
+    }
 }
 
-fn inject_id_node(node: &mut HydroNode, next_stmt_id: &mut usize) {
-    let metadata = node.op_metadata_mut();
-    metadata.id = Some(*next_stmt_id);
-}
+/// Injects new IDs for nodes based on location. Returns a map from the new IDs to the old IDs, if the old IDs are available.
+pub fn inject_id(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
+    let new_id_to_old_id = RefCell::new(HashMap::new());
 
-pub fn inject_id(ir: &mut [HydroRoot]) {
-    traverse_dfir(ir, inject_id_root, inject_id_node);
+    traverse_dfir(
+        ir,
+        |leaf, id| {
+            inject_id_metadata(leaf.op_metadata_mut(), *id, &new_id_to_old_id);
+        },
+        |node, id| {
+            inject_id_metadata(node.op_metadata_mut(), *id, &new_id_to_old_id);
+        },
+    );
+
+    new_id_to_old_id.take()
 }
 
 fn link_cycles_root(root: &mut HydroRoot, sink_inputs: &mut HashMap<Ident, usize>) {
