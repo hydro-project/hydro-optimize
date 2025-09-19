@@ -5,60 +5,51 @@ use hydro_lang::compile::ir::{HydroNode, HydroRoot, traverse_dfir};
 use hydro_lang::location::dynamic::LocationId;
 use syn::visit::Visit;
 
-use super::rewrites::{NetworkType, get_network_type, relevant_inputs};
+use super::rewrites::{NetworkType, get_network_type};
 use crate::partition_syn_analysis::{AnalyzeClosure, StructOrTuple, StructOrTupleIndex};
+use crate::rewrites::op_id_to_inputs;
 
-// Find all inputs of a node
-struct InputMetadata {
-    // Const fields
-    location: LocationId,
-    // Variables
-    inputs: BTreeSet<usize>,               // op_ids of cluster inputs.
-    input_parents: BTreeMap<usize, usize>, /* input op_id -> parent of the input (potentially on a different location) */
-}
-
-fn input_analysis_node(
-    node: &mut HydroNode,
-    next_stmt_id: &mut usize,
-    metadata: &mut InputMetadata,
-) {
-    match get_network_type(node, metadata.location.root().raw_id()) {
-        Some(NetworkType::Recv) | Some(NetworkType::SendRecv) => {
-            metadata.inputs.insert(*next_stmt_id);
-            metadata.input_parents.insert(
-                *next_stmt_id,
-                node.input_metadata().first().unwrap().op.id.unwrap(),
-            );
-        }
-        _ => {}
-    }
-}
-
-fn input_analysis(
+/// Create a mapping from all input nodes to their parents (across locations)
+fn all_inputs_parents(
     ir: &mut [HydroRoot],
-    location: &LocationId,
-) -> (BTreeSet<usize>, BTreeMap<usize, usize>) {
-    let mut input_metadata = InputMetadata {
-        location: location.clone(),
-        inputs: BTreeSet::new(),
-        input_parents: BTreeMap::new(),
-    };
+    inputs: &[usize],
+    cycle_source_to_sink_input: &HashMap<usize, usize>,
+) -> BTreeMap<usize, usize> {
+    op_id_to_inputs(ir, None, cycle_source_to_sink_input)
+        .iter()
+        .filter_map(|(op_id, parents)| {
+            if inputs.contains(op_id) {
+                Some((*op_id, parents[0])) // Each input only has one parent
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Find all input nodes of a location
+fn all_inputs(ir: &mut [HydroRoot], location: &LocationId) -> Vec<usize> {
+    let mut inputs = vec![];
+
     traverse_dfir(
         ir,
         |_, _| {},
-        |node, next_stmt_id| {
-            input_analysis_node(node, next_stmt_id, &mut input_metadata);
+        |node, next_stmt_id| match get_network_type(node, location.root().raw_id()) {
+            Some(NetworkType::Recv) | Some(NetworkType::SendRecv) => {
+                inputs.push(*next_stmt_id);
+            }
+            _ => {}
         },
     );
 
-    (input_metadata.inputs, input_metadata.input_parents)
+    inputs
 }
 
 pub struct InputDependencyMetadata {
     // Const fields
     pub location: LocationId,
-    pub inputs: BTreeSet<usize>,
-    pub input_parents: BTreeMap<usize, usize>,
+    pub inputs: Vec<usize>,
+    pub op_id_to_parents: HashMap<usize, Vec<usize>>,
     // Variables
     pub optimistic_phase: bool, /* If true, tuple intersection continues even if one side does not exist */
     pub input_taint: BTreeMap<usize, BTreeSet<usize>>, /* op_id -> set of input op_ids that taint this node */
@@ -93,7 +84,6 @@ fn input_dependency_analysis_node(
     node: &mut HydroNode,
     next_stmt_id: &mut usize,
     metadata: &mut InputDependencyMetadata,
-    cycle_source_to_sink_input: &HashMap<usize, usize>,
 ) {
     // Filter unrelated nodes
     if metadata.location != *node.metadata().location_kind.root() {
@@ -101,17 +91,11 @@ fn input_dependency_analysis_node(
     }
 
     println!("Analyzing node {} {:?}", next_stmt_id, node.print_root());
-
-    let parent_ids = match node {
-        HydroNode::CycleSource { .. } => {
-            // For CycleSource, its input is its CycleSink's input. Note: assume the CycleSink is on the same cluster
-            vec![*cycle_source_to_sink_input.get(next_stmt_id).unwrap()]
-        }
-        HydroNode::Tee { inner, .. } => {
-            vec![inner.0.borrow().metadata().op.id.unwrap()]
-        }
-        _ => relevant_inputs(node.input_metadata(), &metadata.location),
-    };
+    let parent_ids = metadata
+        .op_id_to_parents
+        .get(next_stmt_id)
+        .cloned()
+        .unwrap_or_default();
 
     let InputDependencyMetadata {
         inputs,
@@ -365,13 +349,12 @@ fn input_dependency_analysis_node(
 fn input_dependency_analysis(
     ir: &mut [HydroRoot],
     location: &LocationId,
-    cycle_source_to_sink_input: &HashMap<usize, usize>,
+    op_id_to_parents: HashMap<usize, Vec<usize>>,
 ) -> InputDependencyMetadata {
-    let (inputs, input_parents) = input_analysis(ir, location);
     let mut metadata = InputDependencyMetadata {
         location: location.clone(),
-        inputs,
-        input_parents,
+        inputs: all_inputs(ir, location),
+        op_id_to_parents,
         optimistic_phase: true,
         input_taint: BTreeMap::new(),
         input_dependencies: BTreeMap::new(),
@@ -387,14 +370,9 @@ fn input_dependency_analysis(
 
         traverse_dfir(
             ir,
-            |_, _| {}, // Don't need to analyze roots since they don't output anyway
+            |_, _| {}, // Don't need to analyze leaves since they don't output anyway
             |node, next_stmt_id| {
-                input_dependency_analysis_node(
-                    node,
-                    next_stmt_id,
-                    &mut metadata,
-                    cycle_source_to_sink_input,
-                );
+                input_dependency_analysis_node(node, next_stmt_id, &mut metadata);
             },
         );
 
@@ -453,7 +431,7 @@ fn partitioning_constraint_analysis_node(
     possible_partitionings: &mut BTreeMap<usize, BTreeSet<BTreeMap<usize, StructOrTupleIndex>>>, /* op -> set of partitioning requirements (input -> indices), one for each input taint. Empty set = cannot partition */
 ) {
     let InputDependencyMetadata {
-        location,
+        op_id_to_parents,
         input_taint,
         input_dependencies,
         ..
@@ -461,7 +439,10 @@ fn partitioning_constraint_analysis_node(
 
     // If this node is tainted by an input (otherwise we don't care)
     if input_taint.contains_key(next_stmt_id) {
-        let parent_ids = relevant_inputs(node.input_metadata(), location);
+        let parent_ids = op_id_to_parents
+            .get(next_stmt_id)
+            .cloned()
+            .unwrap_or_default();
 
         // If there's at least 1 parent that is not tainted by any input, then we can always partition
         if parent_ids
@@ -593,7 +574,8 @@ pub fn partitioning_analysis(
     Vec<BTreeMap<usize, StructOrTupleIndex>>,
     BTreeMap<usize, usize>,
 )> {
-    let dependency_metadata = input_dependency_analysis(ir, location, cycle_source_to_sink_input);
+    let op_id_to_parents = op_id_to_inputs(ir, Some(location), cycle_source_to_sink_input);
+    let dependency_metadata = input_dependency_analysis(ir, location, op_id_to_parents);
     let mut possible_partitionings = BTreeMap::new();
 
     println!("\nBegin partitioning constraint analysis");
@@ -649,7 +631,10 @@ pub fn partitioning_analysis(
     } else {
         // possible_partitionings is empty
         println!("No restrictions on partitioning");
-        return Some((Vec::new(), dependency_metadata.input_parents));
+        return Some((
+            Vec::new(),
+            all_inputs_parents(ir, &dependency_metadata.inputs, cycle_source_to_sink_input),
+        ));
     }
 
     // Iterate through remaining constraints
@@ -706,7 +691,10 @@ pub fn partitioning_analysis(
     if prev_global_partitionings.is_empty() {
         return None; // No possible partitioning
     }
-    Some((prev_global_partitionings, dependency_metadata.input_parents))
+    Some((
+        prev_global_partitionings,
+        all_inputs_parents(ir, &dependency_metadata.inputs, cycle_source_to_sink_input),
+    ))
 }
 
 /// Given the set of possible partitionings, select an arbitrary one to use, and find all the parents of Network nodes that need to be modified
@@ -756,6 +744,7 @@ mod tests {
     };
     use crate::partition_syn_analysis::{StructOrTuple, StructOrTupleIndex};
     use crate::repair::{cycle_source_to_sink_input, inject_id, inject_location};
+    use crate::rewrites::op_id_to_inputs;
 
     fn test_input_with_unnamed_ir_nodes(
         builder: FlowBuilder<'_>,
@@ -768,18 +757,19 @@ mod tests {
         let mut cycle_data = HashMap::new();
         let built = builder
             .optimize_with(persist_pullup)
-            .optimize_with(inject_id)
             .optimize_with(|ir| {
+                inject_id(ir);
                 cycle_data = cycle_source_to_sink_input(ir);
                 inject_location(ir, &cycle_data);
             })
             .into_deploy::<HydroDeploy>();
         let mut ir = deep_clone(built.ir());
+        let op_id_to_parents = op_id_to_inputs(&mut ir, Some(&location), &cycle_data);
         let InputDependencyMetadata {
             input_taint: actual_taint,
             input_dependencies: actual_dependencies,
             ..
-        } = input_dependency_analysis(&mut ir, &location, &cycle_data);
+        } = input_dependency_analysis(&mut ir, &location, op_id_to_parents);
 
         println!("Expected taint: {:?}", expected_taint);
         println!("Expected dependencies: {:?}", expected_dependencies);
@@ -868,8 +858,8 @@ mod tests {
         let mut cycle_data = HashMap::new();
         let built = builder
             .optimize_with(persist_pullup)
-            .optimize_with(inject_id)
             .optimize_with(|ir| {
+                inject_id(ir);
                 cycle_data = cycle_source_to_sink_input(ir);
                 inject_location(ir, &cycle_data);
             })
@@ -1969,10 +1959,11 @@ mod tests {
         let (complete_cycle2, cycle2) =
             cluster2_tick.cycle::<Stream<(usize, usize), _, Bounded, NoOrder>>();
         let chained = {
-            cycle1.ir_node_named("teed chain 1 cycled")
+            cycle1
+                .ir_node_named("teed chain 1 cycled")
                 .join(input.batch(&cluster2_tick, nondet!(/** test */)))
                 .ir_node_named("join")
-                .map(q!(|(_, (b1,b2))| (b1,b2))) // Both values are influenced by the join with cycle2_out
+                .map(q!(|(_, (b1, b2))| (b1, b2))) // Both values are influenced by the join with cycle2_out
                 .ir_node_named("map (x,(a,b)) to (a,b)")
                 .chain(cycle2.ir_node_named("teed map (a,b) to (b,b) 1 cycled"))
         };
@@ -2129,8 +2120,9 @@ mod tests {
         let (complete_cycle2, cycle2) =
             cluster2_tick.cycle::<Stream<(usize, usize), _, Bounded, NoOrder>>();
         let chained = {
-            cycle1.join(input.batch(&cluster2_tick, nondet!(/** test */)))
-                .map(q!(|(_, (b1,b2))| (b1,b2))) // Both values are influenced by the join with cycle2_out
+            cycle1
+                .join(input.batch(&cluster2_tick, nondet!(/** test */)))
+                .map(q!(|(_, (b1, b2))| (b1, b2))) // Both values are influenced by the join with cycle2_out
                 .chain(cycle2)
         };
         complete_cycle1.complete_next_tick(chained.clone());

@@ -1,5 +1,7 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 
+use hydro_build_utils::insta;
 use hydro_lang::compile::rewrites::persist_pullup;
 use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::location::Location;
@@ -24,18 +26,19 @@ fn decoupled_compute_pi_ir() {
         decoupled_location: decoupled_cluster.id().clone(),
         orig_location: cluster.id().clone(),
     };
+    let multi_run_metadata = RefCell::new(vec![]);
     let built = builder
         .optimize_with(persist_pullup::persist_pullup)
-        .optimize_with(|roots| decoupler::decouple(roots, &decoupler))
+        .optimize_with(|roots| decoupler::decouple(roots, &decoupler, &multi_run_metadata, 0))
         .into_deploy::<HydroDeploy>();
 
-    hydro_build_utils::assert_debug_snapshot!(built.ir());
+    insta::assert_debug_snapshot!(built.ir());
 
     for (id, ir) in built.preview_compile().all_dfir() {
-        hydro_build_utils::insta::with_settings!({
+        insta::with_settings!({
             snapshot_suffix => format!("surface_graph_{id}"),
         }, {
-            hydro_build_utils::assert_snapshot!(ir.surface_syntax_string());
+            insta::assert_snapshot!(ir.surface_syntax_string());
         });
     }
 }
@@ -55,13 +58,13 @@ fn partitioned_simple_cluster_ir() {
         .optimize_with(|roots| crate::partitioner::partition(roots, &partitioner))
         .into_deploy::<HydroDeploy>();
 
-    hydro_build_utils::assert_debug_snapshot!(built.ir());
+    insta::assert_debug_snapshot!(built.ir());
 
     for (id, ir) in built.preview_compile().all_dfir() {
-        hydro_build_utils::insta::with_settings!({
+        insta::with_settings!({
             snapshot_suffix => format!("surface_graph_{id}")
         }, {
-            hydro_build_utils::assert_snapshot!(ir.surface_syntax_string());
+            insta::assert_snapshot!(ir.surface_syntax_string());
         });
     }
 }

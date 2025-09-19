@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use stageleft::quote_type;
 use syn::visit_mut::VisitMut;
 
+use crate::parse_results::{MultiRunMetadata, get_or_append_run_metadata};
 use crate::repair::{cycle_source_to_sink_input, inject_id, inject_location};
 use crate::rewrites::ClusterSelfIdReplace;
 
@@ -238,7 +239,12 @@ fn fix_cluster_self_id_node(node: &mut HydroNode, mut locations: ClusterSelfIdRe
     }
 }
 
-pub fn decouple(ir: &mut [HydroRoot], decoupler: &Decoupler) {
+pub fn decouple(
+    ir: &mut [HydroRoot],
+    decoupler: &Decoupler,
+    multi_run_metadata: &RefCell<MultiRunMetadata>,
+    iteration: usize,
+) {
     let mut new_inners = HashMap::new();
     traverse_dfir(
         ir,
@@ -249,7 +255,10 @@ pub fn decouple(ir: &mut [HydroRoot], decoupler: &Decoupler) {
     );
 
     // Fix IDs since we injected nodes
-    inject_id(ir);
+    let new_id_to_old_id = inject_id(ir);
+    let mut mut_multi_run_metadata = multi_run_metadata.borrow_mut();
+    let run_metadata = get_or_append_run_metadata(&mut mut_multi_run_metadata, iteration);
+    run_metadata.op_id_to_prev_iteration_op_id = new_id_to_old_id;
     // Fix locations since we changed some
     let cycle_source_to_sink_input = cycle_source_to_sink_input(ir);
     inject_location(ir, &cycle_source_to_sink_input);
@@ -272,8 +281,10 @@ pub fn decouple(ir: &mut [HydroRoot], decoupler: &Decoupler) {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::HashSet;
 
+    use hydro_build_utils::insta;
     use hydro_deploy::Deployment;
     use hydro_lang::compile::builder::FlowBuilder;
     use hydro_lang::compile::ir;
@@ -309,36 +320,36 @@ mod tests {
             .values()
             .for_each(q!(|a| println!("Got it: {}", a)));
 
-        let built = builder
-            .optimize_with(persist_pullup)
-            .optimize_with(inject_id)
-            .optimize_with(|ir| {
-                // Convert named nodes to IDs, accounting for the offset
-                let name_to_id = name_to_id_map(ir);
-                let decoupler = Decoupler {
-                    output_to_decoupled_machine_after: output_to_decoupled_machine_after
-                        .into_iter()
-                        .map(|(name, offset)| {
-                            (name_to_id.get(name).cloned().unwrap() as i32 + offset) as usize
-                        })
-                        .collect(),
-                    output_to_original_machine_after: output_to_original_machine_after
-                        .into_iter()
-                        .map(|(name, offset)| {
-                            (name_to_id.get(name).cloned().unwrap() as i32 + offset) as usize
-                        })
-                        .collect(),
-                    place_on_decoupled_machine: place_on_decoupled_machine
-                        .into_iter()
-                        .map(|(name, offset)| {
-                            (name_to_id.get(name).cloned().unwrap() as i32 + offset) as usize
-                        })
-                        .collect(),
-                    decoupled_location: decoupled_cluster.id().clone(),
-                    orig_location: send_cluster.id().clone(),
-                };
-                decouple(ir, &decoupler)
-            });
+        let multi_run_metadata = RefCell::new(vec![]);
+        let iteration = 0;
+        let built = builder.optimize_with(persist_pullup).optimize_with(|ir| {
+            inject_id(ir);
+            // Convert named nodes to IDs, accounting for the offset
+            let name_to_id = name_to_id_map(ir);
+            let decoupler = Decoupler {
+                output_to_decoupled_machine_after: output_to_decoupled_machine_after
+                    .into_iter()
+                    .map(|(name, offset)| {
+                        (name_to_id.get(name).cloned().unwrap() as i32 + offset) as usize
+                    })
+                    .collect(),
+                output_to_original_machine_after: output_to_original_machine_after
+                    .into_iter()
+                    .map(|(name, offset)| {
+                        (name_to_id.get(name).cloned().unwrap() as i32 + offset) as usize
+                    })
+                    .collect(),
+                place_on_decoupled_machine: place_on_decoupled_machine
+                    .into_iter()
+                    .map(|(name, offset)| {
+                        (name_to_id.get(name).cloned().unwrap() as i32 + offset) as usize
+                    })
+                    .collect(),
+                decoupled_location: decoupled_cluster.id().clone(),
+                orig_location: send_cluster.id().clone(),
+            };
+            decouple(ir, &decoupler, &multi_run_metadata, iteration)
+        });
         (send_cluster, recv_cluster, decoupled_cluster, built)
     }
 
@@ -401,7 +412,7 @@ mod tests {
         .3;
 
         ir::dbg_dedup_tee(|| {
-            hydro_build_utils::assert_debug_snapshot!(built.ir());
+            insta::assert_debug_snapshot!(built.ir());
         });
     }
 
@@ -436,7 +447,7 @@ mod tests {
         .3;
 
         ir::dbg_dedup_tee(|| {
-            hydro_build_utils::assert_debug_snapshot!(built.ir());
+            insta::assert_debug_snapshot!(built.ir());
         });
     }
 

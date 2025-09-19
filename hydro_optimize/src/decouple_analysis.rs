@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use crate::rewrites::op_id_to_inputs;
 use good_lp::solvers::microlp::MicroLpSolution;
 use good_lp::{
     Constraint, Expression, ProblemVariables, Solution, SolverModel, Variable, constraint, microlp,
@@ -11,7 +12,7 @@ use hydro_lang::compile::ir::{
 };
 use hydro_lang::location::dynamic::LocationId;
 
-use super::rewrites::{NetworkType, get_network_type, relevant_inputs};
+use super::rewrites::{NetworkType, get_network_type};
 
 /// Each operator is assigned either 0 or 1
 /// 0 means that its output will go to the original node, 1 means that it will go to the decoupled node
@@ -39,7 +40,6 @@ struct ModelMetadata {
     orig_node_cpu_usage: Expression,
     decoupled_node_cpu_usage: Expression,
     op_id_to_var: HashMap<usize, Variable>,
-    op_id_to_inputs: HashMap<usize, Vec<usize>>,
     prev_op_input_with_tick: HashMap<usize, usize>, // tick_id: last op_id with that tick_id
     tee_inner_to_decoupled_vars: HashMap<usize, (Variable, Variable)>, /* inner_id: (orig_to_decoupled, decoupled_to_orig) */
     network_ids: HashMap<usize, NetworkType>,
@@ -75,31 +75,16 @@ fn add_equality_constr(
     }
 }
 
-fn add_input_constraints(
-    op_id: usize,
-    input_ids: Vec<usize>,
+// Store the tick that an op is constrained to
+fn add_tick_constraint(
+    metadata: &HydroIrMetadata,
+    op_id_to_inputs: &HashMap<usize, Vec<usize>>,
     model_metadata: &RefCell<ModelMetadata>,
 ) {
     let ModelMetadata {
         variables,
         constraints,
         op_id_to_var,
-        op_id_to_inputs,
-        ..
-    } = &mut *model_metadata.borrow_mut();
-
-    // Add input constraints. All inputs of an op must output to the same machine (be assigned the same var)
-    add_equality_constr(&input_ids, op_id_to_var, variables, constraints);
-    op_id_to_inputs.insert(op_id, input_ids);
-}
-
-// Store the tick that an op is constrained to
-fn add_tick_constraint(metadata: &HydroIrMetadata, model_metadata: &RefCell<ModelMetadata>) {
-    let ModelMetadata {
-        variables,
-        constraints,
-        op_id_to_var,
-        op_id_to_inputs,
         prev_op_input_with_tick,
         ..
     } = &mut *model_metadata.borrow_mut();
@@ -125,13 +110,13 @@ fn add_tick_constraint(metadata: &HydroIrMetadata, model_metadata: &RefCell<Mode
 fn add_cpu_usage(
     metadata: &HydroIrOpMetadata,
     network_type: &Option<NetworkType>,
+    op_id_to_inputs: &HashMap<usize, Vec<usize>>,
     model_metadata: &RefCell<ModelMetadata>,
 ) {
     let ModelMetadata {
         variables,
         orig_node_cpu_usage,
         decoupled_node_cpu_usage,
-        op_id_to_inputs,
         op_id_to_var,
         ..
     } = &mut *model_metadata.borrow_mut();
@@ -198,6 +183,7 @@ fn add_decouple_vars(
 fn add_decoupling_overhead(
     node: &HydroNode,
     network_type: &Option<NetworkType>,
+    op_id_to_inputs: &HashMap<usize, Vec<usize>>,
     model_metadata: &RefCell<ModelMetadata>,
 ) {
     let ModelMetadata {
@@ -207,7 +193,6 @@ fn add_decoupling_overhead(
         constraints,
         orig_node_cpu_usage,
         decoupled_node_cpu_usage,
-        op_id_to_inputs,
         op_id_to_var,
         ..
     } = &mut *model_metadata.borrow_mut();
@@ -301,7 +286,7 @@ fn add_tee_decoupling_overhead(
 
 fn decouple_analysis_root(
     root: &mut HydroRoot,
-    op_id: &mut usize,
+    op_id_to_inputs: &HashMap<usize, Vec<usize>>,
     model_metadata: &RefCell<ModelMetadata>,
 ) {
     // Ignore nodes that are not in the cluster to decouple
@@ -310,19 +295,14 @@ fn decouple_analysis_root(
         return;
     }
 
-    let input_ids = relevant_inputs(
-        root.input_metadata(),
-        &model_metadata.borrow().cluster_to_decouple,
-    );
-    add_input_constraints(*op_id, input_ids, model_metadata);
-    add_tick_constraint(root.input_metadata()[0], model_metadata);
+    add_tick_constraint(root.input_metadata()[0], op_id_to_inputs, model_metadata);
 }
 
 fn decouple_analysis_node(
     node: &mut HydroNode,
     op_id: &mut usize,
+    op_id_to_inputs: &HashMap<usize, Vec<usize>>,
     model_metadata: &RefCell<ModelMetadata>,
-    cycle_source_to_sink_input: &HashMap<usize, usize>,
 ) {
     let network_type = get_network_type(
         node,
@@ -342,22 +322,6 @@ fn decouple_analysis_node(
         return;
     }
 
-    // Add inputs
-    let input_ids = match node {
-        HydroNode::CycleSource { .. } => {
-            // For CycleSource, its input is its CycleSink's input. Note: assume the CycleSink is on the same cluster
-            vec![*cycle_source_to_sink_input.get(op_id).unwrap()]
-        }
-        HydroNode::Tee { inner, .. } => {
-            vec![inner.0.borrow().metadata().op.id.unwrap()]
-        }
-        _ => relevant_inputs(
-            node.input_metadata(),
-            &model_metadata.borrow().cluster_to_decouple,
-        ),
-    };
-    add_input_constraints(*op_id, input_ids, model_metadata);
-
     // Add decoupling overhead. For Tees of the same inner, even if multiple are decoupled, only penalize decoupling once
     if let HydroNode::Tee {
         inner, metadata, ..
@@ -369,11 +333,16 @@ fn decouple_analysis_node(
             model_metadata,
         );
     } else {
-        add_decoupling_overhead(node, &network_type, model_metadata);
+        add_decoupling_overhead(node, &network_type, op_id_to_inputs, model_metadata);
     }
 
-    add_cpu_usage(node.op_metadata(), &network_type, model_metadata);
-    add_tick_constraint(node.metadata(), model_metadata);
+    add_cpu_usage(
+        node.op_metadata(),
+        &network_type,
+        op_id_to_inputs,
+        model_metadata,
+    );
+    add_tick_constraint(node.metadata(), op_id_to_inputs, model_metadata);
 }
 
 fn solve(model_metadata: &RefCell<ModelMetadata>) -> MicroLpSolution {
@@ -393,15 +362,27 @@ fn solve(model_metadata: &RefCell<ModelMetadata>) -> MicroLpSolution {
 
     // Which node has the highest CPU usage?
     let highest_cpu = vars.add_variable();
-    constrs.push(constraint!(highest_cpu >= orig_usage));
-    constrs.push(constraint!(highest_cpu >= decoupled_usage));
+    constrs.push(constraint!(highest_cpu >= orig_usage.clone()));
+    constrs.push(constraint!(highest_cpu >= decoupled_usage.clone()));
 
     // Minimize the CPU usage of that node
-    vars.minimise(highest_cpu)
+    let solution = vars
+        .minimise(highest_cpu)
         .using(microlp)
         .with_all(constrs)
         .solve()
-        .unwrap()
+        .unwrap();
+
+    println!(
+        "Projected orig_usage after decoupling: {}",
+        solution.eval(orig_usage)
+    );
+    println!(
+        "Projected decoupled_usage after decoupling: {}",
+        solution.eval(decoupled_usage)
+    );
+
+    solution
 }
 
 pub(crate) fn decouple_analysis(
@@ -420,31 +401,36 @@ pub(crate) fn decouple_analysis(
         orig_node_cpu_usage: Expression::default(),
         decoupled_node_cpu_usage: Expression::default(),
         op_id_to_var: HashMap::new(),
-        op_id_to_inputs: HashMap::new(),
         prev_op_input_with_tick: HashMap::new(),
         tee_inner_to_decoupled_vars: HashMap::new(),
         network_ids: HashMap::new(),
     });
+    let op_id_to_inputs =
+        op_id_to_inputs(ir, Some(cluster_to_decouple), cycle_source_to_sink_input);
 
     traverse_dfir(
         ir,
-        |leaf, next_op_id| {
-            decouple_analysis_root(leaf, next_op_id, &model_metadata);
+        |root, _| {
+            decouple_analysis_root(root, &op_id_to_inputs, &model_metadata);
         },
         |node, next_op_id| {
-            decouple_analysis_node(
-                node,
-                next_op_id,
-                &model_metadata,
-                cycle_source_to_sink_input,
-            );
+            decouple_analysis_node(node, next_op_id, &op_id_to_inputs, &model_metadata);
         },
     );
+    for inputs in op_id_to_inputs.values() {
+        let ModelMetadata {
+            op_id_to_var,
+            variables,
+            constraints,
+            ..
+        } = &mut *model_metadata.borrow_mut();
+        // Add input constraints. All inputs of an op must output to the same machine (be assigned the same var)
+        add_equality_constr(inputs, op_id_to_var, variables, constraints);
+    }
 
     let solution = solve(&model_metadata);
     let ModelMetadata {
         op_id_to_var,
-        op_id_to_inputs,
         network_ids,
         ..
     } = &mut *model_metadata.borrow_mut();
@@ -456,7 +442,7 @@ pub(crate) fn decouple_analysis(
     let mut place_on_decoupled = vec![];
 
     for (op_id, inputs) in op_id_to_inputs {
-        if let Some(op_var) = op_id_to_var.get(op_id) {
+        if let Some(op_var) = op_id_to_var.get(&op_id) {
             let op_value = solution.value(*op_var).round();
             let mut input_value = None;
             if let Some(input) = inputs.first()
@@ -466,7 +452,7 @@ pub(crate) fn decouple_analysis(
             };
 
             // Don't insert network if this is Source or already a Network
-            let network_type = network_ids.get(op_id);
+            let network_type = network_ids.get(&op_id);
 
             #[expect(clippy::collapsible_else_if, reason = "code symmetry")]
             if network_type.is_none()
@@ -475,27 +461,27 @@ pub(crate) fn decouple_analysis(
                 // Figure out if we should insert Network nodes
                 match (input_unwrapped, op_value) {
                     (0.0, 1.0) => {
-                        orig_to_decoupled.push(*op_id);
+                        orig_to_decoupled.push(op_id);
                     }
                     (1.0, 0.0) => {
-                        decoupled_to_orig.push(*op_id);
+                        decoupled_to_orig.push(op_id);
                     }
                     _ => {}
                 }
 
                 if input_unwrapped == 0.0 {
-                    orig_machine.push(*op_id);
+                    orig_machine.push(op_id);
                 } else {
-                    decoupled_machine.push(*op_id);
+                    decoupled_machine.push(op_id);
                 }
             } else {
                 if op_value == 0.0 {
-                    orig_machine.push(*op_id);
+                    orig_machine.push(op_id);
                 } else {
-                    decoupled_machine.push(*op_id);
+                    decoupled_machine.push(op_id);
                     // Don't modify the destination if we're sending to someone else
                     if !network_type.is_some_and(|t| *t == NetworkType::Send) {
-                        place_on_decoupled.push(*op_id);
+                        place_on_decoupled.push(op_id);
                     }
                 }
             }

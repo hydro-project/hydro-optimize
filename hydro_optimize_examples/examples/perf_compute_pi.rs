@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 /// Run with no args for localhost, with `gcp <GCP PROJECT>` for GCP
 ///
 /// ```bash
@@ -63,6 +65,7 @@ async fn main() {
         std::any::type_name::<Leader>().to_string(),
     )];
 
+    let multi_run_metadata = RefCell::new(vec![]);
     let (rewritten_ir_builder, ir, _, _, _) = deploy_and_analyze(
         &mut reusable_hosts,
         &mut deployment,
@@ -71,6 +74,8 @@ async fn main() {
         &processes,
         vec![],
         None,
+        &multi_run_metadata,
+        0,
     )
     .await;
 

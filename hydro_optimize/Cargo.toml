@@ -1,0 +1,37 @@
+[package]
+name = "hydro_optimize"
+publish = true
+version = "0.13.0"
+documentation = "https://docs.rs/hydro_optimize/"
+description = "Automatic decoupling and partitioning"
+edition = "2024"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+good_lp = { version = "1.14.0", features = ["microlp"], default-features = false }
+hydro_deploy = { git = "https://github.com/hydro-project/hydro.git" }
+hydro_lang = { git = "https://github.com/hydro-project/hydro.git", features = ["deploy"] }
+proc-macro2 = "1.0.95"
+regex = "1.11.1"
+serde = { version = "1.0.197", features = ["derive"] }
+stageleft = "0.9.7"
+syn = { version = "2.0.46", features = [
+    "parsing",
+    "extra-traits",
+    "visit-mut",
+] }
+tokio = { version = "1.29.0", features = ["full"] }
+
+[dev-dependencies]
+ctor = "0.2"
+hydro_build_utils = { git = "https://github.com/hydro-project/hydro.git", version = "0.0.1" }
+hydro_lang = { git = "https://github.com/hydro-project/hydro.git", version = "^0.14.0", features = ["viz"] }
+hydro_test = { git = "https://github.com/hydro-project/hydro.git", version = "^0.0.0" }
+hydro_std = { git = "https://github.com/hydro-project/hydro.git", version = "^0.14.0" }
+clap = { version = "4.4", features = ["derive"] }
+include_mdtests = { git = "https://github.com/hydro-project/hydro.git", version = "^0.0.0" }
+
+[build-dependencies]
+hydro_build_utils = { git = "https://github.com/hydro-project/hydro.git", version = "0.0.1" }
