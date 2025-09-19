@@ -16,7 +16,7 @@ mod tests;
 #[doc(hidden)]
 #[cfg(doctest)]
 mod docs {
-    include_mdtests::include_mdtests!("hydro_optimize/docs/**/*.md*");
+    include_mdtests::include_mdtests!("docs/**/*.md*");
 }
 
 #[cfg(test)]

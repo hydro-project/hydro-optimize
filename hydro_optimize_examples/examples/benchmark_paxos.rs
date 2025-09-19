@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -52,6 +53,8 @@ async fn main() {
     let num_clients_per_node = vec![1, 500, 1000, 2000, 3000];
     let run_seconds = 60;
 
+    let multi_run_metadata = RefCell::new(vec![]);
+    let mut iteration = 0;
     let max_num_clients_per_node = num_clients_per_node.iter().max().unwrap();
     for (i, num_clients) in num_clients.iter().enumerate() {
         // For the 1st client, test a variable number of virtual clients. For the rest, use the max number.
@@ -129,12 +132,16 @@ async fn main() {
                 &processes,
                 vec![],
                 Some(run_seconds),
+                &multi_run_metadata,
+                iteration,
             )
             .await;
 
             // Cleanup and generate graphs if requested
             let built = rewritten_ir_builder.build_with(|_| ir).finalize();
             _ = built.generate_graph_with_config(&args.graph, None);
+
+            iteration += 1;
         }
     }
 }
