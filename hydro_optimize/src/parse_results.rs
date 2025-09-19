@@ -17,15 +17,15 @@ use crate::debug::print_id;
 pub struct RunMetadata {
     pub send_overhead: HashMap<LocationId, f64>,
     pub recv_overhead: HashMap<LocationId, f64>,
-    unaccounted_perf: HashMap<LocationId, f64>, // % of perf samples not mapped to any operator
-    total_usage: HashMap<LocationId, f64>,      // 100% CPU = 1.0
+    pub unaccounted_perf: HashMap<LocationId, f64>, // % of perf samples not mapped to any operator
+    pub total_usage: HashMap<LocationId, f64>,      // 100% CPU = 1.0
     pub op_id_to_prev_iteration_op_id: HashMap<usize, usize>,
-    op_id_to_location: HashMap<usize, LocationId>,
-    op_id_to_cpu_usage: HashMap<usize, f64>,
-    op_id_to_recv_cpu_usage: HashMap<usize, f64>,
-    op_id_to_cardinality: HashMap<usize, usize>,
-    op_id_to_input_op_id: HashMap<usize, Vec<usize>>,
-    network_op_id: HashSet<usize>,
+    pub op_id_to_location: HashMap<usize, LocationId>,
+    pub op_id_to_cpu_usage: HashMap<usize, f64>,
+    pub op_id_to_recv_cpu_usage: HashMap<usize, f64>,
+    pub op_id_to_cardinality: HashMap<usize, usize>,
+    pub op_id_to_input_op_id: HashMap<usize, Vec<usize>>,
+    pub network_op_id: HashSet<usize>,
 }
 
 pub type MultiRunMetadata = Vec<RunMetadata>;
