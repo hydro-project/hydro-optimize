@@ -525,15 +525,14 @@ pub fn compare_expected_performance(
         let mut curr_id = *id;
         while parent_prev_id.is_none() {
             let inputs = run_metadata.op_id_to_input_op_id.get(&curr_id).unwrap();
-            if inputs.len() != 1 {
-                println!(
-                    "Warning: Location {:?}: Created operator {} has {} inputs, expected 1",
-                    location,
-                    id,
-                    inputs.len()
-                );
-                continue;
-            }
+            assert_eq!(
+                inputs.len(),
+                1,
+                "Warning: Location {:?}: Created operator {} has {} inputs, expected 1",
+                location,
+                id,
+                inputs.len()
+            );
             let input = inputs[0];
 
             if let Some(prev_id) = run_metadata.op_id_to_prev_iteration_op_id.get(&input) {

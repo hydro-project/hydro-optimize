@@ -257,7 +257,7 @@ pub fn decouple(
     // Fix IDs since we injected nodes
     let new_id_to_old_id = inject_id(ir);
     let mut mut_multi_run_metadata = multi_run_metadata.borrow_mut();
-    let run_metadata = get_or_append_run_metadata(&mut mut_multi_run_metadata, iteration);
+    let run_metadata = get_or_append_run_metadata(&mut mut_multi_run_metadata, iteration + 1);
     run_metadata.op_id_to_prev_iteration_op_id = new_id_to_old_id;
     // Fix locations since we changed some
     let cycle_source_to_sink_input = cycle_source_to_sink_input(ir);
