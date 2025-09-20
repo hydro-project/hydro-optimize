@@ -316,7 +316,7 @@ pub fn get_or_append_run_metadata(
     multi_run_metadata: &mut MultiRunMetadata,
     iteration: usize,
 ) -> &mut RunMetadata {
-    if multi_run_metadata.len() <= iteration {
+    while multi_run_metadata.len() < iteration + 1 {
         multi_run_metadata.push(RunMetadata::default());
     }
     multi_run_metadata.get_mut(iteration).unwrap()
