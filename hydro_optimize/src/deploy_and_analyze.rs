@@ -216,8 +216,8 @@ pub async fn deploy_and_analyze<'a>(
     // Create a mapping from each CycleSink to its corresponding CycleSource
     let cycle_source_to_sink_input = cycle_source_to_sink_input(&mut ir);
     analyze_send_recv_overheads(&mut ir, run_metadata);
-    let send_overhead = *run_metadata.send_overhead.get(&bottleneck).unwrap();
-    let recv_overhead = *run_metadata.recv_overhead.get(&bottleneck).unwrap();
+    let send_overhead = run_metadata.send_overhead.get(&bottleneck).cloned().unwrap_or_default();
+    let recv_overhead = run_metadata.recv_overhead.get(&bottleneck).cloned().unwrap_or_default();
 
     // Check the expected/actual CPU usages before/after rewrites
     std::mem::drop(mut_multi_run_metadata); // Release borrow

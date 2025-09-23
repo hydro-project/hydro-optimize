@@ -589,7 +589,7 @@ pub fn compare_expected_performance(
         {
             compare_expected_values(
                 cpu_usage,
-                prev_run_metadata.send_overhead.get(prev_location).unwrap()
+                prev_run_metadata.send_overhead.get(prev_location).cloned().unwrap_or_default()
                     * *prev_cardinality as f64,
                 location,
                 prev_location,
@@ -605,7 +605,7 @@ pub fn compare_expected_performance(
         {
             compare_expected_values(
                 cpu_usage,
-                prev_run_metadata.recv_overhead.get(prev_location).unwrap()
+                prev_run_metadata.recv_overhead.get(prev_location).cloned().unwrap_or_default()
                     * *prev_cardinality as f64,
                 &location,
                 prev_location,
