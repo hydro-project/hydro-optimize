@@ -1049,7 +1049,6 @@ dependencies = [
 [[package]]
 name = "dfir_lang"
 version = "0.14.0"
-source = "git+https://github.com/hydro-project/hydro.git#c01575c6f8d249cb0f96e0bc92761bae309e294b"
 dependencies = [
  "auto_impl",
  "documented",
@@ -1705,7 +1704,6 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 [[package]]
 name = "hydro_build_utils"
 version = "0.0.1"
-source = "git+https://github.com/hydro-project/hydro.git#c01575c6f8d249cb0f96e0bc92761bae309e294b"
 dependencies = [
  "insta",
  "rustc_version",
@@ -1714,7 +1712,6 @@ dependencies = [
 [[package]]
 name = "hydro_deploy"
 version = "0.14.0"
-source = "git+https://github.com/hydro-project/hydro.git#c01575c6f8d249cb0f96e0bc92761bae309e294b"
 dependencies = [
  "anyhow",
  "async-process",
@@ -1750,7 +1747,6 @@ dependencies = [
 [[package]]
 name = "hydro_deploy_integration"
 version = "0.14.0"
-source = "git+https://github.com/hydro-project/hydro.git#c01575c6f8d249cb0f96e0bc92761bae309e294b"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -1767,7 +1763,6 @@ dependencies = [
 [[package]]
 name = "hydro_lang"
 version = "0.14.0"
-source = "git+https://github.com/hydro-project/hydro.git#c01575c6f8d249cb0f96e0bc92761bae309e294b"
 dependencies = [
  "auto_impl",
  "backtrace",
@@ -1816,7 +1811,9 @@ dependencies = [
  "hydro_std",
  "hydro_test",
  "include_mdtests",
+ "proc-macro-crate",
  "proc-macro2",
+ "quote",
  "regex",
  "serde",
  "stageleft",
@@ -1848,7 +1845,6 @@ dependencies = [
 [[package]]
 name = "hydro_std"
 version = "0.14.0"
-source = "git+https://github.com/hydro-project/hydro.git#c01575c6f8d249cb0f96e0bc92761bae309e294b"
 dependencies = [
  "hdrhistogram",
  "hydro_lang",
@@ -1860,7 +1856,6 @@ dependencies = [
 [[package]]
 name = "hydro_test"
 version = "0.0.0"
-source = "git+https://github.com/hydro-project/hydro.git#c01575c6f8d249cb0f96e0bc92761bae309e294b"
 dependencies = [
  "bytes",
  "colored",
@@ -2072,7 +2067,6 @@ dependencies = [
 [[package]]
 name = "include_mdtests"
 version = "0.0.0"
-source = "git+https://github.com/hydro-project/hydro.git#c01575c6f8d249cb0f96e0bc92761bae309e294b"
 dependencies = [
  "glob",
  "proc-macro2",

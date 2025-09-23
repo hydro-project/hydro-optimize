@@ -114,6 +114,8 @@ pub fn web_submit<'a, Client>(
     users_this_tick_with_api_key
         .clone()
         .all_ticks()
+        .assume_ordering(nondet!(/** Email order doesn't matter */))
+        .assume_retries(nondet!(/** At least once delivery is fine */))
         .for_each(q!(|(_client_id, (email, _is_admin, api_key))| {
             self::send_email(api_key, email)
         }));

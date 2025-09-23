@@ -6,3 +6,19 @@ members = [
 ]
 
 resolver = "2"
+
+[workspace.dependencies]
+hydro_lang = { path = "../hydroflow/hydro_lang" }
+hydro_std = { path = "../hydroflow/hydro_std" }
+hydro_test = { path = "../hydroflow/hydro_test" }
+dfir_lang = { path = "../hydroflow/dfir_lang" }
+hydro_build_utils = { path = "../hydroflow/hydro_build_utils" }
+hydro_deploy = { path = "../hydroflow/hydro_deploy/core" }
+include_mdtests = { path = "../hydroflow/include_mdtests" }
+serde = { version = "1.0.197", features = ["derive"] }
+stageleft = "0.9.7"
+stageleft_tool = "0.9.7"
+tokio = { version = "1.29.0", features = ["full"] }
+ctor = "0.2"
+clap = { version = "4.4", features = ["derive"] }
+regex = "1.11.1"

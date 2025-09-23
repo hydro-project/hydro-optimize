@@ -6,9 +6,6 @@ use hydro_lang::compile::ir::{
     DebugInstantiate, DebugType, HydroIrMetadata, HydroIrOpMetadata, HydroNode, HydroRoot, TeeNode,
     transform_bottom_up, traverse_dfir,
 };
-use hydro_lang::live_collections::stream::networking::{
-    deserialize_bincode_with_type, serialize_bincode_with_type,
-};
 use hydro_lang::location::MemberId;
 use hydro_lang::location::dynamic::LocationId;
 use proc_macro2::Span;
@@ -18,7 +15,7 @@ use syn::visit_mut::VisitMut;
 
 use crate::parse_results::{MultiRunMetadata, get_or_append_run_metadata};
 use crate::repair::{cycle_source_to_sink_input, inject_id, inject_location};
-use crate::rewrites::ClusterSelfIdReplace;
+use crate::rewrites::{deserialize_bincode_with_type, serialize_bincode_with_type, ClusterSelfIdReplace};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Decoupler {
@@ -287,10 +284,12 @@ mod tests {
     use hydro_build_utils::insta;
     use hydro_deploy::Deployment;
     use hydro_lang::compile::builder::FlowBuilder;
+    use hydro_lang::compile::built::BuiltFlow;
     use hydro_lang::compile::ir;
     use hydro_lang::compile::rewrites::persist_pullup::persist_pullup;
     use hydro_lang::location::Location;
     use hydro_lang::nondet::nondet;
+    use hydro_lang::prelude::Cluster;
     use stageleft::q;
 
     use crate::debug::name_to_id_map;
@@ -302,10 +301,10 @@ mod tests {
         output_to_original_machine_after: Vec<(&str, i32)>,
         place_on_decoupled_machine: Vec<(&str, i32)>,
     ) -> (
-        hydro_lang::location::Cluster<'a, ()>,
-        hydro_lang::location::Cluster<'a, ()>,
-        hydro_lang::location::Cluster<'a, ()>,
-        hydro_lang::compile::built::BuiltFlow<'a>,
+        Cluster<'a, ()>,
+        Cluster<'a, ()>,
+        Cluster<'a, ()>,
+        BuiltFlow<'a>,
     ) {
         let builder = FlowBuilder::new();
         let send_cluster = builder.cluster::<()>();
@@ -318,6 +317,8 @@ mod tests {
             .ir_node_named("map")
             .broadcast_bincode(&recv_cluster, nondet!(/** test */))
             .values()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|a| println!("Got it: {}", a)));
 
         let multi_run_metadata = RefCell::new(vec![]);

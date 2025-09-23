@@ -28,13 +28,17 @@ impl<'a, F> GraphFunction<'a> for F where
 }
 
 fn sha256(n: u32) -> u32 {
+    let start_time = std::time::Instant::now();
     let mut sha_input = n;
 
-    for _ in 0..n {
+    loop {
         let mut sha = Sha256::new();
         sha.update(sha_input.to_be_bytes());
         let sha_output = sha.finalize();
         sha_input = sha_output[0].into();
+        if start_time.elapsed().as_micros() >= n.into() {
+            break;
+        }
     }
 
     sha_input

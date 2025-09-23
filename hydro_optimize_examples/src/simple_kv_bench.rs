@@ -37,6 +37,8 @@ pub fn simple_kv_bench<'a>(
                     }))
                     .entries()
                     .all_ticks()
+                    .assume_ordering(nondet!(/** for_each does nothing, just need to end on a HydroLeaf */))
+                    .assume_retries(nondet!(/** for_each does nothing, just need to end on a HydroLeaf */))
                     .for_each(q!(|_| {})); // Do nothing, just need to end on a HydroLeaf
 
             // Send committed requests back to the original client

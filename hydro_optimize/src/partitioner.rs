@@ -2,16 +2,13 @@ use core::panic;
 use std::collections::HashMap;
 
 use hydro_lang::compile::ir::{HydroNode, HydroRoot, traverse_dfir};
-use hydro_lang::live_collections::stream::networking::{
-    deserialize_bincode_with_type, serialize_bincode_with_type,
-};
 use hydro_lang::location::dynamic::LocationId;
 use serde::{Deserialize, Serialize};
 use syn::visit_mut::{self, VisitMut};
 
 use crate::partition_syn_analysis::StructOrTupleIndex;
 use crate::repair::inject_id;
-use crate::rewrites::{ClusterSelfIdReplace, NetworkType, get_network_type};
+use crate::rewrites::{deserialize_bincode_with_type, get_network_type, serialize_bincode_with_type, ClusterSelfIdReplace, NetworkType};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Partitioner {
