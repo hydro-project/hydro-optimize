@@ -1,14 +1,15 @@
 use core::panic;
 use std::collections::HashMap;
 
-use hydro_lang::compile::ir::{HydroNode, HydroRoot, traverse_dfir};
+use hydro_lang::compile::ir::{BoundKind, CollectionKind, DebugType, HydroNode, HydroRoot, KeyedSingletonBoundKind, StreamOrder, StreamRetry, traverse_dfir};
+use hydro_lang::live_collections::keyed_singleton::KeyedSingletonBound;
 use hydro_lang::location::dynamic::LocationId;
 use serde::{Deserialize, Serialize};
 use syn::visit_mut::{self, VisitMut};
 
 use crate::partition_syn_analysis::StructOrTupleIndex;
 use crate::repair::inject_id;
-use crate::rewrites::{deserialize_bincode_with_type, get_network_type, serialize_bincode_with_type, ClusterSelfIdReplace, NetworkType};
+use crate::rewrites::{ClusterSelfIdReplace, NetworkType, collection_kind_to_debug_type, deserialize_bincode_with_type, get_network_type, serialize_bincode_with_type};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Partitioner {
@@ -125,11 +126,29 @@ fn replace_sender_dest(node: &mut HydroNode, partitioner: &Partitioner, next_stm
 
         let f: syn::Expr = if new_cluster_id.is_some() {
             // Output type of Map now includes dest ID
-            let original_output_type = *metadata.output_type.clone().unwrap().0;
-            let new_output_type: syn::Type = syn::parse_quote! {
-                (::hydro_lang::location::MemberId<()>, #original_output_type)
+            let member_id_syn_type: syn::Type = syn::parse_quote! { ::hydro_lang::location::MemberId<()> };
+            let member_id_debug_type = DebugType::from(member_id_syn_type);
+            metadata.collection_kind = match metadata.collection_kind {
+                CollectionKind::Singleton { element_type, .. }
+                | CollectionKind::Optional { element_type, .. } => {
+                    CollectionKind::KeyedSingleton {
+                        bound: KeyedSingletonBoundKind::Unbounded,
+                        key_type: member_id_debug_type,
+                        value_type: element_type,
+                    }
+                }
+                CollectionKind::Stream { .. }
+                | CollectionKind::KeyedStream { .. }
+                | CollectionKind::KeyedSingleton { .. } => {
+                    CollectionKind::KeyedStream {
+                        bound: BoundKind::Unbounded,
+                        value_order: StreamOrder::NoOrder,
+                        value_retry: StreamRetry::ExactlyOnce,
+                        key_type: member_id_debug_type,
+                        value_type: collection_kind_to_debug_type(&metadata.collection_kind),
+                    }
+                }
             };
-            metadata.output_type = Some(new_output_type.into());
 
             // Partitioning a process into a cluster
             syn::parse_quote!(
@@ -220,7 +239,7 @@ fn replace_network_serialization(node: &mut HydroNode, partitioner: &Partitioner
             panic!("Expected a HydroNode::Network, but found {:?}", node);
         };
 
-        let output_type = metadata.output_type.clone().unwrap().0;
+        let output_type = collection_kind_to_debug_type(&metadata.collection_kind);
 
         // The partitioned process (now cluster) is the sender
         // Its ID will now be in the recipient's output, so change the deserialize fn
@@ -321,22 +340,6 @@ fn replace_process_node_location(node: &mut HydroNode, partitioner: &Partitioner
     }
 }
 
-/// If we're partitioning a process into a cluster, we need to replace references to its location
-fn replace_process_root_location(root: &mut HydroRoot, partitioner: &Partitioner) {
-    let Partitioner {
-        location_id,
-        new_cluster_id,
-        ..
-    } = partitioner;
-
-    if let Some(new_id) = new_cluster_id {
-        // Modify the metadata
-        if let HydroRoot::CycleSink { out_location, .. } = root {
-            replace_process_location_id(out_location, *location_id, *new_id);
-        }
-    }
-}
-
 /// If we're partitioning a process into a cluster, we need to remove the default sender ID on outgoing networks
 fn remove_sender_id_from_receiver(node: &mut HydroNode, partitioner: &Partitioner, op_id: usize) {
     let Partitioner { new_cluster_id, .. } = partitioner;
@@ -383,11 +386,6 @@ pub fn partition(ir: &mut [HydroRoot], partitioner: &Partitioner) {
     );
 
     if partitioner.new_cluster_id.is_some() {
-        // Separately traverse roots since CycleSink isn't processed in traverse_dfir
-        for root in ir.iter_mut() {
-            replace_process_root_location(root, partitioner);
-        }
-
         // DANGER: Do not depend on the ID here, since nodes would've been injected
         // Fix network only after all IDs have been replaced, since get_network_type relies on it
         traverse_dfir(

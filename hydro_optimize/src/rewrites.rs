@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use hydro_lang::compile::builder::{FlowBuilder, RewriteIrFlowBuilder};
-use hydro_lang::compile::ir::{HydroIrMetadata, HydroNode, HydroRoot, deep_clone, traverse_dfir};
+use hydro_lang::compile::ir::{CollectionKind, DebugType, HydroIrMetadata, HydroNode, HydroRoot, deep_clone, traverse_dfir};
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::location::{Cluster, Location};
 use serde::{Deserialize, Serialize};
@@ -253,6 +253,23 @@ pub fn deserialize_bincode_with_type(tagged: Option<&syn::Type>, t_type: &syn::T
             |res| {
                 #root::runtime_support::bincode::deserialize::<#t_type>(&res.unwrap()).unwrap()
             }
+        }
+    }
+}
+
+pub fn collection_kind_to_debug_type(collection_kind: &CollectionKind) -> DebugType {
+    match collection_kind {
+        CollectionKind::Stream { element_type, .. }
+        | CollectionKind::Singleton { element_type, .. }
+        | CollectionKind::Optional { element_type, .. } => DebugType::from(*element_type.clone().0),
+        CollectionKind::KeyedStream { key_type, value_type, .. }
+        | CollectionKind::KeyedSingleton { key_type, value_type, .. }  => {
+            let original_key_type = *key_type.clone().0;
+            let original_value_type = *value_type.clone().0;
+            let new_type: syn::Type = syn::parse_quote! {
+                (#original_key_type, #original_value_type)
+            };
+            DebugType::from(new_type)
         }
     }
 }
