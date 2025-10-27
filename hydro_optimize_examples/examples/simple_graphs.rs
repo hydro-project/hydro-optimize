@@ -5,7 +5,7 @@ use std::sync::Arc;
 use clap::Parser;
 use hydro_deploy::Deployment;
 use hydro_deploy::gcp::GcpNetwork;
-use hydro_lang::graph::config::GraphConfig;
+use hydro_lang::viz::config::GraphConfig;
 use hydro_lang::location::Location;
 use hydro_lang::prelude::FlowBuilder;
 use hydro_optimize::decoupler;

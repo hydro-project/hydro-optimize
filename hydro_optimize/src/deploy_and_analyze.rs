@@ -6,7 +6,6 @@ use hydro_deploy::Deployment;
 use hydro_lang::compile::builder::{FlowBuilder, RewriteIrFlowBuilder};
 use hydro_lang::compile::deploy::DeployResult;
 use hydro_lang::compile::ir::{HydroNode, HydroRoot, deep_clone, traverse_dfir};
-use hydro_lang::compile::rewrites::persist_pullup::persist_pullup;
 use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::deploy::deploy_graph::DeployCrateWrapper;
 use hydro_lang::location::dynamic::LocationId;
@@ -27,14 +26,12 @@ pub(crate) const CPU_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_CPU:";
 fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration: syn::Expr) {
     match node {
         HydroNode::Placeholder
-        | HydroNode::Unpersist { .. }
         | HydroNode::Counter { .. } => {
             std::panic!("Unexpected {:?} found in insert_counter_node", node.print_root());
         }
         HydroNode::Source { metadata, .. }
         | HydroNode::CycleSource { metadata, .. }
         | HydroNode::Persist { metadata, .. }
-        | HydroNode::Delta { metadata, .. }
         | HydroNode::Chain { metadata, .. } // Can technically be derived by summing parent cardinalities
         | HydroNode::ChainFirst { metadata, .. } // Can technically be derived by taking parent cardinality + 1
         | HydroNode::CrossSingleton { metadata, .. }
@@ -79,6 +76,13 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
         | HydroNode::Enumerate { .. }
         | HydroNode::Inspect { .. }
         | HydroNode::Sort { .. }
+        | HydroNode::Cast { .. }
+        | HydroNode::ObserveNonDet { .. }
+        | HydroNode::SingletonSource { .. } // Cardinality = 1
+        | HydroNode::BeginAtomic { .. }
+        | HydroNode::EndAtomic { .. }
+        | HydroNode::Batch { .. }
+        | HydroNode::YieldConcat { .. }
          => {}
     }
 }
@@ -151,7 +155,7 @@ pub async fn deploy_and_analyze<'a>(
 
     // Rewrite with counter tracking
     let rewritten_ir_builder = builder.rewritten_ir_builder();
-    let optimized = builder.optimize_with(persist_pullup).optimize_with(|leaf| {
+    let optimized = builder.optimize_with(|leaf| {
         inject_id(leaf);
         insert_counter(leaf, counter_output_duration);
     });

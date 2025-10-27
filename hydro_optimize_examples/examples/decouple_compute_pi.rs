@@ -15,9 +15,8 @@ struct Args {
 }
 use hydro_deploy::gcp::GcpNetwork;
 use hydro_deploy::{Deployment, Host};
-use hydro_lang::compile::rewrites::persist_pullup;
 use hydro_lang::deploy::TrybuildHost;
-use hydro_lang::graph::config::GraphConfig;
+use hydro_lang::viz::config::GraphConfig;
 use hydro_lang::location::Location;
 use hydro_optimize::debug;
 use hydro_optimize::decoupler::{self, Decoupler};
@@ -82,7 +81,6 @@ async fn main() {
 
     let multi_run_metadata = RefCell::new(vec![]);
     let _nodes = built
-        .optimize_with(persist_pullup::persist_pullup)
         .optimize_with(|roots| decoupler::decouple(roots, &decoupler, &multi_run_metadata, 0))
         .optimize_with(debug::print_id)
         .with_process(

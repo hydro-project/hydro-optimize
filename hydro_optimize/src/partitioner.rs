@@ -1,15 +1,14 @@
 use core::panic;
 use std::collections::HashMap;
 
-use hydro_lang::compile::ir::{BoundKind, CollectionKind, DebugType, HydroNode, HydroRoot, KeyedSingletonBoundKind, StreamOrder, StreamRetry, traverse_dfir};
-use hydro_lang::live_collections::keyed_singleton::KeyedSingletonBound;
+use hydro_lang::compile::ir::{HydroNode, HydroRoot, traverse_dfir};
 use hydro_lang::location::dynamic::LocationId;
 use serde::{Deserialize, Serialize};
 use syn::visit_mut::{self, VisitMut};
 
 use crate::partition_syn_analysis::StructOrTupleIndex;
 use crate::repair::inject_id;
-use crate::rewrites::{ClusterSelfIdReplace, NetworkType, collection_kind_to_debug_type, deserialize_bincode_with_type, get_network_type, serialize_bincode_with_type};
+use crate::rewrites::{ClusterSelfIdReplace, NetworkType, collection_kind_to_debug_type, deserialize_bincode_with_type, get_network_type, prepend_member_id_to_collection_kind, serialize_bincode_with_type};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Partitioner {
@@ -126,29 +125,7 @@ fn replace_sender_dest(node: &mut HydroNode, partitioner: &Partitioner, next_stm
 
         let f: syn::Expr = if new_cluster_id.is_some() {
             // Output type of Map now includes dest ID
-            let member_id_syn_type: syn::Type = syn::parse_quote! { ::hydro_lang::location::MemberId<()> };
-            let member_id_debug_type = DebugType::from(member_id_syn_type);
-            metadata.collection_kind = match metadata.collection_kind {
-                CollectionKind::Singleton { element_type, .. }
-                | CollectionKind::Optional { element_type, .. } => {
-                    CollectionKind::KeyedSingleton {
-                        bound: KeyedSingletonBoundKind::Unbounded,
-                        key_type: member_id_debug_type,
-                        value_type: element_type,
-                    }
-                }
-                CollectionKind::Stream { .. }
-                | CollectionKind::KeyedStream { .. }
-                | CollectionKind::KeyedSingleton { .. } => {
-                    CollectionKind::KeyedStream {
-                        bound: BoundKind::Unbounded,
-                        value_order: StreamOrder::NoOrder,
-                        value_retry: StreamRetry::ExactlyOnce,
-                        key_type: member_id_debug_type,
-                        value_type: collection_kind_to_debug_type(&metadata.collection_kind),
-                    }
-                }
-            };
+            metadata.collection_kind = prepend_member_id_to_collection_kind(&metadata.collection_kind);
 
             // Partitioning a process into a cluster
             syn::parse_quote!(

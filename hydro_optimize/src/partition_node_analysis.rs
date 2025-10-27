@@ -164,8 +164,6 @@ fn input_dependency_analysis_node(
         HydroNode::CycleSource { .. }
         | HydroNode::Tee { .. }
         | HydroNode::Persist { .. }
-        | HydroNode::Unpersist { .. }
-        | HydroNode::Delta { .. }
         | HydroNode::ResolveFutures { .. }
         | HydroNode::ResolveFuturesOrdered { .. }
         | HydroNode::DeferTick { .. }
@@ -176,7 +174,13 @@ fn input_dependency_analysis_node(
         | HydroNode::Filter { .. } // Although it contains a function f, the output is just a subset of the input, so just inherit from the parent
         | HydroNode::Inspect { .. }
         | HydroNode::Network { .. }
-        | HydroNode::ExternalInput { .. } => {
+        | HydroNode::ExternalInput { .. }
+        | HydroNode::Cast { .. }
+        | HydroNode::ObserveNonDet { .. }
+        | HydroNode::BeginAtomic { .. }
+        | HydroNode::EndAtomic { .. }
+        | HydroNode::Batch { .. }
+        | HydroNode::YieldConcat { .. } => {
             // For each input the first (and potentially only) parent depends on, take its dependency
             for input_id in input_taint_entry.iter() {
                 if let Some(parent_dependencies_on_input) = parent_input_dependencies.get(input_id) &&
@@ -327,7 +331,8 @@ fn input_dependency_analysis_node(
         | HydroNode::Fold { .. }
         | HydroNode::Scan { .. }
         | HydroNode::FlatMap { .. }
-        | HydroNode::Source { .. } => {
+        | HydroNode::Source { .. }
+        | HydroNode::SingletonSource { .. } => {
             input_dependencies_entry.clear();
         }
         HydroNode::Placeholder
@@ -548,8 +553,6 @@ fn partitioning_constraint_analysis_node(
             | HydroNode::CycleSource { .. }
             | HydroNode::Tee { .. }
             | HydroNode::Persist { .. }
-            | HydroNode::Unpersist { .. }
-            | HydroNode::Delta { .. }
             | HydroNode::Chain { .. }
             | HydroNode::ChainFirst { .. }
             | HydroNode::ResolveFutures { .. }
@@ -564,7 +567,14 @@ fn partitioning_constraint_analysis_node(
             | HydroNode::Sort { .. }
             | HydroNode::Network { .. }
             | HydroNode::ExternalInput { .. }
-            | HydroNode::Counter { .. } => {
+            | HydroNode::Counter { .. }
+            | HydroNode::Cast { .. }
+            | HydroNode::ObserveNonDet { .. }
+            | HydroNode::SingletonSource { .. }
+            | HydroNode::BeginAtomic { .. }
+            | HydroNode::EndAtomic { .. }
+            | HydroNode::Batch { .. }
+            | HydroNode::YieldConcat { .. } => {
                 // Doesn't impede partitioning, return
                 return;
             }
@@ -754,7 +764,6 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     use hydro_lang::compile::ir::deep_clone;
-    use hydro_lang::compile::rewrites::persist_pullup::persist_pullup;
     use hydro_lang::deploy::HydroDeploy;
     use hydro_lang::live_collections::stream::NoOrder;
     use hydro_lang::location::dynamic::LocationId;
@@ -779,7 +788,6 @@ mod tests {
     ) {
         let mut cycle_data = HashMap::new();
         let built = builder
-            .optimize_with(persist_pullup)
             .optimize_with(|ir| {
                 inject_id(ir);
                 cycle_data = cycle_source_to_sink_input(ir);
@@ -880,7 +888,6 @@ mod tests {
     ) {
         let mut cycle_data = HashMap::new();
         let built = builder
-            .optimize_with(persist_pullup)
             .optimize_with(|ir| {
                 inject_id(ir);
                 cycle_data = cycle_source_to_sink_input(ir);

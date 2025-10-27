@@ -16,8 +16,8 @@ hydro_build_utils = { path = "../hydroflow/hydro_build_utils" }
 hydro_deploy = { path = "../hydroflow/hydro_deploy/core" }
 include_mdtests = { path = "../hydroflow/include_mdtests" }
 serde = { version = "1.0.197", features = ["derive"] }
-stageleft = "0.9.7"
-stageleft_tool = "0.9.7"
+stageleft = "0.10.0"
+stageleft_tool = "0.10.0"
 tokio = { version = "1.29.0", features = ["full"] }
 ctor = "0.2"
 clap = { version = "4.4", features = ["derive"] }
