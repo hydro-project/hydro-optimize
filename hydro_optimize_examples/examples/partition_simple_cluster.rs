@@ -15,9 +15,8 @@ struct Args {
 }
 use hydro_deploy::gcp::GcpNetwork;
 use hydro_deploy::{Deployment, Host};
-use hydro_lang::compile::rewrites::persist_pullup;
 use hydro_lang::deploy::TrybuildHost;
-use hydro_lang::graph::config::GraphConfig;
+use hydro_lang::viz::config::GraphConfig;
 use hydro_lang::location::Location;
 use hydro_optimize::partitioner::{self, Partitioner};
 use tokio::sync::RwLock;
@@ -73,7 +72,6 @@ async fn main() {
     let _ = built.generate_graph_with_config(&args.graph, None);
 
     let _nodes = built
-        .optimize_with(persist_pullup::persist_pullup)
         .optimize_with(|roots| partitioner::partition(roots, &partitioner))
         .with_process(
             &process,

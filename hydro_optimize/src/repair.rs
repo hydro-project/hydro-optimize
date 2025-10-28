@@ -84,24 +84,6 @@ pub fn cycle_source_to_sink_input(ir: &mut [HydroRoot]) -> HashMap<usize, usize>
     source_to_sink_input
 }
 
-fn inject_location_root(
-    root: &mut HydroRoot,
-    id_to_location: &RefCell<HashMap<usize, LocationId>>,
-    missing_location: &RefCell<bool>,
-) {
-    let inputs = root.input_metadata();
-    let input_metadata = inputs.first().unwrap();
-
-    if let Some(location) = id_to_location.borrow().get(&input_metadata.op.id.unwrap()) {
-        if let HydroRoot::CycleSink { out_location, .. } = root {
-            out_location.swap_root(location.root().clone());
-        }
-    } else {
-        println!("Missing location for root: {:?}", root.print_root());
-        *missing_location.borrow_mut() = true;
-    }
-}
-
 fn inject_location_input_persist(input: &mut Box<HydroNode>, new_location: LocationId) {
     if let HydroNode::Persist {
         metadata: persist_metadata,
@@ -112,22 +94,22 @@ fn inject_location_input_persist(input: &mut Box<HydroNode>, new_location: Locat
     }
 }
 
+// Returns whether location was missing for any node and requires another round of calculation (to reach fixpoint)
 fn inject_location_node(
     node: &mut HydroNode,
-    id_to_location: &RefCell<HashMap<usize, LocationId>>,
-    missing_location: &RefCell<bool>,
+    id_to_location: &mut HashMap<usize, LocationId>,
     cycle_source_to_sink_input: &HashMap<usize, usize>,
-) {
+) -> bool {
     if let Some(op_id) = node.op_metadata().id {
         let inputs = match node {
             HydroNode::Source { metadata, .. }
+            | HydroNode::SingletonSource { metadata, .. }
             | HydroNode::ExternalInput { metadata, .. }
             | HydroNode::Network { metadata, .. } => {
                 // Get location sources from the nodes must have it be correct: Source and Network
                 id_to_location
-                    .borrow_mut()
                     .insert(op_id, metadata.location_kind.clone());
-                return;
+                return false;
             }
             HydroNode::Tee { inner, .. } => {
                 vec![inner.0.borrow().op_metadata().id.unwrap()]
@@ -145,11 +127,10 @@ fn inject_location_node(
         // Otherwise, get it from (either) input
         let metadata = node.metadata_mut();
         for input in inputs {
-            let location = id_to_location.borrow().get(&input).cloned();
+            let location = id_to_location.get(&input).cloned();
             if let Some(location) = location {
                 metadata.location_kind.swap_root(location.root().clone());
                 id_to_location
-                    .borrow_mut()
                     .insert(op_id, metadata.location_kind.clone());
 
                 match node {
@@ -168,45 +149,46 @@ fn inject_location_node(
                     | HydroNode::FoldKeyed { input, .. }
                     | HydroNode::Reduce { input, .. }
                     | HydroNode::ReduceKeyed { input, .. }
+                    | HydroNode::ReduceKeyedWatermark { input, .. }
                     | HydroNode::Scan { input, .. } => {
                         inject_location_input_persist(input, location.root().clone());
                     }
                     _ => {}
                 }
-                return;
+                return false;
             }
         }
 
         // If the location was not set, let the recursive function know
         println!("Missing location for node: {:?}", node.print_root());
-        *missing_location.borrow_mut() = true;
+        return true;
     }
+
+    // No op_id, probably can ignore?
+    false
 }
 
 pub fn inject_location(ir: &mut [HydroRoot], cycle_source_to_sink_input: &HashMap<usize, usize>) {
-    let id_to_location = RefCell::new(HashMap::new());
+    let mut id_to_location = HashMap::new();
 
     loop {
         println!("Attempting to inject location, looping until fixpoint...");
-        let missing_location = RefCell::new(false);
+        let mut missing_location = false;
 
         transform_bottom_up(
             ir,
-            &mut |leaf| {
-                inject_location_root(leaf, &id_to_location, &missing_location);
-            },
+            &mut |_| {},
             &mut |node| {
-                inject_location_node(
+                missing_location |= inject_location_node(
                     node,
-                    &id_to_location,
-                    &missing_location,
+                    &mut id_to_location,
                     cycle_source_to_sink_input,
                 );
             },
             false,
         );
 
-        if !*missing_location.borrow() {
+        if !missing_location {
             println!("Locations injected!");
 
             // Check well-formedness here

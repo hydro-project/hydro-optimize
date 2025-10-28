@@ -17,7 +17,7 @@ async fn main() {
     use clap::Parser;
     use hydro_deploy::Deployment;
     use hydro_deploy::gcp::GcpNetwork;
-    use hydro_lang::graph::config::GraphConfig;
+    use hydro_lang::viz::config::GraphConfig;
     use hydro_lang::location::Location;
     use hydro_optimize::deploy::ReusableHosts;
     use hydro_optimize::deploy_and_analyze::deploy_and_analyze;

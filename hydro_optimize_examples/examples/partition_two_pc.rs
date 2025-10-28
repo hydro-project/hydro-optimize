@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use hydro_deploy::gcp::GcpNetwork;
 use hydro_deploy::{Deployment, Host};
-use hydro_lang::compile::rewrites::persist_pullup::persist_pullup;
 use hydro_lang::deploy::TrybuildHost;
 use hydro_lang::location::Location;
 use hydro_optimize::partition_node_analysis::{nodes_to_partition, partitioning_analysis};
@@ -60,7 +59,6 @@ async fn main() {
 
     let mut cycle_data = HashMap::new();
     let deployable = builder
-        .optimize_with(persist_pullup)
         .optimize_with(|ir| {
             inject_id(ir);
             cycle_data = cycle_source_to_sink_input(ir);

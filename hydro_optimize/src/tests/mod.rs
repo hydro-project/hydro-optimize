@@ -2,7 +2,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use hydro_build_utils::insta;
-use hydro_lang::compile::rewrites::persist_pullup;
 use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::location::Location;
 use hydro_lang::prelude::*;
@@ -28,7 +27,6 @@ fn decoupled_compute_pi_ir() {
     };
     let multi_run_metadata = RefCell::new(vec![]);
     let built = builder
-        .optimize_with(persist_pullup::persist_pullup)
         .optimize_with(|roots| decoupler::decouple(roots, &decoupler, &multi_run_metadata, 0))
         .into_deploy::<HydroDeploy>();
 
@@ -54,7 +52,6 @@ fn partitioned_simple_cluster_ir() {
         new_cluster_id: None,
     };
     let built = builder
-        .optimize_with(persist_pullup::persist_pullup)
         .optimize_with(|roots| crate::partitioner::partition(roots, &partitioner))
         .into_deploy::<HydroDeploy>();
 

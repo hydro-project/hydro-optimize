@@ -19,7 +19,7 @@ async fn main() {
     #[command(author, version, about, long_about = None)]
     struct BenchmarkArgs {
         #[command(flatten)]
-        graph: hydro_lang::graph::config::GraphConfig,
+        graph: hydro_lang::viz::config::GraphConfig,
 
         /// Use GCP for deployment (provide project name)
         #[arg(long)]
