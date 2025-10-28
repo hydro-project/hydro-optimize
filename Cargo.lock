@@ -1055,6 +1055,7 @@ dependencies = [
 [[package]]
 name = "dfir_lang"
 version = "0.14.0"
+source = "git+https://github.com/hydro-project/hydro.git#5eb4bf6aafe41a984936c3eb39c18bdbc875b648"
 dependencies = [
  "auto_impl",
  "documented",
@@ -1714,6 +1715,7 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 [[package]]
 name = "hydro_build_utils"
 version = "0.0.1"
+source = "git+https://github.com/hydro-project/hydro.git#5eb4bf6aafe41a984936c3eb39c18bdbc875b648"
 dependencies = [
  "insta",
  "rustc_version",
@@ -1722,6 +1724,7 @@ dependencies = [
 [[package]]
 name = "hydro_deploy"
 version = "0.14.0"
+source = "git+https://github.com/hydro-project/hydro.git#5eb4bf6aafe41a984936c3eb39c18bdbc875b648"
 dependencies = [
  "anyhow",
  "async-process",
@@ -1757,6 +1760,7 @@ dependencies = [
 [[package]]
 name = "hydro_deploy_integration"
 version = "0.14.0"
+source = "git+https://github.com/hydro-project/hydro.git#5eb4bf6aafe41a984936c3eb39c18bdbc875b648"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -1774,6 +1778,7 @@ dependencies = [
 [[package]]
 name = "hydro_lang"
 version = "0.14.0"
+source = "git+https://github.com/hydro-project/hydro.git#5eb4bf6aafe41a984936c3eb39c18bdbc875b648"
 dependencies = [
  "auto_impl",
  "backtrace",
@@ -1858,6 +1863,7 @@ dependencies = [
 [[package]]
 name = "hydro_std"
 version = "0.14.0"
+source = "git+https://github.com/hydro-project/hydro.git#5eb4bf6aafe41a984936c3eb39c18bdbc875b648"
 dependencies = [
  "hdrhistogram",
  "hydro_lang",
@@ -1869,6 +1875,7 @@ dependencies = [
 [[package]]
 name = "hydro_test"
 version = "0.0.0"
+source = "git+https://github.com/hydro-project/hydro.git#5eb4bf6aafe41a984936c3eb39c18bdbc875b648"
 dependencies = [
  "bytes",
  "colored",
@@ -2080,6 +2087,7 @@ dependencies = [
 [[package]]
 name = "include_mdtests"
 version = "0.0.0"
+source = "git+https://github.com/hydro-project/hydro.git#5eb4bf6aafe41a984936c3eb39c18bdbc875b648"
 dependencies = [
  "glob",
  "proc-macro2",
@@ -3970,6 +3978,7 @@ checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 [[package]]
 name = "sinktools"
 version = "0.0.1"
+source = "git+https://github.com/hydro-project/hydro.git#5eb4bf6aafe41a984936c3eb39c18bdbc875b648"
 dependencies = [
  "futures-util",
  "pin-project-lite",
@@ -4676,6 +4685,7 @@ dependencies = [
 [[package]]
 name = "variadics"
 version = "0.0.9"
+source = "git+https://github.com/hydro-project/hydro.git#5eb4bf6aafe41a984936c3eb39c18bdbc875b648"
 dependencies = [
  "hashbrown 0.14.5",
  "hydro_build_utils",
