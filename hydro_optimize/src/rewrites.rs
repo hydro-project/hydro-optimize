@@ -294,7 +294,7 @@ pub fn prepend_member_id_to_collection_kind(collection_kind: &CollectionKind) ->
                 value_order: StreamOrder::NoOrder,
                 value_retry: StreamRetry::ExactlyOnce,
                 key_type: member_id_debug_type,
-                value_type: collection_kind_to_debug_type(&collection_kind),
+                value_type: collection_kind_to_debug_type(collection_kind),
             }
         }
     }
