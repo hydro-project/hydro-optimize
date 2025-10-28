@@ -151,7 +151,7 @@ pub fn op_id_to_inputs(
     traverse_dfir(
         ir,
         |leaf, op_id| {
-            let relevant_input_ids = relevant_inputs(leaf.input_metadata(), location);
+            let relevant_input_ids = relevant_inputs(vec![leaf.input_metadata()], location);
             mapping.borrow_mut().insert(*op_id, relevant_input_ids);
         },
         |node, op_id| {

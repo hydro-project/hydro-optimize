@@ -367,11 +367,11 @@ fn record_metadata(
 }
 
 fn record_metadata_root(root: &mut HydroRoot, run_metadata: &mut RunMetadata) {
-    record_metadata(root.op_metadata(), root.input_metadata(), run_metadata);
+    record_metadata(root.op_metadata(), vec![root.input_metadata()], run_metadata);
 
     // Location = input's location, cardinality = input's cardinality
     let id = root.op_metadata().id.unwrap();
-    let input = root.input_metadata()[0];
+    let input = root.input_metadata();
     run_metadata
         .op_id_to_location
         .insert(id, input.location_kind.root().clone());

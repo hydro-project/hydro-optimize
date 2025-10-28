@@ -49,6 +49,7 @@ fn sha256(n: u32) -> u32 {
 pub fn get_graph_function<'a>(name: &str) -> impl GraphFunction<'a> {
     match name {
         "noop" => noop,
+        "map_h_map_h" => map_h_map_h,
         "map_h_map_h_map_h" => map_h_map_h_map_h,
         "map_h_map_h_map_l" => map_h_map_h_map_l,
         "map_h_map_l_map_h" => map_h_map_l_map_h,
@@ -90,6 +91,21 @@ pub fn noop<'a>(
     payloads: KeyedStream<MemberId<Client>, (u32, u32), Cluster<'a, Server>, Unbounded, NoOrder>,
 ) -> KeyedStream<MemberId<Client>, (u32, u32), Cluster<'a, Server>, Unbounded, NoOrder> {
     payloads
+}
+
+pub fn map_h_map_h<'a>(
+    _server: &Cluster<'a, Server>,
+    payloads: KeyedStream<MemberId<Client>, (u32, u32), Cluster<'a, Server>, Unbounded, NoOrder>,
+) -> KeyedStream<MemberId<Client>, (u32, u32), Cluster<'a, Server>, Unbounded, NoOrder> {
+    payloads
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(100 + n % 2)
+        )))
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(100 + n % 2)
+        )))
 }
 
 pub fn map_h_map_h_map_h<'a>(

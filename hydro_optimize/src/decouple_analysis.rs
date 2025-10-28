@@ -290,12 +290,12 @@ fn decouple_analysis_root(
     model_metadata: &RefCell<ModelMetadata>,
 ) {
     // Ignore nodes that are not in the cluster to decouple
-    if model_metadata.borrow().cluster_to_decouple != *root.input_metadata()[0].location_kind.root()
+    if model_metadata.borrow().cluster_to_decouple != *root.input_metadata().location_kind.root()
     {
         return;
     }
 
-    add_tick_constraint(root.input_metadata()[0], op_id_to_inputs, model_metadata);
+    add_tick_constraint(root.input_metadata(), op_id_to_inputs, model_metadata);
 }
 
 fn decouple_analysis_node(

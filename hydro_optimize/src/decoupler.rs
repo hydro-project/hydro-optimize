@@ -215,7 +215,7 @@ fn fix_cluster_self_id_root(root: &mut HydroRoot, mut locations: ClusterSelfIdRe
         decoupled_cluster_id,
         ..
     } = locations
-        && root.input_metadata()[0].location_kind.root().raw_id() == decoupled_cluster_id
+        && root.input_metadata().location_kind.root().raw_id() == decoupled_cluster_id
     {
         root.visit_debug_expr(|expr| {
             locations.visit_expr_mut(&mut expr.0);

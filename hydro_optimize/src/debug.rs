@@ -3,16 +3,12 @@ use std::collections::HashMap;
 use hydro_lang::compile::ir::{HydroNode, HydroRoot, traverse_dfir};
 
 fn print_id_root(root: &mut HydroRoot, next_stmt_id: &mut usize) {
-    let inputs = root
-        .input_metadata()
-        .iter()
-        .map(|m| m.op.id)
-        .collect::<Vec<Option<usize>>>();
+    let input = root.input_metadata().op.id;
     println!(
         "{} Root {}, Inputs: {:?}",
         next_stmt_id,
         root.print_root(),
-        inputs,
+        input,
     );
 }
 
