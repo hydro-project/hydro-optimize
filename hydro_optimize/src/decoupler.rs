@@ -3,13 +3,9 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use hydro_lang::compile::ir::{
-    DebugInstantiate, DebugType, HydroIrMetadata, HydroIrOpMetadata, HydroNode, HydroRoot, TeeNode,
+    DebugInstantiate, HydroIrMetadata, HydroIrOpMetadata, HydroNode, HydroRoot, TeeNode,
     transform_bottom_up, traverse_dfir,
 };
-use hydro_lang::live_collections::stream::networking::{
-    deserialize_bincode_with_type, serialize_bincode_with_type,
-};
-use hydro_lang::location::MemberId;
 use hydro_lang::location::dynamic::LocationId;
 use proc_macro2::Span;
 use serde::{Deserialize, Serialize};
@@ -18,7 +14,7 @@ use syn::visit_mut::VisitMut;
 
 use crate::parse_results::{MultiRunMetadata, get_or_append_run_metadata};
 use crate::repair::{cycle_source_to_sink_input, inject_id, inject_location};
-use crate::rewrites::ClusterSelfIdReplace;
+use crate::rewrites::{ClusterSelfIdReplace, collection_kind_to_debug_type, deserialize_bincode_with_type, prepend_member_id_to_collection_kind, serialize_bincode_with_type};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Decoupler {
@@ -31,8 +27,6 @@ pub struct Decoupler {
 
 fn add_network(node: &mut HydroNode, new_location: &LocationId) {
     let metadata = node.metadata().clone();
-    let output_debug_type = metadata.output_type.clone().unwrap();
-
     let parent_id = metadata.location_kind.root().raw_id();
     let node_content = std::mem::replace(node, HydroNode::Placeholder);
 
@@ -45,14 +39,17 @@ fn add_network(node: &mut HydroNode, new_location: &LocationId) {
         ::hydro_lang::location::MemberId::<()>::from_raw(#ident),
         b
     ));
-    let cluster_id_type = quote_type::<MemberId<()>>();
-    let mapped_output_type: syn::Type = syn::parse_quote!((#cluster_id_type, #output_debug_type));
+
+    // Calculate the new CollectionKind
+    let original_collection_kind = metadata.collection_kind.clone();
+    let new_collection_kind = prepend_member_id_to_collection_kind(&original_collection_kind);
+
     let mapped_node = HydroNode::Map {
         f: f.into(),
         input: Box::new(node_content),
         metadata: HydroIrMetadata {
             location_kind: metadata.location_kind.root().clone(), // Remove any ticks
-            output_type: Some(DebugType(Box::new(mapped_output_type.clone()))),
+            collection_kind: new_collection_kind.clone(),
             cardinality: None,
             tag: None,
             op: HydroIrOpMetadata {
@@ -65,19 +62,19 @@ fn add_network(node: &mut HydroNode, new_location: &LocationId) {
     };
 
     // Set up the network node
-    let output_type = output_debug_type.clone().0;
+    let output_debug_type = collection_kind_to_debug_type(&original_collection_kind);
     let network_node = HydroNode::Network {
-        serialize_fn: Some(serialize_bincode_with_type(true, &output_type)).map(|e| e.into()),
+        serialize_fn: Some(serialize_bincode_with_type(true, &output_debug_type)).map(|e| e.into()),
         instantiate_fn: DebugInstantiate::Building,
         deserialize_fn: Some(deserialize_bincode_with_type(
             Some(&quote_type::<()>()),
-            &output_type,
+            &output_debug_type,
         ))
         .map(|e| e.into()),
         input: Box::new(mapped_node),
         metadata: HydroIrMetadata {
             location_kind: new_location.clone(),
-            output_type: Some(DebugType(Box::new(mapped_output_type))),
+            collection_kind: new_collection_kind,
             cardinality: None,
             tag: None,
             op: HydroIrOpMetadata {
@@ -96,11 +93,11 @@ fn add_network(node: &mut HydroNode, new_location: &LocationId) {
         input: Box::new(network_node),
         metadata: HydroIrMetadata {
             location_kind: new_location.clone(),
-            output_type: Some(output_debug_type),
+            collection_kind: original_collection_kind,
             cardinality: None,
             tag: None,
             op: HydroIrOpMetadata {
-                backtrace: metadata.op.backtrace.clone(),
+                backtrace: metadata.op.backtrace,
                 cpu_usage: None,
                 network_recv_cpu_usage: None,
                 id: None,
@@ -218,7 +215,7 @@ fn fix_cluster_self_id_root(root: &mut HydroRoot, mut locations: ClusterSelfIdRe
         decoupled_cluster_id,
         ..
     } = locations
-        && root.input_metadata()[0].location_kind.root().raw_id() == decoupled_cluster_id
+        && root.input_metadata().location_kind.root().raw_id() == decoupled_cluster_id
     {
         root.visit_debug_expr(|expr| {
             locations.visit_expr_mut(&mut expr.0);
@@ -287,10 +284,11 @@ mod tests {
     use hydro_build_utils::insta;
     use hydro_deploy::Deployment;
     use hydro_lang::compile::builder::FlowBuilder;
+    use hydro_lang::compile::built::BuiltFlow;
     use hydro_lang::compile::ir;
-    use hydro_lang::compile::rewrites::persist_pullup::persist_pullup;
     use hydro_lang::location::Location;
     use hydro_lang::nondet::nondet;
+    use hydro_lang::prelude::Cluster;
     use stageleft::q;
 
     use crate::debug::name_to_id_map;
@@ -302,10 +300,10 @@ mod tests {
         output_to_original_machine_after: Vec<(&str, i32)>,
         place_on_decoupled_machine: Vec<(&str, i32)>,
     ) -> (
-        hydro_lang::location::Cluster<'a, ()>,
-        hydro_lang::location::Cluster<'a, ()>,
-        hydro_lang::location::Cluster<'a, ()>,
-        hydro_lang::compile::built::BuiltFlow<'a>,
+        Cluster<'a, ()>,
+        Cluster<'a, ()>,
+        Cluster<'a, ()>,
+        BuiltFlow<'a>,
     ) {
         let builder = FlowBuilder::new();
         let send_cluster = builder.cluster::<()>();
@@ -318,11 +316,13 @@ mod tests {
             .ir_node_named("map")
             .broadcast_bincode(&recv_cluster, nondet!(/** test */))
             .values()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|a| println!("Got it: {}", a)));
 
         let multi_run_metadata = RefCell::new(vec![]);
         let iteration = 0;
-        let built = builder.optimize_with(persist_pullup).optimize_with(|ir| {
+        let built = builder.optimize_with(|ir| {
             inject_id(ir);
             // Convert named nodes to IDs, accounting for the offset
             let name_to_id = name_to_id_map(ir);

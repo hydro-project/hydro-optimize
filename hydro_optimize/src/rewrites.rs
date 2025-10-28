@@ -2,11 +2,14 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use hydro_lang::compile::builder::{FlowBuilder, RewriteIrFlowBuilder};
-use hydro_lang::compile::ir::{HydroIrMetadata, HydroNode, HydroRoot, deep_clone, traverse_dfir};
+use hydro_lang::compile::ir::{BoundKind, CollectionKind, DebugType, HydroIrMetadata, HydroNode, HydroRoot, KeyedSingletonBoundKind, StreamOrder, StreamRetry, deep_clone, traverse_dfir};
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::location::{Cluster, Location};
 use serde::{Deserialize, Serialize};
+use syn::parse_quote;
 use syn::visit_mut::{self, VisitMut};
+use proc_macro2::{Span, TokenStream};
+use quote::quote;
 
 use crate::decoupler::{self, Decoupler};
 use crate::partitioner::Partitioner;
@@ -148,7 +151,7 @@ pub fn op_id_to_inputs(
     traverse_dfir(
         ir,
         |leaf, op_id| {
-            let relevant_input_ids = relevant_inputs(leaf.input_metadata(), location);
+            let relevant_input_ids = relevant_inputs(vec![leaf.input_metadata()], location);
             mapping.borrow_mut().insert(*op_id, relevant_input_ids);
         },
         |node, op_id| {
@@ -199,4 +202,100 @@ pub fn get_network_type(node: &HydroNode, location: usize) -> Option<NetworkType
         };
     }
     None
+}
+
+fn get_this_crate() -> TokenStream {
+    let hydro_lang_crate = proc_macro_crate::crate_name("hydro_lang")
+        .expect("hydro_lang should be present in `Cargo.toml`");
+    match hydro_lang_crate {
+        proc_macro_crate::FoundCrate::Itself => quote! { hydro_lang },
+        proc_macro_crate::FoundCrate::Name(name) => {
+            let ident = syn::Ident::new(&name, Span::call_site());
+            quote! { #ident }
+        }
+    }
+}
+
+pub fn serialize_bincode_with_type(is_demux: bool, t_type: &syn::Type) -> syn::Expr {
+    let root = get_this_crate();
+
+    if is_demux {
+        parse_quote! {
+            ::#root::runtime_support::stageleft::runtime_support::fn1_type_hint::<(#root::location::MemberId<_>, #t_type), _>(
+                |(id, data)| {
+                    (id.raw_id, #root::runtime_support::bincode::serialize(&data).unwrap().into())
+                }
+            )
+        }
+    } else {
+        parse_quote! {
+            ::#root::runtime_support::stageleft::runtime_support::fn1_type_hint::<#t_type, _>(
+                |data| {
+                    #root::runtime_support::bincode::serialize(&data).unwrap().into()
+                }
+            )
+        }
+    }
+}
+
+pub fn deserialize_bincode_with_type(tagged: Option<&syn::Type>, t_type: &syn::Type) -> syn::Expr {
+    let root = get_this_crate();
+
+    if let Some(c_type) = tagged {
+        parse_quote! {
+            |res| {
+                let (id, b) = res.unwrap();
+                (#root::location::MemberId::<#c_type>::from_raw(id), #root::runtime_support::bincode::deserialize::<#t_type>(&b).unwrap())
+            }
+        }
+    } else {
+        parse_quote! {
+            |res| {
+                #root::runtime_support::bincode::deserialize::<#t_type>(&res.unwrap()).unwrap()
+            }
+        }
+    }
+}
+
+pub fn collection_kind_to_debug_type(collection_kind: &CollectionKind) -> DebugType {
+    match collection_kind {
+        CollectionKind::Stream { element_type, .. }
+        | CollectionKind::Singleton { element_type, .. }
+        | CollectionKind::Optional { element_type, .. } => DebugType::from(*element_type.clone().0),
+        CollectionKind::KeyedStream { key_type, value_type, .. }
+        | CollectionKind::KeyedSingleton { key_type, value_type, .. }  => {
+            let original_key_type = *key_type.clone().0;
+            let original_value_type = *value_type.clone().0;
+            let new_type: syn::Type = syn::parse_quote! {
+                (#original_key_type, #original_value_type)
+            };
+            DebugType::from(new_type)
+        }
+    }
+}
+
+pub fn prepend_member_id_to_collection_kind(collection_kind: &CollectionKind) -> CollectionKind {
+    let member_id_syn_type: syn::Type = syn::parse_quote! { ::hydro_lang::location::MemberId<()> };
+    let member_id_debug_type = DebugType::from(member_id_syn_type);
+    match collection_kind {
+        CollectionKind::Singleton { element_type, .. }
+        | CollectionKind::Optional { element_type, .. } => {
+            CollectionKind::KeyedSingleton {
+                bound: KeyedSingletonBoundKind::Unbounded,
+                key_type: member_id_debug_type,
+                value_type: element_type.clone(),
+            }
+        }
+        CollectionKind::Stream { .. }
+        | CollectionKind::KeyedStream { .. }
+        | CollectionKind::KeyedSingleton { .. } => {
+            CollectionKind::KeyedStream {
+                bound: BoundKind::Unbounded,
+                value_order: StreamOrder::NoOrder,
+                value_retry: StreamRetry::ExactlyOnce,
+                key_type: member_id_debug_type,
+                value_type: collection_kind_to_debug_type(&collection_kind),
+            }
+        }
+    }
 }

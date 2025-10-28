@@ -164,8 +164,6 @@ fn input_dependency_analysis_node(
         HydroNode::CycleSource { .. }
         | HydroNode::Tee { .. }
         | HydroNode::Persist { .. }
-        | HydroNode::Unpersist { .. }
-        | HydroNode::Delta { .. }
         | HydroNode::ResolveFutures { .. }
         | HydroNode::ResolveFuturesOrdered { .. }
         | HydroNode::DeferTick { .. }
@@ -176,7 +174,13 @@ fn input_dependency_analysis_node(
         | HydroNode::Filter { .. } // Although it contains a function f, the output is just a subset of the input, so just inherit from the parent
         | HydroNode::Inspect { .. }
         | HydroNode::Network { .. }
-        | HydroNode::ExternalInput { .. } => {
+        | HydroNode::ExternalInput { .. }
+        | HydroNode::Cast { .. }
+        | HydroNode::ObserveNonDet { .. }
+        | HydroNode::BeginAtomic { .. }
+        | HydroNode::EndAtomic { .. }
+        | HydroNode::Batch { .. }
+        | HydroNode::YieldConcat { .. } => {
             // For each input the first (and potentially only) parent depends on, take its dependency
             for input_id in input_taint_entry.iter() {
                 if let Some(parent_dependencies_on_input) = parent_input_dependencies.get(input_id) &&
@@ -190,7 +194,8 @@ fn input_dependency_analysis_node(
             }
         }
         // Alters parent in a predicatable way
-        HydroNode::Chain { .. } => {
+        HydroNode::Chain { .. }
+        | HydroNode::ChainFirst { .. } => {
             assert_eq!(parent_ids.len(), 2, "Node {:?} has the wrong number of parents.", node);
             // [a,b] chain [c,d] = [a,b,c,d]. Take the intersection of dependencies of the two parents for each input. If only one parent is tainted, then just take that dependency
             for (input_id, parent_positions) in parent_taints {
@@ -326,7 +331,8 @@ fn input_dependency_analysis_node(
         | HydroNode::Fold { .. }
         | HydroNode::Scan { .. }
         | HydroNode::FlatMap { .. }
-        | HydroNode::Source { .. } => {
+        | HydroNode::Source { .. }
+        | HydroNode::SingletonSource { .. } => {
             input_dependencies_entry.clear();
         }
         HydroNode::Placeholder
@@ -538,10 +544,37 @@ fn partitioning_constraint_analysis_node(
             }
             HydroNode::Reduce { .. }
             | HydroNode::Fold { .. }
+            | HydroNode::Scan { .. }
             | HydroNode::Enumerate { .. }
             | HydroNode::CrossProduct { .. }
             | HydroNode::CrossSingleton { .. } => {} // Partitioning is impossible
-            _ => {
+            HydroNode::Placeholder
+            | HydroNode::Source { .. }
+            | HydroNode::CycleSource { .. }
+            | HydroNode::Tee { .. }
+            | HydroNode::Persist { .. }
+            | HydroNode::Chain { .. }
+            | HydroNode::ChainFirst { .. }
+            | HydroNode::ResolveFutures { .. }
+            | HydroNode::ResolveFuturesOrdered { .. }
+            | HydroNode::Map { .. }
+            | HydroNode::FlatMap { .. }
+            | HydroNode::Filter { .. }
+            | HydroNode::FilterMap { .. }
+            | HydroNode::DeferTick { .. }
+            | HydroNode::Inspect { .. }
+            | HydroNode::Unique { .. }
+            | HydroNode::Sort { .. }
+            | HydroNode::Network { .. }
+            | HydroNode::ExternalInput { .. }
+            | HydroNode::Counter { .. }
+            | HydroNode::Cast { .. }
+            | HydroNode::ObserveNonDet { .. }
+            | HydroNode::SingletonSource { .. }
+            | HydroNode::BeginAtomic { .. }
+            | HydroNode::EndAtomic { .. }
+            | HydroNode::Batch { .. }
+            | HydroNode::YieldConcat { .. } => {
                 // Doesn't impede partitioning, return
                 return;
             }
@@ -731,7 +764,6 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     use hydro_lang::compile::ir::deep_clone;
-    use hydro_lang::compile::rewrites::persist_pullup::persist_pullup;
     use hydro_lang::deploy::HydroDeploy;
     use hydro_lang::live_collections::stream::NoOrder;
     use hydro_lang::location::dynamic::LocationId;
@@ -756,7 +788,6 @@ mod tests {
     ) {
         let mut cycle_data = HashMap::new();
         let built = builder
-            .optimize_with(persist_pullup)
             .optimize_with(|ir| {
                 inject_id(ir);
                 cycle_data = cycle_source_to_sink_input(ir);
@@ -857,7 +888,6 @@ mod tests {
     ) {
         let mut cycle_data = HashMap::new();
         let built = builder
-            .optimize_with(persist_pullup)
             .optimize_with(|ir| {
                 inject_id(ir);
                 cycle_data = cycle_source_to_sink_input(ir);
@@ -900,6 +930,8 @@ mod tests {
             .ir_node_named("the map following network")
             .map(q!(|(a, b)| (b, a + 2)))
             .ir_node_named("the operator being tested")
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|(b, a2)| {
                 println!("b: {}, a+2: {}", b, a2);
             }));
@@ -947,6 +979,8 @@ mod tests {
             .broadcast_bincode(&cluster2, nondet!(/** test */))
             .values()
             .map(q!(|(a, b)| (b, a + 2)))
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|(b, a2)| {
                 println!("b: {}, a+2: {}", b, a2);
             }));
@@ -970,6 +1004,8 @@ mod tests {
             .ir_node_named("map 1")
             .map(q!(|(b1, _a, b0a)| (b0a, b1.0)))
             .ir_node_named("map 2")
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|(b0a, b10)| {
                 println!("b.0 - a: {}, b.1.0: {}", b0a, b10);
             }));
@@ -1039,6 +1075,8 @@ mod tests {
             .ir_node_named("map after network")
             .filter_map(q!(|(a, b)| { if a > 1 { Some((b, a + 2)) } else { None } }))
             .ir_node_named("operator")
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|(b, a2)| {
                 println!("b: {}, a+2: {}", b, a2);
             }));
@@ -1097,6 +1135,8 @@ mod tests {
                 }
             }))
             .ir_node_named("operator")
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|(none, a2)| {
                 println!("None: {:?}, a+2: {}", none, a2);
             }));
@@ -1127,73 +1167,6 @@ mod tests {
     }
 
     #[test]
-    fn test_delta() {
-        let builder = FlowBuilder::new();
-        let cluster1 = builder.cluster::<()>();
-        let cluster2 = builder.cluster::<()>();
-        cluster1
-            .source_iter(q!([(1, 2)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
-            .ir_node_named("network")
-            .values()
-            .ir_node_named("map after network")
-            .batch(&cluster2.tick(), nondet!(/** test */))
-            .delta()
-            .ir_node_named("operator")
-            .all_ticks()
-            .for_each(q!(|(a, b)| {
-                println!("a: {}, b: {}", a, b);
-            }));
-
-        let expected_taint = BTreeMap::from([
-            ("map after network", BTreeSet::from(["network"])),
-            ("operator", BTreeSet::from(["network"])),
-        ]);
-
-        let mut implicit_map_dependencies = StructOrTuple::default();
-        implicit_map_dependencies.add_dependency(&vec![], vec!["1".to_string()]);
-
-        let expected_dependencies = BTreeMap::from([
-            ("network", BTreeMap::new()),
-            (
-                "map after network",
-                BTreeMap::from([("network", implicit_map_dependencies.clone())]),
-            ),
-            (
-                "operator",
-                BTreeMap::from([("network", implicit_map_dependencies)]),
-            ), // No dependency changes from parent
-        ]);
-
-        test_input(
-            builder,
-            cluster2.id(),
-            expected_taint,
-            expected_dependencies,
-        );
-    }
-
-    #[test]
-    fn test_delta_partitionable() {
-        let builder = FlowBuilder::new();
-        let cluster1 = builder.cluster::<()>();
-        let cluster2 = builder.cluster::<()>();
-        cluster1
-            .source_iter(q!([(1, 2)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
-            .values()
-            .batch(&cluster2.tick(), nondet!(/** test */))
-            .delta()
-            .all_ticks()
-            .for_each(q!(|(a, b)| {
-                println!("a: {}, b: {}", a, b);
-            }));
-
-        let expected_partitionings = Some(Vec::new()); // No partitioning constraints
-        test_input_partitionable(builder, cluster2.id(), expected_partitionings);
-    }
-
-    #[test]
     fn test_chain() {
         let builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
@@ -1219,6 +1192,8 @@ mod tests {
             .chain(stream1.batch(&tick, nondet!(/** test */)))
             .ir_node_named("chain")
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|((x, b1), y)| {
                 println!("x: {}, b.1: {}, y: {}", x, b1, y);
             }));
@@ -1303,6 +1278,8 @@ mod tests {
             .batch(&tick, nondet!(/** test */))
             .chain(stream1.batch(&tick, nondet!(/** test */)))
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|((x, b1), y)| {
                 println!("x: {}, b.1: {}, y: {}", x, b1, y);
             }));
@@ -1337,6 +1314,8 @@ mod tests {
             .cross_product(stream1.batch(&tick, nondet!(/** test */)))
             .ir_node_named("cross product")
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|(((b1, b1_again), a3), (b, a2))| {
                 println!("((({}, {}), {}), ({:?}, {}))", b1, b1_again, a3, b, a2);
             }));
@@ -1432,6 +1411,8 @@ mod tests {
             .batch(&tick, nondet!(/** test */))
             .cross_product(stream1.batch(&tick, nondet!(/** test */)))
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|(((b1, b1_again), a3), (b, a2))| {
                 println!("((({}, {}), {}), ({:?}, {}))", b1, b1_again, a3, b, a2);
             }));
@@ -1466,6 +1447,8 @@ mod tests {
             .join(stream1.batch(&tick, nondet!(/** test */)))
             .ir_node_named("join")
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|((b1, b1_again), (a3, a))| {
                 println!("(({}, {}), {}, {})", b1, b1_again, a3, a);
             }));
@@ -1571,6 +1554,8 @@ mod tests {
             .batch(&tick, nondet!(/** test */))
             .join(stream1.batch(&tick, nondet!(/** test */)))
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|((b1, b1_again), (a3, a))| {
                 println!("(({}, {}), {}, {})", b1, b1_again, a3, a);
             }));
@@ -1677,6 +1662,8 @@ mod tests {
             .ir_node_named("reduce keyed")
             .entries()
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|(a, b_sum)| {
                 println!("a: {}, b_sum: {}", a, b_sum);
             }));
@@ -1729,6 +1716,8 @@ mod tests {
             .reduce_commutative(q!(|acc, b| *acc += b))
             .entries()
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|(a, b_sum)| {
                 println!("a: {}, b_sum: {}", a, b_sum);
             }));
@@ -1839,6 +1828,8 @@ mod tests {
         cycle
             .ir_node_named("teed cycle 2")
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|(a, b)| {
                 println!("a: {}, b: {}", a, b);
             }));
@@ -1934,9 +1925,13 @@ mod tests {
             prev_tick_input.chain(input.batch(&cluster2_tick, nondet!(/** test */))),
         );
 
-        cycle.all_ticks().for_each(q!(|(a, b)| {
-            println!("a: {}, b: {}", a, b);
-        }));
+        cycle
+            .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
+            .for_each(q!(|(a, b)| {
+                println!("a: {}, b: {}", a, b);
+            }));
 
         let expected_partitionings = Some(Vec::new());
         test_input_partitionable(builder, cluster2.id(), expected_partitionings);
@@ -1979,6 +1974,8 @@ mod tests {
         cycle2_out
             .ir_node_named("teed map (a,b) to (b,b) 2")
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|(b, _)| {
                 println!("b: {}", b);
             }));
@@ -2128,7 +2125,8 @@ mod tests {
         complete_cycle1.complete_next_tick(chained.clone());
         let cycle2_out = chained.map(q!(|(_a, b)| (b, b)));
         complete_cycle2.complete_next_tick(cycle2_out.clone());
-        cycle2_out.all_ticks().for_each(q!(|(b, _)| {
+        cycle2_out.all_ticks().assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */)).for_each(q!(|(b, _)| {
             println!("b: {}", b);
         }));
 
@@ -2160,6 +2158,8 @@ mod tests {
             .chain(stream1.batch(&tick, nondet!(/** test */)))
             .ir_node_named("chain")
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|_| {
                 println!("No dependencies");
             }));
@@ -2221,6 +2221,8 @@ mod tests {
             .batch(&tick, nondet!(/** test */))
             .chain(stream1.batch(&tick, nondet!(/** test */)))
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|_| {
                 println!("No dependencies");
             }));
@@ -2259,6 +2261,8 @@ mod tests {
             .chain(stream1.clone().ir_node_named("teed map1 1"))
             .ir_node_named("chain")
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|_| {
                 println!("Dependent on both input1.b and input2.b");
             }));
@@ -2267,6 +2271,8 @@ mod tests {
             .join(stream1.ir_node_named("teed map1 2"))
             .ir_node_named("join")
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|(_, (b1, b2))| {
                 println!("b from input 1: {}, b from input 2: {}", b1, b2);
             }));
@@ -2393,12 +2399,16 @@ mod tests {
             .clone()
             .chain(stream1.clone())
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|_| {
                 println!("Dependent on both input1.b and input2.b");
             }));
         stream2
             .join(stream1)
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|(_, (a1, a2))| {
                 println!("a*2 from input 1: {}, -a from input 2: {}", a1, a2);
             }));
@@ -2433,6 +2443,8 @@ mod tests {
             .filter_not_in(input2.batch(&tick, nondet!(/** test */)))
             .ir_node_named("difference")
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|(a, b)| {
                 println!("a: {}, b: {}", a, b);
             }));
@@ -2491,6 +2503,8 @@ mod tests {
             .batch(&tick, nondet!(/** test */))
             .filter_not_in(input2.batch(&tick, nondet!(/** test */)))
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|(a, b)| {
                 println!("a: {}, b: {}", a, b);
             }));
