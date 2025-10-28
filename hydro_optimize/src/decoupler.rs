@@ -291,7 +291,7 @@ mod tests {
     use hydro_lang::prelude::Cluster;
     use stageleft::q;
 
-    use crate::debug::name_to_id_map;
+    use crate::debug::{name_to_id_map, print_id};
     use crate::decoupler::{Decoupler, decouple};
     use crate::repair::inject_id;
 
@@ -320,10 +320,12 @@ mod tests {
             .assume_retries(nondet!(/** test */))
             .for_each(q!(|a| println!("Got it: {}", a)));
 
+
         let multi_run_metadata = RefCell::new(vec![]);
         let iteration = 0;
         let built = builder.optimize_with(|ir| {
             inject_id(ir);
+            print_id(ir);
             // Convert named nodes to IDs, accounting for the offset
             let name_to_id = name_to_id_map(ir);
             let decoupler = Decoupler {
@@ -401,7 +403,7 @@ mod tests {
         let output_to_original_machine_after = vec![];
         let place_on_decoupled_machine = vec![
             // the source of cluster membership (TODO(shadaj): should have a better way of identifying)
-            ("map", -6),
+            ("map", -11),
         ];
 
         let built = decouple_mini_program(
@@ -422,7 +424,7 @@ mod tests {
         let output_to_original_machine_after = vec![];
         let place_on_decoupled_machine = vec![
             // the source of cluster membership (TODO(shadaj): should have a better way of identifying)
-            ("map", -6),
+            ("map", -11),
         ];
 
         check_decouple_mini_program(

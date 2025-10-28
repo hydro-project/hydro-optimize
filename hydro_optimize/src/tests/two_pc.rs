@@ -60,13 +60,13 @@ fn two_pc_partition_coordinator() {
     let c_commits_id = *name_to_id.get("c_commits").unwrap();
     // 1 is the partitioning index of those inputs. Specifically, given the client sends (sender_id, payload) to the coordinator, we can partition on the entire payload
     let expected_coordinator_partitioning = vec![BTreeMap::from([
-        (c_votes_id, vec!["1".to_string()]),
-        (c_commits_id, vec!["1".to_string()]),
+        (c_votes_id - 1, vec!["1".to_string()]),
+        (c_commits_id - 1, vec!["1".to_string()]),
     ])];
     let expected_coordinator_input_parents = BTreeMap::from([
-        (c_prepare_id, c_prepare_id - 1),
-        (c_votes_id, c_votes_id - 1),
-        (c_commits_id, c_commits_id - 1),
+        (c_prepare_id - 2, c_prepare_id - 3),
+        (c_votes_id - 1, c_votes_id - 2),
+        (c_commits_id - 1, c_commits_id - 2),
     ]);
     assert_eq!(
         coordinator_partitioning,
