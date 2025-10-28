@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, HashMap};
 
 use hydro_build_utils::insta;
 use hydro_lang::compile::ir::deep_clone;
-use hydro_lang::compile::rewrites::persist_pullup::persist_pullup;
 use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::location::Location;
 use hydro_lang::prelude::*;
@@ -45,7 +44,6 @@ fn two_pc_partition_coordinator() {
 
     let mut cycle_data = HashMap::new();
     let built = builder
-        .optimize_with(persist_pullup)
         .optimize_with(|ir| {
             inject_id(ir);
             cycle_data = cycle_source_to_sink_input(ir);
@@ -62,13 +60,13 @@ fn two_pc_partition_coordinator() {
     let c_commits_id = *name_to_id.get("c_commits").unwrap();
     // 1 is the partitioning index of those inputs. Specifically, given the client sends (sender_id, payload) to the coordinator, we can partition on the entire payload
     let expected_coordinator_partitioning = vec![BTreeMap::from([
-        (c_votes_id, vec!["1".to_string()]),
-        (c_commits_id, vec!["1".to_string()]),
+        (c_votes_id - 1, vec!["1".to_string()]),
+        (c_commits_id - 1, vec!["1".to_string()]),
     ])];
     let expected_coordinator_input_parents = BTreeMap::from([
-        (c_prepare_id, c_prepare_id - 1),
-        (c_votes_id, c_votes_id - 1),
-        (c_commits_id, c_commits_id - 1),
+        (c_prepare_id - 2, c_prepare_id - 3),
+        (c_votes_id - 1, c_votes_id - 2),
+        (c_commits_id - 1, c_commits_id - 2),
     ]);
     assert_eq!(
         coordinator_partitioning,
@@ -101,7 +99,6 @@ fn two_pc_partition_participant() {
 
     let mut cycle_data = HashMap::new();
     let built = builder
-        .optimize_with(persist_pullup)
         .optimize_with(|ir| {
             inject_id(ir);
             cycle_data = cycle_source_to_sink_input(ir);

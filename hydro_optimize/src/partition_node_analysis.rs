@@ -164,8 +164,6 @@ fn input_dependency_analysis_node(
         HydroNode::CycleSource { .. }
         | HydroNode::Tee { .. }
         | HydroNode::Persist { .. }
-        | HydroNode::Unpersist { .. }
-        | HydroNode::Delta { .. }
         | HydroNode::ResolveFutures { .. }
         | HydroNode::ResolveFuturesOrdered { .. }
         | HydroNode::DeferTick { .. }
@@ -176,7 +174,13 @@ fn input_dependency_analysis_node(
         | HydroNode::Filter { .. } // Although it contains a function f, the output is just a subset of the input, so just inherit from the parent
         | HydroNode::Inspect { .. }
         | HydroNode::Network { .. }
-        | HydroNode::ExternalInput { .. } => {
+        | HydroNode::ExternalInput { .. }
+        | HydroNode::Cast { .. }
+        | HydroNode::ObserveNonDet { .. }
+        | HydroNode::BeginAtomic { .. }
+        | HydroNode::EndAtomic { .. }
+        | HydroNode::Batch { .. }
+        | HydroNode::YieldConcat { .. } => {
             // For each input the first (and potentially only) parent depends on, take its dependency
             for input_id in input_taint_entry.iter() {
                 if let Some(parent_dependencies_on_input) = parent_input_dependencies.get(input_id) &&
@@ -190,7 +194,8 @@ fn input_dependency_analysis_node(
             }
         }
         // Alters parent in a predicatable way
-        HydroNode::Chain { .. } => {
+        HydroNode::Chain { .. }
+        | HydroNode::ChainFirst { .. } => {
             assert_eq!(parent_ids.len(), 2, "Node {:?} has the wrong number of parents.", node);
             // [a,b] chain [c,d] = [a,b,c,d]. Take the intersection of dependencies of the two parents for each input. If only one parent is tainted, then just take that dependency
             for (input_id, parent_positions) in parent_taints {
@@ -326,7 +331,8 @@ fn input_dependency_analysis_node(
         | HydroNode::Fold { .. }
         | HydroNode::Scan { .. }
         | HydroNode::FlatMap { .. }
-        | HydroNode::Source { .. } => {
+        | HydroNode::Source { .. }
+        | HydroNode::SingletonSource { .. } => {
             input_dependencies_entry.clear();
         }
         HydroNode::Placeholder
@@ -538,10 +544,37 @@ fn partitioning_constraint_analysis_node(
             }
             HydroNode::Reduce { .. }
             | HydroNode::Fold { .. }
+            | HydroNode::Scan { .. }
             | HydroNode::Enumerate { .. }
             | HydroNode::CrossProduct { .. }
             | HydroNode::CrossSingleton { .. } => {} // Partitioning is impossible
-            _ => {
+            HydroNode::Placeholder
+            | HydroNode::Source { .. }
+            | HydroNode::CycleSource { .. }
+            | HydroNode::Tee { .. }
+            | HydroNode::Persist { .. }
+            | HydroNode::Chain { .. }
+            | HydroNode::ChainFirst { .. }
+            | HydroNode::ResolveFutures { .. }
+            | HydroNode::ResolveFuturesOrdered { .. }
+            | HydroNode::Map { .. }
+            | HydroNode::FlatMap { .. }
+            | HydroNode::Filter { .. }
+            | HydroNode::FilterMap { .. }
+            | HydroNode::DeferTick { .. }
+            | HydroNode::Inspect { .. }
+            | HydroNode::Unique { .. }
+            | HydroNode::Sort { .. }
+            | HydroNode::Network { .. }
+            | HydroNode::ExternalInput { .. }
+            | HydroNode::Counter { .. }
+            | HydroNode::Cast { .. }
+            | HydroNode::ObserveNonDet { .. }
+            | HydroNode::SingletonSource { .. }
+            | HydroNode::BeginAtomic { .. }
+            | HydroNode::EndAtomic { .. }
+            | HydroNode::Batch { .. }
+            | HydroNode::YieldConcat { .. } => {
                 // Doesn't impede partitioning, return
                 return;
             }
@@ -728,136 +761,25 @@ pub fn nodes_to_partition(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::collections::HashMap;
 
     use hydro_lang::compile::ir::deep_clone;
-    use hydro_lang::compile::rewrites::persist_pullup::persist_pullup;
     use hydro_lang::deploy::HydroDeploy;
     use hydro_lang::live_collections::stream::NoOrder;
     use hydro_lang::location::dynamic::LocationId;
     use hydro_lang::prelude::*;
     use stageleft::q;
 
-    use crate::debug::name_to_id_map;
-    use crate::partition_node_analysis::{
-        InputDependencyMetadata, input_dependency_analysis, partitioning_analysis,
-    };
-    use crate::partition_syn_analysis::{StructOrTuple, StructOrTupleIndex};
+    use crate::partition_node_analysis::partitioning_analysis;
     use crate::repair::{cycle_source_to_sink_input, inject_id, inject_location};
-    use crate::rewrites::op_id_to_inputs;
-
-    fn test_input_with_unnamed_ir_nodes(
-        builder: FlowBuilder<'_>,
-        location: LocationId,
-        expected_taint: BTreeMap<&str, BTreeSet<&str>>,
-        unnamed_expected_taint: BTreeMap<(&str, i32), BTreeSet<&str>>, /* The i32 will be added to the named ir node's ID as offset */
-        expected_dependencies: BTreeMap<&str, BTreeMap<&str, StructOrTuple>>,
-        unnamed_expected_dependencies: BTreeMap<(&str, i32), BTreeMap<&str, StructOrTuple>>,
-    ) {
-        let mut cycle_data = HashMap::new();
-        let built = builder
-            .optimize_with(persist_pullup)
-            .optimize_with(|ir| {
-                inject_id(ir);
-                cycle_data = cycle_source_to_sink_input(ir);
-                inject_location(ir, &cycle_data);
-            })
-            .into_deploy::<HydroDeploy>();
-        let mut ir = deep_clone(built.ir());
-        let op_id_to_parents = op_id_to_inputs(&mut ir, Some(&location), &cycle_data);
-        let InputDependencyMetadata {
-            input_taint: actual_taint,
-            input_dependencies: actual_dependencies,
-            ..
-        } = input_dependency_analysis(&mut ir, &location, op_id_to_parents);
-
-        println!("Expected taint: {:?}", expected_taint);
-        println!("Expected dependencies: {:?}", expected_dependencies);
-
-        // Convert names to IDs
-        let name_to_id = name_to_id_map(&mut ir);
-        let expected_taint_ids = expected_taint.into_iter().map(|(k, v)| {
-            println!("Converting IR name {} to ID", k);
-            (
-                *name_to_id.get(k).unwrap(),
-                v.into_iter()
-                    .map(|e| *name_to_id.get(e).unwrap())
-                    .collect::<BTreeSet<_>>(),
-            )
-        });
-        let unnamed_expected_taint_ids =
-            unnamed_expected_taint.into_iter().map(|((k, offset), v)| {
-                (
-                    (*name_to_id.get(k).unwrap() as i32 + offset) as usize,
-                    v.into_iter()
-                        .map(|e| *name_to_id.get(e).unwrap())
-                        .collect::<BTreeSet<_>>(),
-                )
-            });
-        let all_expected_taint_ids = expected_taint_ids
-            .chain(unnamed_expected_taint_ids)
-            .collect::<BTreeMap<_, _>>();
-        let expected_dependencies_ids = expected_dependencies.into_iter().map(|(k, v)| {
-            let k_id = *name_to_id.get(k).unwrap();
-            let v_id = v
-                .into_iter()
-                .map(|(inner_k, inner_v)| (*name_to_id.get(inner_k).unwrap(), inner_v.clone()))
-                .collect::<BTreeMap<_, _>>();
-            (k_id, v_id)
-        });
-        let unnamed_expected_dependencies_ids =
-            unnamed_expected_dependencies
-                .into_iter()
-                .map(|((k, offset), v)| {
-                    let k_id = (*name_to_id.get(k).unwrap() as i32 + offset) as usize;
-                    let v_id = v
-                        .into_iter()
-                        .map(|(inner_k, inner_v)| {
-                            (*name_to_id.get(inner_k).unwrap(), inner_v.clone())
-                        })
-                        .collect::<BTreeMap<_, _>>();
-                    (k_id, v_id)
-                });
-        let all_expected_dependencies_ids = expected_dependencies_ids
-            .chain(unnamed_expected_dependencies_ids)
-            .collect::<BTreeMap<_, _>>();
-
-        println!("Expected taint, translated: {:?}", all_expected_taint_ids);
-        println!("Actual taint: {:?}", actual_taint);
-        println!(
-            "Expected dependencies, translated: {:?}",
-            all_expected_dependencies_ids
-        );
-        println!("Actual dependencies: {:?}", actual_dependencies);
-
-        assert_eq!(actual_taint, all_expected_taint_ids);
-        assert_eq!(actual_dependencies, all_expected_dependencies_ids);
-    }
-
-    fn test_input(
-        builder: FlowBuilder<'_>,
-        location: LocationId,
-        expected_taint: BTreeMap<&str, BTreeSet<&str>>,
-        expected_dependencies: BTreeMap<&str, BTreeMap<&str, StructOrTuple>>,
-    ) {
-        test_input_with_unnamed_ir_nodes(
-            builder,
-            location,
-            expected_taint,
-            BTreeMap::new(),
-            expected_dependencies,
-            BTreeMap::new(),
-        );
-    }
 
     fn test_input_partitionable(
         builder: FlowBuilder<'_>,
         location: LocationId,
-        expected_partitionings: Option<Vec<BTreeMap<&str, StructOrTupleIndex>>>,
+        partitionable: bool,
     ) {
         let mut cycle_data = HashMap::new();
         let built = builder
-            .optimize_with(persist_pullup)
             .optimize_with(|ir| {
                 inject_id(ir);
                 cycle_data = cycle_source_to_sink_input(ir);
@@ -867,74 +789,7 @@ mod tests {
         let mut ir = deep_clone(built.ir());
         let partitioning = partitioning_analysis(&mut ir, &location, &cycle_data);
 
-        if expected_partitionings.is_none() {
-            assert!(partitioning.is_none());
-            return;
-        }
-
-        // Convert names to IDs
-        let name_to_id = name_to_id_map(&mut ir);
-        let expected_partitionings_ids = expected_partitionings.map(|vec| {
-            vec.into_iter()
-                .map(|map| {
-                    map.into_iter()
-                        .map(|(k, v)| (*name_to_id.get(k).unwrap(), v.clone()))
-                        .collect::<BTreeMap<_, _>>()
-                })
-                .collect::<Vec<_>>()
-        });
-
-        assert_eq!(partitioning.unwrap().0, expected_partitionings_ids.unwrap());
-    }
-
-    #[test]
-    fn test_map() {
-        let builder = FlowBuilder::new();
-        let cluster1 = builder.cluster::<()>();
-        let cluster2 = builder.cluster::<()>();
-        cluster1
-            .source_iter(q!([(1, 2)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
-            .ir_node_named("network")
-            .values()
-            .ir_node_named("the map following network")
-            .map(q!(|(a, b)| (b, a + 2)))
-            .ir_node_named("the operator being tested")
-            .for_each(q!(|(b, a2)| {
-                println!("b: {}, a+2: {}", b, a2);
-            }));
-
-        let expected_taint = BTreeMap::from([
-            ("the map following network", BTreeSet::from(["network"])),
-            ("the operator being tested", BTreeSet::from(["network"])),
-        ]);
-
-        let mut implicit_map_dependencies = StructOrTuple::default();
-        implicit_map_dependencies.add_dependency(&vec![], vec!["1".to_string()]);
-        let mut map_expected_dependencies = StructOrTuple::default();
-        map_expected_dependencies.add_dependency(
-            &vec!["0".to_string()],
-            vec!["1".to_string(), "1".to_string()],
-        );
-
-        let expected_dependencies = BTreeMap::from([
-            ("network", BTreeMap::new()),
-            (
-                "the map following network",
-                BTreeMap::from([("network", implicit_map_dependencies)]),
-            ),
-            (
-                "the operator being tested",
-                BTreeMap::from([("network", map_expected_dependencies)]),
-            ),
-        ]);
-
-        test_input(
-            builder,
-            cluster2.id(),
-            expected_taint,
-            expected_dependencies,
-        );
+        assert_eq!(partitionable, partitioning.is_some());
     }
 
     #[test]
@@ -947,146 +802,63 @@ mod tests {
             .broadcast_bincode(&cluster2, nondet!(/** test */))
             .values()
             .map(q!(|(a, b)| (b, a + 2)))
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|(b, a2)| {
                 println!("b: {}, a+2: {}", b, a2);
             }));
 
-        let expected_partitionings = Some(Vec::new());
-        test_input_partitionable(builder, cluster2.id(), expected_partitionings);
+        test_input_partitionable(builder, cluster2.id(), true);
     }
 
     #[test]
-    fn test_map_complex() {
+    fn test_map_complex_partitionable() {
         let builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         cluster1
             .source_iter(q!([(1, (2, (3, 4)))]))
             .broadcast_bincode(&cluster2, nondet!(/** test */))
-            .ir_node_named("network")
             .values()
-            .ir_node_named("map after network")
             .map(q!(|(a, b)| (b.1, a, b.0 - a)))
-            .ir_node_named("map 1")
             .map(q!(|(b1, _a, b0a)| (b0a, b1.0)))
-            .ir_node_named("map 2")
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|(b0a, b10)| {
                 println!("b.0 - a: {}, b.1.0: {}", b0a, b10);
             }));
 
-        let expected_taint = BTreeMap::from([
-            ("map after network", BTreeSet::from(["network"])),
-            ("map 1", BTreeSet::from(["network"])),
-            ("map 2", BTreeSet::from(["network"])),
-        ]);
-
-        let mut implicit_map_dependencies = StructOrTuple::default();
-        implicit_map_dependencies.add_dependency(&vec![], vec!["1".to_string()]);
-        let mut map1_expected_dependencies = StructOrTuple::default();
-        map1_expected_dependencies.add_dependency(
-            &vec!["0".to_string()],
-            vec!["1".to_string(), "1".to_string(), "1".to_string()],
-        );
-        map1_expected_dependencies.add_dependency(
-            &vec!["1".to_string()],
-            vec!["1".to_string(), "0".to_string()],
-        );
-        let mut map2_expected_dependencies = StructOrTuple::default();
-        map2_expected_dependencies.add_dependency(
-            &vec!["1".to_string()],
-            vec![
-                "1".to_string(),
-                "1".to_string(),
-                "1".to_string(),
-                "0".to_string(),
-            ],
-        );
-
-        let expected_dependencies = BTreeMap::from([
-            ("network", BTreeMap::new()),
-            (
-                "map after network",
-                BTreeMap::from([("network", implicit_map_dependencies)]),
-            ),
-            (
-                "map 1",
-                BTreeMap::from([("network", map1_expected_dependencies)]),
-            ),
-            (
-                "map 2",
-                BTreeMap::from([("network", map2_expected_dependencies)]),
-            ),
-        ]);
-
-        test_input(
-            builder,
-            cluster2.id(),
-            expected_taint,
-            expected_dependencies,
-        );
+        test_input_partitionable(builder, cluster2.id(), true);
     }
 
     #[test]
-    fn test_filter_map() {
+    fn test_filter_map_partitionable() {
         let builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         cluster1
             .source_iter(q!([(1, 2)]))
             .broadcast_bincode(&cluster2, nondet!(/** test */))
-            .ir_node_named("network")
             .values()
-            .ir_node_named("map after network")
             .filter_map(q!(|(a, b)| { if a > 1 { Some((b, a + 2)) } else { None } }))
-            .ir_node_named("operator")
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|(b, a2)| {
                 println!("b: {}, a+2: {}", b, a2);
             }));
 
-        let expected_taint = BTreeMap::from([
-            ("map after network", BTreeSet::from(["network"])),
-            ("operator", BTreeSet::from(["network"])),
-        ]);
-
-        let mut implicit_map_dependencies = StructOrTuple::default();
-        implicit_map_dependencies.add_dependency(&vec![], vec!["1".to_string()]);
-        let mut map_expected_dependencies = StructOrTuple::default();
-        map_expected_dependencies.add_dependency(
-            &vec!["0".to_string()],
-            vec!["1".to_string(), "1".to_string()],
-        );
-
-        let expected_dependencies = BTreeMap::from([
-            ("network", BTreeMap::new()),
-            (
-                "map after network",
-                BTreeMap::from([("network", implicit_map_dependencies)]),
-            ),
-            (
-                "operator",
-                BTreeMap::from([("network", map_expected_dependencies)]),
-            ),
-        ]);
-
-        test_input(
-            builder,
-            cluster2.id(),
-            expected_taint,
-            expected_dependencies,
-        );
+        test_input_partitionable(builder, cluster2.id(), true);
     }
 
     #[test]
-    fn test_filter_map_remove_none() {
+    fn test_filter_map_remove_none_partitionable() {
         let builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         cluster1
             .source_iter(q!([(1, 2)]))
             .broadcast_bincode(&cluster2, nondet!(/** test */))
-            .ir_node_named("network")
             .values()
-            .ir_node_named("map after network")
             .filter_map(q!(|(a, b)| {
                 if a > 1 {
                     Some((None, a + 2))
@@ -1096,195 +868,13 @@ mod tests {
                     None
                 }
             }))
-            .ir_node_named("operator")
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|(none, a2)| {
                 println!("None: {:?}, a+2: {}", none, a2);
             }));
 
-        let expected_taint = BTreeMap::from([
-            ("map after network", BTreeSet::from(["network"])),
-            ("operator", BTreeSet::from(["network"])),
-        ]);
-
-        let mut implicit_map_dependencies = StructOrTuple::default();
-        implicit_map_dependencies.add_dependency(&vec![], vec!["1".to_string()]);
-
-        let expected_dependencies = BTreeMap::from([
-            ("network", BTreeMap::new()),
-            (
-                "map after network",
-                BTreeMap::from([("network", implicit_map_dependencies)]),
-            ),
-            ("operator", BTreeMap::new()),
-        ]);
-
-        test_input(
-            builder,
-            cluster2.id(),
-            expected_taint,
-            expected_dependencies,
-        );
-    }
-
-    #[test]
-    fn test_delta() {
-        let builder = FlowBuilder::new();
-        let cluster1 = builder.cluster::<()>();
-        let cluster2 = builder.cluster::<()>();
-        cluster1
-            .source_iter(q!([(1, 2)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
-            .ir_node_named("network")
-            .values()
-            .ir_node_named("map after network")
-            .batch(&cluster2.tick(), nondet!(/** test */))
-            .delta()
-            .ir_node_named("operator")
-            .all_ticks()
-            .for_each(q!(|(a, b)| {
-                println!("a: {}, b: {}", a, b);
-            }));
-
-        let expected_taint = BTreeMap::from([
-            ("map after network", BTreeSet::from(["network"])),
-            ("operator", BTreeSet::from(["network"])),
-        ]);
-
-        let mut implicit_map_dependencies = StructOrTuple::default();
-        implicit_map_dependencies.add_dependency(&vec![], vec!["1".to_string()]);
-
-        let expected_dependencies = BTreeMap::from([
-            ("network", BTreeMap::new()),
-            (
-                "map after network",
-                BTreeMap::from([("network", implicit_map_dependencies.clone())]),
-            ),
-            (
-                "operator",
-                BTreeMap::from([("network", implicit_map_dependencies)]),
-            ), // No dependency changes from parent
-        ]);
-
-        test_input(
-            builder,
-            cluster2.id(),
-            expected_taint,
-            expected_dependencies,
-        );
-    }
-
-    #[test]
-    fn test_delta_partitionable() {
-        let builder = FlowBuilder::new();
-        let cluster1 = builder.cluster::<()>();
-        let cluster2 = builder.cluster::<()>();
-        cluster1
-            .source_iter(q!([(1, 2)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
-            .values()
-            .batch(&cluster2.tick(), nondet!(/** test */))
-            .delta()
-            .all_ticks()
-            .for_each(q!(|(a, b)| {
-                println!("a: {}, b: {}", a, b);
-            }));
-
-        let expected_partitionings = Some(Vec::new()); // No partitioning constraints
-        test_input_partitionable(builder, cluster2.id(), expected_partitionings);
-    }
-
-    #[test]
-    fn test_chain() {
-        let builder = FlowBuilder::new();
-        let cluster1 = builder.cluster::<()>();
-        let cluster2 = builder.cluster::<()>();
-        let input = cluster1
-            .source_iter(q!([(1, (2, 3))]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
-            .ir_node_named("network")
-            .values()
-            .ir_node_named("map after network");
-        let stream1 = input
-            .clone()
-            .ir_node_named("teed input 1")
-            .map(q!(|(a, b)| (b, a + 2)))
-            .ir_node_named("map 1");
-        let stream2 = input
-            .ir_node_named("teed input 2")
-            .map(q!(|(a, b)| ((b.1, b.1), a + 3)))
-            .ir_node_named("map 2");
-        let tick = cluster2.tick();
-        stream2
-            .batch(&tick, nondet!(/** test */))
-            .chain(stream1.batch(&tick, nondet!(/** test */)))
-            .ir_node_named("chain")
-            .all_ticks()
-            .for_each(q!(|((x, b1), y)| {
-                println!("x: {}, b.1: {}, y: {}", x, b1, y);
-            }));
-
-        let expected_taint = BTreeMap::from([
-            ("map after network", BTreeSet::from(["network"])),
-            ("teed input 2", BTreeSet::from(["network"])),
-            ("map 2", BTreeSet::from(["network"])),
-            ("teed input 1", BTreeSet::from(["network"])),
-            ("map 1", BTreeSet::from(["network"])),
-            ("chain", BTreeSet::from(["network"])),
-        ]);
-
-        let mut implicit_map_dependencies = StructOrTuple::default();
-        implicit_map_dependencies.add_dependency(&vec![], vec!["1".to_string()]);
-        let mut stream1_map_dependencies = StructOrTuple::default();
-        stream1_map_dependencies.add_dependency(
-            &vec!["0".to_string()],
-            vec!["1".to_string(), "1".to_string()],
-        );
-        let mut stream2_map_dependencies = StructOrTuple::default();
-        stream2_map_dependencies.add_dependency(
-            &vec!["0".to_string(), "0".to_string()],
-            vec!["1".to_string(), "1".to_string(), "1".to_string()],
-        );
-        stream2_map_dependencies.add_dependency(
-            &vec!["0".to_string(), "1".to_string()],
-            vec!["1".to_string(), "1".to_string(), "1".to_string()],
-        );
-        let mut chain_dependencies = StructOrTuple::default();
-        chain_dependencies.add_dependency(
-            &vec!["0".to_string(), "1".to_string()],
-            vec!["1".to_string(), "1".to_string(), "1".to_string()],
-        );
-
-        let expected_dependencies = BTreeMap::from([
-            ("network", BTreeMap::new()),
-            (
-                "map after network",
-                BTreeMap::from([("network", implicit_map_dependencies.clone())]),
-            ),
-            (
-                "teed input 2",
-                BTreeMap::from([("network", implicit_map_dependencies.clone())]),
-            ),
-            (
-                "map 2",
-                BTreeMap::from([("network", stream2_map_dependencies)]),
-            ),
-            (
-                "teed input 1",
-                BTreeMap::from([("network", implicit_map_dependencies)]),
-            ),
-            (
-                "map 1",
-                BTreeMap::from([("network", stream1_map_dependencies)]),
-            ),
-            ("chain", BTreeMap::from([("network", chain_dependencies)])),
-        ]);
-
-        test_input(
-            builder,
-            cluster2.id(),
-            expected_taint,
-            expected_dependencies,
-        );
+        test_input_partitionable(builder, cluster2.id(), true);
     }
 
     #[test]
@@ -1303,117 +893,13 @@ mod tests {
             .batch(&tick, nondet!(/** test */))
             .chain(stream1.batch(&tick, nondet!(/** test */)))
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|((x, b1), y)| {
                 println!("x: {}, b.1: {}, y: {}", x, b1, y);
             }));
 
-        let expected_partitionings = Some(Vec::new()); // No partitioning constraints
-        test_input_partitionable(builder, cluster2.id(), expected_partitionings);
-    }
-
-    #[test]
-    fn test_cross_product() {
-        let builder = FlowBuilder::new();
-        let cluster1 = builder.cluster::<()>();
-        let cluster2 = builder.cluster::<()>();
-        let input = cluster1
-            .source_iter(q!([(1, (2, 3))]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
-            .ir_node_named("network")
-            .values()
-            .ir_node_named("map after network");
-        let stream1 = input
-            .clone()
-            .ir_node_named("teed input 1")
-            .map(q!(|(a, b)| (b, a + 2)))
-            .ir_node_named("map 1");
-        let stream2 = input
-            .ir_node_named("teed input 2")
-            .map(q!(|(a, b)| ((b.1, b.1), a + 3)))
-            .ir_node_named("map 2");
-        let tick = cluster2.tick();
-        stream2
-            .batch(&tick, nondet!(/** test */))
-            .cross_product(stream1.batch(&tick, nondet!(/** test */)))
-            .ir_node_named("cross product")
-            .all_ticks()
-            .for_each(q!(|(((b1, b1_again), a3), (b, a2))| {
-                println!("((({}, {}), {}), ({:?}, {}))", b1, b1_again, a3, b, a2);
-            }));
-
-        let expected_taint = BTreeMap::from([
-            ("map after network", BTreeSet::from(["network"])),
-            ("teed input 2", BTreeSet::from(["network"])),
-            ("map 2", BTreeSet::from(["network"])),
-            ("teed input 1", BTreeSet::from(["network"])),
-            ("map 1", BTreeSet::from(["network"])),
-            ("cross product", BTreeSet::from(["network"])),
-        ]);
-
-        let mut implicit_map_dependencies = StructOrTuple::default();
-        implicit_map_dependencies.add_dependency(&vec![], vec!["1".to_string()]);
-        let mut stream1_map_dependencies = StructOrTuple::default();
-        stream1_map_dependencies.add_dependency(
-            &vec!["0".to_string()],
-            vec!["1".to_string(), "1".to_string()],
-        );
-        let mut stream2_map_dependencies = StructOrTuple::default();
-        stream2_map_dependencies.add_dependency(
-            &vec!["0".to_string(), "0".to_string()],
-            vec!["1".to_string(), "1".to_string(), "1".to_string()],
-        );
-        stream2_map_dependencies.add_dependency(
-            &vec!["0".to_string(), "1".to_string()],
-            vec!["1".to_string(), "1".to_string(), "1".to_string()],
-        );
-        let mut cross_product_dependencies = StructOrTuple::default();
-        cross_product_dependencies.add_dependency(
-            &vec!["0".to_string(), "0".to_string(), "0".to_string()],
-            vec!["1".to_string(), "1".to_string(), "1".to_string()],
-        );
-        cross_product_dependencies.add_dependency(
-            &vec!["0".to_string(), "0".to_string(), "1".to_string()],
-            vec!["1".to_string(), "1".to_string(), "1".to_string()],
-        );
-        cross_product_dependencies.add_dependency(
-            &vec!["1".to_string(), "0".to_string()],
-            vec!["1".to_string(), "1".to_string()],
-        );
-
-        let expected_dependencies = BTreeMap::from([
-            ("network", BTreeMap::new()),
-            (
-                "map after network",
-                BTreeMap::from([("network", implicit_map_dependencies.clone())]),
-            ),
-            (
-                "teed input 2",
-                BTreeMap::from([("network", implicit_map_dependencies.clone())]),
-            ),
-            (
-                "map 2",
-                BTreeMap::from([("network", stream2_map_dependencies)]),
-            ),
-            (
-                "teed input 1",
-                BTreeMap::from([("network", implicit_map_dependencies)]),
-            ),
-            (
-                "map 1",
-                BTreeMap::from([("network", stream1_map_dependencies)]),
-            ),
-            (
-                "cross product",
-                BTreeMap::from([("network", cross_product_dependencies)]),
-            ),
-        ]);
-
-        test_input(
-            builder,
-            cluster2.id(),
-            expected_taint,
-            expected_dependencies,
-        );
+        test_input_partitionable(builder, cluster2.id(), true);
     }
 
     #[test]
@@ -1432,126 +918,13 @@ mod tests {
             .batch(&tick, nondet!(/** test */))
             .cross_product(stream1.batch(&tick, nondet!(/** test */)))
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|(((b1, b1_again), a3), (b, a2))| {
                 println!("((({}, {}), {}), ({:?}, {}))", b1, b1_again, a3, b, a2);
             }));
 
-        let expected_partitionings = None;
-        test_input_partitionable(builder, cluster2.id(), expected_partitionings);
-    }
-
-    #[test]
-    fn test_join() {
-        let builder = FlowBuilder::new();
-        let cluster1 = builder.cluster::<()>();
-        let cluster2 = builder.cluster::<()>();
-        let input = cluster1
-            .source_iter(q!([(1, (2, 3))]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
-            .ir_node_named("network")
-            .values()
-            .ir_node_named("map after network");
-        let stream1 = input
-            .clone()
-            .ir_node_named("teed input 1")
-            .map(q!(|(a, b)| (b, a)))
-            .ir_node_named("map 1");
-        let stream2 = input
-            .ir_node_named("teed input 2")
-            .map(q!(|(a, b)| ((b.1, b.1), a + 3)))
-            .ir_node_named("map 2");
-        let tick = cluster2.tick();
-        stream2
-            .batch(&tick, nondet!(/** test */))
-            .join(stream1.batch(&tick, nondet!(/** test */)))
-            .ir_node_named("join")
-            .all_ticks()
-            .for_each(q!(|((b1, b1_again), (a3, a))| {
-                println!("(({}, {}), {}, {})", b1, b1_again, a3, a);
-            }));
-
-        let expected_taint = BTreeMap::from([
-            ("map after network", BTreeSet::from(["network"])),
-            ("teed input 2", BTreeSet::from(["network"])),
-            ("map 2", BTreeSet::from(["network"])),
-            ("teed input 1", BTreeSet::from(["network"])),
-            ("map 1", BTreeSet::from(["network"])),
-            ("join", BTreeSet::from(["network"])),
-        ]);
-
-        let mut implicit_map_dependencies = StructOrTuple::default();
-        implicit_map_dependencies.add_dependency(&vec![], vec!["1".to_string()]);
-        let mut stream1_map_dependencies = StructOrTuple::default();
-        stream1_map_dependencies.add_dependency(
-            &vec!["0".to_string()],
-            vec!["1".to_string(), "1".to_string()],
-        );
-        stream1_map_dependencies.add_dependency(
-            &vec!["1".to_string()],
-            vec!["1".to_string(), "0".to_string()],
-        );
-        let mut stream2_map_dependencies = StructOrTuple::default();
-        stream2_map_dependencies.add_dependency(
-            &vec!["0".to_string(), "0".to_string()],
-            vec!["1".to_string(), "1".to_string(), "1".to_string()],
-        );
-        stream2_map_dependencies.add_dependency(
-            &vec!["0".to_string(), "1".to_string()],
-            vec!["1".to_string(), "1".to_string(), "1".to_string()],
-        );
-        let mut join_dependencies = StructOrTuple::default();
-        join_dependencies.add_dependency(
-            &vec!["0".to_string()],
-            vec!["1".to_string(), "1".to_string()],
-        );
-        join_dependencies.add_dependency(
-            &vec!["0".to_string(), "0".to_string()],
-            vec!["1".to_string(), "1".to_string(), "0".to_string()],
-        ); // Technically redundant
-        join_dependencies.add_dependency(
-            &vec!["0".to_string(), "0".to_string()],
-            vec!["1".to_string(), "1".to_string(), "1".to_string()],
-        );
-        join_dependencies.add_dependency(
-            &vec!["0".to_string(), "1".to_string()],
-            vec!["1".to_string(), "1".to_string(), "1".to_string()],
-        );
-        join_dependencies.add_dependency(
-            &vec!["1".to_string(), "1".to_string()],
-            vec!["1".to_string(), "0".to_string()],
-        );
-
-        let expected_dependencies = BTreeMap::from([
-            ("network", BTreeMap::new()),
-            (
-                "map after network",
-                BTreeMap::from([("network", implicit_map_dependencies.clone())]),
-            ),
-            (
-                "teed input 2",
-                BTreeMap::from([("network", implicit_map_dependencies.clone())]),
-            ),
-            (
-                "map 2",
-                BTreeMap::from([("network", stream2_map_dependencies)]),
-            ),
-            (
-                "teed input 1",
-                BTreeMap::from([("network", implicit_map_dependencies)]),
-            ),
-            (
-                "map 1",
-                BTreeMap::from([("network", stream1_map_dependencies)]),
-            ),
-            ("join", BTreeMap::from([("network", join_dependencies)])),
-        ]);
-
-        test_input(
-            builder,
-            cluster2.id(),
-            expected_taint,
-            expected_dependencies,
-        );
+        test_input_partitionable(builder, cluster2.id(), false);
     }
 
     #[test]
@@ -1571,74 +944,13 @@ mod tests {
             .batch(&tick, nondet!(/** test */))
             .join(stream1.batch(&tick, nondet!(/** test */)))
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|((b1, b1_again), (a3, a))| {
                 println!("(({}, {}), {}, {})", b1, b1_again, a3, a);
             }));
 
-        // Can either partition on b.0 or b.1, since the join is only successful when both b.0=b.1 or b.1=b.1
-        let expected_partitionings = Some(vec![
-            BTreeMap::from([(
-                "network",
-                vec!["1".to_string(), "1".to_string(), "0".to_string()],
-            )]),
-            BTreeMap::from([(
-                "network",
-                vec!["1".to_string(), "1".to_string(), "1".to_string()],
-            )]),
-        ]);
-        test_input_partitionable(builder, cluster2.id(), expected_partitionings);
-    }
-
-    #[test]
-    fn test_enumerate() {
-        let builder = FlowBuilder::new();
-        let cluster1 = builder.cluster::<()>();
-        let cluster2 = builder.cluster::<()>();
-        cluster1
-            .source_iter(q!([(1, 2)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
-            .ir_node_named("network")
-            // Batching is unnecessary, but otherwise enumerate will be implicitly wrapped with a Persist (removed with persist_pullup)
-            .batch(&cluster1.tick(), nondet!(/** test */))
-            .values()
-            .ir_node_named("map after network")
-            .assume_ordering(nondet!(/** test */))
-            .enumerate()
-            .ir_node_named("enumerate")
-            .all_ticks()
-            .for_each(q!(|(i, (a, b))| {
-                println!("i: {}, a: {}, b: {}", i, a, b);
-            }));
-
-        let expected_taint = BTreeMap::from([
-            ("map after network", BTreeSet::from(["network"])),
-            ("enumerate", BTreeSet::from(["network"])),
-        ]);
-
-        let mut implicit_map_dependencies = StructOrTuple::default();
-        implicit_map_dependencies.add_dependency(&vec![], vec!["1".to_string()]);
-        let mut enumerate_expected_dependencies = StructOrTuple::default();
-        enumerate_expected_dependencies
-            .add_dependency(&vec!["1".to_string()], vec!["1".to_string()]);
-
-        let expected_dependencies = BTreeMap::from([
-            ("network", BTreeMap::new()),
-            (
-                "map after network",
-                BTreeMap::from([("network", implicit_map_dependencies)]),
-            ),
-            (
-                "enumerate",
-                BTreeMap::from([("network", enumerate_expected_dependencies)]),
-            ),
-        ]);
-
-        test_input(
-            builder,
-            cluster2.id(),
-            expected_taint,
-            expected_dependencies,
-        );
+        test_input_partitionable(builder, cluster2.id(), true);
     }
 
     #[test]
@@ -1656,62 +968,7 @@ mod tests {
                 println!("i: {}, a: {}, b: {}", i, a, b);
             }));
 
-        let expected_partitionings = None;
-        test_input_partitionable(builder, cluster2.id(), expected_partitionings);
-    }
-
-    #[test]
-    fn test_reduce_keyed() {
-        let builder = FlowBuilder::new();
-        let cluster1 = builder.cluster::<()>();
-        let cluster2 = builder.cluster::<()>();
-        cluster1
-            .source_iter(q!([(1, 2)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
-            .ir_node_named("network")
-            .values()
-            .ir_node_named("map after network")
-            .batch(&cluster2.tick(), nondet!(/** test */))
-            .into_keyed()
-            .reduce_commutative(q!(|acc, b| *acc += b))
-            .ir_node_named("reduce keyed")
-            .entries()
-            .all_ticks()
-            .for_each(q!(|(a, b_sum)| {
-                println!("a: {}, b_sum: {}", a, b_sum);
-            }));
-
-        let expected_taint = BTreeMap::from([
-            ("map after network", BTreeSet::from(["network"])),
-            ("reduce keyed", BTreeSet::from(["network"])),
-        ]);
-
-        let mut implicit_map_dependencies = StructOrTuple::default();
-        implicit_map_dependencies.add_dependency(&vec![], vec!["1".to_string()]);
-        let mut reduce_keyed_expected_dependencies = StructOrTuple::default();
-        reduce_keyed_expected_dependencies.add_dependency(
-            &vec!["0".to_string()],
-            vec!["1".to_string(), "0".to_string()],
-        );
-
-        let expected_dependencies = BTreeMap::from([
-            ("network", BTreeMap::new()),
-            (
-                "map after network",
-                BTreeMap::from([("network", implicit_map_dependencies)]),
-            ),
-            (
-                "reduce keyed",
-                BTreeMap::from([("network", reduce_keyed_expected_dependencies)]),
-            ),
-        ]);
-
-        test_input(
-            builder,
-            cluster2.id(),
-            expected_taint,
-            expected_dependencies,
-        );
+        test_input_partitionable(builder, cluster2.id(), false);
     }
 
     #[test]
@@ -1729,61 +986,13 @@ mod tests {
             .reduce_commutative(q!(|acc, b| *acc += b))
             .entries()
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|(a, b_sum)| {
                 println!("a: {}, b_sum: {}", a, b_sum);
             }));
 
-        let expected_partitionings = Some(vec![BTreeMap::from([(
-            "network",
-            vec!["1".to_string(), "0".to_string()],
-        )])]);
-        test_input_partitionable(builder, cluster2.id(), expected_partitionings);
-    }
-
-    #[test]
-    fn test_reduce() {
-        let builder = FlowBuilder::new();
-        let cluster1 = builder.cluster::<()>();
-        let cluster2 = builder.cluster::<()>();
-        cluster1
-            .source_iter(q!([(1, 2)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
-            .ir_node_named("network")
-            .values()
-            .ir_node_named("map after network")
-            .batch(&cluster2.tick(), nondet!(/** test */))
-            .reduce_commutative(q!(|(acc_a, acc_b), (a, b)| {
-                *acc_a += a;
-                *acc_b += b;
-            }))
-            .ir_node_named("reduce")
-            .all_ticks()
-            .for_each(q!(|(a_sum, b_sum)| {
-                println!("a_sum: {}, b_sum: {}", a_sum, b_sum);
-            }));
-
-        let expected_taint = BTreeMap::from([
-            ("map after network", BTreeSet::from(["network"])),
-            ("reduce", BTreeSet::from(["network"])),
-        ]);
-
-        let mut implicit_map_dependencies = StructOrTuple::default();
-        implicit_map_dependencies.add_dependency(&vec![], vec!["1".to_string()]);
-        let expected_dependencies = BTreeMap::from([
-            ("network", BTreeMap::new()),
-            (
-                "map after network",
-                BTreeMap::from([("network", implicit_map_dependencies)]),
-            ),
-            ("reduce", BTreeMap::new()),
-        ]);
-
-        test_input(
-            builder,
-            cluster2.id(),
-            expected_taint,
-            expected_dependencies,
-        );
+        test_input_partitionable(builder, cluster2.id(), true);
     }
 
     #[test]
@@ -1805,113 +1014,7 @@ mod tests {
                 println!("a_sum: {}, b_sum: {}", a_sum, b_sum);
             }));
 
-        let expected_partitionings = None;
-        test_input_partitionable(builder, cluster2.id(), expected_partitionings);
-    }
-
-    #[test]
-    fn test_cycle() {
-        let builder = FlowBuilder::new();
-        let cluster1 = builder.cluster::<()>();
-        let cluster2 = builder.cluster::<()>();
-        let input = cluster1
-            .source_iter(q!([(1, 2)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
-            .ir_node_named("network")
-            .values()
-            .ir_node_named("map after network");
-        let cluster2_tick = cluster2.tick();
-        let (complete_cycle, cycle) =
-            cluster2_tick.cycle::<Stream<(usize, usize), _, Bounded, NoOrder>>();
-        let prev_tick_input = cycle
-            .clone()
-            .ir_node_named("teed cycle 1")
-            .filter(q!(|(a, _b)| *a > 2))
-            .ir_node_named("filter")
-            .map(q!(|(a, b)| (a, b + 2)))
-            .ir_node_named("map");
-        complete_cycle.complete_next_tick(
-            prev_tick_input
-                .chain(input.batch(&cluster2_tick, nondet!(/** test */)))
-                .ir_node_named("chain"),
-        );
-
-        cycle
-            .ir_node_named("teed cycle 2")
-            .all_ticks()
-            .for_each(q!(|(a, b)| {
-                println!("a: {}, b: {}", a, b);
-            }));
-
-        let expected_taint = BTreeMap::from([
-            ("teed cycle 1", BTreeSet::from(["network"])),
-            ("filter", BTreeSet::from(["network"])),
-            ("map", BTreeSet::from(["network"])),
-            ("map after network", BTreeSet::from(["network"])),
-            ("chain", BTreeSet::from(["network"])),
-            ("teed cycle 2", BTreeSet::from(["network"])),
-        ]);
-        // IR nodes aren't exposed, so we'll have to find them through relative positioning
-        let unnamed_expected_taint = BTreeMap::from([
-            (("teed cycle 1", -2), BTreeSet::from(["network"])), // CycleSource
-            (("teed cycle 1", -1), BTreeSet::from(["network"])), // DeferTick
-        ]);
-
-        let mut implicit_map_dependencies = StructOrTuple::default();
-        implicit_map_dependencies.add_dependency(&vec![], vec!["1".to_string()]);
-        let mut cycle_dependencies = StructOrTuple::default();
-        cycle_dependencies.add_dependency(
-            &vec!["0".to_string()],
-            vec!["1".to_string(), "0".to_string()],
-        );
-
-        let expected_dependencies = BTreeMap::from([
-            (
-                "teed cycle 1",
-                BTreeMap::from([("network", cycle_dependencies.clone())]),
-            ),
-            (
-                "filter",
-                BTreeMap::from([("network", cycle_dependencies.clone())]),
-            ),
-            (
-                "map",
-                BTreeMap::from([("network", cycle_dependencies.clone())]),
-            ),
-            ("network", BTreeMap::new()),
-            (
-                "map after network",
-                BTreeMap::from([("network", implicit_map_dependencies)]),
-            ),
-            (
-                "chain",
-                BTreeMap::from([("network", cycle_dependencies.clone())]),
-            ),
-            (
-                "teed cycle 2",
-                BTreeMap::from([("network", cycle_dependencies.clone())]),
-            ),
-        ]);
-
-        let unnamed_expected_dependencies = BTreeMap::from([
-            (
-                ("teed cycle 1", -2),
-                BTreeMap::from([("network", cycle_dependencies.clone())]),
-            ), // CycleSource
-            (
-                ("teed cycle 1", -1),
-                BTreeMap::from([("network", cycle_dependencies)]),
-            ), // DeferTick
-        ]);
-
-        test_input_with_unnamed_ir_nodes(
-            builder,
-            cluster2.id(),
-            expected_taint,
-            unnamed_expected_taint,
-            expected_dependencies,
-            unnamed_expected_dependencies,
-        );
+        test_input_partitionable(builder, cluster2.id(), false);
     }
 
     #[test]
@@ -1934,174 +1037,15 @@ mod tests {
             prev_tick_input.chain(input.batch(&cluster2_tick, nondet!(/** test */))),
         );
 
-        cycle.all_ticks().for_each(q!(|(a, b)| {
-            println!("a: {}, b: {}", a, b);
-        }));
-
-        let expected_partitionings = Some(Vec::new());
-        test_input_partitionable(builder, cluster2.id(), expected_partitionings);
-    }
-
-    #[test]
-    fn test_nested_cycle() {
-        let builder = FlowBuilder::new();
-        let cluster1 = builder.cluster::<()>();
-        let cluster2 = builder.cluster::<()>();
-        let input = cluster1
-            .source_iter(q!([(1, 2)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
-            .ir_node_named("network")
-            .values()
-            .ir_node_named("map after network");
-        let cluster2_tick = cluster2.tick();
-        let (complete_cycle1, cycle1) =
-            cluster2_tick.cycle::<Stream<(usize, usize), _, Bounded, NoOrder>>();
-        let (complete_cycle2, cycle2) =
-            cluster2_tick.cycle::<Stream<(usize, usize), _, Bounded, NoOrder>>();
-        let chained = {
-            cycle1
-                .ir_node_named("teed chain 1 cycled")
-                .join(input.batch(&cluster2_tick, nondet!(/** test */)))
-                .ir_node_named("join")
-                .map(q!(|(_, (b1, b2))| (b1, b2))) // Both values are influenced by the join with cycle2_out
-                .ir_node_named("map (x,(a,b)) to (a,b)")
-                .chain(cycle2.ir_node_named("teed map (a,b) to (b,b) 1 cycled"))
-        };
-        complete_cycle1.complete_next_tick(chained.clone().ir_node_named("teed chain 1"));
-        let cycle2_out = chained
-            .ir_node_named("teed chain 2")
-            .map(q!(|(_a, b)| (b, b)));
-        complete_cycle2.complete_next_tick(
-            cycle2_out
-                .clone()
-                .ir_node_named("teed map (a,b) to (b,b) 1"),
-        );
-        cycle2_out
-            .ir_node_named("teed map (a,b) to (b,b) 2")
+        cycle
             .all_ticks()
-            .for_each(q!(|(b, _)| {
-                println!("b: {}", b);
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
+            .for_each(q!(|(a, b)| {
+                println!("a: {}, b: {}", a, b);
             }));
 
-        let expected_taint = BTreeMap::from([
-            ("map after network", BTreeSet::from(["network"])),
-            ("join", BTreeSet::from(["network"])),
-            ("map (x,(a,b)) to (a,b)", BTreeSet::from(["network"])), // map (x,(a,b)) to (a,b)
-            ("teed chain 1", BTreeSet::from(["network"])),           // Tee(chain)
-            ("teed chain 2", BTreeSet::from(["network"])),           // Tee(chain)
-            ("teed map (a,b) to (b,b) 1", BTreeSet::from(["network"])), // Tee(map)
-            ("teed map (a,b) to (b,b) 2", BTreeSet::from(["network"])), // Tee(map)
-        ]);
-        let unnamed_expected_taint = BTreeMap::from([
-            (("teed chain 1 cycled", -1), BTreeSet::from(["network"])), /* CycleSource(cycle1), parent = DeferTick(cycle1) */
-            (
-                ("teed map (a,b) to (b,b) 1 cycled", -1),
-                BTreeSet::from(["network"]),
-            ), // CycleSource(cycle2)
-            (("teed chain 1", -1), BTreeSet::from(["network"])),        // Chain
-            (("teed chain 1 cycled", 0), BTreeSet::from(["network"])),  // DeferTick(cycle1)
-            (
-                ("teed map (a,b) to (b,b) 1", -1),
-                BTreeSet::from(["network"]),
-            ), // map (a,b) to (b,b)
-            (
-                ("teed map (a,b) to (b,b) 1 cycled", 0),
-                BTreeSet::from(["network"]),
-            ), // DeferTick(cycle2)
-        ]);
-
-        let mut implicit_map_dependencies = StructOrTuple::default();
-        implicit_map_dependencies.add_dependency(&vec![], vec!["1".to_string()]);
-        let mut join_dependencies = StructOrTuple::default();
-        join_dependencies.add_dependency(
-            &vec!["0".to_string()],
-            vec!["1".to_string(), "0".to_string()],
-        );
-        join_dependencies.add_dependency(
-            &vec!["0".to_string()],
-            vec!["1".to_string(), "1".to_string()],
-        );
-        join_dependencies.add_dependency(
-            &vec!["1".to_string(), "0".to_string()],
-            vec!["1".to_string(), "1".to_string()],
-        );
-        join_dependencies.add_dependency(
-            &vec!["1".to_string(), "1".to_string()],
-            vec!["1".to_string(), "1".to_string()],
-        );
-        let mut other_dependencies = StructOrTuple::default();
-        other_dependencies.add_dependency(
-            &vec!["0".to_string()],
-            vec!["1".to_string(), "1".to_string()],
-        );
-        other_dependencies.add_dependency(
-            &vec!["1".to_string()],
-            vec!["1".to_string(), "1".to_string()],
-        );
-
-        let expected_dependencies = BTreeMap::from([
-            ("network", BTreeMap::new()),
-            (
-                "map after network",
-                BTreeMap::from([("network", implicit_map_dependencies)]),
-            ),
-            ("join", BTreeMap::from([("network", join_dependencies)])),
-            (
-                "map (x,(a,b)) to (a,b)",
-                BTreeMap::from([("network", other_dependencies.clone())]),
-            ),
-            (
-                "teed chain 1",
-                BTreeMap::from([("network", other_dependencies.clone())]),
-            ), // Tee(chain)
-            (
-                "teed chain 2",
-                BTreeMap::from([("network", other_dependencies.clone())]),
-            ), // Tee(chain)
-            (
-                "teed map (a,b) to (b,b) 1",
-                BTreeMap::from([("network", other_dependencies.clone())]),
-            ), // Tee(map)
-            (
-                "teed map (a,b) to (b,b) 2",
-                BTreeMap::from([("network", other_dependencies.clone())]),
-            ), // Tee(map)
-        ]);
-        let unnamed_expected_dependencies = BTreeMap::from([
-            (
-                ("teed chain 1 cycled", -1),
-                BTreeMap::from([("network", other_dependencies.clone())]),
-            ), // CycleSource(cycle1), parent = DeferTick(cycle1)
-            (
-                ("teed map (a,b) to (b,b) 1 cycled", -1),
-                BTreeMap::from([("network", other_dependencies.clone())]),
-            ), // CycleSource(cycle2)
-            (
-                ("teed chain 1", -1),
-                BTreeMap::from([("network", other_dependencies.clone())]),
-            ), // Chain
-            (
-                ("teed chain 1 cycled", 0),
-                BTreeMap::from([("network", other_dependencies.clone())]),
-            ), // DeferTick(cycle1)
-            (
-                ("teed map (a,b) to (b,b) 1", -1),
-                BTreeMap::from([("network", other_dependencies.clone())]),
-            ), // map (a,b) to (b,b)
-            (
-                ("teed map (a,b) to (b,b) 1 cycled", 0),
-                BTreeMap::from([("network", other_dependencies)]),
-            ), // DeferTick(cycle2)
-        ]);
-
-        test_input_with_unnamed_ir_nodes(
-            builder,
-            cluster2.id(),
-            expected_taint,
-            unnamed_expected_taint,
-            expected_dependencies,
-            unnamed_expected_dependencies,
-        );
+        test_input_partitionable(builder, cluster2.id(), true);
     }
 
     #[test]
@@ -2128,81 +1072,15 @@ mod tests {
         complete_cycle1.complete_next_tick(chained.clone());
         let cycle2_out = chained.map(q!(|(_a, b)| (b, b)));
         complete_cycle2.complete_next_tick(cycle2_out.clone());
-        cycle2_out.all_ticks().for_each(q!(|(b, _)| {
-            println!("b: {}", b);
-        }));
-
-        // Less confusing with thought experiment: Consider input tuples (1,2) and (1,3)
-        // Partitioning on b fails if cycle1 (somehow) already contains tuple (1,1)
-        let expected_partitionings = Some(vec![BTreeMap::from([(
-            "network",
-            vec!["1".to_string(), "0".to_string()],
-        )])]);
-        test_input_partitionable(builder, cluster2.id(), expected_partitionings);
-    }
-
-    #[test]
-    fn test_source_iter() {
-        let builder = FlowBuilder::new();
-        let cluster1 = builder.cluster::<()>();
-        let cluster2 = builder.cluster::<()>();
-        let input = cluster1
-            .source_iter(q!([(1, 2)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
-            .ir_node_named("network")
-            .values()
-            .ir_node_named("map after network");
-        let tick = cluster2.tick();
-        let stream1 = input.map(q!(|(a, b)| (b, a + 2))).ir_node_named("map");
-        let stream2 = cluster2.source_iter(q!([(3, 4)]));
-        stream2
-            .batch(&tick, nondet!(/** test */))
-            .chain(stream1.batch(&tick, nondet!(/** test */)))
-            .ir_node_named("chain")
+        cycle2_out
             .all_ticks()
-            .for_each(q!(|_| {
-                println!("No dependencies");
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
+            .for_each(q!(|(b, _)| {
+                println!("b: {}", b);
             }));
 
-        let expected_taint = BTreeMap::from([
-            ("map after network", BTreeSet::from(["network"])),
-            ("map", BTreeSet::from(["network"])),
-            ("chain", BTreeSet::from(["network"])),
-        ]);
-        let unnamed_expected_taint = BTreeMap::from([]);
-
-        let mut implicit_map_dependencies = StructOrTuple::default();
-        implicit_map_dependencies.add_dependency(&vec![], vec!["1".to_string()]);
-        let mut map_dependencies = StructOrTuple::default();
-        map_dependencies.add_dependency(
-            &vec!["0".to_string()],
-            vec!["1".to_string(), "1".to_string()],
-        );
-
-        let expected_dependencies = BTreeMap::from([
-            ("network", BTreeMap::new()),
-            (
-                "map after network",
-                BTreeMap::from([("network", implicit_map_dependencies)]),
-            ),
-            (
-                "map",
-                BTreeMap::from([("network", map_dependencies.clone())]),
-            ),
-            ("chain", BTreeMap::from([("network", map_dependencies)])),
-        ]);
-        let unnamed_expected_dependencies = BTreeMap::from([
-            (("network", -8), BTreeMap::from([])), // Source
-        ]);
-
-        test_input_with_unnamed_ir_nodes(
-            builder,
-            cluster2.id(),
-            expected_taint,
-            unnamed_expected_taint,
-            expected_dependencies,
-            unnamed_expected_dependencies,
-        );
+        test_input_partitionable(builder, cluster2.id(), true);
     }
 
     #[test]
@@ -2221,150 +1099,13 @@ mod tests {
             .batch(&tick, nondet!(/** test */))
             .chain(stream1.batch(&tick, nondet!(/** test */)))
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|_| {
                 println!("No dependencies");
             }));
 
-        let expected_partitionings = Some(Vec::new());
-        test_input_partitionable(builder, cluster2.id(), expected_partitionings);
-    }
-
-    #[test]
-    fn test_multiple_inputs() {
-        let builder = FlowBuilder::new();
-        let cluster1 = builder.cluster::<()>();
-        let cluster2 = builder.cluster::<()>();
-        let input1 = cluster1
-            .source_iter(q!([(1, 2)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
-            .ir_node_named("input1")
-            .values()
-            .ir_node_named("map after input1");
-        let input2 = cluster1
-            .source_iter(q!([(3, 4)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
-            .ir_node_named("input2")
-            .values()
-            .ir_node_named("map after input2");
-        let tick = cluster2.tick();
-        let stream1 = input1
-            .map(q!(|(a, b)| (a * 2, b)))
-            .batch(&tick, nondet!(/** test */));
-        let stream2 = input2
-            .map(q!(|(a, b)| (-a, b)))
-            .batch(&tick, nondet!(/** test */));
-        stream2
-            .clone()
-            .ir_node_named("teed map2 1")
-            .chain(stream1.clone().ir_node_named("teed map1 1"))
-            .ir_node_named("chain")
-            .all_ticks()
-            .for_each(q!(|_| {
-                println!("Dependent on both input1.b and input2.b");
-            }));
-        stream2
-            .ir_node_named("teed map2 2")
-            .join(stream1.ir_node_named("teed map1 2"))
-            .ir_node_named("join")
-            .all_ticks()
-            .for_each(q!(|(_, (b1, b2))| {
-                println!("b from input 1: {}, b from input 2: {}", b1, b2);
-            }));
-
-        let expected_taint = BTreeMap::from([
-            ("map after input2", BTreeSet::from(["input2"])),
-            ("teed map2 1", BTreeSet::from(["input2"])),
-            ("map after input1", BTreeSet::from(["input1"])),
-            ("teed map1 1", BTreeSet::from(["input1"])),
-            ("chain", BTreeSet::from(["input1", "input2"])),
-            ("teed map2 2", BTreeSet::from(["input2"])),
-            ("teed map1 2", BTreeSet::from(["input1"])),
-            ("join", BTreeSet::from(["input1", "input2"])),
-        ]);
-        let unnamed_expected_taint = BTreeMap::from([
-            (("teed map2 1", -1), BTreeSet::from(["input2"])), // map2
-            (("teed map1 1", -1), BTreeSet::from(["input1"])), // map1
-        ]);
-
-        let mut implicit_map_dependencies = StructOrTuple::default();
-        implicit_map_dependencies.add_dependency(&vec![], vec!["1".to_string()]);
-        let mut input_map_dependencies = StructOrTuple::default();
-        input_map_dependencies.add_dependency(
-            &vec!["1".to_string()],
-            vec!["1".to_string(), "1".to_string()],
-        );
-        let mut join_input1_dependencies = StructOrTuple::default();
-        join_input1_dependencies.add_dependency(
-            &vec!["1".to_string(), "1".to_string()],
-            vec!["1".to_string(), "1".to_string()],
-        );
-        let mut join_input2_dependencies = StructOrTuple::default();
-        join_input2_dependencies.add_dependency(
-            &vec!["1".to_string(), "0".to_string()],
-            vec!["1".to_string(), "1".to_string()],
-        );
-
-        let expected_dependencies = BTreeMap::from([
-            ("input2", BTreeMap::new()),
-            (
-                "map after input2",
-                BTreeMap::from([("input2", implicit_map_dependencies.clone())]),
-            ),
-            (
-                "teed map2 1",
-                BTreeMap::from([("input2", input_map_dependencies.clone())]),
-            ),
-            ("input1", BTreeMap::new()),
-            (
-                "map after input1",
-                BTreeMap::from([("input1", implicit_map_dependencies)]),
-            ),
-            (
-                "teed map1 1",
-                BTreeMap::from([("input1", input_map_dependencies.clone())]),
-            ),
-            (
-                "chain",
-                BTreeMap::from([
-                    ("input1", input_map_dependencies.clone()),
-                    ("input2", input_map_dependencies.clone()),
-                ]),
-            ),
-            (
-                "teed map2 2",
-                BTreeMap::from([("input2", input_map_dependencies.clone())]),
-            ),
-            (
-                "teed map1 2",
-                BTreeMap::from([("input1", input_map_dependencies.clone())]),
-            ),
-            (
-                "join",
-                BTreeMap::from([
-                    ("input1", join_input1_dependencies),
-                    ("input2", join_input2_dependencies),
-                ]),
-            ),
-        ]);
-        let unnamed_expected_dependencies = BTreeMap::from([
-            (
-                ("teed map2 1", -1),
-                BTreeMap::from([("input2", input_map_dependencies.clone())]),
-            ), // map2
-            (
-                ("teed map1 1", -1),
-                BTreeMap::from([("input1", input_map_dependencies)]),
-            ), // map1
-        ]);
-
-        test_input_with_unnamed_ir_nodes(
-            builder,
-            cluster2.id(),
-            expected_taint,
-            unnamed_expected_taint,
-            expected_dependencies,
-            unnamed_expected_dependencies,
-        );
+        test_input_partitionable(builder, cluster2.id(), true);
     }
 
     #[test]
@@ -2393,82 +1134,21 @@ mod tests {
             .clone()
             .chain(stream1.clone())
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|_| {
                 println!("Dependent on both input1.b and input2.b");
             }));
         stream2
             .join(stream1)
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|(_, (a1, a2))| {
                 println!("a*2 from input 1: {}, -a from input 2: {}", a1, a2);
             }));
 
-        let expected_partitioning = Some(vec![BTreeMap::from([
-            ("input2", vec!["1".to_string(), "1".to_string()]),
-            ("input1", vec!["1".to_string(), "1".to_string()]),
-        ])]);
-        test_input_partitionable(builder, cluster2.id(), expected_partitioning);
-    }
-
-    #[test]
-    fn test_difference() {
-        let builder = FlowBuilder::new();
-        let cluster1 = builder.cluster::<()>();
-        let cluster2 = builder.cluster::<()>();
-        let input1 = cluster1
-            .source_iter(q!([(1, 2)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
-            .ir_node_named("input1")
-            .values()
-            .ir_node_named("map after input1");
-        let input2 = cluster1
-            .source_iter(q!([(3, 4)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
-            .ir_node_named("input2")
-            .values()
-            .ir_node_named("map after input2");
-        let tick = cluster2.tick();
-        input1
-            .batch(&tick, nondet!(/** test */))
-            .filter_not_in(input2.batch(&tick, nondet!(/** test */)))
-            .ir_node_named("difference")
-            .all_ticks()
-            .for_each(q!(|(a, b)| {
-                println!("a: {}, b: {}", a, b);
-            }));
-
-        let expected_taint = BTreeMap::from([
-            ("map after input1", BTreeSet::from(["input1"])),
-            ("map after input2", BTreeSet::from(["input2"])),
-            ("difference", BTreeSet::from(["input1"])), // Isn't tainted by anti-joined parent
-        ]);
-
-        let mut implicit_map_dependencies = StructOrTuple::default();
-        implicit_map_dependencies.add_dependency(&vec![], vec!["1".to_string()]);
-
-        let expected_dependencies = BTreeMap::from([
-            ("input1", BTreeMap::new()),
-            (
-                "map after input1",
-                BTreeMap::from([("input1", implicit_map_dependencies.clone())]),
-            ),
-            ("input2", BTreeMap::new()),
-            (
-                "map after input2",
-                BTreeMap::from([("input2", implicit_map_dependencies.clone())]),
-            ),
-            (
-                "difference",
-                BTreeMap::from([("input1", implicit_map_dependencies)]),
-            ),
-        ]);
-
-        test_input(
-            builder,
-            cluster2.id(),
-            expected_taint,
-            expected_dependencies,
-        );
+        test_input_partitionable(builder, cluster2.id(), true);
     }
 
     #[test]
@@ -2491,14 +1171,12 @@ mod tests {
             .batch(&tick, nondet!(/** test */))
             .filter_not_in(input2.batch(&tick, nondet!(/** test */)))
             .all_ticks()
+            .assume_ordering(nondet!(/** test */))
+            .assume_retries(nondet!(/** test */))
             .for_each(q!(|(a, b)| {
                 println!("a: {}, b: {}", a, b);
             }));
 
-        let expected_partitionings = Some(vec![BTreeMap::from([
-            ("input1", vec!["1".to_string()]),
-            ("input2", vec!["1".to_string()]),
-        ])]);
-        test_input_partitionable(builder, cluster2.id(), expected_partitionings);
+        test_input_partitionable(builder, cluster2.id(), true);
     }
 }
