@@ -46,18 +46,13 @@ impl ReusableHosts {
         deployment: &mut Deployment,
         display_name: String,
     ) -> TrybuildHost {
-        let rustflags = if self.host_arg == "gcp" {
-            "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off -C link-args=--no-rosegment"
-        } else {
-            "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off"
-        };
         TrybuildHost::new(self.lazy_create_host(deployment, display_name.clone()))
             .additional_hydro_features(vec!["runtime_measure".to_string()])
             .build_env(
                 "HYDRO_RUNTIME_MEASURE_CPU_PREFIX",
                 super::deploy_and_analyze::CPU_USAGE_PREFIX,
             )
-            .rustflags(rustflags)
+            .rustflags("-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off")
             .tracing(
                 TracingOptions::builder()
                     .perf_raw_outfile(format!("{}.perf.data", display_name.clone()))
