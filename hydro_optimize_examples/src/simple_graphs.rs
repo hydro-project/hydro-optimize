@@ -50,6 +50,8 @@ pub fn get_graph_function<'a>(name: &str) -> impl GraphFunction<'a> {
     match name {
         "noop" => noop,
         "map_h_map_h" => map_h_map_h,
+        "map_h_map_h_split_up" => map_h_map_h_split_up,
+        "map_h_map_h_parallel" => map_h_map_h_parallel,
         "map_h_map_h_map_h" => map_h_map_h_map_h,
         "map_h_map_h_map_l" => map_h_map_h_map_l,
         "map_h_map_l_map_h" => map_h_map_l_map_h,
@@ -106,6 +108,130 @@ pub fn map_h_map_h<'a>(
             virt_client_id,
             self::sha256(100 + n % 2)
         )))
+}
+
+pub fn map_h_map_h_split_up<'a>(
+    _server: &Cluster<'a, Server>,
+    payloads: KeyedStream<MemberId<Client>, (u32, u32), Cluster<'a, Server>, Unbounded, NoOrder>,
+) -> KeyedStream<MemberId<Client>, (u32, u32), Cluster<'a, Server>, Unbounded, NoOrder> {
+    payloads
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(10 + n % 2)
+        )))
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(10 + n % 2)
+        )))
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(10 + n % 2)
+        )))
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(10 + n % 2)
+        )))
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(10 + n % 2)
+        )))
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(10 + n % 2)
+        )))
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(10 + n % 2)
+        )))
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(10 + n % 2)
+        )))
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(10 + n % 2)
+        )))
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(10 + n % 2)
+        )))
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(10 + n % 2)
+        )))
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(10 + n % 2)
+        )))
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(10 + n % 2)
+        )))
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(10 + n % 2)
+        )))
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(10 + n % 2)
+        )))
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(10 + n % 2)
+        )))
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(10 + n % 2)
+        )))
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(10 + n % 2)
+        )))
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(10 + n % 2)
+        )))
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(10 + n % 2)
+        )))
+}
+
+pub fn map_h_map_h_parallel<'a>(
+    _server: &Cluster<'a, Server>,
+    payloads: KeyedStream<MemberId<Client>, (u32, u32), Cluster<'a, Server>, Unbounded, NoOrder>,
+) -> KeyedStream<MemberId<Client>, (u32, u32), Cluster<'a, Server>, Unbounded, NoOrder> {
+    let batch0 = payloads.clone().filter(q!(|(virt_client_id, _)| virt_client_id % 2 == 0));
+    let batch1 = payloads.filter(q!(|(virt_client_id, _)| virt_client_id % 2 == 1));
+    let batch0out = batch0
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(100 + n % 2)
+        )));
+    batch1
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(100 + n % 2)
+        )))
+        .interleave(batch0out)
+}
+
+pub fn map_h_map_h_parallel_no_union<'a>(
+    _server: &Cluster<'a, Server>,
+    payloads1: KeyedStream<MemberId<Client>, (u32, u32), Cluster<'a, Server>, Unbounded, NoOrder>,
+    payloads2: KeyedStream<MemberId<Client>, (u32, u32), Cluster<'a, Server>, Unbounded, NoOrder>,
+) -> (KeyedStream<MemberId<Client>, (u32, u32), Cluster<'a, Server>, Unbounded, NoOrder>,
+KeyedStream<MemberId<Client>, (u32, u32), Cluster<'a, Server>, Unbounded, NoOrder>) {
+    (payloads1
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(100 + n % 2)
+        ))),
+    payloads2
+        .map(q!(|(virt_client_id, n)| (
+            virt_client_id,
+            self::sha256(100 + n % 2)
+        ))))
 }
 
 pub fn map_h_map_h_map_h<'a>(

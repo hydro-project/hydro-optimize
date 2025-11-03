@@ -12,7 +12,7 @@ use hydro_optimize::decoupler;
 use hydro_optimize::deploy::ReusableHosts;
 use hydro_optimize::deploy_and_analyze::deploy_and_analyze;
 use hydro_optimize_examples::simple_graphs::{Client, Server, get_graph_function};
-use hydro_optimize_examples::simple_graphs_bench::{Aggregator, simple_graphs_bench};
+use hydro_optimize_examples::simple_graphs_bench::{Aggregator, simple_graphs_bench, simple_graphs_bench_no_union};
 use tokio::sync::RwLock;
 
 #[derive(Parser, Debug)]
@@ -56,6 +56,12 @@ async fn main() {
         &client_aggregator,
         graph_function,
     );
+    // simple_graphs_bench_no_union(
+    //     num_clients_per_node,
+    //     &server,
+    //     &clients,
+    //     &client_aggregator,
+    // );
 
     let mut clusters = vec![
         (
