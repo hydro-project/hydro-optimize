@@ -1,5 +1,6 @@
 stageleft::stageleft_no_entry_crate!();
 
+pub mod network_calibrator;
 pub mod simple_graphs;
 pub mod simple_graphs_bench;
 pub mod simple_kv_bench;

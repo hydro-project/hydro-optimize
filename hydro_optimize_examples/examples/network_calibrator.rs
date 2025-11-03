@@ -1,0 +1,112 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use clap::Parser;
+use hydro_deploy::Deployment;
+use hydro_deploy::gcp::GcpNetwork;
+use hydro_lang::viz::config::GraphConfig;
+use hydro_lang::location::Location;
+use hydro_lang::prelude::FlowBuilder;
+use hydro_optimize::deploy::ReusableHosts;
+use hydro_optimize::deploy_and_analyze::deploy_and_analyze;
+use hydro_optimize_examples::network_calibrator::{Aggregator, Client, Server, network_calibrator};
+use tokio::sync::RwLock;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[command(flatten)]
+    graph: GraphConfig,
+
+    /// Use GCP for deployment (provide project name)
+    #[arg(long)]
+    gcp: Option<String>,
+
+    #[arg(long)]
+    function: String,
+}
+
+#[tokio::main]
+async fn main() {
+    let args = Args::parse();
+
+    let mut deployment = Deployment::new();
+    let (host_arg, project) = if let Some(project) = args.gcp {
+        ("gcp".to_string(), project)
+    } else {
+        ("localhost".to_string(), String::new())
+    };
+    let network = Arc::new(RwLock::new(GcpNetwork::new(&project, None)));
+
+    let mut builder = FlowBuilder::new();
+    let num_clients = 1;
+    let num_clients_per_node = 10000000;
+    let server = builder.cluster();
+    let clients = builder.cluster();
+    let client_aggregator = builder.process();
+
+    let clusters = vec![
+        (
+            server.id().raw_id(),
+            std::any::type_name::<Server>().to_string(),
+            1,
+        ),
+        (
+            clients.id().raw_id(),
+            std::any::type_name::<Client>().to_string(),
+            num_clients,
+        ),
+    ];
+    let processes = vec![(
+        client_aggregator.id().raw_id(),
+        std::any::type_name::<Aggregator>().to_string(),
+    )];
+
+    // Deploy
+    let mut reusable_hosts = ReusableHosts {
+        hosts: HashMap::new(),
+        host_arg,
+        project: project.clone(),
+        network: network.clone(),
+    };
+
+    let message_sizes = vec![1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
+    let num_seconds_to_profile = Some(20);
+    let multi_run_metadata = RefCell::new(vec![]);
+
+    for (i, message_size) in message_sizes.iter().enumerate() {
+
+        network_calibrator(
+            num_clients_per_node,
+            *message_size,
+            &server,
+            &clients,
+            &client_aggregator,
+        );
+
+        let (rewritten_ir_builder, ir, _, _, _) =
+            deploy_and_analyze(
+                &mut reusable_hosts,
+                &mut deployment,
+                builder,
+                &clusters,
+                &processes,
+                vec![
+                    std::any::type_name::<Client>().to_string(),
+                    std::any::type_name::<Aggregator>().to_string(),
+                ],
+                num_seconds_to_profile,
+                &multi_run_metadata,
+                i,
+            )
+            .await;
+
+        builder = rewritten_ir_builder.build_with(|_| ir);
+    }
+
+    let built = builder.finalize();
+
+    // Generate graphs if requested
+    _ = built.generate_graph_with_config(&args.graph, None);
+}
