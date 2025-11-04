@@ -2,9 +2,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::rewrites::op_id_to_inputs;
-use good_lp::solvers::lpsolve::LpSolveSolution;
+use good_lp::solvers::highs::HighsSolution;
 use good_lp::{
-    Constraint, Expression, ProblemVariables, Solution, SolverModel, Variable, constraint, lp_solve, variable, variables
+    Constraint, Expression, ProblemVariables, Solution, SolverModel, Variable, constraint, highs, variable, variables
 };
 use hydro_lang::compile::ir::{
     HydroIrMetadata, HydroIrOpMetadata, HydroNode, HydroRoot, traverse_dfir,
@@ -344,7 +344,7 @@ fn decouple_analysis_node(
     add_tick_constraint(node.metadata(), op_id_to_inputs, model_metadata);
 }
 
-fn solve(model_metadata: &RefCell<ModelMetadata>) -> LpSolveSolution {
+fn solve(model_metadata: &RefCell<ModelMetadata>) -> HighsSolution {
     let ModelMetadata {
         variables,
         constraints,
@@ -367,7 +367,7 @@ fn solve(model_metadata: &RefCell<ModelMetadata>) -> LpSolveSolution {
     // Minimize the CPU usage of that node
     let problem = vars
         .minimise(highest_cpu);
-    let solution = lp_solve(problem)
+    let solution = highs(problem)
         .with_all(constrs)  
         .solve()
         .unwrap();

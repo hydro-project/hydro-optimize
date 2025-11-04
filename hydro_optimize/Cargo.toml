@@ -10,7 +10,7 @@ edition = "2024"
 all-features = true
 
 [dependencies]
-good_lp = { version = "1.14.0", features = ["lpsolve"], default-features = false }
+good_lp = { version = "1.14.0", features = ["highs"], default-features = false }
 hydro_deploy.workspace = true
 hydro_lang = { workspace = true, features = ["deploy"] }
 proc-macro2 = "1.0.95"
