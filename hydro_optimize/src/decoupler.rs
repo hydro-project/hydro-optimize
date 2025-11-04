@@ -14,7 +14,7 @@ use syn::visit_mut::VisitMut;
 
 use crate::parse_results::{MultiRunMetadata, get_or_append_run_metadata};
 use crate::repair::{cycle_source_to_sink_input, inject_id, inject_location};
-use crate::rewrites::{ClusterSelfIdReplace, collection_kind_to_debug_type, deserialize_bincode_with_type, prepend_member_id_to_collection_kind, serialize_bincode_with_type};
+use crate::rewrites::{ClusterSelfIdReplace, collection_kind_to_debug_type, deserialize_bincode_with_type, prepend_member_id_to_collection_kind, serialize_bincode_with_type, tee_to_inner_id};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Decoupler {
@@ -111,16 +111,13 @@ fn add_tee(
     node: &mut HydroNode,
     new_location: &LocationId,
     new_inners: &mut HashMap<(usize, LocationId), Rc<RefCell<HydroNode>>>,
+    tee_to_inner_id_before_rewrites: &HashMap<usize, usize>,
 ) {
     let metadata = node.metadata().clone();
-    let inner_id = if let HydroNode::Tee { inner, .. } = node {
-        inner.0.borrow().op_metadata().id.unwrap()
-    } else {
-        std::panic!("Decoupler add_tee() called on non-Tee");
-    };
+    let inner_id = tee_to_inner_id_before_rewrites.get(&metadata.op.id.unwrap()).unwrap();
 
     let new_inner = new_inners
-        .entry((inner_id, new_location.clone()))
+        .entry((*inner_id, new_location.clone()))
         .or_insert_with(|| {
             println!(
                 "Adding network before Tee to location {:?} after id: {}",
@@ -144,11 +141,14 @@ fn decouple_node(
     decoupler: &Decoupler,
     next_stmt_id: &mut usize,
     new_inners: &mut HashMap<(usize, LocationId), Rc<RefCell<HydroNode>>>,
+    tee_to_inner_id_before_rewrites: &HashMap<usize, usize>,
 ) {
     // Replace location of sources, if necessary
     if decoupler.place_on_decoupled_machine.contains(next_stmt_id) {
         match node {
-            HydroNode::Source { metadata, .. } | HydroNode::Network { metadata, .. } => {
+            HydroNode::Source { metadata, .. }
+            | HydroNode::SingletonSource { metadata, .. }
+            | HydroNode::Network { metadata, .. } => {
                 println!(
                     "Changing source/network destination from {:?} to location {:?}, id: {}",
                     metadata.location_kind,
@@ -196,7 +196,7 @@ fn decouple_node(
                 "Creating a TEE to location {:?}, id: {}",
                 new_location, next_stmt_id
             );
-            add_tee(node, new_location, new_inners);
+            add_tee(node, new_location, new_inners, tee_to_inner_id_before_rewrites);
         }
         _ => {
             println!(
@@ -242,12 +242,13 @@ pub fn decouple(
     multi_run_metadata: &RefCell<MultiRunMetadata>,
     iteration: usize,
 ) {
+    let tee_to_inner_id_before_rewrites = tee_to_inner_id(ir);
     let mut new_inners = HashMap::new();
     traverse_dfir(
         ir,
         |_, _| {},
         |node, next_stmt_id| {
-            decouple_node(node, decoupler, next_stmt_id, &mut new_inners);
+            decouple_node(node, decoupler, next_stmt_id, &mut new_inners, &tee_to_inner_id_before_rewrites);
         },
     );
 
