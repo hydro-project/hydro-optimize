@@ -2,10 +2,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::rewrites::op_id_to_inputs;
-use good_lp::solvers::microlp::MicroLpSolution;
+use good_lp::solvers::highs::HighsSolution;
 use good_lp::{
-    Constraint, Expression, ProblemVariables, Solution, SolverModel, Variable, constraint, microlp,
-    variable, variables,
+    Constraint, Expression, ProblemVariables, Solution, SolverModel, Variable, constraint, highs, variable, variables
 };
 use hydro_lang::compile::ir::{
     HydroIrMetadata, HydroIrOpMetadata, HydroNode, HydroRoot, traverse_dfir,
@@ -345,7 +344,7 @@ fn decouple_analysis_node(
     add_tick_constraint(node.metadata(), op_id_to_inputs, model_metadata);
 }
 
-fn solve(model_metadata: &RefCell<ModelMetadata>) -> MicroLpSolution {
+fn solve(model_metadata: &RefCell<ModelMetadata>) -> HighsSolution {
     let ModelMetadata {
         variables,
         constraints,
@@ -366,10 +365,10 @@ fn solve(model_metadata: &RefCell<ModelMetadata>) -> MicroLpSolution {
     constrs.push(constraint!(highest_cpu >= decoupled_usage.clone()));
 
     // Minimize the CPU usage of that node
-    let solution = vars
-        .minimise(highest_cpu)
-        .using(microlp)
-        .with_all(constrs)
+    let problem = vars
+        .minimise(highest_cpu);
+    let solution = highs(problem)
+        .with_all(constrs)  
         .solve()
         .unwrap();
 
