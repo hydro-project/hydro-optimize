@@ -165,7 +165,7 @@ fn inject_location_node(
     }
 
     // No op_id, probably can ignore?
-    return false;
+    false
 }
 
 pub fn inject_location(ir: &mut [HydroRoot], cycle_source_to_sink_input: &HashMap<usize, usize>) {

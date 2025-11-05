@@ -172,6 +172,22 @@ pub fn op_id_to_inputs(
     mapping.take()
 }
 
+pub fn tee_to_inner_id(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
+    let mut mapping = HashMap::new();
+
+    traverse_dfir(
+        ir,
+        |_, _| {},
+        |node, op_id| {
+            if let HydroNode::Tee { inner, .. } = node {
+                mapping.insert(*op_id, inner.0.borrow().op_metadata().id.unwrap());
+            }
+        },
+    );
+
+    mapping
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub enum NetworkType {
     Recv,
@@ -294,7 +310,7 @@ pub fn prepend_member_id_to_collection_kind(collection_kind: &CollectionKind) ->
                 value_order: StreamOrder::NoOrder,
                 value_retry: StreamRetry::ExactlyOnce,
                 key_type: member_id_debug_type,
-                value_type: collection_kind_to_debug_type(&collection_kind),
+                value_type: collection_kind_to_debug_type(collection_kind),
             }
         }
     }
