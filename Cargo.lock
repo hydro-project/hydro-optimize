@@ -107,12 +107,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
-name = "allocator-api2"
-version = "0.2.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
-
-[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1669,10 +1663,6 @@ dependencies = [
  "ahash",
  "allocator-api2",
 ]
-dependencies = [
- "ahash",
- "allocator-api2",
-]
 
 [[package]]
 name = "hashbrown"
@@ -1859,7 +1849,6 @@ dependencies = [
  "pin-project-lite",
  "serde",
  "sinktools",
- "sinktools",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -1878,7 +1867,6 @@ dependencies = [
  "ctor 0.2.9",
  "data-encoding",
  "dfir_lang",
- "flate2",
  "flate2",
  "futures",
  "hydro_build_utils",
@@ -1904,7 +1892,6 @@ dependencies = [
  "toml",
  "trybuild-internals-api",
  "urlencoding",
- "urlencoding",
  "webbrowser",
 ]
 
@@ -1922,9 +1909,7 @@ dependencies = [
  "hydro_test",
  "include_mdtests",
  "proc-macro-crate",
- "proc-macro-crate",
  "proc-macro2",
- "quote",
  "quote",
  "regex",
  "serde",
@@ -1941,16 +1926,11 @@ dependencies = [
  "ctor 0.2.9",
  "dfir_lang",
  "hydro_build_utils",
- "dfir_lang",
- "hydro_build_utils",
  "hydro_deploy",
  "hydro_lang",
  "hydro_optimize",
  "hydro_std",
  "hydro_test",
- "regex",
- "serde",
- "sha2",
  "regex",
  "serde",
  "sha2",
@@ -2298,9 +2278,9 @@ checksum = "469fb0b9cefa57e3ef31275ee7cacb78f2fdca44e4765491884a2b119d4eb130"
 
 [[package]]
 name = "iri-string"
-version = "0.7.8"
+version = "0.7.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbc5ebe9c3a1a7a5127f920a418f7585e9e758e911d0466ed004f393b0e380b2"
+checksum = "4f867b9d1d896b67beb18518eda36fdb77a32ea590de864f1325b294a6d14397"
 dependencies = [
  "memchr",
  "serde",
@@ -3717,9 +3697,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.34"
+version = "0.23.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a9586e9ee2b4f8fab52a0048ca7334d7024eef48e2cb9407e3497bb7cab7fa7"
+checksum = "533f54bc6a7d4f647e46ad909549eda97bf5afc1585190ef692b4286b198bd8f"
 dependencies = [
  "once_cell",
  "ring",
@@ -4145,9 +4125,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stageleft"
 version = "0.10.0"
-version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b92cb4d28ec3c2b3aba8ee05487f10c3aa00d7a369a3fe9d4d89e8719f28ca4f"
 checksum = "b92cb4d28ec3c2b3aba8ee05487f10c3aa00d7a369a3fe9d4d89e8719f28ca4f"
 dependencies = [
  "ctor 0.4.3",
@@ -4161,9 +4139,7 @@ dependencies = [
 [[package]]
 name = "stageleft_macro"
 version = "0.10.0"
-version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e05624677c37d2abebe0c3e50fa7722f99936d26de2a8a23ac5d2a397be596c0"
 checksum = "e05624677c37d2abebe0c3e50fa7722f99936d26de2a8a23ac5d2a397be596c0"
 dependencies = [
  "proc-macro-crate",
@@ -4176,9 +4152,7 @@ dependencies = [
 [[package]]
 name = "stageleft_tool"
 version = "0.10.0"
-version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da14207006ed0031a24197e0a2d3bc84b2a7ecf3a2ca70b70f1886cf1a37b464"
 checksum = "da14207006ed0031a24197e0a2d3bc84b2a7ecf3a2ca70b70f1886cf1a37b464"
 dependencies = [
  "prettyplease",
@@ -4731,12 +4705,6 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
-
-[[package]]
-name = "urlencoding"
-version = "2.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
 name = "urlencoding"
