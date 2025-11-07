@@ -45,6 +45,9 @@ pub fn size_based_workload_generator<'a, Client>(
                 return (virtual_id, payload);
             }
         }
-        (virtual_id, vec![0; message_size])
+
+        // Temp fix for macro stuff that isn't supported by stageleft I guess
+        let msg_size = message_size;
+        (virtual_id, vec![0; msg_size])
     }))
 }

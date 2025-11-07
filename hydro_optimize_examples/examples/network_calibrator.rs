@@ -22,9 +22,6 @@ struct Args {
     /// Use GCP for deployment (provide project name)
     #[arg(long)]
     gcp: Option<String>,
-
-    #[arg(long)]
-    function: String,
 }
 
 #[tokio::main]
@@ -39,29 +36,8 @@ async fn main() {
     };
     let network = Arc::new(RwLock::new(GcpNetwork::new(&project, None)));
 
-    let mut builder = FlowBuilder::new();
-    let num_clients = 1;
-    let num_clients_per_node = 10000000;
-    let server = builder.cluster();
-    let clients = builder.cluster();
-    let client_aggregator = builder.process();
-
-    let clusters = vec![
-        (
-            server.id().raw_id(),
-            std::any::type_name::<Server>().to_string(),
-            1,
-        ),
-        (
-            clients.id().raw_id(),
-            std::any::type_name::<Client>().to_string(),
-            num_clients,
-        ),
-    ];
-    let processes = vec![(
-        client_aggregator.id().raw_id(),
-        std::any::type_name::<Aggregator>().to_string(),
-    )];
+    let num_clients = 5; // >1 clients so it doesn't become the bottleneck
+    let num_clients_per_node = 1;
 
     // Deploy
     let mut reusable_hosts = ReusableHosts {
@@ -75,11 +51,33 @@ async fn main() {
     let num_seconds_to_profile = Some(20);
     let multi_run_metadata = RefCell::new(vec![]);
 
-    for (i, message_size) in message_sizes.iter().enumerate() {
+    for message_size in message_sizes {
+        let builder = FlowBuilder::new();
+        let server = builder.cluster();
+        let clients = builder.cluster();
+        let client_aggregator = builder.process();
 
+        let clusters = vec![
+            (
+                server.id().raw_id(),
+                std::any::type_name::<Server>().to_string(),
+                1,
+            ),
+            (
+                clients.id().raw_id(),
+                std::any::type_name::<Client>().to_string(),
+                num_clients,
+            ),
+        ];
+        let processes = vec![(
+            client_aggregator.id().raw_id(),
+            std::any::type_name::<Aggregator>().to_string(),
+        )];
+
+        println!("Running network calibrator with message size: {} bytes, num clients: {}", message_size, num_clients);
         network_calibrator(
             num_clients_per_node,
-            *message_size,
+            message_size,
             &server,
             &clients,
             &client_aggregator,
@@ -98,15 +96,13 @@ async fn main() {
                 ],
                 num_seconds_to_profile,
                 &multi_run_metadata,
-                i,
+                0, // Set to 0 to turn off comparisons between iterations
             )
             .await;
 
-        builder = rewritten_ir_builder.build_with(|_| ir);
+        let built = rewritten_ir_builder.build_with(|_| ir).finalize();
+
+        // Generate graphs if requested
+        _ = built.generate_graph_with_config(&args.graph, None);
     }
-
-    let built = builder.finalize();
-
-    // Generate graphs if requested
-    _ = built.generate_graph_with_config(&args.graph, None);
 }
