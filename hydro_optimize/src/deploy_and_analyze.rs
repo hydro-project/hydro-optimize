@@ -23,6 +23,7 @@ use crate::repair::{cycle_source_to_sink_input, inject_id, remove_counter};
 const COUNTER_PREFIX: &str = "_optimize_counter";
 pub(crate) const CPU_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_CPU:";
 
+// Note: Ensure edits to the match arms are consistent with inject_count_node
 fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration: syn::Expr) {
     match node {
         HydroNode::Placeholder
@@ -37,8 +38,6 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
         | HydroNode::CrossSingleton { metadata, .. }
         | HydroNode::CrossProduct { metadata, .. } // Can technically be derived by multiplying parent cardinalities
         | HydroNode::Join { metadata, .. }
-        | HydroNode::ResolveFutures { metadata, .. }
-        | HydroNode::ResolveFuturesOrdered { metadata, .. }
         | HydroNode::Difference { metadata, .. }
         | HydroNode::AntiJoin { metadata, .. }
         | HydroNode::FlatMap { metadata, .. }
@@ -72,7 +71,7 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
         }
         HydroNode::Tee { .. } // Do nothing, we will count the parent of the Tee
         | HydroNode::Map { .. } // Equal to parent cardinality
-        | HydroNode::DeferTick { .. } // Equal to parent cardinality
+        | HydroNode::DeferTick { .. }
         | HydroNode::Enumerate { .. }
         | HydroNode::Inspect { .. }
         | HydroNode::Sort { .. }
@@ -83,6 +82,8 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
         | HydroNode::EndAtomic { .. }
         | HydroNode::Batch { .. }
         | HydroNode::YieldConcat { .. }
+        | HydroNode::ResolveFutures { .. }
+        | HydroNode::ResolveFuturesOrdered { .. }
          => {}
     }
 }
