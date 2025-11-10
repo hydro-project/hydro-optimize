@@ -52,6 +52,7 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
         | HydroNode::ReduceKeyedWatermark { metadata, .. }
         | HydroNode::Network { metadata, .. }
         | HydroNode::ExternalInput { metadata, .. }
+        | HydroNode::SingletonSource { metadata, .. }
          => {
             let metadata = metadata.clone();
             let node_content = std::mem::replace(node, HydroNode::Placeholder);
@@ -77,7 +78,6 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
         | HydroNode::Sort { .. }
         | HydroNode::Cast { .. }
         | HydroNode::ObserveNonDet { .. }
-        | HydroNode::SingletonSource { .. } // Cardinality = 1
         | HydroNode::BeginAtomic { .. }
         | HydroNode::EndAtomic { .. }
         | HydroNode::Batch { .. }
