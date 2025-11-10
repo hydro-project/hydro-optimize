@@ -407,7 +407,11 @@ fn record_metadata(
 }
 
 fn record_metadata_root(root: &mut HydroRoot, run_metadata: &mut RunMetadata) {
-    record_metadata(root.op_metadata(), vec![root.input_metadata()], run_metadata);
+    record_metadata(
+        root.op_metadata(),
+        vec![root.input_metadata()],
+        run_metadata,
+    );
 
     // Location = input's location, cardinality = input's cardinality
     let id = root.op_metadata().id.unwrap();
@@ -629,7 +633,11 @@ pub fn compare_expected_performance(
         {
             compare_expected_values(
                 cpu_usage,
-                prev_run_metadata.send_overhead.get(prev_location).cloned().unwrap_or_default()
+                prev_run_metadata
+                    .send_overhead
+                    .get(prev_location)
+                    .cloned()
+                    .unwrap_or_default()
                     * *prev_cardinality as f64,
                 location,
                 prev_location,
@@ -645,7 +653,11 @@ pub fn compare_expected_performance(
         {
             compare_expected_values(
                 cpu_usage,
-                prev_run_metadata.recv_overhead.get(prev_location).cloned().unwrap_or_default()
+                prev_run_metadata
+                    .recv_overhead
+                    .get(prev_location)
+                    .cloned()
+                    .unwrap_or_default()
                     * *prev_cardinality as f64,
                 &location,
                 prev_location,

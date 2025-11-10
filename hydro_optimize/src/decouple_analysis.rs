@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use crate::rewrites::op_id_to_inputs;
 use good_lp::solvers::highs::HighsSolution;
 use good_lp::{
-    Constraint, Expression, ProblemVariables, Solution, SolverModel, Variable, constraint, highs, variable, variables
+    Constraint, Expression, ProblemVariables, Solution, SolverModel, Variable, constraint, highs,
+    variable, variables,
 };
 use hydro_lang::compile::ir::{
     HydroIrMetadata, HydroIrOpMetadata, HydroNode, HydroRoot, traverse_dfir,
@@ -289,8 +290,7 @@ fn decouple_analysis_root(
     model_metadata: &RefCell<ModelMetadata>,
 ) {
     // Ignore nodes that are not in the cluster to decouple
-    if model_metadata.borrow().cluster_to_decouple != *root.input_metadata().location_kind.root()
-    {
+    if model_metadata.borrow().cluster_to_decouple != *root.input_metadata().location_kind.root() {
         return;
     }
 
@@ -365,12 +365,8 @@ fn solve(model_metadata: &RefCell<ModelMetadata>) -> HighsSolution {
     constrs.push(constraint!(highest_cpu >= decoupled_usage.clone()));
 
     // Minimize the CPU usage of that node
-    let problem = vars
-        .minimise(highest_cpu);
-    let solution = highs(problem)
-        .with_all(constrs)  
-        .solve()
-        .unwrap();
+    let problem = vars.minimise(highest_cpu);
+    let solution = highs(problem).with_all(constrs).solve().unwrap();
 
     println!(
         "Projected orig_usage after decoupling: {}",

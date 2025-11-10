@@ -8,7 +8,11 @@ use syn::visit_mut::{self, VisitMut};
 
 use crate::partition_syn_analysis::StructOrTupleIndex;
 use crate::repair::inject_id;
-use crate::rewrites::{ClusterSelfIdReplace, NetworkType, collection_kind_to_debug_type, deserialize_bincode_with_type, get_network_type, prepend_member_id_to_collection_kind, serialize_bincode_with_type};
+use crate::rewrites::{
+    ClusterSelfIdReplace, NetworkType, collection_kind_to_debug_type,
+    deserialize_bincode_with_type, get_network_type, prepend_member_id_to_collection_kind,
+    serialize_bincode_with_type,
+};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Partitioner {
@@ -125,7 +129,8 @@ fn replace_sender_dest(node: &mut HydroNode, partitioner: &Partitioner, next_stm
 
         let f: syn::Expr = if new_cluster_id.is_some() {
             // Output type of Map now includes dest ID
-            metadata.collection_kind = prepend_member_id_to_collection_kind(&metadata.collection_kind);
+            metadata.collection_kind =
+                prepend_member_id_to_collection_kind(&metadata.collection_kind);
 
             // Partitioning a process into a cluster
             syn::parse_quote!(
