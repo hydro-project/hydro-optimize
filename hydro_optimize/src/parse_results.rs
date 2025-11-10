@@ -128,29 +128,69 @@ pub fn parse_counter_usage(measurement: String) -> (usize, usize) {
     (op_id, count)
 }
 
+// Note: Ensure edits to the match arms are consistent with insert_counter_node
 fn inject_count_node(
     node: &mut HydroNode,
     next_stmt_id: &mut usize,
     op_to_count: &HashMap<usize, usize>,
 ) {
-    if let Some(count) = op_to_count.get(next_stmt_id) {
-        let metadata = node.metadata_mut();
-        metadata.cardinality = Some(*count);
-    } else {
-        match node {
-            HydroNode::Tee { inner ,metadata, .. } => {
-                metadata.cardinality = inner.0.borrow().metadata().cardinality;
+    match node {
+        HydroNode::Placeholder => {
+            std::panic!("Unexpected {:?} found in inject_count_node", node.print_root());
+        }
+        HydroNode::Source { metadata, .. }
+        | HydroNode::CycleSource { metadata, .. }
+        | HydroNode::Persist { metadata, .. }
+        | HydroNode::Chain { metadata, .. } // Can technically be derived by summing parent cardinalities
+        | HydroNode::ChainFirst { metadata, .. } // Can technically be derived by taking parent cardinality + 1
+        | HydroNode::CrossSingleton { metadata, .. }
+        | HydroNode::CrossProduct { metadata, .. } // Can technically be derived by multiplying parent cardinalities
+        | HydroNode::Join { metadata, .. }
+        | HydroNode::Difference { metadata, .. }
+        | HydroNode::AntiJoin { metadata, .. }
+        | HydroNode::FlatMap { metadata, .. }
+        | HydroNode::Filter { metadata, .. }
+        | HydroNode::FilterMap { metadata, .. }
+        | HydroNode::Unique { metadata, .. }
+        | HydroNode::Scan { metadata, .. }
+        | HydroNode::Fold { metadata, .. } // Output 1 value per tick
+        | HydroNode::Reduce { metadata, .. } // Output 1 value per tick
+        | HydroNode::FoldKeyed { metadata, .. }
+        | HydroNode::ReduceKeyed { metadata, .. }
+        | HydroNode::ReduceKeyedWatermark { metadata, .. }
+        | HydroNode::Network { metadata, .. }
+        | HydroNode::ExternalInput { metadata, .. } => {
+            if let Some(count) = op_to_count.get(next_stmt_id) {
+                metadata.cardinality = Some(*count);
             }
-            | HydroNode::Map { input, metadata, .. } // Equal to parent cardinality
-            | HydroNode::DeferTick { input, metadata, .. } // Equal to parent cardinality
-            | HydroNode::Enumerate { input, metadata, .. }
-            | HydroNode::Inspect { input, metadata, .. }
-            | HydroNode::Sort { input, metadata, .. }
-            | HydroNode::Counter { input, metadata, .. }
-            => {
-                metadata.cardinality = input.metadata().cardinality;
+            else {
+                // No counter found, set to 1 so division doesn't result in infinity
+                metadata.cardinality = Some(1);
             }
-            _ => {}
+        }
+        HydroNode::Tee { inner ,metadata, .. } => {
+            metadata.cardinality = inner.0.borrow().metadata().cardinality;
+        }
+        | HydroNode::Map { input, metadata, .. } // Equal to parent cardinality
+        | HydroNode::DeferTick { input, metadata, .. }
+        | HydroNode::Enumerate { input, metadata, .. }
+        | HydroNode::Inspect { input, metadata, .. }
+        | HydroNode::Sort { input, metadata, .. }
+        | HydroNode::Counter { input, metadata, .. }
+        | HydroNode::Cast { inner: input, metadata }
+        | HydroNode::ObserveNonDet { inner: input, metadata, .. }
+        | HydroNode::BeginAtomic { inner: input, metadata }
+        | HydroNode::EndAtomic { inner: input, metadata }
+        | HydroNode::Batch { inner: input, metadata }
+        | HydroNode::YieldConcat { inner: input, metadata }
+        | HydroNode::ResolveFutures { input, metadata }
+        | HydroNode::ResolveFuturesOrdered { input, metadata }
+        => {
+            metadata.cardinality = input.metadata().cardinality;
+        }
+        | HydroNode::SingletonSource { metadata, .. }
+        => {
+            metadata.cardinality = Some(1);
         }
     }
 }
@@ -367,7 +407,11 @@ fn record_metadata(
 }
 
 fn record_metadata_root(root: &mut HydroRoot, run_metadata: &mut RunMetadata) {
-    record_metadata(root.op_metadata(), vec![root.input_metadata()], run_metadata);
+    record_metadata(
+        root.op_metadata(),
+        vec![root.input_metadata()],
+        run_metadata,
+    );
 
     // Location = input's location, cardinality = input's cardinality
     let id = root.op_metadata().id.unwrap();
@@ -589,7 +633,11 @@ pub fn compare_expected_performance(
         {
             compare_expected_values(
                 cpu_usage,
-                prev_run_metadata.send_overhead.get(prev_location).cloned().unwrap_or_default()
+                prev_run_metadata
+                    .send_overhead
+                    .get(prev_location)
+                    .cloned()
+                    .unwrap_or_default()
                     * *prev_cardinality as f64,
                 location,
                 prev_location,
@@ -605,7 +653,11 @@ pub fn compare_expected_performance(
         {
             compare_expected_values(
                 cpu_usage,
-                prev_run_metadata.recv_overhead.get(prev_location).cloned().unwrap_or_default()
+                prev_run_metadata
+                    .recv_overhead
+                    .get(prev_location)
+                    .cloned()
+                    .unwrap_or_default()
                     * *prev_cardinality as f64,
                 &location,
                 prev_location,

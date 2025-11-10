@@ -2,14 +2,17 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use hydro_lang::compile::builder::{FlowBuilder, RewriteIrFlowBuilder};
-use hydro_lang::compile::ir::{BoundKind, CollectionKind, DebugType, HydroIrMetadata, HydroNode, HydroRoot, KeyedSingletonBoundKind, StreamOrder, StreamRetry, deep_clone, traverse_dfir};
+use hydro_lang::compile::ir::{
+    BoundKind, CollectionKind, DebugType, HydroIrMetadata, HydroNode, HydroRoot,
+    KeyedSingletonBoundKind, StreamOrder, StreamRetry, deep_clone, traverse_dfir,
+};
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::location::{Cluster, Location};
+use proc_macro2::{Span, TokenStream};
+use quote::quote;
 use serde::{Deserialize, Serialize};
 use syn::parse_quote;
 use syn::visit_mut::{self, VisitMut};
-use proc_macro2::{Span, TokenStream};
-use quote::quote;
 
 use crate::decoupler::{self, Decoupler};
 use crate::partitioner::Partitioner;
@@ -278,8 +281,16 @@ pub fn collection_kind_to_debug_type(collection_kind: &CollectionKind) -> DebugT
         CollectionKind::Stream { element_type, .. }
         | CollectionKind::Singleton { element_type, .. }
         | CollectionKind::Optional { element_type, .. } => DebugType::from(*element_type.clone().0),
-        CollectionKind::KeyedStream { key_type, value_type, .. }
-        | CollectionKind::KeyedSingleton { key_type, value_type, .. }  => {
+        CollectionKind::KeyedStream {
+            key_type,
+            value_type,
+            ..
+        }
+        | CollectionKind::KeyedSingleton {
+            key_type,
+            value_type,
+            ..
+        } => {
             let original_key_type = *key_type.clone().0;
             let original_value_type = *value_type.clone().0;
             let new_type: syn::Type = syn::parse_quote! {
@@ -295,23 +306,19 @@ pub fn prepend_member_id_to_collection_kind(collection_kind: &CollectionKind) ->
     let member_id_debug_type = DebugType::from(member_id_syn_type);
     match collection_kind {
         CollectionKind::Singleton { element_type, .. }
-        | CollectionKind::Optional { element_type, .. } => {
-            CollectionKind::KeyedSingleton {
-                bound: KeyedSingletonBoundKind::Unbounded,
-                key_type: member_id_debug_type,
-                value_type: element_type.clone(),
-            }
-        }
+        | CollectionKind::Optional { element_type, .. } => CollectionKind::KeyedSingleton {
+            bound: KeyedSingletonBoundKind::Unbounded,
+            key_type: member_id_debug_type,
+            value_type: element_type.clone(),
+        },
         CollectionKind::Stream { .. }
         | CollectionKind::KeyedStream { .. }
-        | CollectionKind::KeyedSingleton { .. } => {
-            CollectionKind::KeyedStream {
-                bound: BoundKind::Unbounded,
-                value_order: StreamOrder::NoOrder,
-                value_retry: StreamRetry::ExactlyOnce,
-                key_type: member_id_debug_type,
-                value_type: collection_kind_to_debug_type(collection_kind),
-            }
-        }
+        | CollectionKind::KeyedSingleton { .. } => CollectionKind::KeyedStream {
+            bound: BoundKind::Unbounded,
+            value_order: StreamOrder::NoOrder,
+            value_retry: StreamRetry::ExactlyOnce,
+            key_type: member_id_debug_type,
+            value_type: collection_kind_to_debug_type(collection_kind),
+        },
     }
 }

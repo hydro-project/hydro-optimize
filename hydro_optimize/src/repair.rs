@@ -107,8 +107,7 @@ fn inject_location_node(
             | HydroNode::ExternalInput { metadata, .. }
             | HydroNode::Network { metadata, .. } => {
                 // Get location sources from the nodes must have it be correct: Source and Network
-                id_to_location
-                    .insert(op_id, metadata.location_kind.clone());
+                id_to_location.insert(op_id, metadata.location_kind.clone());
                 return false;
             }
             HydroNode::Tee { inner, .. } => {
@@ -130,8 +129,7 @@ fn inject_location_node(
             let location = id_to_location.get(&input).cloned();
             if let Some(location) = location {
                 metadata.location_kind.swap_root(location.root().clone());
-                id_to_location
-                    .insert(op_id, metadata.location_kind.clone());
+                id_to_location.insert(op_id, metadata.location_kind.clone());
 
                 match node {
                     // Update Persist's location as well (we won't see it during traversal)
@@ -179,11 +177,8 @@ pub fn inject_location(ir: &mut [HydroRoot], cycle_source_to_sink_input: &HashMa
             ir,
             &mut |_| {},
             &mut |node| {
-                missing_location |= inject_location_node(
-                    node,
-                    &mut id_to_location,
-                    cycle_source_to_sink_input,
-                );
+                missing_location |=
+                    inject_location_node(node, &mut id_to_location, cycle_source_to_sink_input);
             },
             false,
         );

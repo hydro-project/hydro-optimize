@@ -14,7 +14,10 @@ use syn::visit_mut::VisitMut;
 
 use crate::parse_results::{MultiRunMetadata, get_or_append_run_metadata};
 use crate::repair::{cycle_source_to_sink_input, inject_id, inject_location};
-use crate::rewrites::{ClusterSelfIdReplace, collection_kind_to_debug_type, deserialize_bincode_with_type, prepend_member_id_to_collection_kind, serialize_bincode_with_type, tee_to_inner_id};
+use crate::rewrites::{
+    ClusterSelfIdReplace, collection_kind_to_debug_type, deserialize_bincode_with_type,
+    prepend_member_id_to_collection_kind, serialize_bincode_with_type, tee_to_inner_id,
+};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Decoupler {
@@ -114,7 +117,9 @@ fn add_tee(
     tee_to_inner_id_before_rewrites: &HashMap<usize, usize>,
 ) {
     let metadata = node.metadata().clone();
-    let inner_id = tee_to_inner_id_before_rewrites.get(&metadata.op.id.unwrap()).unwrap();
+    let inner_id = tee_to_inner_id_before_rewrites
+        .get(&metadata.op.id.unwrap())
+        .unwrap();
 
     let new_inner = new_inners
         .entry((*inner_id, new_location.clone()))
@@ -196,7 +201,12 @@ fn decouple_node(
                 "Creating a TEE to location {:?}, id: {}",
                 new_location, next_stmt_id
             );
-            add_tee(node, new_location, new_inners, tee_to_inner_id_before_rewrites);
+            add_tee(
+                node,
+                new_location,
+                new_inners,
+                tee_to_inner_id_before_rewrites,
+            );
         }
         _ => {
             println!(
@@ -248,7 +258,13 @@ pub fn decouple(
         ir,
         |_, _| {},
         |node, next_stmt_id| {
-            decouple_node(node, decoupler, next_stmt_id, &mut new_inners, &tee_to_inner_id_before_rewrites);
+            decouple_node(
+                node,
+                decoupler,
+                next_stmt_id,
+                &mut new_inners,
+                &tee_to_inner_id_before_rewrites,
+            );
         },
     );
 
@@ -320,7 +336,6 @@ mod tests {
             .assume_ordering(nondet!(/** test */))
             .assume_retries(nondet!(/** test */))
             .for_each(q!(|a| println!("Got it: {}", a)));
-
 
         let multi_run_metadata = RefCell::new(vec![]);
         let iteration = 0;

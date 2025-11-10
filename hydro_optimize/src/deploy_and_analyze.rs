@@ -23,6 +23,7 @@ use crate::repair::{cycle_source_to_sink_input, inject_id, remove_counter};
 const COUNTER_PREFIX: &str = "_optimize_counter";
 pub(crate) const CPU_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_CPU:";
 
+// Note: Ensure edits to the match arms are consistent with inject_count_node
 fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration: syn::Expr) {
     match node {
         HydroNode::Placeholder
@@ -37,8 +38,6 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
         | HydroNode::CrossSingleton { metadata, .. }
         | HydroNode::CrossProduct { metadata, .. } // Can technically be derived by multiplying parent cardinalities
         | HydroNode::Join { metadata, .. }
-        | HydroNode::ResolveFutures { metadata, .. }
-        | HydroNode::ResolveFuturesOrdered { metadata, .. }
         | HydroNode::Difference { metadata, .. }
         | HydroNode::AntiJoin { metadata, .. }
         | HydroNode::FlatMap { metadata, .. }
@@ -72,7 +71,7 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
         }
         HydroNode::Tee { .. } // Do nothing, we will count the parent of the Tee
         | HydroNode::Map { .. } // Equal to parent cardinality
-        | HydroNode::DeferTick { .. } // Equal to parent cardinality
+        | HydroNode::DeferTick { .. }
         | HydroNode::Enumerate { .. }
         | HydroNode::Inspect { .. }
         | HydroNode::Sort { .. }
@@ -83,6 +82,8 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
         | HydroNode::EndAtomic { .. }
         | HydroNode::Batch { .. }
         | HydroNode::YieldConcat { .. }
+        | HydroNode::ResolveFutures { .. }
+        | HydroNode::ResolveFuturesOrdered { .. }
          => {}
     }
 }
@@ -133,7 +134,10 @@ async fn track_cluster_usage_cardinality(
 
 /// TODO: Return type should be changed to also include Partitioner
 #[expect(clippy::too_many_arguments, reason = "Optimizer internal function")]
-#[expect(clippy::await_holding_refcell_ref, reason = "Await function needs to write to data in RefCell")]
+#[expect(
+    clippy::await_holding_refcell_ref,
+    reason = "Await function needs to write to data in RefCell"
+)]
 pub async fn deploy_and_analyze<'a>(
     reusable_hosts: &mut ReusableHosts,
     deployment: &mut Deployment,
@@ -220,8 +224,16 @@ pub async fn deploy_and_analyze<'a>(
     // Create a mapping from each CycleSink to its corresponding CycleSource
     let cycle_source_to_sink_input = cycle_source_to_sink_input(&mut ir);
     analyze_send_recv_overheads(&mut ir, run_metadata);
-    let send_overhead = run_metadata.send_overhead.get(&bottleneck).cloned().unwrap_or_default();
-    let recv_overhead = run_metadata.recv_overhead.get(&bottleneck).cloned().unwrap_or_default();
+    let send_overhead = run_metadata
+        .send_overhead
+        .get(&bottleneck)
+        .cloned()
+        .unwrap_or_default();
+    let recv_overhead = run_metadata
+        .recv_overhead
+        .get(&bottleneck)
+        .cloned()
+        .unwrap_or_default();
 
     // Check the expected/actual CPU usages before/after rewrites
     std::mem::drop(mut_multi_run_metadata); // Release borrow
