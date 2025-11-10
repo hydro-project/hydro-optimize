@@ -159,7 +159,8 @@ fn inject_count_node(
         | HydroNode::ReduceKeyed { metadata, .. }
         | HydroNode::ReduceKeyedWatermark { metadata, .. }
         | HydroNode::Network { metadata, .. }
-        | HydroNode::ExternalInput { metadata, .. } => {
+        | HydroNode::ExternalInput { metadata, .. }
+        | HydroNode::SingletonSource { metadata, .. } => {
             if let Some(count) = op_to_count.get(next_stmt_id) {
                 metadata.cardinality = Some(*count);
             }
@@ -188,10 +189,6 @@ fn inject_count_node(
         => {
             metadata.cardinality = input.metadata().cardinality;
         }
-        | HydroNode::SingletonSource { metadata, .. }
-        => {
-            metadata.cardinality = Some(1);
-        }
     }
 }
 
@@ -208,6 +205,7 @@ pub fn inject_count(ir: &mut [HydroRoot], op_to_count: &HashMap<usize, usize>) {
 pub async fn analyze_process_results(
     process: &impl DeployCrateWrapper,
     ir: &mut [HydroRoot],
+    op_to_count: &mut HashMap<usize, usize>,
     node_cardinality: &mut UnboundedReceiver<String>,
 ) -> f64 {
     let perf_results = process.tracing_results().await.unwrap();
@@ -216,12 +214,10 @@ pub async fn analyze_process_results(
     let unidentified_usage = inject_perf(ir, perf_results.folded_data);
 
     // Get cardinality data. Allow later values to overwrite earlier ones
-    let mut op_to_counter = HashMap::new();
     while let Some(measurement) = node_cardinality.recv().await {
-        let (op_id, count) = parse_counter_usage(measurement);
-        op_to_counter.insert(op_id, count);
+        let (op_id, count) = parse_counter_usage(measurement.clone());
+        op_to_count.insert(op_id, count);
     }
-    inject_count(ir, &op_to_counter);
 
     unidentified_usage
 }
@@ -238,6 +234,7 @@ pub async fn analyze_cluster_results(
     let mut max_usage_cluster_size = 0;
     let mut max_usage_cluster_name = String::new();
     let mut max_usage_overall = 0f64;
+    let mut op_to_count = HashMap::new();
 
     for (id, name, cluster) in nodes.get_all_clusters() {
         println!("Analyzing cluster {:?}: {}", id, name);
@@ -262,9 +259,13 @@ pub async fn analyze_cluster_results(
             let node_cardinality = cardinality_out
                 .get_mut(&(id.clone(), name.clone(), idx))
                 .unwrap();
-            let unidentified_perf =
-                analyze_process_results(cluster.members().get(idx).unwrap(), ir, node_cardinality)
-                    .await;
+            let unidentified_perf = analyze_process_results(
+                cluster.members().get(idx).unwrap(),
+                ir,
+                &mut op_to_count,
+                node_cardinality,
+            )
+            .await;
 
             run_metadata.total_usage.insert(id.clone(), usage);
             run_metadata
@@ -281,6 +282,8 @@ pub async fn analyze_cluster_results(
             }
         }
     }
+
+    inject_count(ir, &op_to_count);
 
     (
         max_usage_cluster_id.unwrap(),
