@@ -89,7 +89,7 @@ async fn main() {
     };
 
     let num_times_to_optimize = 2;
-    let num_seconds_to_profile = Some(20);
+    let num_seconds_to_profile = Some(60);
     let multi_run_metadata = RefCell::new(vec![]);
 
     for i in 0..num_times_to_optimize {

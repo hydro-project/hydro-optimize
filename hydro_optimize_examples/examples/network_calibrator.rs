@@ -36,8 +36,8 @@ async fn main() {
     };
     let network = Arc::new(RwLock::new(GcpNetwork::new(&project, None)));
 
-    let num_clients = 5; // >1 clients so it doesn't become the bottleneck
-    let num_clients_per_node = 1;
+    let num_clients = 10; // >1 clients so it doesn't become the bottleneck
+    let num_clients_per_node = 1000;
 
     // Deploy
     let mut reusable_hosts = ReusableHosts {
@@ -48,7 +48,7 @@ async fn main() {
     };
 
     let message_sizes = vec![1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
-    let num_seconds_to_profile = Some(20);
+    let num_seconds_to_profile = Some(60);
     let multi_run_metadata = RefCell::new(vec![]);
 
     for message_size in message_sizes {
