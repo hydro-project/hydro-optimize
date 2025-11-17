@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use hydro_lang::compile::ir::{HydroNode, HydroRoot, traverse_dfir};
@@ -43,6 +44,63 @@ fn all_inputs(ir: &mut [HydroRoot], location: &LocationId) -> Vec<usize> {
     );
 
     inputs
+}
+
+/// Add id to dependent_nodes if its parent_id is already in dependent_nodes
+fn insert_dependent_node(dependent_nodes: &RefCell<HashSet<usize>>, parent_id: Option<usize>, id: usize) {
+    let mut dependent_nodes_borrow = dependent_nodes.borrow_mut();
+    if let Some(parent_id) = parent_id {
+        if dependent_nodes_borrow.contains(&parent_id) {
+            dependent_nodes_borrow.insert(id);
+        }
+    }
+}
+
+/// Returns IDs of nodes that are dependent on at least 1 input
+fn nodes_dependent_on_inputs(
+    ir: &mut [HydroRoot],
+    location: &LocationId,
+    inputs: &Vec<usize>,
+    cycle_source_to_sink_input: &HashMap<usize, usize>,
+) -> HashSet<usize> {
+    let dependent_nodes = RefCell::new(HashSet::from_iter(inputs.iter().cloned()));
+    let mut num_dependent_nodes = inputs.len();
+
+    loop {
+        traverse_dfir(
+            ir,
+            |root, next_stmt_id| {
+                // Don't check location, but should be fine because its parent HydroNode should check location
+                insert_dependent_node(&dependent_nodes, root.input_metadata().op.id, *next_stmt_id);
+            },
+            |node, next_stmt_id| {
+                if node.metadata().location_kind.root() == location.root() {
+                    match node {
+                        HydroNode::Tee { inner, ..} => {
+                            insert_dependent_node(&dependent_nodes, inner.0.borrow().op_metadata().id, *next_stmt_id);
+                        }
+                        HydroNode::CycleSource { .. } => {
+                            insert_dependent_node(&dependent_nodes, cycle_source_to_sink_input.get(next_stmt_id).cloned(), *next_stmt_id);
+                        }
+                        _ => {
+                            node.input_metadata().iter().for_each(|metadata| {
+                                insert_dependent_node(&dependent_nodes, metadata.op.id, *next_stmt_id);
+                            });
+                        }
+                    }
+                }
+            },
+        );
+
+        if dependent_nodes.borrow().len() == num_dependent_nodes {
+            // No new dependent nodes found, reached fixpoint
+            break;
+        }
+        num_dependent_nodes = dependent_nodes.borrow().len();
+        println!("Rerunning nodes_dependent_on_inputs loop until fixpoint.");
+    }
+
+    dependent_nodes.take()
 }
 
 pub struct InputDependencyMetadata {
