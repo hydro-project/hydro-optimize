@@ -4,6 +4,7 @@ pub mod decoupler;
 pub mod deploy;
 pub mod deploy_and_analyze;
 pub mod parse_results;
+pub mod partition_ilp_analysis;
 pub mod partition_node_analysis;
 pub mod partition_syn_analysis;
 pub mod partitioner;
