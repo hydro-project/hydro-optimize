@@ -143,6 +143,23 @@ pub fn relevant_inputs(
         .collect()
 }
 
+pub fn input_ids(
+    node: &HydroNode,
+    location: Option<&LocationId>,
+    cycle_source_to_sink_input: &HashMap<usize, usize>,
+) -> Vec<usize> {
+    match node {
+        HydroNode::CycleSource { metadata, .. } => {
+            // For CycleSource, its input is its CycleSink's input. Note: assumes the CycleSink is on the same cluster
+            vec![*cycle_source_to_sink_input.get(&metadata.op.id.unwrap()).unwrap()]
+        }
+        HydroNode::Tee { inner, .. } => {
+            vec![inner.0.borrow().op_metadata().id.unwrap()]
+        }
+        _ => relevant_inputs(node.input_metadata(), location),
+    }
+}
+
 /// Creates a mapping from op_id to its input op_ids, filtered by location if provided
 pub fn op_id_to_inputs(
     ir: &mut [HydroRoot],
@@ -158,17 +175,7 @@ pub fn op_id_to_inputs(
             mapping.borrow_mut().insert(*op_id, relevant_input_ids);
         },
         |node, op_id| {
-            let input_ids = match node {
-                HydroNode::CycleSource { .. } => {
-                    // For CycleSource, its input is its CycleSink's input. Note: assumes the CycleSink is on the same cluster
-                    vec![*cycle_source_to_sink_input.get(op_id).unwrap()]
-                }
-                HydroNode::Tee { inner, .. } => {
-                    vec![inner.0.borrow().op_metadata().id.unwrap()]
-                }
-                _ => relevant_inputs(node.input_metadata(), location),
-            };
-            mapping.borrow_mut().insert(*op_id, input_ids);
+            mapping.borrow_mut().insert(*op_id, input_ids(node, location, cycle_source_to_sink_input));
         },
     );
 
