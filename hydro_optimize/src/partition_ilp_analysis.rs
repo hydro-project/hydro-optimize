@@ -1,12 +1,25 @@
-use std::{cell::RefCell, collections::{HashMap, HashSet}};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+};
 
-use hydro_lang::{compile::ir::{HydroNode, HydroRoot, traverse_dfir}, location::dynamic::LocationId};
+use hydro_lang::{
+    compile::ir::{HydroNode, HydroRoot, traverse_dfir},
+    location::dynamic::LocationId,
+};
 use syn::visit::Visit;
 
-use crate::{partition_syn_analysis::{AnalyzeClosure, StructOrTuple}, rewrites::input_ids};
+use crate::{
+    partition_syn_analysis::{AnalyzeClosure, StructOrTuple},
+    rewrites::input_ids,
+};
 
 /// Add id to dependent_nodes if its parent_id is already in dependent_nodes
-fn insert_dependent_node(dependent_nodes: &RefCell<HashSet<usize>>, parent_id: Option<usize>, id: usize) {
+fn insert_dependent_node(
+    dependent_nodes: &RefCell<HashSet<usize>>,
+    parent_id: Option<usize>,
+    id: usize,
+) {
     let mut dependent_nodes_borrow = dependent_nodes.borrow_mut();
     if let Some(parent_id) = parent_id {
         if dependent_nodes_borrow.contains(&parent_id) {
@@ -168,7 +181,7 @@ pub enum Partitionability {
 /// If this node is an IDB, and it is the only non-network node in its location, can we partition that location?
 /// - `NoEffect`: Yes, and we can actually partition randomly for each element.
 /// - `Conditional`: Yes, we can partition on some specific keys.
-/// - `Unpartitionable`: No. 
+/// - `Unpartitionable`: No.
 fn node_partitionability(node: &HydroNode) -> Partitionability {
     match node {
         HydroNode::Placeholder => {
@@ -212,5 +225,61 @@ fn node_partitionability(node: &HydroNode) -> Partitionability {
         | HydroNode::Scan { .. }
         | HydroNode::Fold { .. }
         | HydroNode::Reduce { .. } => Partitionability::Unpartitionable,
+    }
+}
+
+/// Whether this node introduces persistence.
+/// Note: Must keep in sync with `emit_core` in hydro_lang.
+fn node_persists(node: &HydroNode) -> bool {
+    match node {
+        HydroNode::Placeholder => {
+            panic!()
+        }
+        HydroNode::Cast { .. }
+        | HydroNode::ObserveNonDet { .. }
+        | HydroNode::Source { .. }
+        | HydroNode::SingletonSource { .. }
+        | HydroNode::CycleSource { .. }
+        | HydroNode::Tee { .. }
+        | HydroNode::YieldConcat { .. }
+        | HydroNode::BeginAtomic { .. }
+        | HydroNode::EndAtomic { .. }
+        | HydroNode::Batch { .. }
+        | HydroNode::ResolveFutures { .. }
+        | HydroNode::ResolveFuturesOrdered { .. }
+        | HydroNode::Filter { .. }
+        | HydroNode::Inspect { .. }
+        | HydroNode::ExternalInput { .. }
+        | HydroNode::Network { .. }
+        | HydroNode::Counter { .. }
+        | HydroNode::Map { .. }
+        | HydroNode::FilterMap { .. }
+        | HydroNode::FlatMap { .. }
+        | HydroNode::Chain { .. }
+        | HydroNode::ChainFirst { .. }
+        | HydroNode::CrossSingleton { .. }
+        | HydroNode::Sort { .. } => false,
+        // Maybe, depending on if it's 'static (either hidden input parent is Persist)
+        HydroNode::Join { left, right, .. } | HydroNode::CrossProduct { left, right, .. } => {
+            matches!(left.as_ref(), HydroNode::Persist { .. })
+                || matches!(right.as_ref(), HydroNode::Persist { .. })
+                || left.metadata().location_kind.is_top_level()
+                || right.metadata().location_kind.is_top_level()
+        }
+        // Maybe, depending on if it's 'static (neg parent is Persist)
+        HydroNode::Difference { neg, .. } | HydroNode::AntiJoin { neg, .. } => {
+            matches!(neg.as_ref(), HydroNode::Persist { .. }) || neg.metadata().location_kind.is_top_level()
+        }
+        HydroNode::FoldKeyed { input, .. }
+        | HydroNode::ReduceKeyed { input, .. }
+        | HydroNode::ReduceKeyedWatermark { input, .. }
+        | HydroNode::Scan { input, .. }
+        | HydroNode::Fold { input, .. }
+        | HydroNode::Reduce { input, .. } => matches!(input.as_ref(), HydroNode::Persist { .. }),
+        // Maybe, depending on if it's 'static (input.metadata().location_kind.is_top_level())
+        HydroNode::Enumerate { input, .. } | HydroNode::Unique { input, .. } => {
+            input.metadata().location_kind.is_top_level()
+        }
+        HydroNode::Persist { .. } | HydroNode::DeferTick { .. } => true,
     }
 }
