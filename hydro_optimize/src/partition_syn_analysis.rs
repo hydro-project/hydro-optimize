@@ -26,15 +26,42 @@ impl StructOrTuple {
         self.dependencies.is_empty() && self.fields.is_empty()
     }
 
-    fn create_child(&mut self, index: StructOrTupleIndex) -> &mut StructOrTuple {
+    /// Create the child field if necessary, and duplicate any general dependencies to the child field.
+    /// Returns the child field, and whether any mutations were made.
+    fn create_child(&mut self, index: StructOrTupleIndex) -> (&mut StructOrTuple, bool) {
+        let mut deps = self.dependencies.clone();
         let mut child = self;
+        let mut mutated = false;
+        
         for i in index {
             child = &mut **child
                 .fields
-                .entry(i)
-                .or_insert_with(|| Box::new(StructOrTuple::default()));
+                .entry(i.clone())
+                .or_insert_with(|| {
+                    mutated = true;
+                    Box::new(StructOrTuple::default())
+                });
+
+            // Create more specific dependencies
+            let mut new_deps = BTreeSet::new();
+            for dependency in &deps {
+                let mut new_dependency = dependency.clone();
+                new_dependency.push(i.clone());
+                new_deps.insert(new_dependency);
+            }
+
+            // Add any existing dependencies in the child to the deps to track
+            deps = child.dependencies.clone();
+            // Modify the child's dependencies with more specific ones
+            let prev_num_child_dependencies = child.dependencies.len();
+            child.dependencies.extend(new_deps.clone());
+            if child.dependencies.len() > prev_num_child_dependencies {
+                mutated = true;
+            }
+            // Add new dependencies to track
+            deps.extend(new_deps);
         }
-        child
+        (child, mutated)
     }
 
     /// Copy dependencies from RHS, extending it with rhs_index
@@ -62,7 +89,7 @@ impl StructOrTuple {
                 rhs = child.as_ref();
             } else if !rhs.dependencies.is_empty() {
                 // Create a child if necessary and set the dependency
-                let child = self.create_child(index.clone());
+                let (child, _) = self.create_child(index.clone());
                 child.add_dependencies(rhs, rhs_index);
                 child.could_be_none = rhs.could_be_none;
                 return;
@@ -73,7 +100,7 @@ impl StructOrTuple {
         }
 
         // Create a child if necessary and copy everything from the RHS
-        let child = self.create_child(index.clone());
+        let (child, _) = self.create_child(index.clone());
         child.dependencies.extend(rhs.dependencies.clone());
         child.fields = rhs.fields.clone();
         child.could_be_none = rhs.could_be_none;
@@ -84,7 +111,7 @@ impl StructOrTuple {
         index: &StructOrTupleIndex,
         input_tuple_index: StructOrTupleIndex,
     ) {
-        let child = self.create_child(index.clone());
+        let (child, _) = self.create_child(index.clone());
         child.dependencies.insert(input_tuple_index);
     }
 
@@ -105,6 +132,15 @@ impl StructOrTuple {
             }
         }
         Some(child)
+    }
+
+    fn get_all_nested_dependencies(&self) -> BTreeSet<StructOrTupleIndex> {
+        let mut all_dependencies = self.dependencies.clone();
+        for (_, child) in &self.fields {
+            let child_dependencies = child.get_all_nested_dependencies();
+            all_dependencies.extend(child_dependencies);
+        }
+        all_dependencies
     }
 
     /// Remove any fields that could be None. If a parent could be None, then remove all children.
@@ -356,6 +392,20 @@ impl StructOrTuple {
             Some(new_child)
         }
     }
+
+    /// For each field in the child that references a field in the parent (self), if the field in the parent doesn't exist, create that field in the parent.
+    /// If the parent had a value at a less specific field, duplicate the dependency to the more specific field.
+    /// Returns true if fields were added to the parent and false otherwise.
+    pub fn extend_parent_fields(&mut self, child: &StructOrTuple) -> bool {
+        let mut mutated = false;
+        for dependency in child.get_all_nested_dependencies() {
+            let (_, parent_mutated) = self.create_child(dependency);
+            if parent_mutated {
+                mutated = true;
+            }
+        }
+        mutated
+    }
 }
 
 // Find whether a tuple's usage (Ex: a.0.1) references an existing var (Ex: a), and if so, calculate the new StructOrTupleIndex
@@ -379,7 +429,7 @@ impl StructOrTupleUseRhs {
     }
 
     fn set_field_could_be_none(&mut self) {
-        let field = self.rhs_tuple.create_child(self.field_index.clone());
+        let (field, _) = self.rhs_tuple.create_child(self.field_index.clone());
         field.could_be_none = true;
     }
 }
