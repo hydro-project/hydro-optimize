@@ -1,5 +1,4 @@
-use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use hydro_lang::compile::ir::{HydroNode, HydroRoot, traverse_dfir};
