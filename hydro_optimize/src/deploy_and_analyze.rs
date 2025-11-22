@@ -239,11 +239,14 @@ pub async fn deploy_and_analyze<'a>(
     std::mem::drop(mut_multi_run_metadata); // Release borrow
     compare_expected_performance(&mut ir, multi_run_metadata, iteration);
 
-    let (orig_to_decoupled, decoupled_to_orig, place_on_decoupled) = decouple_analysis(
+    // TODO: Remove hard-coded 2 decoupling
+    let num_locations = 2;
+    let (new_networks, place_on_loc) = decouple_analysis(
         &mut ir,
         &bottleneck,
         send_overhead,
         recv_overhead,
+        num_locations,
         &cycle_source_to_sink_input,
     );
 
@@ -253,9 +256,9 @@ pub async fn deploy_and_analyze<'a>(
         rewritten_ir_builder,
         ir,
         Decoupler {
-            output_to_decoupled_machine_after: orig_to_decoupled,
-            output_to_original_machine_after: decoupled_to_orig,
-            place_on_decoupled_machine: place_on_decoupled,
+            output_to_decoupled_machine_after: new_networks[&(0, 1)].clone(),
+            output_to_original_machine_after: new_networks[&(1, 0)].clone(),
+            place_on_decoupled_machine: place_on_loc[&1].clone(),
             orig_location: bottleneck.clone(),
             decoupled_location: LocationId::Process(0), // Placeholder, must replace
         },

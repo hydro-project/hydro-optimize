@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -66,9 +67,9 @@ async fn main() {
         // Decouple between these operators:
         // .map(q!(|_| rand::random::<(f64, f64)>()))
         // .map(q!(|(x, y)| x * x + y * y < 1.0))
-        output_to_decoupled_machine_after: vec![4],
-        output_to_original_machine_after: vec![],
-        place_on_decoupled_machine: vec![],
+        output_to_decoupled_machine_after: HashSet::from([4]),
+        output_to_original_machine_after: HashSet::new(),
+        place_on_decoupled_machine: HashSet::new(),
         orig_location: cluster.id().clone(),
         decoupled_location: decoupled_cluster.id().clone(),
     };

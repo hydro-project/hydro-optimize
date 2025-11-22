@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use hydro_lang::compile::ir::{
@@ -21,9 +21,9 @@ use crate::rewrites::{
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Decoupler {
-    pub output_to_decoupled_machine_after: Vec<usize>, /* The output of the operator at this index should be sent to the decoupled machine */
-    pub output_to_original_machine_after: Vec<usize>, /* The output of the operator at this index should be sent to the original machine */
-    pub place_on_decoupled_machine: Vec<usize>, /* This operator should be placed on the decoupled machine. Only for sources */
+    pub output_to_decoupled_machine_after: HashSet<usize>, /* The output of the operator at this index should be sent to the decoupled machine */
+    pub output_to_original_machine_after: HashSet<usize>, /* The output of the operator at this index should be sent to the original machine */
+    pub place_on_decoupled_machine: HashSet<usize>, /* This operator should be placed on the decoupled machine. Only for sources */
     pub orig_location: LocationId,
     pub decoupled_location: LocationId,
 }
@@ -313,9 +313,9 @@ mod tests {
     use crate::repair::inject_id;
 
     fn decouple_mini_program<'a>(
-        output_to_decoupled_machine_after: Vec<(&str, i32)>, // name, offset
-        output_to_original_machine_after: Vec<(&str, i32)>,
-        place_on_decoupled_machine: Vec<(&str, i32)>,
+        output_to_decoupled_machine_after: HashSet<(&str, i32)>, // name, offset
+        output_to_original_machine_after: HashSet<(&str, i32)>,
+        place_on_decoupled_machine: HashSet<(&str, i32)>,
     ) -> (
         Cluster<'a, ()>,
         Cluster<'a, ()>,
@@ -372,9 +372,9 @@ mod tests {
     }
 
     async fn check_decouple_mini_program(
-        output_to_decoupled_machine_after: Vec<(&str, i32)>, // name, offset
-        output_to_original_machine_after: Vec<(&str, i32)>,
-        place_on_decoupled_machine: Vec<(&str, i32)>,
+        output_to_decoupled_machine_after: HashSet<(&str, i32)>, // name, offset
+        output_to_original_machine_after: HashSet<(&str, i32)>,
+        place_on_decoupled_machine: HashSet<(&str, i32)>,
     ) {
         let (send_cluster, recv_cluster, decoupled_cluster, built) = decouple_mini_program(
             output_to_decoupled_machine_after,
@@ -415,12 +415,12 @@ mod tests {
 
     #[test]
     fn decouple_after_source_ir() {
-        let output_to_decoupled_machine_after = vec![("map", -1)];
-        let output_to_original_machine_after = vec![];
-        let place_on_decoupled_machine = vec![
+        let output_to_decoupled_machine_after = HashSet::from([("map", -1)]);
+        let output_to_original_machine_after = HashSet::new();
+        let place_on_decoupled_machine = HashSet::from([
             // the source of cluster membership (TODO(shadaj): should have a better way of identifying)
             ("map", -11),
-        ];
+        ]);
 
         let built = decouple_mini_program(
             output_to_decoupled_machine_after,
@@ -436,12 +436,12 @@ mod tests {
 
     #[tokio::test]
     async fn decouple_after_source() {
-        let output_to_decoupled_machine_after = vec![("map", -1)];
-        let output_to_original_machine_after = vec![];
-        let place_on_decoupled_machine = vec![
+        let output_to_decoupled_machine_after = HashSet::from([("map", -1)]);
+        let output_to_original_machine_after = HashSet::new();
+        let place_on_decoupled_machine = HashSet::from([
             // the source of cluster membership (TODO(shadaj): should have a better way of identifying)
             ("map", -11),
-        ];
+        ]);
 
         check_decouple_mini_program(
             output_to_decoupled_machine_after,
@@ -453,9 +453,9 @@ mod tests {
 
     #[test]
     fn move_source_decouple_map_ir() {
-        let output_to_decoupled_machine_after = vec![];
-        let output_to_original_machine_after = vec![("map", 0)];
-        let place_on_decoupled_machine = vec![("map", -1)];
+        let output_to_decoupled_machine_after = HashSet::new();
+        let output_to_original_machine_after = HashSet::from([("map", 0)]);
+        let place_on_decoupled_machine = HashSet::from([("map", -1)]);
 
         let built = decouple_mini_program(
             output_to_decoupled_machine_after,
@@ -471,9 +471,9 @@ mod tests {
 
     #[tokio::test]
     async fn move_source_decouple_map() {
-        let output_to_decoupled_machine_after = vec![];
-        let output_to_original_machine_after = vec![("map", 0)];
-        let place_on_decoupled_machine = vec![("map", -1)];
+        let output_to_decoupled_machine_after = HashSet::new();
+        let output_to_original_machine_after = HashSet::from([("map", 0)]);
+        let place_on_decoupled_machine = HashSet::from([("map", -1)]);
 
         check_decouple_mini_program(
             output_to_decoupled_machine_after,
