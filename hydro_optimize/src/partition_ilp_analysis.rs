@@ -3,6 +3,7 @@ use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
 };
 
+use good_lp::Expression;
 use hydro_lang::{
     compile::ir::{HydroNode, HydroRoot, traverse_dfir},
     location::dynamic::LocationId,
@@ -10,6 +11,8 @@ use hydro_lang::{
 use syn::visit::Visit;
 
 use crate::{
+    decouple_analysis::{DecoupleILPMetadata, node_is_in_bottleneck},
+    partition_node_analysis::all_inputs,
     partition_syn_analysis::{AnalyzeClosure, StructOrTuple},
     rewrites::{input_ids, op_id_to_inputs},
 };
@@ -378,4 +381,99 @@ fn node_persists(node: &HydroNode) -> bool {
         }
         HydroNode::Persist { .. } | HydroNode::DeferTick { .. } => true,
     }
+}
+
+/// Modifies cpu_usage in DecoupleILPMetadata
+struct PartitionILPMetadata {
+    num_relevant_operators: HashMap<usize, Expression>, // location: number of relevant operators
+    partitionable_operators: HashMap<usize, Expression>, // location: number of partitionable operators. Partitioning is possible at the location if partitionable_operators == num_relevant_operators
+    num_persist_operators: HashMap<usize, Expression>, // location: number of nodes where node_persists() == true. If 0, then partitioning is always possible
+}
+
+/// Add the operator with `id` to the location_sum for each location
+fn add_op_to_location_sum(id: usize, decoupling_metadata: &RefCell<DecoupleILPMetadata>, location_sum: &mut HashMap<usize, Expression>) {
+    for loc in 0..decoupling_metadata.borrow().num_locations {
+        let op_var = *decoupling_metadata
+            .borrow()
+            .op_id_to_var
+            .get(&id)
+            .unwrap()
+            .get(&loc)
+            .unwrap();
+
+        location_sum
+            .entry(loc)
+            .and_modify(|expr| {
+                let temp_expr = std::mem::take(expr);
+                *expr = temp_expr + op_var;
+            })
+            .or_insert_with(|| Expression::default() + op_var);
+    }
+}
+
+fn partition_ilp_node_analysis(
+    node: &HydroNode,
+    op_id: usize,
+    idbs: &HashSet<usize>,
+    metadata: &mut PartitionILPMetadata,
+    decoupling_metadata: &RefCell<DecoupleILPMetadata>,
+) {
+    let network_type = decoupling_metadata
+        .borrow()
+        .network_ids
+        .get(&op_id)
+        .cloned();
+    if !node_is_in_bottleneck(node, op_id, &network_type, decoupling_metadata) {
+        return;
+    }
+
+    let PartitionILPMetadata {
+        num_relevant_operators,
+        num_persist_operators,
+        ..
+    } = metadata;
+
+    // A node is relevant if it is an IDB and affects partitionability
+    let affect_partitionability = match node_partitionability(node) {
+        Partitionability::NoEffect => false,
+        Partitionability::Conditional | Partitionability::Unpartitionable => true,
+    };
+    if idbs.contains(&op_id) && affect_partitionability {
+        add_op_to_location_sum(op_id, decoupling_metadata, num_relevant_operators);
+    }
+
+    if node_persists(node) {
+        add_op_to_location_sum(op_id, decoupling_metadata, num_persist_operators);
+    }
+}
+
+pub(crate) fn partition_ilp_analysis(
+    ir: &mut [HydroRoot],
+    cycle_source_to_sink_input: &HashMap<usize, usize>,
+    decoupling_metadata: &RefCell<DecoupleILPMetadata>,
+) {
+    let mut metadata = PartitionILPMetadata {
+        num_relevant_operators: HashMap::new(),
+        partitionable_operators: HashMap::new(),
+        num_persist_operators: HashMap::new(),
+    };
+
+    let inputs = all_inputs(ir, &decoupling_metadata.borrow().bottleneck);
+    let idbs = nodes_dependent_on_inputs(
+        ir,
+        &decoupling_metadata.borrow().bottleneck,
+        &inputs,
+        cycle_source_to_sink_input,
+    );
+
+    traverse_dfir(
+        ir,
+        |_, _| {},
+        |node, id| {
+            partition_ilp_node_analysis(node, *id, &idbs, &mut metadata, decoupling_metadata);
+        },
+    );
+
+    // Set cost to 0 if all relevant operators are partitionable
+    // Set cost to 0 if no nodes persist
 }

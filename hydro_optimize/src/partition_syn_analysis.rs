@@ -3,18 +3,18 @@ use std::hash::Hash;
 
 use syn::visit::Visit;
 
-pub type StructOrTupleIndex = Vec<String>; // Ex: ["a", "b"] represents x.a.b
+pub(crate) type StructOrTupleIndex = Vec<String>; // Ex: ["a", "b"] represents x.a.b
 
 // Invariant: Cannot have both a dependency and fields (fields are more specific)
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub struct StructOrTuple {
+pub(crate) struct StructOrTuple {
     dependencies: BTreeSet<StructOrTupleIndex>, /* Input tuple indices this tuple is equal to, if any */
     fields: BTreeMap<String, Box<StructOrTuple>>, // Fields 1 layer deep
     could_be_none: bool, // True if this field could also be None (used for FilterMap)
 }
 
 impl StructOrTuple {
-    pub fn new_completely_dependent() -> Self {
+    pub(crate) fn new_completely_dependent() -> Self {
         StructOrTuple {
             dependencies: BTreeSet::from([vec![]]), /* Empty vec means it is completely dependent on the input tuple */
             fields: BTreeMap::new(),
@@ -22,7 +22,7 @@ impl StructOrTuple {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.dependencies.is_empty() && self.fields.is_empty()
     }
 
@@ -66,7 +66,7 @@ impl StructOrTuple {
 
     /// Copy dependencies from RHS, extending it with rhs_index
     /// Note: Does NOT copy RHS fields
-    pub fn add_dependencies(&mut self, rhs: &StructOrTuple, rhs_index: &StructOrTupleIndex) {
+    pub(crate) fn add_dependencies(&mut self, rhs: &StructOrTuple, rhs_index: &StructOrTupleIndex) {
         for dependency in &rhs.dependencies {
             let mut dependency = dependency.clone();
             dependency.extend_from_slice(rhs_index);
@@ -77,7 +77,7 @@ impl StructOrTuple {
     /// Overwrite self at index with rhs at rhs_index, creating the necessary indices when necessary
     /// Note: Results in undefined behavior when used on a "unioned" tuple (where a StructOrTuple with a dependency also has fields).
     /// A broader dependency may conflict with a specific narrower dependency in its field.
-    pub fn set_dependencies(
+    pub(crate) fn set_dependencies(
         &mut self,
         index: &StructOrTupleIndex,
         mut rhs: &StructOrTuple,
@@ -106,7 +106,7 @@ impl StructOrTuple {
         child.could_be_none = rhs.could_be_none;
     }
 
-    pub fn add_dependency(
+    pub(crate) fn add_dependency(
         &mut self,
         index: &StructOrTupleIndex,
         input_tuple_index: StructOrTupleIndex,
@@ -116,7 +116,7 @@ impl StructOrTuple {
     }
 
     /// Note: May return redundant dependencies; no easy fix given we can the same field can depend on multiple things
-    pub fn get_dependencies(&self, index: &StructOrTupleIndex) -> Option<StructOrTuple> {
+    pub(crate) fn get_dependencies(&self, index: &StructOrTupleIndex) -> Option<StructOrTuple> {
         let mut child = self.clone();
         for (i, field) in index.iter().enumerate() {
             if let Some(grandchild) = child.fields.get(field) {
@@ -144,7 +144,7 @@ impl StructOrTuple {
     }
 
     /// Remove any fields that could be None. If a parent could be None, then remove all children.
-    pub fn remove_none_fields(&self, keep_topmost_none: bool) -> Option<StructOrTuple> {
+    pub(crate) fn remove_none_fields(&self, keep_topmost_none: bool) -> Option<StructOrTuple> {
         if !keep_topmost_none && self.could_be_none {
             return None;
         }
@@ -162,7 +162,7 @@ impl StructOrTuple {
     }
 
     /// Create a tuple representing dependencies present in both tuples, keeping the more specific dependency if there is one
-    pub fn intersect(tuple1: &StructOrTuple, tuple2: &StructOrTuple) -> Option<StructOrTuple> {
+    pub(crate) fn intersect(tuple1: &StructOrTuple, tuple2: &StructOrTuple) -> Option<StructOrTuple> {
         // If either tuple1 or tuple2 are empty and None, just return the other tuple
         for (tuple, other) in [(tuple1, tuple2), (tuple2, tuple1)] {
             if tuple.is_empty() && tuple.could_be_none {
@@ -210,7 +210,7 @@ impl StructOrTuple {
     }
 
     /// Find the intersection between all tuples (calling intersect n-1 times)
-    pub fn intersect_tuples(tuples: &[StructOrTuple]) -> Option<StructOrTuple> {
+    pub(crate) fn intersect_tuples(tuples: &[StructOrTuple]) -> Option<StructOrTuple> {
         if tuples.is_empty() {
             return None;
         }
@@ -229,7 +229,7 @@ impl StructOrTuple {
     /// Find the fields where all tuples have a dependency, regardless of what that dependency is.
     /// For each such field, record the dependency index of each tuple.
     /// Return an array of such arrays
-    pub fn intersect_dependencies_with_matching_fields(
+    pub(crate) fn intersect_dependencies_with_matching_fields(
         tuples: &[StructOrTuple],
     ) -> Vec<Vec<StructOrTupleIndex>> {
         let mut intersections = Vec::new();
@@ -297,7 +297,7 @@ impl StructOrTuple {
         intersections
     }
 
-    pub fn index_intersection(
+    pub(crate) fn index_intersection(
         index1: &StructOrTupleIndex,
         index2: &StructOrTupleIndex,
     ) -> Option<StructOrTupleIndex> {
@@ -318,7 +318,7 @@ impl StructOrTuple {
         Some(index2.clone())
     }
 
-    pub fn union(tuple1: &StructOrTuple, tuple2: &StructOrTuple) -> Option<StructOrTuple> {
+    pub(crate) fn union(tuple1: &StructOrTuple, tuple2: &StructOrTuple) -> Option<StructOrTuple> {
         if tuple1.is_empty() && tuple2.is_empty() {
             return None;
         }
@@ -358,7 +358,7 @@ impl StructOrTuple {
     ///
     /// The parent's dependencies are absolute (dependency on an input to the node);
     /// the child's dependencies are relative (dependency within the function).
-    pub fn project_parent(parent: &StructOrTuple, child: &StructOrTuple) -> Option<StructOrTuple> {
+    pub(crate) fn project_parent(parent: &StructOrTuple, child: &StructOrTuple) -> Option<StructOrTuple> {
         let mut new_child = StructOrTuple::default();
         assert!(
             !parent.could_be_none && !child.could_be_none,
@@ -396,7 +396,7 @@ impl StructOrTuple {
     /// For each field in the child that references a field in the parent (self), if the field in the parent doesn't exist, create that field in the parent.
     /// If the parent had a value at a less specific field, duplicate the dependency to the more specific field.
     /// Returns true if fields were added to the parent and false otherwise.
-    pub fn extend_parent_fields(&mut self, child: &StructOrTuple) -> bool {
+    pub(crate) fn extend_parent_fields(&mut self, child: &StructOrTuple) -> bool {
         let mut mutated = false;
         for dependency in child.get_all_nested_dependencies() {
             let (_, parent_mutated) = self.create_child(dependency);
@@ -780,9 +780,9 @@ impl Visit<'_> for EqualityAnalysis {
 }
 
 #[derive(Default)]
-pub struct AnalyzeClosure {
+pub(crate) struct AnalyzeClosure {
     found_closure: bool, // Used to avoid executing visit_pat on anything but the function body
-    pub output_dependencies: StructOrTuple,
+    pub(crate) output_dependencies: StructOrTuple,
 }
 
 impl Visit<'_> for AnalyzeClosure {
