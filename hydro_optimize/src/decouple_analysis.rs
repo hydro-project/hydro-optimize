@@ -1,7 +1,5 @@
-use core::num;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::ops;
 
 use crate::rewrites::op_id_to_inputs;
 use good_lp::solvers::highs::HighsSolution;
