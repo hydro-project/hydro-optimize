@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
+use crate::partition_ilp_analysis::partition_ilp_analysis;
 use crate::rewrites::op_id_to_inputs;
 use good_lp::solvers::highs::HighsSolution;
 use good_lp::{
@@ -29,20 +30,20 @@ use super::rewrites::{NetworkType, get_network_type};
 /// 1. If we are the receiver, then create a var, we pay deserialization
 /// 2. If we are the sender (and not the receiver), don't create a var (because the destination is another machine and can't change), but we still pay serialization
 /// 3. If we are the sender and receiver, then create a var, pay for both
-struct ModelMetadata {
+pub(crate) struct DecoupleILPMetadata {
     // Const fields
-    cluster_to_decouple: LocationId,
+    pub(crate) bottleneck: LocationId,
     decoupling_send_overhead: f64, /* CPU usage per cardinality to send, assuming all messages serialize/deserialize similarly */
     decoupling_recv_overhead: f64,
-    num_locations: usize,
+    pub(crate) num_locations: usize,
     // Model variables to construct final cost function
-    variables: ProblemVariables,
-    constraints: Vec<Constraint>,
-    cpu_usages: HashMap<usize, Expression>, // location_id: cpu_usage
-    op_id_to_var: HashMap<usize, HashMap<usize, Variable>>, // op_id: (location_id: var). Var = 1 for a location if the op is assigned to that location
-    prev_op_input_with_tick: HashMap<usize, usize>,         // tick_id: last op_id with that tick_id
+    pub(crate) variables: ProblemVariables,
+    pub(crate) constraints: Vec<Constraint>,
+    pub(crate) cpu_usages: HashMap<usize, Expression>, // location_id: cpu_usage
+    pub(crate) op_id_to_var: HashMap<usize, HashMap<usize, Variable>>, // op_id: (location_id: var). Var = 1 for a location if the op is assigned to that location
+    prev_op_input_with_tick: HashMap<usize, usize>, // tick_id: last op_id with that tick_id
     tee_inner_to_decoupled_vars: HashMap<usize, HashMap<usize, (Variable, Variable)>>, /* inner_id: (loc: (send var, recv var)) */
-    network_ids: HashMap<usize, NetworkType>,
+    pub(crate) network_ids: HashMap<usize, NetworkType>,
 }
 
 // Penalty for decoupling regardless of cardinality (to prevent decoupling low cardinality operators)
@@ -107,16 +108,16 @@ fn add_equality_constr(
 fn add_tick_constraint(
     metadata: &HydroIrMetadata,
     op_id_to_inputs: &HashMap<usize, Vec<usize>>,
-    model_metadata: &RefCell<ModelMetadata>,
+    decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
-    let ModelMetadata {
+    let DecoupleILPMetadata {
         variables,
         constraints,
         num_locations,
         op_id_to_var,
         prev_op_input_with_tick,
         ..
-    } = &mut *model_metadata.borrow_mut();
+    } = &mut *decoupling_metadata.borrow_mut();
 
     if let LocationId::Tick(tick_id, _) = metadata.location_kind {
         // Set each input = to the last input
@@ -146,16 +147,16 @@ fn add_cpu_usage(
     metadata: &HydroIrOpMetadata,
     network_type: &Option<NetworkType>,
     op_id_to_inputs: &HashMap<usize, Vec<usize>>,
-    model_metadata: &RefCell<ModelMetadata>,
+    decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
-    let ModelMetadata {
+    let DecoupleILPMetadata {
         variables,
         constraints,
         num_locations,
         cpu_usages,
         op_id_to_var,
         ..
-    } = &mut *model_metadata.borrow_mut();
+    } = &mut *decoupling_metadata.borrow_mut();
 
     let op_id = metadata.id.unwrap();
 
@@ -236,9 +237,9 @@ fn add_decoupling_overhead(
     node: &HydroNode,
     network_type: &Option<NetworkType>,
     op_id_to_inputs: &HashMap<usize, Vec<usize>>,
-    model_metadata: &RefCell<ModelMetadata>,
+    decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
-    let ModelMetadata {
+    let DecoupleILPMetadata {
         decoupling_send_overhead,
         decoupling_recv_overhead,
         variables,
@@ -247,7 +248,7 @@ fn add_decoupling_overhead(
         cpu_usages,
         op_id_to_var,
         ..
-    } = &mut *model_metadata.borrow_mut();
+    } = &mut *decoupling_metadata.borrow_mut();
 
     let metadata = node.metadata();
     let cardinality = match network_type {
@@ -291,9 +292,9 @@ fn add_decoupling_overhead(
 fn add_tee_decoupling_overhead(
     inner_id: usize,
     metadata: &HydroIrMetadata,
-    model_metadata: &RefCell<ModelMetadata>,
+    decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
-    let ModelMetadata {
+    let DecoupleILPMetadata {
         decoupling_send_overhead,
         decoupling_recv_overhead,
         variables,
@@ -303,7 +304,7 @@ fn add_tee_decoupling_overhead(
         op_id_to_var,
         tee_inner_to_decoupled_vars,
         ..
-    } = &mut *model_metadata.borrow_mut();
+    } = &mut *decoupling_metadata.borrow_mut();
 
     let cardinality = metadata.cardinality.unwrap_or_default();
     let op_id = metadata.op.id.unwrap();
@@ -356,37 +357,46 @@ fn add_tee_decoupling_overhead(
 fn decouple_analysis_root(
     root: &mut HydroRoot,
     op_id_to_inputs: &HashMap<usize, Vec<usize>>,
-    model_metadata: &RefCell<ModelMetadata>,
+    decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
     // Ignore nodes that are not in the cluster to decouple
-    if model_metadata.borrow().cluster_to_decouple != *root.input_metadata().location_kind.root() {
+    if decoupling_metadata.borrow().bottleneck != *root.input_metadata().location_kind.root() {
         return;
     }
 
-    add_tick_constraint(root.input_metadata(), op_id_to_inputs, model_metadata);
+    add_tick_constraint(root.input_metadata(), op_id_to_inputs, decoupling_metadata);
+}
+
+pub(crate) fn node_is_in_bottleneck(
+    node: &HydroNode,
+    op_id: usize,
+    network_type: &Option<NetworkType>,
+    decoupling_metadata: &RefCell<DecoupleILPMetadata>,
+) -> bool {
+    if let HydroNode::Network { .. } = node {
+        if let Some(network_type) = network_type {
+            decoupling_metadata
+                .borrow_mut()
+                .network_ids
+                .insert(op_id, network_type.clone());
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    // If it's not a network, then its location should == the bottleneck
+    decoupling_metadata.borrow().bottleneck == *node.metadata().location_kind.root()
 }
 
 fn decouple_analysis_node(
     node: &mut HydroNode,
     op_id: &mut usize,
     op_id_to_inputs: &HashMap<usize, Vec<usize>>,
-    model_metadata: &RefCell<ModelMetadata>,
+    decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
-    let network_type = get_network_type(
-        node,
-        model_metadata.borrow().cluster_to_decouple.root().raw_id(),
-    );
-    if let HydroNode::Network { .. } = node {
-        // If this is a network and we're not involved, ignore
-        if network_type.is_none() {
-            return;
-        }
-        model_metadata
-            .borrow_mut()
-            .network_ids
-            .insert(*op_id, network_type.clone().unwrap());
-    } else if model_metadata.borrow().cluster_to_decouple != *node.metadata().location_kind.root() {
-        // If it's not a network and the operator isn't on the cluster, ignore
+    let network_type = get_network_type(node, decoupling_metadata.borrow().bottleneck.root().raw_id());
+    if !node_is_in_bottleneck(node, *op_id, &network_type, decoupling_metadata) {
         return;
     }
 
@@ -398,28 +408,28 @@ fn decouple_analysis_node(
         add_tee_decoupling_overhead(
             inner.0.borrow().metadata().op.id.unwrap(),
             metadata,
-            model_metadata,
+            decoupling_metadata,
         );
     } else {
-        add_decoupling_overhead(node, &network_type, op_id_to_inputs, model_metadata);
+        add_decoupling_overhead(node, &network_type, op_id_to_inputs, decoupling_metadata);
     }
 
     add_cpu_usage(
         node.op_metadata(),
         &network_type,
         op_id_to_inputs,
-        model_metadata,
+        decoupling_metadata,
     );
-    add_tick_constraint(node.metadata(), op_id_to_inputs, model_metadata);
+    add_tick_constraint(node.metadata(), op_id_to_inputs, decoupling_metadata);
 }
 
-fn solve(model_metadata: &RefCell<ModelMetadata>) -> HighsSolution {
-    let ModelMetadata {
+fn solve(decoupling_metadata: &RefCell<DecoupleILPMetadata>) -> HighsSolution {
+    let DecoupleILPMetadata {
         variables,
         constraints,
         cpu_usages,
         ..
-    } = &mut *model_metadata.borrow_mut();
+    } = &mut *decoupling_metadata.borrow_mut();
 
     // Need values to be taken instead of &mut
     let mut vars = std::mem::take(variables);
@@ -461,11 +471,12 @@ fn op_loc(op_vars: &HashMap<usize, Variable>, solution: &HighsSolution) -> usize
 /// - `place_on_loc`: map from loc to set of op_ids that should be placed on that loc
 pub(crate) fn decouple_analysis(
     ir: &mut [HydroRoot],
-    cluster_to_decouple: &LocationId,
+    bottleneck: &LocationId,
     send_overhead: f64,
     recv_overhead: f64,
     num_locations: usize,
     cycle_source_to_sink_input: &HashMap<usize, usize>,
+    consider_partitioning: bool,
 ) -> (
     HashMap<(usize, usize), HashSet<usize>>,
     HashMap<usize, HashSet<usize>>,
@@ -474,8 +485,8 @@ pub(crate) fn decouple_analysis(
         panic!("Must decouple to at least 2 locations (original location, decoupled location)");
     }
 
-    let model_metadata = RefCell::new(ModelMetadata {
-        cluster_to_decouple: cluster_to_decouple.clone(),
+    let decoupling_metadata = RefCell::new(DecoupleILPMetadata {
+        bottleneck: bottleneck.clone(),
         decoupling_send_overhead: send_overhead,
         decoupling_recv_overhead: recv_overhead,
         num_locations,
@@ -489,35 +500,43 @@ pub(crate) fn decouple_analysis(
         tee_inner_to_decoupled_vars: HashMap::new(),
         network_ids: HashMap::new(),
     });
-    let op_id_to_inputs =
-        op_id_to_inputs(ir, Some(cluster_to_decouple), cycle_source_to_sink_input);
+    let op_id_to_inputs = op_id_to_inputs(ir, Some(bottleneck), cycle_source_to_sink_input);
 
     traverse_dfir(
         ir,
         |root, _| {
-            decouple_analysis_root(root, &op_id_to_inputs, &model_metadata);
+            decouple_analysis_root(root, &op_id_to_inputs, &decoupling_metadata);
         },
         |node, next_op_id| {
-            decouple_analysis_node(node, next_op_id, &op_id_to_inputs, &model_metadata);
+            decouple_analysis_node(node, next_op_id, &op_id_to_inputs, &decoupling_metadata);
         },
     );
     for inputs in op_id_to_inputs.values() {
-        let ModelMetadata {
+        let DecoupleILPMetadata {
             op_id_to_var,
             variables,
             constraints,
             ..
-        } = &mut *model_metadata.borrow_mut();
+        } = &mut *decoupling_metadata.borrow_mut();
         // Add input constraints. All inputs of an op must output to the same machine (be assigned the same var)
         add_equality_constr(inputs, num_locations, op_id_to_var, variables, constraints);
     }
 
-    let solution = solve(&model_metadata);
-    let ModelMetadata {
+    // Consider partitioning after all variables for decoupling have been created
+    if consider_partitioning {
+        partition_ilp_analysis(
+            ir,
+            cycle_source_to_sink_input,
+            &decoupling_metadata,
+        );
+    }
+
+    let solution = solve(&decoupling_metadata);
+    let DecoupleILPMetadata {
         op_id_to_var,
         network_ids,
         ..
-    } = &mut *model_metadata.borrow_mut();
+    } = &mut *decoupling_metadata.borrow_mut();
 
     let mut ops_on_loc: HashMap<usize, HashSet<usize>> =
         HashMap::from_iter((0..num_locations).map(|loc_id| (loc_id, HashSet::new())));

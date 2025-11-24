@@ -28,7 +28,7 @@ fn all_inputs_parents(
 }
 
 /// Find all input nodes of a location
-fn all_inputs(ir: &mut [HydroRoot], location: &LocationId) -> Vec<usize> {
+pub(crate) fn all_inputs(ir: &mut [HydroRoot], location: &LocationId) -> Vec<usize> {
     let mut inputs = vec![];
 
     traverse_dfir(
@@ -45,16 +45,16 @@ fn all_inputs(ir: &mut [HydroRoot], location: &LocationId) -> Vec<usize> {
     inputs
 }
 
-pub struct InputDependencyMetadata {
+pub(crate) struct InputDependencyMetadata {
     // Const fields
-    pub location: LocationId,
-    pub inputs: Vec<usize>,
-    pub op_id_to_parents: HashMap<usize, Vec<usize>>,
+    pub(crate) location: LocationId,
+    pub(crate) inputs: Vec<usize>,
+    pub(crate) op_id_to_parents: HashMap<usize, Vec<usize>>,
     // Variables
-    pub optimistic_phase: bool, /* If true, tuple intersection continues even if one side does not exist */
-    pub input_taint: BTreeMap<usize, BTreeSet<usize>>, /* op_id -> set of input op_ids that taint this node */
-    pub input_dependencies: BTreeMap<usize, BTreeMap<usize, StructOrTuple>>, /* op_id -> (input op_id -> index of input in output) */
-    pub syn_analysis: BTreeMap<usize, StructOrTuple>, /* Cached results for analyzing f for each operator */
+    pub(crate) optimistic_phase: bool, /* If true, tuple intersection continues even if one side does not exist */
+    pub(crate) input_taint: BTreeMap<usize, BTreeSet<usize>>, /* op_id -> set of input op_ids that taint this node */
+    pub(crate) input_dependencies: BTreeMap<usize, BTreeMap<usize, StructOrTuple>>, /* op_id -> (input op_id -> index of input in output) */
+    pub(crate) syn_analysis: BTreeMap<usize, StructOrTuple>, /* Cached results for analyzing f for each operator */
 }
 
 impl Hash for InputDependencyMetadata {

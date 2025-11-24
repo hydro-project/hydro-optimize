@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use hydro_build_utils::insta;
 use hydro_lang::deploy::HydroDeploy;
@@ -19,9 +19,9 @@ fn decoupled_compute_pi_ir() {
     let (cluster, _) = hydro_test::cluster::compute_pi::compute_pi(&builder, 8192);
     let decoupled_cluster = builder.cluster::<DecoupledCluster>();
     let decoupler = decoupler::Decoupler {
-        output_to_decoupled_machine_after: vec![4],
-        output_to_original_machine_after: vec![],
-        place_on_decoupled_machine: vec![],
+        output_to_decoupled_machine_after: HashSet::from([4]),
+        output_to_original_machine_after: HashSet::new(),
+        place_on_decoupled_machine: HashSet::new(),
         decoupled_location: decoupled_cluster.id().clone(),
         orig_location: cluster.id().clone(),
     };

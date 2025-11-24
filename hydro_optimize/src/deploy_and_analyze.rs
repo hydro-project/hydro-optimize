@@ -248,6 +248,7 @@ pub async fn deploy_and_analyze<'a>(
         recv_overhead,
         num_locations,
         &cycle_source_to_sink_input,
+        true,
     );
 
     // TODO: Save decoupling decision to file
