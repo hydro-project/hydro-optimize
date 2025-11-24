@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use hydro_deploy::Deployment;
@@ -256,9 +256,9 @@ pub async fn deploy_and_analyze<'a>(
         rewritten_ir_builder,
         ir,
         Decoupler {
-            output_to_decoupled_machine_after: new_networks[&(0, 1)].clone(),
-            output_to_original_machine_after: new_networks[&(1, 0)].clone(),
-            place_on_decoupled_machine: place_on_loc[&1].clone(),
+            output_to_decoupled_machine_after: new_networks.get(&(0, 1)).cloned().unwrap_or(HashSet::new()),
+            output_to_original_machine_after: new_networks.get(&(1, 0)).cloned().unwrap_or(HashSet::new()),
+            place_on_decoupled_machine: place_on_loc.get(&1).cloned().unwrap_or_default(),
             orig_location: bottleneck.clone(),
             decoupled_location: LocationId::Process(0), // Placeholder, must replace
         },
