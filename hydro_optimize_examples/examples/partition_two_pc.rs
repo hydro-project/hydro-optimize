@@ -7,7 +7,7 @@ use hydro_lang::deploy::TrybuildHost;
 use hydro_lang::location::Location;
 use hydro_optimize::partition_node_analysis::{nodes_to_partition, partitioning_analysis};
 use hydro_optimize::partitioner::{Partitioner, partition};
-use hydro_optimize::repair::{cycle_source_to_sink_input, inject_id, inject_location};
+use hydro_optimize::repair::{cycle_source_to_sink_parent, inject_id, inject_location};
 use tokio::sync::RwLock;
 
 type HostCreator = Box<dyn Fn(&mut Deployment) -> Arc<dyn Host>>;
@@ -61,7 +61,7 @@ async fn main() {
     let deployable = builder
         .optimize_with(|ir| {
             inject_id(ir);
-            cycle_data = cycle_source_to_sink_input(ir);
+            cycle_data = cycle_source_to_sink_parent(ir);
             inject_location(ir, &cycle_data);
 
             // Partition coordinator
@@ -78,7 +78,7 @@ async fn main() {
             partition(ir, &coordinator_partitioner);
 
             // Partition participants
-            cycle_data = cycle_source_to_sink_input(ir); // Recompute since IDs have changed
+            cycle_data = cycle_source_to_sink_parent(ir); // Recompute since IDs have changed
             let participant_partitioning =
                 partitioning_analysis(ir, &participants.id(), &cycle_data);
             let participant_nodes_to_partition =

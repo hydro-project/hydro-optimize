@@ -13,7 +13,7 @@ use stageleft::quote_type;
 use syn::visit_mut::VisitMut;
 
 use crate::parse_results::{MultiRunMetadata, get_or_append_run_metadata};
-use crate::repair::{cycle_source_to_sink_input, inject_id, inject_location};
+use crate::repair::{cycle_source_to_sink_parent, inject_id, inject_location};
 use crate::rewrites::{
     ClusterSelfIdReplace, collection_kind_to_debug_type, deserialize_bincode_with_type,
     prepend_member_id_to_collection_kind, serialize_bincode_with_type, tee_to_inner_id,
@@ -274,8 +274,8 @@ pub fn decouple(
     let run_metadata = get_or_append_run_metadata(&mut mut_multi_run_metadata, iteration + 1);
     run_metadata.op_id_to_prev_iteration_op_id = new_id_to_old_id;
     // Fix locations since we changed some
-    let cycle_source_to_sink_input = cycle_source_to_sink_input(ir);
-    inject_location(ir, &cycle_source_to_sink_input);
+    let cycle_source_to_sink_parent = cycle_source_to_sink_parent(ir);
+    inject_location(ir, &cycle_source_to_sink_parent);
     // Fix CLUSTER_SELF_ID for the decoupled node
     let locations = ClusterSelfIdReplace::Decouple {
         orig_cluster_id: decoupler.orig_location.raw_id(),
