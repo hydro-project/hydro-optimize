@@ -14,7 +14,7 @@ use crate::{
     decouple_analysis::{DecoupleILPMetadata, node_is_in_bottleneck},
     partition_node_analysis::all_inputs,
     partition_syn_analysis::{AnalyzeClosure, StructOrTuple, StructOrTupleIndex},
-    rewrites::{parent_ids, op_id_to_parents},
+    rewrites::{op_id_to_parents, parent_ids},
 };
 
 /// Add id to dependent_nodes if its parent_id is already in dependent_nodes
@@ -171,54 +171,6 @@ fn output_to_parent_fields(node: &HydroNode) -> (StructOrTuple, StructOrTuple) {
         | HydroNode::Fold { .. }
         | HydroNode::Reduce { .. }
         => (StructOrTuple::default(), StructOrTuple::default()),
-    }
-}
-
-/// Note: Should be kept in sync with `output_to_parent_fields`
-fn num_parents(node: &HydroNode) -> usize {
-    match node {
-        HydroNode::Placeholder => {
-            panic!()
-        }
-        // We don't consider parents on other nodes for partitioning
-        HydroNode::Network { .. } => 0,
-        HydroNode::Cast { .. }
-        | HydroNode::ObserveNonDet { .. }
-        | HydroNode::Source { .. }
-        | HydroNode::SingletonSource { .. }
-        | HydroNode::CycleSource { .. }
-        | HydroNode::Tee { .. }
-        | HydroNode::Persist { .. }
-        | HydroNode::YieldConcat { .. }
-        | HydroNode::BeginAtomic { .. }
-        | HydroNode::EndAtomic { .. }
-        | HydroNode::Batch { .. }
-        | HydroNode::ResolveFutures { .. }
-        | HydroNode::ResolveFuturesOrdered { .. }
-        | HydroNode::Filter { .. }
-        | HydroNode::DeferTick { .. }
-        | HydroNode::Inspect { .. }
-        | HydroNode::Unique { .. }
-        | HydroNode::Sort { .. }
-        | HydroNode::ExternalInput { .. }
-        | HydroNode::Counter { .. }
-        | HydroNode::Map { .. }
-        | HydroNode::FilterMap { .. }
-        | HydroNode::Enumerate { .. }
-        | HydroNode::FoldKeyed { .. }
-        | HydroNode::ReduceKeyed { .. }
-        | HydroNode::ReduceKeyedWatermark { .. }
-        | HydroNode::FlatMap { .. }
-        | HydroNode::Scan { .. }
-        | HydroNode::Fold { .. }
-        | HydroNode::Reduce { .. } => 1,
-        HydroNode::Chain { .. }
-        | HydroNode::ChainFirst { .. }
-        | HydroNode::Difference { .. }
-        | HydroNode::CrossProduct { .. }
-        | HydroNode::CrossSingleton { .. }
-        | HydroNode::Join { .. }
-        | HydroNode::AntiJoin { .. } => 2,
     }
 }
 
@@ -434,7 +386,7 @@ fn node_persists(node: &HydroNode) -> bool {
 struct PartitionILPMetadata {
     op_id_to_field_vars: HashMap<usize, HashMap<StructOrTupleIndex, Variable>>, // op_id: field_name: variable
     op_id_to_partition_expr: HashMap<usize, Expression>, // op_id: 1 if the op is partitioned on any of its fields, 0 otherwise
-    num_relevant_operators: HashMap<usize, Expression>,  // location: number of relevant operators
+    num_relevant_operators: HashMap<usize, Expression>, // location: number of relevant operators
     partitionable_operators: HashMap<usize, Expression>, // location: number of partitionable operators. Partitioning is possible at the location if partitionable_operators == num_relevant_operators
     num_persist_operators: HashMap<usize, Expression>, // location: number of nodes where node_persists() == true. If 0, then partitioning is always possible
 }
@@ -461,11 +413,11 @@ fn add_op_to_location_sum(
     }
 }
 
-fn add_is_input_var(
+fn add_is_input_expr(
     id: usize,
-    parents: Vec<usize>,
+    parents: &Vec<usize>,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
-) {
+) -> Expression {
     let DecoupleILPMetadata {
         op_id_to_var,
         variables,
@@ -473,18 +425,26 @@ fn add_is_input_var(
         ..
     } = &mut *decoupling_metadata.borrow_mut();
 
-    let is_input_var = variables.add(variable().binary());
+    let mut is_input_expr = Expression::default();
 
-    let parent_vars = parents.iter().map(|parent_id| {
-        op_id_to_var
-            .get(parent_id)
-            .unwrap()
-    }).collect::<Vec<_>>();
+    // Only consider the 1st parent, since there's the invariant that both parents must have the same location
+    let parent_vars = op_id_to_var.get(parents.get(0).unwrap()).unwrap();
     for (loc, var) in op_id_to_var.get(&id).unwrap() {
-        
-        // Enforce is_input_var == 1 if op is at this location
-        constraints.push(constraint!(is_input_var >= *var));
+        let is_loc_input = variables.add(variable().binary());
+        let parent_var = parent_vars.get(loc).unwrap();
+        // Force is_input_var == |var - parent_var| for binary vars.
+        constraints.push(constraint!(is_loc_input >= *var - *parent_var));
+        constraints.push(constraint!(is_loc_input >= *parent_var - *var));
+        // Force is_loc_input to be 0 if both vars are 0
+        constraints.push(constraint!(is_loc_input <= *var + *parent_var));
+        // Force is_loc_input to be 0 if both vars are 1
+        constraints.push(constraint!(is_loc_input <= 2.0 - (*var + *parent_var)));
+
+        is_input_expr = is_input_expr + is_loc_input;
     }
+
+    // Divide by 2 since if the parent's location differs from this nodes location, is_loc_input will be 1 for 2 different locations
+    is_input_expr / 2
 }
 
 fn field_vars_from_op(
@@ -529,10 +489,16 @@ fn constrain_field_vars_to_parents(
     op_id: usize,
     op_id_to_parents: &HashMap<usize, Vec<usize>>,
     canonical_fields: &HashMap<usize, (StructOrTuple, StructOrTuple)>,
-    op_id_to_field_vars: &mut HashMap<usize, HashMap<StructOrTupleIndex, Variable>>,
-    op_id_to_partition_expr: &mut HashMap<usize, Expression>,
+    metadata: &mut PartitionILPMetadata,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
+    let PartitionILPMetadata {
+        op_id_to_field_vars,
+        op_id_to_partition_expr,
+        partitionable_operators,
+        ..
+    } = metadata;
+
     // Create field vars
     let field_vars = field_vars_from_op(
         op_id,
@@ -545,7 +511,7 @@ fn constrain_field_vars_to_parents(
     // Create field vars for parents
     let parents = op_id_to_parents.get(&op_id).unwrap();
     if parents.is_empty() {
-        // Must be a Network node, no constraints
+        // Must be a Source, no constraints
         return;
     }
 
@@ -570,8 +536,12 @@ fn constrain_field_vars_to_parents(
         })
         .collect::<Vec<_>>();
 
-    let DecoupleILPMetadata { constraints, .. } = &mut *decoupling_metadata.borrow_mut();
+    // Get expr that is 1 if this node is an input, 0 otherwise
+    let is_input_expr = add_is_input_expr(op_id, parents, decoupling_metadata);
 
+    let DecoupleILPMetadata { variables, constraints, op_id_to_var, .. } = &mut *decoupling_metadata.borrow_mut();
+
+    let mut is_partitionable = Expression::default();
     for (field_name, field_var) in field_vars {
         // If there's a link from this field to all parents, constrain it to the corresponding field in all parents
         // Otherwise, only allow using this field for partitioning if this is an input node
@@ -600,14 +570,34 @@ fn constrain_field_vars_to_parents(
             // For each field:
             // 1. Both parents must partition on some corresponding field
             // 2. If a parent has multiple corresponding fields, it only needs to partition on one of them
+            // 3. If this node is an input, no constraints
             for parent_vars in corresponding_parent_field_vars {
                 let mut parent_var_sum = Expression::default();
                 for parent_var in parent_vars {
                     parent_var_sum = parent_var_sum + *parent_var;
                 }
-                constraints.push(constraint!(field_var <= parent_var_sum));
+                constraints.push(constraint!(field_var <= parent_var_sum + is_input_expr.clone()));
             }
         }
+        else {
+            // At least 1 parent doesn't have a corresponding field. Can only partition on this field if this is an input node
+            constraints.push(constraint!(field_var <= is_input_expr.clone()));
+        }
+
+        // This node is partitionable if ANY field is partitionable
+        is_partitionable = is_partitionable + field_var;
+    }
+
+    // Add to partitionable operators
+    for (loc, partitionable_expr) in partitionable_operators {
+        let is_at_loc_and_partitionable = variables.add(variable().binary());
+        let is_at_loc = op_id_to_var.get(&op_id).unwrap().get(loc).unwrap();
+
+        constraints.push(constraint!(is_at_loc_and_partitionable <= is_partitionable.clone()));
+        constraints.push(constraint!(is_at_loc_and_partitionable <= *is_at_loc));
+
+        let temp_expr = std::mem::take(partitionable_expr);
+        *partitionable_expr = temp_expr + is_at_loc_and_partitionable;
     }
 }
 
@@ -630,8 +620,6 @@ fn partition_ilp_node_analysis(
     }
 
     let PartitionILPMetadata {
-        op_id_to_field_vars,
-        op_id_to_partition_expr,
         num_relevant_operators,
         num_persist_operators,
         ..
@@ -655,8 +643,7 @@ fn partition_ilp_node_analysis(
         op_id,
         op_id_to_parents,
         canonical_fields,
-        op_id_to_field_vars,
-        op_id_to_partition_expr,
+        metadata,
         decoupling_metadata,
     );
 }
@@ -693,7 +680,7 @@ fn zero_cost_if_expr_sums_to_zero(
                 cpu_usage_var >= prev_cpu_usage - 1 + zero_if_sums_to_zero
             ));
 
-            *cpu_usage = Expression::default() + cpu_usage_var;
+            *cpu_usage = Expression::from(cpu_usage_var);
         });
     }
 }
@@ -722,7 +709,7 @@ fn zero_cost_if_partitionable(
         constraints.push(constraint!(
             difference_var >= num_partitionable.clone() - num_relevant.clone()
         ));
-        loc_to_difference.insert(*loc, Expression::default() + difference_var);
+        loc_to_difference.insert(*loc, Expression::from(difference_var));
     }
 
     zero_cost_if_expr_sums_to_zero(&loc_to_difference, decoupling_metadata, max_num_ops);
@@ -737,7 +724,7 @@ pub(crate) fn partition_ilp_analysis(
     // Make all cost expressions at all locations default to 0
     let location_to_zero_expr: HashMap<usize, Expression> =
         (0..decoupling_metadata.borrow().num_locations)
-            .map(|loc| (loc, Expression::default() + 0))
+            .map(|loc| (loc, Expression::from(0)))
             .collect();
     let mut metadata = PartitionILPMetadata {
         op_id_to_field_vars: HashMap::new(),
