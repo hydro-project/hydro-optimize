@@ -143,6 +143,27 @@ impl StructOrTuple {
         all_dependencies
     }
 
+    fn get_nested_fields(&self, prefix: StructOrTupleIndex) -> BTreeSet<StructOrTupleIndex> {
+        let mut all_fields = BTreeSet::new();
+        for (field, child) in &self.fields {
+            let mut cloned_prefix = prefix.clone();
+            cloned_prefix.push(field.clone());
+            all_fields.insert(cloned_prefix.clone());
+
+            let child_fields = child.get_nested_fields(cloned_prefix);
+            all_fields.extend(child_fields);
+        }
+        all_fields
+    }
+
+    /// Returns all known fields, including nested fields.
+    /// If there are more and less specific versions of the same field, return both.
+    pub(crate) fn get_all_nested_fields(&self) -> BTreeSet<StructOrTupleIndex> {
+        let mut nested_fields = self.get_nested_fields(vec![]);
+        nested_fields.insert(vec![]); // Include the entire struct/tuple as a field
+        nested_fields
+    }
+
     /// Remove any fields that could be None. If a parent could be None, then remove all children.
     pub(crate) fn remove_none_fields(&self, keep_topmost_none: bool) -> Option<StructOrTuple> {
         if !keep_topmost_none && self.could_be_none {

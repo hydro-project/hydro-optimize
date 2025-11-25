@@ -3,17 +3,17 @@ use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
 };
 
-use good_lp::Expression;
+use good_lp::{Expression, Variable, constraint, variable};
 use hydro_lang::{
     compile::ir::{HydroNode, HydroRoot, traverse_dfir},
-    location::dynamic::LocationId,
+    location::{self, dynamic::LocationId},
 };
 use syn::visit::Visit;
 
 use crate::{
     decouple_analysis::{DecoupleILPMetadata, node_is_in_bottleneck},
     partition_node_analysis::all_inputs,
-    partition_syn_analysis::{AnalyzeClosure, StructOrTuple},
+    partition_syn_analysis::{AnalyzeClosure, StructOrTuple, StructOrTupleIndex},
     rewrites::{input_ids, op_id_to_inputs},
 };
 
@@ -383,15 +383,20 @@ fn node_persists(node: &HydroNode) -> bool {
     }
 }
 
-/// Modifies cpu_usage in DecoupleILPMetadata
 struct PartitionILPMetadata {
-    num_relevant_operators: HashMap<usize, Expression>, // location: number of relevant operators
+    op_id_to_field_vars: HashMap<usize, HashMap<StructOrTupleIndex, Variable>>, // op_id: field_name: variable
+    op_id_to_partition_expr: HashMap<usize, Expression>, // op_id: 1 if the op is partitioned on any of its fields, 0 otherwise
+    num_relevant_operators: HashMap<usize, Expression>,  // location: number of relevant operators
     partitionable_operators: HashMap<usize, Expression>, // location: number of partitionable operators. Partitioning is possible at the location if partitionable_operators == num_relevant_operators
     num_persist_operators: HashMap<usize, Expression>, // location: number of nodes where node_persists() == true. If 0, then partitioning is always possible
 }
 
 /// Add the operator with `id` to the location_sum for each location
-fn add_op_to_location_sum(id: usize, decoupling_metadata: &RefCell<DecoupleILPMetadata>, location_sum: &mut HashMap<usize, Expression>) {
+fn add_op_to_location_sum(
+    id: usize,
+    decoupling_metadata: &RefCell<DecoupleILPMetadata>,
+    location_sum: &mut HashMap<usize, Expression>,
+) {
     for loc in 0..decoupling_metadata.borrow().num_locations {
         let op_var = *decoupling_metadata
             .borrow()
@@ -406,15 +411,53 @@ fn add_op_to_location_sum(id: usize, decoupling_metadata: &RefCell<DecoupleILPMe
             .and_modify(|expr| {
                 let temp_expr = std::mem::take(expr);
                 *expr = temp_expr + op_var;
-            })
-            .or_insert_with(|| Expression::default() + op_var);
+            });
     }
+}
+
+fn field_vars_from_op(
+    op_id: usize,
+    canonical_fields: &HashMap<usize, (StructOrTuple, StructOrTuple)>,
+    op_id_to_field_vars: &mut HashMap<usize, HashMap<StructOrTupleIndex, Variable>>,
+    op_id_to_partition_expr: &mut HashMap<usize, Expression>,
+    decoupling_metadata: &RefCell<DecoupleILPMetadata>,
+) -> HashMap<StructOrTupleIndex, Variable> {
+    op_id_to_field_vars
+        .entry(op_id)
+        .or_insert_with(|| {
+            // Find all fields that could possibly be referenced by this operator's children
+            let (l_dependencies, r_dependencies) = canonical_fields.get(&op_id).unwrap();
+            let mut field_names = l_dependencies.get_all_nested_fields();
+            field_names.extend(r_dependencies.get_all_nested_fields());
+
+            let mut field_to_var = HashMap::new();
+            let mut sum_expr = Expression::default();
+            for field_name in field_names {
+                let var = decoupling_metadata
+                    .borrow_mut()
+                    .variables
+                    .add(variable().binary());
+                field_to_var.insert(field_name.clone(), var);
+                sum_expr = sum_expr + var;
+            }
+            op_id_to_partition_expr.insert(op_id, sum_expr.clone());
+
+            // Constrain sum to 1 (the op is partitioned on at most 1 field)
+            decoupling_metadata
+                .borrow_mut()
+                .constraints
+                .push(constraint!(sum_expr <= 1));
+
+            field_to_var
+        })
+        .clone()
 }
 
 fn partition_ilp_node_analysis(
     node: &HydroNode,
     op_id: usize,
     idbs: &HashSet<usize>,
+    canonical_fields: &HashMap<usize, (StructOrTuple, StructOrTuple)>,
     metadata: &mut PartitionILPMetadata,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
@@ -428,6 +471,8 @@ fn partition_ilp_node_analysis(
     }
 
     let PartitionILPMetadata {
+        op_id_to_field_vars,
+        op_id_to_partition_expr,
         num_relevant_operators,
         num_persist_operators,
         ..
@@ -442,9 +487,84 @@ fn partition_ilp_node_analysis(
         add_op_to_location_sum(op_id, decoupling_metadata, num_relevant_operators);
     }
 
+    // Partitioning is possible if no node in the location persists
     if node_persists(node) {
         add_op_to_location_sum(op_id, decoupling_metadata, num_persist_operators);
     }
+
+    // Create field vars
+    let field_vars = field_vars_from_op(
+        op_id,
+        canonical_fields,
+        op_id_to_field_vars,
+        op_id_to_partition_expr,
+        decoupling_metadata,
+    );
+
+    // TODO: Constrain in line with parent partitionings
+}
+
+fn zero_cost_if_expr_sums_to_zero(
+    loc_to_expr: &HashMap<usize, Expression>,
+    decoupling_metadata: &RefCell<DecoupleILPMetadata>,
+    max_num_ops: usize,
+) {
+    let DecoupleILPMetadata {
+        cpu_usages,
+        variables,
+        constraints,
+        ..
+    } = &mut *decoupling_metadata.borrow_mut();
+
+    for (loc, expr) in loc_to_expr {
+        cpu_usages.entry(*loc).and_modify(|cpu_usage| {
+            // If expr == 0, set cost to 0, otherwise, keep original cost
+            // Enforce with big-M constraints, where M = max_num_ops + 1:
+            //   expr <= M * zero_if_sums_to_zero
+            //   expr >= zero_if_sums_to_zero
+            let zero_if_sums_to_zero = variables.add(variable().binary());
+            constraints.push(constraint!(
+                expr.clone() <= (max_num_ops + 1) as f64 * zero_if_sums_to_zero
+            ));
+            constraints.push(constraint!(expr.clone() >= zero_if_sums_to_zero));
+
+            // Similar constraints for CPU, where M = 1.0 (100% CPU usage)
+            let prev_cpu_usage = std::mem::take(cpu_usage);
+            let cpu_usage_var = variables.add(variable().min(0));
+            constraints.push(constraint!(cpu_usage_var <= zero_if_sums_to_zero));
+            constraints.push(constraint!(
+                cpu_usage_var >= prev_cpu_usage - 1 + zero_if_sums_to_zero
+            ));
+
+            *cpu_usage = Expression::default() + cpu_usage_var;
+        });
+    }
+}
+
+fn zero_cost_if_partitionable(
+    num_relevant_operators: &HashMap<usize, Expression>,
+    partitionable_operators: &HashMap<usize, Expression>,
+    decoupling_metadata: &RefCell<DecoupleILPMetadata>,
+    max_num_ops: usize,
+) {
+    let DecoupleILPMetadata {
+        variables,
+        constraints,
+        ..
+    } = &mut *decoupling_metadata.borrow_mut();
+
+    let mut loc_to_difference = HashMap::new();
+    for (loc, num_relevant) in num_relevant_operators {
+        let num_partitionable = partitionable_operators.get(loc).unwrap();
+
+        // Difference > 0 if num_relevant != num_partitionable
+        let difference_var = variables.add(variable());
+        constraints.push(constraint!(difference_var >= num_relevant.clone() - num_partitionable.clone()));
+        constraints.push(constraint!(difference_var >= num_partitionable.clone() - num_relevant.clone()));
+        loc_to_difference.insert(*loc, Expression::default() + difference_var);
+    }
+
+    zero_cost_if_expr_sums_to_zero(&loc_to_difference, decoupling_metadata, max_num_ops);
 }
 
 pub(crate) fn partition_ilp_analysis(
@@ -452,10 +572,17 @@ pub(crate) fn partition_ilp_analysis(
     cycle_source_to_sink_input: &HashMap<usize, usize>,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
+    // Make all cost expressions at all locations default to 0
+    let location_to_zero_expr: HashMap<usize, Expression> =
+        (0..decoupling_metadata.borrow().num_locations)
+            .map(|loc| (loc, Expression::default() + 0))
+            .collect();
     let mut metadata = PartitionILPMetadata {
-        num_relevant_operators: HashMap::new(),
-        partitionable_operators: HashMap::new(),
-        num_persist_operators: HashMap::new(),
+        op_id_to_field_vars: HashMap::new(),
+        op_id_to_partition_expr: HashMap::new(),
+        num_relevant_operators: location_to_zero_expr.clone(),
+        partitionable_operators: location_to_zero_expr.clone(),
+        num_persist_operators: location_to_zero_expr,
     };
 
     let inputs = all_inputs(ir, &decoupling_metadata.borrow().bottleneck);
@@ -465,15 +592,35 @@ pub(crate) fn partition_ilp_analysis(
         &inputs,
         cycle_source_to_sink_input,
     );
+    let canonical_fields = create_canonical_fields(
+        ir,
+        &decoupling_metadata.borrow().bottleneck,
+        cycle_source_to_sink_input,
+    );
 
     traverse_dfir(
         ir,
         |_, _| {},
         |node, id| {
-            partition_ilp_node_analysis(node, *id, &idbs, &mut metadata, decoupling_metadata);
+            partition_ilp_node_analysis(
+                node,
+                *id,
+                &idbs,
+                &canonical_fields,
+                &mut metadata,
+                decoupling_metadata,
+            );
         },
     );
 
+    let num_ops = decoupling_metadata.borrow().op_id_to_var.len();
+
     // Set cost to 0 if all relevant operators are partitionable
+    zero_cost_if_partitionable(&metadata.num_relevant_operators, &metadata.partitionable_operators, decoupling_metadata, num_ops);
     // Set cost to 0 if no nodes persist
+    zero_cost_if_expr_sums_to_zero(
+        &metadata.num_persist_operators,
+        decoupling_metadata,
+        num_ops,
+    );
 }
