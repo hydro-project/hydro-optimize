@@ -11,7 +11,7 @@ use hydro_test::cluster::two_pc_bench::{Aggregator, Client};
 use crate::debug::name_to_id_map;
 use crate::partition_node_analysis::{nodes_to_partition, partitioning_analysis};
 use crate::partitioner::{Partitioner, partition};
-use crate::repair::{cycle_source_to_sink_input, inject_id, inject_location};
+use crate::repair::{cycle_source_to_sink_parent, inject_id, inject_location};
 
 const NUM_PARTICIPANTS: usize = 3;
 
@@ -46,7 +46,7 @@ fn two_pc_partition_coordinator() {
     let built = builder
         .optimize_with(|ir| {
             inject_id(ir);
-            cycle_data = cycle_source_to_sink_input(ir);
+            cycle_data = cycle_source_to_sink_parent(ir);
             inject_location(ir, &cycle_data);
         })
         .into_deploy::<HydroDeploy>();
@@ -101,7 +101,7 @@ fn two_pc_partition_participant() {
     let built = builder
         .optimize_with(|ir| {
             inject_id(ir);
-            cycle_data = cycle_source_to_sink_input(ir);
+            cycle_data = cycle_source_to_sink_parent(ir);
             inject_location(ir, &cycle_data);
         })
         .into_deploy::<HydroDeploy>();

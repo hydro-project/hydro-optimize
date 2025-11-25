@@ -6,7 +6,7 @@ use std::{
 use good_lp::{Expression, Variable, constraint, variable};
 use hydro_lang::{
     compile::ir::{HydroNode, HydroRoot, traverse_dfir},
-    location::{self, dynamic::LocationId},
+    location::dynamic::LocationId,
 };
 use syn::visit::Visit;
 
@@ -14,7 +14,7 @@ use crate::{
     decouple_analysis::{DecoupleILPMetadata, node_is_in_bottleneck},
     partition_node_analysis::all_inputs,
     partition_syn_analysis::{AnalyzeClosure, StructOrTuple, StructOrTupleIndex},
-    rewrites::{input_ids, op_id_to_inputs},
+    rewrites::{parent_ids, op_id_to_parents},
 };
 
 /// Add id to dependent_nodes if its parent_id is already in dependent_nodes
@@ -36,7 +36,7 @@ fn nodes_dependent_on_inputs(
     ir: &mut [HydroRoot],
     location: &LocationId,
     inputs: &Vec<usize>,
-    cycle_source_to_sink_input: &HashMap<usize, usize>,
+    cycle_source_to_sink_parent: &HashMap<usize, usize>,
 ) -> HashSet<usize> {
     let dependent_nodes = RefCell::new(HashSet::from_iter(inputs.iter().cloned()));
     let mut num_dependent_nodes = inputs.len();
@@ -55,7 +55,7 @@ fn nodes_dependent_on_inputs(
             },
             |node, next_stmt_id| {
                 if node.metadata().location_kind.root() == location.root() {
-                    for parent_id in input_ids(node, Some(location), cycle_source_to_sink_input) {
+                    for parent_id in parent_ids(node, Some(location), cycle_source_to_sink_parent) {
                         insert_dependent_node(&dependent_nodes, Some(parent_id), *next_stmt_id);
                     }
                 }
@@ -76,7 +76,7 @@ fn nodes_dependent_on_inputs(
 /// Given a node type, return how its output fields is dependent on its left and right parents.
 /// A node that has 2 parents is only partitionable if it can be partitioned on a field with a dependency to a field in each parent, and both parents can also be partitioned on those fields.
 /// TODO: If the node is a KeyedStream with TotalOrder, we need to restrict partitioning to only the key fields.
-fn output_to_input_fields(node: &HydroNode) -> (StructOrTuple, StructOrTuple) {
+fn output_to_parent_fields(node: &HydroNode) -> (StructOrTuple, StructOrTuple) {
     match node {
         HydroNode::Placeholder => {
             panic!()
@@ -174,6 +174,54 @@ fn output_to_input_fields(node: &HydroNode) -> (StructOrTuple, StructOrTuple) {
     }
 }
 
+/// Note: Should be kept in sync with `output_to_parent_fields`
+fn num_parents(node: &HydroNode) -> usize {
+    match node {
+        HydroNode::Placeholder => {
+            panic!()
+        }
+        // We don't consider parents on other nodes for partitioning
+        HydroNode::Network { .. } => 0,
+        HydroNode::Cast { .. }
+        | HydroNode::ObserveNonDet { .. }
+        | HydroNode::Source { .. }
+        | HydroNode::SingletonSource { .. }
+        | HydroNode::CycleSource { .. }
+        | HydroNode::Tee { .. }
+        | HydroNode::Persist { .. }
+        | HydroNode::YieldConcat { .. }
+        | HydroNode::BeginAtomic { .. }
+        | HydroNode::EndAtomic { .. }
+        | HydroNode::Batch { .. }
+        | HydroNode::ResolveFutures { .. }
+        | HydroNode::ResolveFuturesOrdered { .. }
+        | HydroNode::Filter { .. }
+        | HydroNode::DeferTick { .. }
+        | HydroNode::Inspect { .. }
+        | HydroNode::Unique { .. }
+        | HydroNode::Sort { .. }
+        | HydroNode::ExternalInput { .. }
+        | HydroNode::Counter { .. }
+        | HydroNode::Map { .. }
+        | HydroNode::FilterMap { .. }
+        | HydroNode::Enumerate { .. }
+        | HydroNode::FoldKeyed { .. }
+        | HydroNode::ReduceKeyed { .. }
+        | HydroNode::ReduceKeyedWatermark { .. }
+        | HydroNode::FlatMap { .. }
+        | HydroNode::Scan { .. }
+        | HydroNode::Fold { .. }
+        | HydroNode::Reduce { .. } => 1,
+        HydroNode::Chain { .. }
+        | HydroNode::ChainFirst { .. }
+        | HydroNode::Difference { .. }
+        | HydroNode::CrossProduct { .. }
+        | HydroNode::CrossSingleton { .. }
+        | HydroNode::Join { .. }
+        | HydroNode::AntiJoin { .. } => 2,
+    }
+}
+
 /// Returns whether any additional dependencies were added
 fn create_canonical_fields_node(
     node: Option<&HydroNode>,
@@ -191,7 +239,7 @@ fn create_canonical_fields_node(
             if let Some(node) = node {
                 // Create the dependencies if necessary
                 mutated = true;
-                entry.insert(output_to_input_fields(&node))
+                entry.insert(output_to_parent_fields(&node))
             } else {
                 // If we have found this node recursively, and there is no mapping yet, wait until we process this node
                 return false;
@@ -237,9 +285,9 @@ fn create_canonical_fields_node(
 fn create_canonical_fields(
     ir: &mut [HydroRoot],
     location: &LocationId,
-    cycle_source_to_sink_input: &HashMap<usize, usize>,
+    cycle_source_to_sink_parent: &HashMap<usize, usize>,
 ) -> HashMap<usize, (StructOrTuple, StructOrTuple)> {
-    let op_to_parents = op_id_to_inputs(ir, Some(location), cycle_source_to_sink_input);
+    let op_to_parents = op_id_to_parents(ir, Some(location), cycle_source_to_sink_parent);
     let mut op_to_dependencies = HashMap::new();
 
     loop {
@@ -357,7 +405,7 @@ fn node_persists(node: &HydroNode) -> bool {
         | HydroNode::ChainFirst { .. }
         | HydroNode::CrossSingleton { .. }
         | HydroNode::Sort { .. } => false,
-        // Maybe, depending on if it's 'static (either hidden input parent is Persist)
+        // Maybe, depending on if it's 'static (either hidden parent is Persist)
         HydroNode::Join { left, right, .. } | HydroNode::CrossProduct { left, right, .. } => {
             matches!(left.as_ref(), HydroNode::Persist { .. })
                 || matches!(right.as_ref(), HydroNode::Persist { .. })
@@ -406,12 +454,36 @@ fn add_op_to_location_sum(
             .get(&loc)
             .unwrap();
 
-        location_sum
-            .entry(loc)
-            .and_modify(|expr| {
-                let temp_expr = std::mem::take(expr);
-                *expr = temp_expr + op_var;
-            });
+        location_sum.entry(loc).and_modify(|expr| {
+            let temp_expr = std::mem::take(expr);
+            *expr = temp_expr + op_var;
+        });
+    }
+}
+
+fn add_is_input_var(
+    id: usize,
+    parents: Vec<usize>,
+    decoupling_metadata: &RefCell<DecoupleILPMetadata>,
+) {
+    let DecoupleILPMetadata {
+        op_id_to_var,
+        variables,
+        constraints,
+        ..
+    } = &mut *decoupling_metadata.borrow_mut();
+
+    let is_input_var = variables.add(variable().binary());
+
+    let parent_vars = parents.iter().map(|parent_id| {
+        op_id_to_var
+            .get(parent_id)
+            .unwrap()
+    }).collect::<Vec<_>>();
+    for (loc, var) in op_id_to_var.get(&id).unwrap() {
+        
+        // Enforce is_input_var == 1 if op is at this location
+        constraints.push(constraint!(is_input_var >= *var));
     }
 }
 
@@ -453,6 +525,92 @@ fn field_vars_from_op(
         .clone()
 }
 
+fn constrain_field_vars_to_parents(
+    op_id: usize,
+    op_id_to_parents: &HashMap<usize, Vec<usize>>,
+    canonical_fields: &HashMap<usize, (StructOrTuple, StructOrTuple)>,
+    op_id_to_field_vars: &mut HashMap<usize, HashMap<StructOrTupleIndex, Variable>>,
+    op_id_to_partition_expr: &mut HashMap<usize, Expression>,
+    decoupling_metadata: &RefCell<DecoupleILPMetadata>,
+) {
+    // Create field vars
+    let field_vars = field_vars_from_op(
+        op_id,
+        canonical_fields,
+        op_id_to_field_vars,
+        op_id_to_partition_expr,
+        decoupling_metadata,
+    );
+
+    // Create field vars for parents
+    let parents = op_id_to_parents.get(&op_id).unwrap();
+    if parents.is_empty() {
+        // Must be a Network node, no constraints
+        return;
+    }
+
+    // Only track r_parent if this node has 2 parents
+    let (l_parent_dependencies, r_parent_dependencies) = canonical_fields.get(&op_id).unwrap();
+    let mut parent_dependencies = vec![l_parent_dependencies];
+    if parents.len() == 2 {
+        parent_dependencies.push(r_parent_dependencies);
+    }
+
+    // Create parent field vars
+    let parent_field_vars = parents
+        .iter()
+        .map(|parent_id| {
+            field_vars_from_op(
+                *parent_id,
+                canonical_fields,
+                op_id_to_field_vars,
+                op_id_to_partition_expr,
+                decoupling_metadata,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let DecoupleILPMetadata { constraints, .. } = &mut *decoupling_metadata.borrow_mut();
+
+    for (field_name, field_var) in field_vars {
+        // If there's a link from this field to all parents, constrain it to the corresponding field in all parents
+        // Otherwise, only allow using this field for partitioning if this is an input node
+        let mut corresponding_parent_field_vars = vec![vec![]; parents.len()];
+        for (left_or_right, parent_dependency) in parent_dependencies.iter().enumerate() {
+            // Does this field point to something in this parent? If so, find the vars
+            if let Some(corresponding_parent_nested_field) =
+                parent_dependency.get_dependencies(&field_name)
+            {
+                for parent_field in &corresponding_parent_nested_field.get_dependency() {
+                    corresponding_parent_field_vars[left_or_right].push(
+                        parent_field_vars
+                            .get(left_or_right)
+                            .unwrap()
+                            .get(parent_field)
+                            .unwrap(),
+                    );
+                }
+            }
+        }
+
+        let all_parents_have_corresponding_fields = corresponding_parent_field_vars
+            .iter()
+            .all(|vars| !vars.is_empty());
+        if all_parents_have_corresponding_fields {
+            // For each field:
+            // 1. Both parents must partition on some corresponding field
+            // 2. If a parent has multiple corresponding fields, it only needs to partition on one of them
+            for parent_vars in corresponding_parent_field_vars {
+                let mut parent_var_sum = Expression::default();
+                for parent_var in parent_vars {
+                    parent_var_sum = parent_var_sum + *parent_var;
+                }
+                constraints.push(constraint!(field_var <= parent_var_sum));
+            }
+        }
+    }
+}
+
 fn partition_ilp_node_analysis(
     node: &HydroNode,
     op_id: usize,
@@ -460,6 +618,7 @@ fn partition_ilp_node_analysis(
     canonical_fields: &HashMap<usize, (StructOrTuple, StructOrTuple)>,
     metadata: &mut PartitionILPMetadata,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
+    op_id_to_parents: &HashMap<usize, Vec<usize>>,
 ) {
     let network_type = decoupling_metadata
         .borrow()
@@ -492,16 +651,14 @@ fn partition_ilp_node_analysis(
         add_op_to_location_sum(op_id, decoupling_metadata, num_persist_operators);
     }
 
-    // Create field vars
-    let field_vars = field_vars_from_op(
+    constrain_field_vars_to_parents(
         op_id,
+        op_id_to_parents,
         canonical_fields,
         op_id_to_field_vars,
         op_id_to_partition_expr,
         decoupling_metadata,
     );
-
-    // TODO: Constrain in line with parent partitionings
 }
 
 fn zero_cost_if_expr_sums_to_zero(
@@ -559,8 +716,12 @@ fn zero_cost_if_partitionable(
 
         // Difference > 0 if num_relevant != num_partitionable
         let difference_var = variables.add(variable());
-        constraints.push(constraint!(difference_var >= num_relevant.clone() - num_partitionable.clone()));
-        constraints.push(constraint!(difference_var >= num_partitionable.clone() - num_relevant.clone()));
+        constraints.push(constraint!(
+            difference_var >= num_relevant.clone() - num_partitionable.clone()
+        ));
+        constraints.push(constraint!(
+            difference_var >= num_partitionable.clone() - num_relevant.clone()
+        ));
         loc_to_difference.insert(*loc, Expression::default() + difference_var);
     }
 
@@ -569,7 +730,8 @@ fn zero_cost_if_partitionable(
 
 pub(crate) fn partition_ilp_analysis(
     ir: &mut [HydroRoot],
-    cycle_source_to_sink_input: &HashMap<usize, usize>,
+    cycle_source_to_sink_parent: &HashMap<usize, usize>,
+    op_id_to_parents: &HashMap<usize, Vec<usize>>,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
     // Make all cost expressions at all locations default to 0
@@ -590,12 +752,12 @@ pub(crate) fn partition_ilp_analysis(
         ir,
         &decoupling_metadata.borrow().bottleneck,
         &inputs,
-        cycle_source_to_sink_input,
+        cycle_source_to_sink_parent,
     );
     let canonical_fields = create_canonical_fields(
         ir,
         &decoupling_metadata.borrow().bottleneck,
-        cycle_source_to_sink_input,
+        cycle_source_to_sink_parent,
     );
 
     traverse_dfir(
@@ -609,6 +771,7 @@ pub(crate) fn partition_ilp_analysis(
                 &canonical_fields,
                 &mut metadata,
                 decoupling_metadata,
+                op_id_to_parents,
             );
         },
     );
@@ -616,7 +779,12 @@ pub(crate) fn partition_ilp_analysis(
     let num_ops = decoupling_metadata.borrow().op_id_to_var.len();
 
     // Set cost to 0 if all relevant operators are partitionable
-    zero_cost_if_partitionable(&metadata.num_relevant_operators, &metadata.partitionable_operators, decoupling_metadata, num_ops);
+    zero_cost_if_partitionable(
+        &metadata.num_relevant_operators,
+        &metadata.partitionable_operators,
+        decoupling_metadata,
+        num_ops,
+    );
     // Set cost to 0 if no nodes persist
     zero_cost_if_expr_sums_to_zero(
         &metadata.num_persist_operators,

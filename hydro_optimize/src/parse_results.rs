@@ -24,7 +24,7 @@ pub struct RunMetadata {
     pub op_id_to_cpu_usage: HashMap<usize, f64>,
     pub op_id_to_recv_cpu_usage: HashMap<usize, f64>,
     pub op_id_to_cardinality: HashMap<usize, usize>,
-    pub op_id_to_input_op_id: HashMap<usize, Vec<usize>>,
+    pub op_id_to_parent_op_id: HashMap<usize, Vec<usize>>,
     pub network_op_id: HashSet<usize>,
 }
 
@@ -310,7 +310,7 @@ pub fn analyze_send_recv_overheads(ir: &mut [HydroRoot], run_metadata: &mut RunM
                 let sender = input.metadata().location_kind.root();
                 let receiver = metadata.location_kind.root();
 
-                // Use cardinality from the network's input, not the network itself.
+                // Use cardinality from the network's parent, not the network itself.
                 // Reason: Cardinality is measured at ONE recipient, but the sender may be sending to MANY machines.
                 if let Some(cpu_usage) = metadata.op.cpu_usage
                     && let Some(cardinality) = input.metadata().cardinality
@@ -402,11 +402,11 @@ fn record_metadata(
             .insert(id, network_recv_cpu_usage);
     }
 
-    let input_ids = input_metadata
+    let parent_ids = input_metadata
         .iter()
-        .filter_map(|input| input.op.id)
+        .filter_map(|parent| parent.op.id)
         .collect();
-    run_metadata.op_id_to_input_op_id.insert(id, input_ids);
+    run_metadata.op_id_to_parent_op_id.insert(id, parent_ids);
 }
 
 fn record_metadata_root(root: &mut HydroRoot, run_metadata: &mut RunMetadata) {
@@ -416,13 +416,13 @@ fn record_metadata_root(root: &mut HydroRoot, run_metadata: &mut RunMetadata) {
         run_metadata,
     );
 
-    // Location = input's location, cardinality = input's cardinality
+    // Location = parent's location, cardinality = parent's cardinality
     let id = root.op_metadata().id.unwrap();
-    let input = root.input_metadata();
+    let parent = root.input_metadata();
     run_metadata
         .op_id_to_location
-        .insert(id, input.location_kind.root().clone());
-    if let Some(cardinality) = input.cardinality {
+        .insert(id, parent.location_kind.root().clone());
+    if let Some(cardinality) = parent.cardinality {
         run_metadata.op_id_to_cardinality.insert(id, cardinality);
     }
 }
@@ -462,7 +462,7 @@ fn compare_expected_values(
 /// If the op_id is a network node, return the sender's location by checking its parent. Otherwise return the operator's location
 fn sender_location_if_network(run_metadata: &RunMetadata, op_id: usize) -> &LocationId {
     if run_metadata.network_op_id.contains(&op_id) {
-        let parent = run_metadata.op_id_to_input_op_id.get(&op_id).unwrap();
+        let parent = run_metadata.op_id_to_parent_op_id.get(&op_id).unwrap();
         assert!(
             parent.len() == 1,
             "Network operator should have exactly one input"
@@ -560,7 +560,7 @@ pub fn compare_expected_performance(
 
     // 2. Compare operators without orig_id (added by decoupling)
     let mut prev_id_and_loc_to_send_usage = HashMap::new(); // (id in prev iteration, LocationId of sender) -> CPU usage of decoupled output nodes
-    let mut prev_id_and_loc_to_recv_usage = HashMap::new(); // (id in prev iteration, LocationId of receiver) -> CPU usage of decoupled input nodes
+    let mut prev_id_and_loc_to_recv_usage = HashMap::new(); // (id in prev iteration, LocationId of receiver) -> CPU usage of decoupled parent nodes
     for (id, location) in run_metadata.op_id_to_location.iter() {
         if run_metadata.op_id_to_prev_iteration_op_id.contains_key(id) {
             continue;
@@ -571,22 +571,22 @@ pub fn compare_expected_performance(
         let mut parent_prev_id = None;
         let mut curr_id = *id;
         while parent_prev_id.is_none() {
-            let inputs = run_metadata.op_id_to_input_op_id.get(&curr_id).unwrap();
+            let parents = run_metadata.op_id_to_parent_op_id.get(&curr_id).unwrap();
             assert_eq!(
-                inputs.len(),
+                parents.len(),
                 1,
-                "Warning: Location {:?}: Created operator {} has {} inputs, expected 1",
+                "Warning: Location {:?}: Created operator {} has {} parents, expected 1",
                 location,
                 id,
-                inputs.len()
+                parents.len()
             );
-            let input = inputs[0];
+            let parent = parents[0];
 
-            if let Some(prev_id) = run_metadata.op_id_to_prev_iteration_op_id.get(&input) {
+            if let Some(prev_id) = run_metadata.op_id_to_prev_iteration_op_id.get(&parent) {
                 parent_prev_id = Some(*prev_id);
-                parent_id = Some(input);
+                parent_id = Some(parent);
             } else {
-                curr_id = input;
+                curr_id = parent;
             }
         }
 

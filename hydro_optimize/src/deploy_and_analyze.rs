@@ -18,7 +18,7 @@ use crate::parse_results::{
     MultiRunMetadata, analyze_cluster_results, analyze_send_recv_overheads,
     compare_expected_performance, get_or_append_run_metadata,
 };
-use crate::repair::{cycle_source_to_sink_input, inject_id, remove_counter};
+use crate::repair::{cycle_source_to_sink_parent, inject_id, remove_counter};
 
 const COUNTER_PREFIX: &str = "_optimize_counter";
 pub(crate) const CPU_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_CPU:";
@@ -222,7 +222,7 @@ pub async fn deploy_and_analyze<'a>(
     remove_counter(&mut ir);
 
     // Create a mapping from each CycleSink to its corresponding CycleSource
-    let cycle_source_to_sink_input = cycle_source_to_sink_input(&mut ir);
+    let cycle_source_to_sink_parent = cycle_source_to_sink_parent(&mut ir);
     analyze_send_recv_overheads(&mut ir, run_metadata);
     let send_overhead = run_metadata
         .send_overhead
@@ -247,7 +247,7 @@ pub async fn deploy_and_analyze<'a>(
         send_overhead,
         recv_overhead,
         num_locations,
-        &cycle_source_to_sink_input,
+        &cycle_source_to_sink_parent,
         true,
     );
 

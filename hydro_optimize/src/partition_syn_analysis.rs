@@ -8,7 +8,7 @@ pub(crate) type StructOrTupleIndex = Vec<String>; // Ex: ["a", "b"] represents x
 // Invariant: Cannot have both a dependency and fields (fields are more specific)
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub(crate) struct StructOrTuple {
-    dependencies: BTreeSet<StructOrTupleIndex>, /* Input tuple indices this tuple is equal to, if any */
+    dependencies: BTreeSet<StructOrTupleIndex>, /* Parent tuple indices this tuple is equal to, if any */
     fields: BTreeMap<String, Box<StructOrTuple>>, // Fields 1 layer deep
     could_be_none: bool, // True if this field could also be None (used for FilterMap)
 }
@@ -16,7 +16,7 @@ pub(crate) struct StructOrTuple {
 impl StructOrTuple {
     pub(crate) fn new_completely_dependent() -> Self {
         StructOrTuple {
-            dependencies: BTreeSet::from([vec![]]), /* Empty vec means it is completely dependent on the input tuple */
+            dependencies: BTreeSet::from([vec![]]), /* Empty vec means it is completely dependent on the parent tuple */
             fields: BTreeMap::new(),
             could_be_none: false,
         }
@@ -109,10 +109,10 @@ impl StructOrTuple {
     pub(crate) fn add_dependency(
         &mut self,
         index: &StructOrTupleIndex,
-        input_tuple_index: StructOrTupleIndex,
+        parent_tuple_index: StructOrTupleIndex,
     ) {
         let (child, _) = self.create_child(index.clone());
-        child.dependencies.insert(input_tuple_index);
+        child.dependencies.insert(parent_tuple_index);
     }
 
     /// Note: May return redundant dependencies; no easy fix given we can the same field can depend on multiple things
@@ -132,6 +132,10 @@ impl StructOrTuple {
             }
         }
         Some(child)
+    }
+
+    pub(crate) fn get_dependency(&self) -> BTreeSet<StructOrTupleIndex> {
+        self.dependencies.clone()
     }
 
     fn get_all_nested_dependencies(&self) -> BTreeSet<StructOrTupleIndex> {
@@ -655,7 +659,7 @@ impl Visit<'_> for StructOrTupleUseRhs {
     }
 }
 
-// Create a mapping from Ident to tuple indices (Note: Not necessarily input tuple indices)
+// Create a mapping from Ident to tuple indices (Note: Not necessarily parent tuple indices)
 // For example, (a, (b, c)) -> { a: [0], b: [1, 0], c: [1, 1] }
 #[derive(Default)]
 struct TupleDeclareLhs {
@@ -724,8 +728,8 @@ struct EqualityAnalysis {
 impl EqualityAnalysis {
     pub fn visit_assignment(&mut self, lhs: &syn::Pat, rhs: Option<Box<syn::Expr>>) {
         // Analyze LHS
-        let mut input_analysis: TupleDeclareLhs = TupleDeclareLhs::default();
-        input_analysis.visit_pat(lhs);
+        let mut parent_analysis: TupleDeclareLhs = TupleDeclareLhs::default();
+        parent_analysis.visit_pat(lhs);
 
         // Analyze RHS
         let mut analysis = StructOrTupleUseRhs::default();
@@ -736,7 +740,7 @@ impl EqualityAnalysis {
         }
 
         // Set dependencies from LHS to RHS
-        for (lhs, tuple_index) in input_analysis.lhs_tuple.iter() {
+        for (lhs, tuple_index) in parent_analysis.lhs_tuple.iter() {
             let mut tuple = StructOrTuple::default();
             tuple.set_dependencies(tuple_index, &analysis.rhs_tuple, tuple_index);
             if tuple.is_empty() {
@@ -812,25 +816,25 @@ impl Visit<'_> for AnalyzeClosure {
             panic!("Nested closures found in a single Expr during partitioning analysis.");
         }
 
-        // Find all input vars
+        // Find all parent vars
         self.output_dependencies = StructOrTuple::default();
         self.found_closure = true;
         if closure.inputs.len() > 1 {
             panic!(
-                "Partitioning analysis does not currently support closures with multiple inputs (such as reduce): {:?}.",
+                "Partitioning analysis does not currently support closures with multiple parents (such as reduce): {:?}.",
                 closure
             );
         }
-        let mut input_analysis = TupleDeclareLhs::default();
-        input_analysis.visit_pat(&closure.inputs[0]);
+        let mut parent_analysis = TupleDeclareLhs::default();
+        parent_analysis.visit_pat(&closure.inputs[0]);
         println!(
             "Input idents to tuple indices: {:?}",
-            input_analysis.lhs_tuple
+            parent_analysis.lhs_tuple
         );
 
         // Perform dependency analysis on the body
         let mut analyzer = EqualityAnalysis {
-            dependencies: input_analysis.into_tuples(),
+            dependencies: parent_analysis.into_tuples(),
             ..Default::default()
         };
         analyzer.visit_expr(&closure.body);
@@ -931,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tuple_input_assignment() {
+    fn test_tuple_parent_assignment() {
         let builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
@@ -944,7 +948,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tuple_input_implicit_nesting() {
+    fn test_tuple_parent_implicit_nesting() {
         let builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
@@ -1005,7 +1009,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tuple_input_output_implicit_nesting() {
+    fn test_tuple_parent_output_implicit_nesting() {
         let builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster

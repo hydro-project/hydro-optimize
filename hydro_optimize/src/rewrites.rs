@@ -125,7 +125,7 @@ impl VisitMut for ClusterSelfIdReplace {
 }
 
 /// Converts input metadata to IDs, filtering by location if provided
-pub fn relevant_inputs(
+pub fn relevant_parents(
     input_metadatas: Vec<&HydroIrMetadata>,
     location: Option<&LocationId>,
 ) -> Vec<usize> {
@@ -143,39 +143,39 @@ pub fn relevant_inputs(
         .collect()
 }
 
-pub fn input_ids(
+pub fn parent_ids(
     node: &HydroNode,
     location: Option<&LocationId>,
-    cycle_source_to_sink_input: &HashMap<usize, usize>,
+    cycle_source_to_sink_parent: &HashMap<usize, usize>,
 ) -> Vec<usize> {
     match node {
         HydroNode::CycleSource { metadata, .. } => {
-            // For CycleSource, its input is its CycleSink's input. Note: assumes the CycleSink is on the same cluster
-            vec![*cycle_source_to_sink_input.get(&metadata.op.id.unwrap()).unwrap()]
+            // For CycleSource, its parent is its CycleSink's parent. Note: assumes the CycleSink is on the same cluster
+            vec![*cycle_source_to_sink_parent.get(&metadata.op.id.unwrap()).unwrap()]
         }
         HydroNode::Tee { inner, .. } => {
             vec![inner.0.borrow().op_metadata().id.unwrap()]
         }
-        _ => relevant_inputs(node.input_metadata(), location),
+        _ => relevant_parents(node.input_metadata(), location),
     }
 }
 
-/// Creates a mapping from op_id to its input op_ids, filtered by location if provided
-pub fn op_id_to_inputs(
+/// Creates a mapping from op_id to its parent op_ids, filtered by location if provided
+pub fn op_id_to_parents(
     ir: &mut [HydroRoot],
     location: Option<&LocationId>,
-    cycle_source_to_sink_input: &HashMap<usize, usize>,
+    cycle_source_to_sink_parent: &HashMap<usize, usize>,
 ) -> HashMap<usize, Vec<usize>> {
     let mapping = RefCell::new(HashMap::new());
 
     traverse_dfir(
         ir,
         |leaf, op_id| {
-            let relevant_input_ids = relevant_inputs(vec![leaf.input_metadata()], location);
-            mapping.borrow_mut().insert(*op_id, relevant_input_ids);
+            let relevant_parent_ids = relevant_parents(vec![leaf.input_metadata()], location);
+            mapping.borrow_mut().insert(*op_id, relevant_parent_ids);
         },
         |node, op_id| {
-            mapping.borrow_mut().insert(*op_id, input_ids(node, location, cycle_source_to_sink_input));
+            mapping.borrow_mut().insert(*op_id, parent_ids(node, location, cycle_source_to_sink_parent));
         },
     );
 

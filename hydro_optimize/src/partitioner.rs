@@ -265,15 +265,15 @@ fn replace_process_location_id(
     }
 }
 
-fn replace_process_input_persist_location_id(
-    input: &mut Box<HydroNode>,
+fn replace_process_persist_location_id(
+    persist: &mut Box<HydroNode>,
     process_location: usize,
     cluster_location: usize,
 ) {
     if let HydroNode::Persist {
         metadata: persist_metadata,
         ..
-    } = input.as_mut()
+    } = persist.as_mut()
     {
         replace_process_location_id(
             &mut persist_metadata.location_kind,
@@ -296,19 +296,19 @@ fn replace_process_node_location(node: &mut HydroNode, partitioner: &Partitioner
         match node {
             // Update Persist's location as well (we won't see it during traversal)
             HydroNode::CrossProduct { left, right, .. } | HydroNode::Join { left, right, .. } => {
-                replace_process_input_persist_location_id(left, *location_id, *new_id);
-                replace_process_input_persist_location_id(right, *location_id, *new_id);
+                replace_process_persist_location_id(left, *location_id, *new_id);
+                replace_process_persist_location_id(right, *location_id, *new_id);
             }
             HydroNode::Difference { pos, neg, .. } | HydroNode::AntiJoin { pos, neg, .. } => {
-                replace_process_input_persist_location_id(pos, *location_id, *new_id);
-                replace_process_input_persist_location_id(neg, *location_id, *new_id);
+                replace_process_persist_location_id(pos, *location_id, *new_id);
+                replace_process_persist_location_id(neg, *location_id, *new_id);
             }
             HydroNode::Fold { input, .. }
             | HydroNode::FoldKeyed { input, .. }
             | HydroNode::Reduce { input, .. }
             | HydroNode::ReduceKeyed { input, .. }
             | HydroNode::Scan { input, .. } => {
-                replace_process_input_persist_location_id(input, *location_id, *new_id);
+                replace_process_persist_location_id(input, *location_id, *new_id);
             }
             _ => {}
         }

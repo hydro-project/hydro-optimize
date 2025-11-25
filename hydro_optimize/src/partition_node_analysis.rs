@@ -7,15 +7,15 @@ use syn::visit::Visit;
 
 use super::rewrites::{NetworkType, get_network_type};
 use crate::partition_syn_analysis::{AnalyzeClosure, StructOrTuple, StructOrTupleIndex};
-use crate::rewrites::op_id_to_inputs;
+use crate::rewrites::op_id_to_parents;
 
 /// Create a mapping from all input nodes to their parents (across locations)
 fn all_inputs_parents(
     ir: &mut [HydroRoot],
     inputs: &[usize],
-    cycle_source_to_sink_input: &HashMap<usize, usize>,
+    cycle_source_to_sink_parent: &HashMap<usize, usize>,
 ) -> BTreeMap<usize, usize> {
-    op_id_to_inputs(ir, None, cycle_source_to_sink_input)
+    op_id_to_parents(ir, None, cycle_source_to_sink_parent)
         .iter()
         .filter_map(|(op_id, parents)| {
             if inputs.contains(op_id) {
@@ -169,9 +169,9 @@ fn input_dependency_analysis_node(
         | HydroNode::DeferTick { .. }
         | HydroNode::Unique { .. }
         | HydroNode::Sort { .. }
-        | HydroNode::Difference { .. } // [a,b,c] difference [c,d] = [a,b]. Since only a subset of the 1st input is taken, we only care about its dependencies
+        | HydroNode::Difference { .. } // [a,b,c] difference [c,d] = [a,b]. Since only a subset of the 1st parent is taken, we only care about its dependencies
         | HydroNode::AntiJoin { .. } // [(a,1),(b,2)] anti-join [a] = [(b,2)]. Similar to Difference
-        | HydroNode::Filter { .. } // Although it contains a function f, the output is just a subset of the input, so just inherit from the parent
+        | HydroNode::Filter { .. } // Although it contains a function f, the output is just a subset of the parent, so just inherit from the parent
         | HydroNode::Inspect { .. }
         | HydroNode::Network { .. }
         | HydroNode::ExternalInput { .. }
@@ -602,12 +602,12 @@ fn partitioning_constraint_analysis_node(
 pub fn partitioning_analysis(
     ir: &mut [HydroRoot],
     location: &LocationId,
-    cycle_source_to_sink_input: &HashMap<usize, usize>,
+    cycle_source_to_sink_parent: &HashMap<usize, usize>,
 ) -> Option<(
     Vec<BTreeMap<usize, StructOrTupleIndex>>,
     BTreeMap<usize, usize>,
 )> {
-    let op_id_to_parents = op_id_to_inputs(ir, Some(location), cycle_source_to_sink_input);
+    let op_id_to_parents = op_id_to_parents(ir, Some(location), cycle_source_to_sink_parent);
     let dependency_metadata = input_dependency_analysis(ir, location, op_id_to_parents);
     let mut possible_partitionings = BTreeMap::new();
 
@@ -666,7 +666,7 @@ pub fn partitioning_analysis(
         println!("No restrictions on partitioning");
         return Some((
             Vec::new(),
-            all_inputs_parents(ir, &dependency_metadata.inputs, cycle_source_to_sink_input),
+            all_inputs_parents(ir, &dependency_metadata.inputs, cycle_source_to_sink_parent),
         ));
     }
 
@@ -726,7 +726,7 @@ pub fn partitioning_analysis(
     }
     Some((
         prev_global_partitionings,
-        all_inputs_parents(ir, &dependency_metadata.inputs, cycle_source_to_sink_input),
+        all_inputs_parents(ir, &dependency_metadata.inputs, cycle_source_to_sink_parent),
     ))
 }
 
@@ -771,7 +771,7 @@ mod tests {
     use stageleft::q;
 
     use crate::partition_node_analysis::partitioning_analysis;
-    use crate::repair::{cycle_source_to_sink_input, inject_id, inject_location};
+    use crate::repair::{cycle_source_to_sink_parent, inject_id, inject_location};
 
     fn test_input_partitionable(
         builder: FlowBuilder<'_>,
@@ -782,7 +782,7 @@ mod tests {
         let built = builder
             .optimize_with(|ir| {
                 inject_id(ir);
-                cycle_data = cycle_source_to_sink_input(ir);
+                cycle_data = cycle_source_to_sink_parent(ir);
                 inject_location(ir, &cycle_data);
             })
             .into_deploy::<HydroDeploy>();

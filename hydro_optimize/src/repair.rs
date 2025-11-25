@@ -7,6 +7,8 @@ use hydro_lang::compile::ir::{
 use hydro_lang::location::dynamic::LocationId;
 use syn::Ident;
 
+use crate::rewrites::parent_ids;
+
 fn inject_id_metadata(
     metadata: &mut HydroIrOpMetadata,
     new_id: usize,
@@ -35,9 +37,9 @@ pub fn inject_id(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
     new_id_to_old_id.take()
 }
 
-fn link_cycles_root(root: &mut HydroRoot, sink_inputs: &mut HashMap<Ident, usize>) {
+fn link_cycles_root(root: &mut HydroRoot, sink_parents: &mut HashMap<Ident, usize>) {
     if let HydroRoot::CycleSink { ident, input, .. } = root {
-        sink_inputs.insert(ident.clone(), input.op_metadata().id.unwrap());
+        sink_parents.insert(ident.clone(), input.op_metadata().id.unwrap());
     }
 }
 
@@ -50,17 +52,17 @@ fn link_cycles_node(node: &mut HydroNode, sources: &mut HashMap<Ident, usize>) {
     }
 }
 
-// Returns map from CycleSource id to the input IDs of the corresponding CycleSink's input
+// Returns map from CycleSource id to the parent IDs of the corresponding CycleSink's parent
 // Assumes that metadtata.id is set for all nodes
-pub fn cycle_source_to_sink_input(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
+pub fn cycle_source_to_sink_parent(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
     let mut sources = HashMap::new();
-    let mut sink_inputs = HashMap::new();
+    let mut sink_parents = HashMap::new();
 
     // Can't use traverse_dfir since that skips CycleSink
     transform_bottom_up(
         ir,
         &mut |leaf| {
-            link_cycles_root(leaf, &mut sink_inputs);
+            link_cycles_root(leaf, &mut sink_parents);
         },
         &mut |node| {
             link_cycles_node(node, &mut sources);
@@ -68,27 +70,27 @@ pub fn cycle_source_to_sink_input(ir: &mut [HydroRoot]) -> HashMap<usize, usize>
         false,
     );
 
-    let mut source_to_sink_input = HashMap::new();
-    for (sink_ident, sink_input_id) in sink_inputs {
+    let mut source_to_sink_parent = HashMap::new();
+    for (sink_ident, sink_parent_id) in sink_parents {
         if let Some(source_id) = sources.get(&sink_ident) {
-            source_to_sink_input.insert(*source_id, sink_input_id);
+            source_to_sink_parent.insert(*source_id, sink_parent_id);
         } else {
             std::panic!(
-                "No source found for CycleSink {}, Input Id {}",
+                "No source found for CycleSink {}, Parent Id {}",
                 sink_ident,
-                sink_input_id
+                sink_parent_id
             );
         }
     }
-    println!("Source to sink input: {:?}", source_to_sink_input);
-    source_to_sink_input
+    println!("Source to sink parent: {:?}", source_to_sink_parent);
+    source_to_sink_parent
 }
 
-fn inject_location_input_persist(input: &mut Box<HydroNode>, new_location: LocationId) {
+fn inject_location_persist(persist: &mut Box<HydroNode>, new_location: LocationId) {
     if let HydroNode::Persist {
         metadata: persist_metadata,
         ..
-    } = input.as_mut()
+    } = persist.as_mut()
     {
         persist_metadata.location_kind.swap_root(new_location);
     }
@@ -98,10 +100,10 @@ fn inject_location_input_persist(input: &mut Box<HydroNode>, new_location: Locat
 fn inject_location_node(
     node: &mut HydroNode,
     id_to_location: &mut HashMap<usize, LocationId>,
-    cycle_source_to_sink_input: &HashMap<usize, usize>,
+    cycle_source_to_sink_parent: &HashMap<usize, usize>,
 ) -> bool {
     if let Some(op_id) = node.op_metadata().id {
-        let inputs = match node {
+        let parents = match node {
             HydroNode::Source { metadata, .. }
             | HydroNode::SingletonSource { metadata, .. }
             | HydroNode::ExternalInput { metadata, .. }
@@ -110,23 +112,13 @@ fn inject_location_node(
                 id_to_location.insert(op_id, metadata.location_kind.clone());
                 return false;
             }
-            HydroNode::Tee { inner, .. } => {
-                vec![inner.0.borrow().op_metadata().id.unwrap()]
-            }
-            HydroNode::CycleSource { .. } => {
-                vec![*cycle_source_to_sink_input.get(&op_id).unwrap()]
-            }
-            _ => node
-                .input_metadata()
-                .iter()
-                .map(|input_metadata| input_metadata.op.id.unwrap())
-                .collect(),
+            _ => parent_ids(node, None, cycle_source_to_sink_parent),
         };
 
-        // Otherwise, get it from (either) input
+        // Otherwise, get it from (either) parent
         let metadata = node.metadata_mut();
-        for input in inputs {
-            let location = id_to_location.get(&input).cloned();
+        for parent in parents {
+            let location = id_to_location.get(&parent).cloned();
             if let Some(location) = location {
                 metadata.location_kind.swap_root(location.root().clone());
                 id_to_location.insert(op_id, metadata.location_kind.clone());
@@ -135,13 +127,13 @@ fn inject_location_node(
                     // Update Persist's location as well (we won't see it during traversal)
                     HydroNode::CrossProduct { left, right, .. }
                     | HydroNode::Join { left, right, .. } => {
-                        inject_location_input_persist(left, location.root().clone());
-                        inject_location_input_persist(right, location.root().clone());
+                        inject_location_persist(left, location.root().clone());
+                        inject_location_persist(right, location.root().clone());
                     }
                     HydroNode::Difference { pos, neg, .. }
                     | HydroNode::AntiJoin { pos, neg, .. } => {
-                        inject_location_input_persist(pos, location.root().clone());
-                        inject_location_input_persist(neg, location.root().clone());
+                        inject_location_persist(pos, location.root().clone());
+                        inject_location_persist(neg, location.root().clone());
                     }
                     HydroNode::Fold { input, .. }
                     | HydroNode::FoldKeyed { input, .. }
@@ -149,7 +141,7 @@ fn inject_location_node(
                     | HydroNode::ReduceKeyed { input, .. }
                     | HydroNode::ReduceKeyedWatermark { input, .. }
                     | HydroNode::Scan { input, .. } => {
-                        inject_location_input_persist(input, location.root().clone());
+                        inject_location_persist(input, location.root().clone());
                     }
                     _ => {}
                 }
@@ -166,7 +158,7 @@ fn inject_location_node(
     false
 }
 
-pub fn inject_location(ir: &mut [HydroRoot], cycle_source_to_sink_input: &HashMap<usize, usize>) {
+pub fn inject_location(ir: &mut [HydroRoot], cycle_source_to_sink_parent: &HashMap<usize, usize>) {
     let mut id_to_location = HashMap::new();
 
     loop {
@@ -178,7 +170,7 @@ pub fn inject_location(ir: &mut [HydroRoot], cycle_source_to_sink_input: &HashMa
             &mut |_| {},
             &mut |node| {
                 missing_location |=
-                    inject_location_node(node, &mut id_to_location, cycle_source_to_sink_input);
+                    inject_location_node(node, &mut id_to_location, cycle_source_to_sink_parent);
             },
             false,
         );

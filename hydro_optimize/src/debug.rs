@@ -3,31 +3,31 @@ use std::collections::HashMap;
 use hydro_lang::compile::ir::{HydroNode, HydroRoot, traverse_dfir};
 
 fn print_id_root(root: &mut HydroRoot, next_stmt_id: &mut usize) {
-    let input = root.input_metadata().op.id;
+    let parent = root.input_metadata().op.id;
     println!(
-        "{} Root {}, Inputs: {:?}",
+        "{} Root {}, Parents: {:?}",
         next_stmt_id,
         root.print_root(),
-        input,
+        parent,
     );
 }
 
 fn print_id_node(node: &mut HydroNode, next_stmt_id: &mut usize) {
     let metadata = node.metadata();
-    let inputs = node
+    let parents = node
         .input_metadata()
         .iter()
         .map(|m| m.op.id)
         .collect::<Vec<Option<usize>>>();
     println!(
-        "{} Node {}, {:?}, Cardinality: {:?}, CPU Usage: {:?}, Network Recv CPU Usage: {:?}, Inputs: {:?}",
+        "{} Node {}, {:?}, Cardinality: {:?}, CPU Usage: {:?}, Network Recv CPU Usage: {:?}, Parents: {:?}",
         next_stmt_id,
         node.print_root(),
         metadata,
         metadata.cardinality,
         metadata.op.cpu_usage,
         metadata.op.network_recv_cpu_usage,
-        inputs,
+        parents,
     );
 }
 

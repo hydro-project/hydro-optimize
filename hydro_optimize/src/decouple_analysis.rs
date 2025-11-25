@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use crate::partition_ilp_analysis::partition_ilp_analysis;
-use crate::rewrites::op_id_to_inputs;
+use crate::rewrites::op_id_to_parents;
 use good_lp::solvers::highs::HighsSolution;
 use good_lp::{
     Constraint, Expression, ProblemVariables, Solution, SolverModel, Variable, constraint, highs,
@@ -23,7 +23,7 @@ use super::rewrites::{NetworkType, get_network_type};
 /// Each operator is executed on the machine indicated by its INPUT's variable.
 ///
 /// Constraints:
-/// 1. For binary operators, both inputs must be assigned the same var (output to the same location)
+/// 1. For binary operators, both parents must be assigned the same var (output to the same location)
 /// 2. For Tee, the serialization/deserialization cost is paid only once if multiple branches are assigned different vars. (instead of sending each branch of the Tee over to a different node, we'll send it once and have the receiver Tee)
 ///
 /// HydroNode::Network:
@@ -41,7 +41,7 @@ pub(crate) struct DecoupleILPMetadata {
     pub(crate) constraints: Vec<Constraint>,
     pub(crate) cpu_usages: HashMap<usize, Expression>, // location_id: cpu_usage
     pub(crate) op_id_to_var: HashMap<usize, HashMap<usize, Variable>>, // op_id: (location_id: var). Var = 1 for a location if the op is assigned to that location
-    prev_op_input_with_tick: HashMap<usize, usize>, // tick_id: last op_id with that tick_id
+    prev_op_parent_with_tick: HashMap<usize, usize>, // tick_id: last op_id with that tick_id
     tee_inner_to_decoupled_vars: HashMap<usize, HashMap<usize, (Variable, Variable)>>, /* inner_id: (loc: (send var, recv var)) */
     pub(crate) network_ids: HashMap<usize, NetworkType>,
 }
@@ -107,7 +107,7 @@ fn add_equality_constr(
 // Store the tick that an op is constrained to
 fn add_tick_constraint(
     metadata: &HydroIrMetadata,
-    op_id_to_inputs: &HashMap<usize, Vec<usize>>,
+    op_id_to_parents: &HashMap<usize, Vec<usize>>,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
     let DecoupleILPMetadata {
@@ -115,30 +115,30 @@ fn add_tick_constraint(
         constraints,
         num_locations,
         op_id_to_var,
-        prev_op_input_with_tick,
+        prev_op_parent_with_tick,
         ..
     } = &mut *decoupling_metadata.borrow_mut();
 
     if let LocationId::Tick(tick_id, _) = metadata.location_kind {
-        // Set each input = to the last input
-        let mut inputs = op_id_to_inputs
+        // Set each parent = to the last parent
+        let mut parents: Vec<usize> = op_id_to_parents
             .get(&metadata.op.id.unwrap())
             .unwrap()
             .clone();
-        if let Some(prev_input) = prev_op_input_with_tick.get(&tick_id) {
-            inputs.push(*prev_input);
+        if let Some(prev_parent) = prev_op_parent_with_tick.get(&tick_id) {
+            parents.push(*prev_parent);
         }
         add_equality_constr(
-            &inputs,
+            &parents,
             *num_locations,
             op_id_to_var,
             variables,
             constraints,
         );
 
-        // Set this op's last input as the last op's input that had this tick
-        if let Some(last_input) = inputs.last() {
-            prev_op_input_with_tick.insert(tick_id, *last_input);
+        // Set this op's last parent as the last op's parent that had this tick
+        if let Some(last_parent) = parents.last() {
+            prev_op_parent_with_tick.insert(tick_id, *last_parent);
         }
     }
 }
@@ -146,7 +146,7 @@ fn add_tick_constraint(
 fn add_cpu_usage(
     metadata: &HydroIrOpMetadata,
     network_type: &Option<NetworkType>,
-    op_id_to_inputs: &HashMap<usize, Vec<usize>>,
+    op_id_to_parents: &HashMap<usize, Vec<usize>>,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
     let DecoupleILPMetadata {
@@ -160,24 +160,24 @@ fn add_cpu_usage(
 
     let op_id = metadata.id.unwrap();
 
-    // Calculate total CPU usage on each node (before overheads). Operators are run on the machine that their inputs send to.
+    // Calculate total CPU usage on each node (before overheads). Operators are run on the machine that their parents send to.
     match network_type {
         Some(NetworkType::Send) | Some(NetworkType::SendRecv) | None => {
-            if let Some(inputs) = op_id_to_inputs.get(&op_id) {
-                // All inputs must be assigned the same var (by constraints above), so it suffices to check one
-                if let Some(first_input) = inputs.first() {
-                    let input_vars = var_from_op_id(
-                        *first_input,
+            if let Some(parents) = op_id_to_parents.get(&op_id) {
+                // All parents must be assigned the same var (by constraints above), so it suffices to check one
+                if let Some(first_parent) = parents.first() {
+                    let parent_vars = var_from_op_id(
+                        *first_parent,
                         *num_locations,
                         op_id_to_var,
                         variables,
                         constraints,
                     );
                     if let Some(cpu_usage) = metadata.cpu_usage {
-                        for (loc, input_var) in input_vars {
+                        for (loc, parent_var) in parent_vars {
                             let node_cpu_usage = cpu_usages.get_mut(&loc).unwrap();
                             let node_cpu_usage_temp = std::mem::take(node_cpu_usage);
-                            *node_cpu_usage = node_cpu_usage_temp + cpu_usage * input_var;
+                            *node_cpu_usage = node_cpu_usage_temp + cpu_usage * parent_var;
                         }
                     }
                 }
@@ -191,10 +191,10 @@ fn add_cpu_usage(
             let op_vars =
                 var_from_op_id(op_id, *num_locations, op_id_to_var, variables, constraints);
             if let Some(recv_cpu_usage) = metadata.network_recv_cpu_usage {
-                for (loc, input_var) in op_vars {
+                for (loc, parent_var) in op_vars {
                     let node_cpu_usage = cpu_usages.get_mut(&loc).unwrap();
                     let node_cpu_usage_temp = std::mem::take(node_cpu_usage);
-                    *node_cpu_usage = node_cpu_usage_temp + recv_cpu_usage * input_var;
+                    *node_cpu_usage = node_cpu_usage_temp + recv_cpu_usage * parent_var;
                 }
             }
         }
@@ -236,7 +236,7 @@ fn add_decouple_vars(
 fn add_decoupling_overhead(
     node: &HydroNode,
     network_type: &Option<NetworkType>,
-    op_id_to_inputs: &HashMap<usize, Vec<usize>>,
+    op_id_to_parents: &HashMap<usize, Vec<usize>>,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
     let DecoupleILPMetadata {
@@ -262,14 +262,14 @@ fn add_decoupling_overhead(
     };
 
     let op_id = metadata.op.id.unwrap();
-    if let Some(inputs) = op_id_to_inputs.get(&op_id) {
-        // All inputs must be assigned the same var (by constraints above), so it suffices to check one
-        if let Some(input) = inputs.first() {
+    if let Some(parents) = op_id_to_parents.get(&op_id) {
+        // All parents must be assigned the same var (by constraints above), so it suffices to check one
+        if let Some(parent) = parents.first() {
             let decouple_vars = add_decouple_vars(
                 *num_locations,
                 variables,
                 constraints,
-                *input,
+                *parent,
                 op_id,
                 op_id_to_var,
             );
@@ -356,7 +356,7 @@ fn add_tee_decoupling_overhead(
 
 fn decouple_analysis_root(
     root: &mut HydroRoot,
-    op_id_to_inputs: &HashMap<usize, Vec<usize>>,
+    op_id_to_parents: &HashMap<usize, Vec<usize>>,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
     // Ignore nodes that are not in the cluster to decouple
@@ -364,7 +364,7 @@ fn decouple_analysis_root(
         return;
     }
 
-    add_tick_constraint(root.input_metadata(), op_id_to_inputs, decoupling_metadata);
+    add_tick_constraint(root.input_metadata(), op_id_to_parents, decoupling_metadata);
 }
 
 pub(crate) fn node_is_in_bottleneck(
@@ -392,7 +392,7 @@ pub(crate) fn node_is_in_bottleneck(
 fn decouple_analysis_node(
     node: &mut HydroNode,
     op_id: &mut usize,
-    op_id_to_inputs: &HashMap<usize, Vec<usize>>,
+    op_id_to_parents: &HashMap<usize, Vec<usize>>,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
     let network_type = get_network_type(node, decoupling_metadata.borrow().bottleneck.root().raw_id());
@@ -411,16 +411,16 @@ fn decouple_analysis_node(
             decoupling_metadata,
         );
     } else {
-        add_decoupling_overhead(node, &network_type, op_id_to_inputs, decoupling_metadata);
+        add_decoupling_overhead(node, &network_type, op_id_to_parents, decoupling_metadata);
     }
 
     add_cpu_usage(
         node.op_metadata(),
         &network_type,
-        op_id_to_inputs,
+        op_id_to_parents,
         decoupling_metadata,
     );
-    add_tick_constraint(node.metadata(), op_id_to_inputs, decoupling_metadata);
+    add_tick_constraint(node.metadata(), op_id_to_parents, decoupling_metadata);
 }
 
 fn solve(decoupling_metadata: &RefCell<DecoupleILPMetadata>) -> HighsSolution {
@@ -475,7 +475,7 @@ pub(crate) fn decouple_analysis(
     send_overhead: f64,
     recv_overhead: f64,
     num_locations: usize,
-    cycle_source_to_sink_input: &HashMap<usize, usize>,
+    cycle_source_to_sink_parent: &HashMap<usize, usize>,
     consider_partitioning: bool,
 ) -> (
     HashMap<(usize, usize), HashSet<usize>>,
@@ -496,37 +496,38 @@ pub(crate) fn decouple_analysis(
             (0..num_locations).map(|loc_id| (loc_id, Expression::default())),
         ),
         op_id_to_var: HashMap::new(),
-        prev_op_input_with_tick: HashMap::new(),
+        prev_op_parent_with_tick: HashMap::new(),
         tee_inner_to_decoupled_vars: HashMap::new(),
         network_ids: HashMap::new(),
     });
-    let op_id_to_inputs = op_id_to_inputs(ir, Some(bottleneck), cycle_source_to_sink_input);
+    let op_id_to_parents = op_id_to_parents(ir, Some(bottleneck), cycle_source_to_sink_parent);
 
     traverse_dfir(
         ir,
         |root, _| {
-            decouple_analysis_root(root, &op_id_to_inputs, &decoupling_metadata);
+            decouple_analysis_root(root, &op_id_to_parents, &decoupling_metadata);
         },
         |node, next_op_id| {
-            decouple_analysis_node(node, next_op_id, &op_id_to_inputs, &decoupling_metadata);
+            decouple_analysis_node(node, next_op_id, &op_id_to_parents, &decoupling_metadata);
         },
     );
-    for inputs in op_id_to_inputs.values() {
+    for parents in op_id_to_parents.values() {
         let DecoupleILPMetadata {
             op_id_to_var,
             variables,
             constraints,
             ..
         } = &mut *decoupling_metadata.borrow_mut();
-        // Add input constraints. All inputs of an op must output to the same machine (be assigned the same var)
-        add_equality_constr(inputs, num_locations, op_id_to_var, variables, constraints);
+        // Add parent constraints. All parents of an op must output to the same machine (be assigned the same var)
+        add_equality_constr(parents, num_locations, op_id_to_var, variables, constraints);
     }
 
     // Consider partitioning after all variables for decoupling have been created
     if consider_partitioning {
         partition_ilp_analysis(
             ir,
-            cycle_source_to_sink_input,
+            cycle_source_to_sink_parent,
+            &op_id_to_parents,
             &decoupling_metadata,
         );
     }
@@ -543,13 +544,13 @@ pub(crate) fn decouple_analysis(
     let mut new_networks = HashMap::new(); // (src loc, dest loc): [op_id]
     let mut place_on_loc = HashMap::new();
 
-    for (op_id, inputs) in op_id_to_inputs {
+    for (op_id, parents) in op_id_to_parents {
         if let Some(op_vars) = op_id_to_var.get(&op_id) {
             let op_location = op_loc(op_vars, &solution);
-            let input_location = if let Some(input) = inputs.first()
-                && let Some(input_vars) = op_id_to_var.get(input)
+            let parent_location = if let Some(parent) = parents.first()
+                && let Some(parent_vars) = op_id_to_var.get(parent)
             {
-                Some(op_loc(input_vars, &solution))
+                Some(op_loc(parent_vars, &solution))
             } else {
                 None
             };
@@ -559,19 +560,19 @@ pub(crate) fn decouple_analysis(
 
             #[expect(clippy::collapsible_else_if, reason = "code symmetry")]
             if network_type.is_none()
-                && let Some(input_unwrapped) = input_location
+                && let Some(parent_unwrapped) = parent_location
             {
                 // Figure out if we should insert Network nodes
-                if input_unwrapped != op_location {
+                if parent_unwrapped != op_location {
                     new_networks
-                        .entry((input_unwrapped, op_location))
+                        .entry((parent_unwrapped, op_location))
                         .or_insert(HashSet::new())
                         .insert(op_id);
                 }
-                // Record where the op is, based on its input's location
-                ops_on_loc.get_mut(&input_unwrapped).unwrap().insert(op_id);
+                // Record where the op is, based on its parent's location
+                ops_on_loc.get_mut(&parent_unwrapped).unwrap().insert(op_id);
             } else {
-                // If this is a network node, or there's no input (Source), then the op's location is its own location
+                // If this is a network node, or there's no parent (Source), then the op's location is its own location
                 ops_on_loc.get_mut(&op_location).unwrap().insert(op_id);
                 // If this is not a network node (Source), or it's a Network Recv/SendRecv node (with an unknown source), then place it on whatever node it is assigned to
                 if !network_type.is_some_and(|t| *t == NetworkType::Send) {
