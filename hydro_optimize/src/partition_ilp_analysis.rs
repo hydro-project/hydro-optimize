@@ -199,29 +199,18 @@ fn create_canonical_fields_node(
         }
     }
     .clone();
+    let dependencies = vec![left_dependencies, right_dependencies];
 
-    let parents = op_to_parents.get(&id).unwrap();
-    let left_parent = parents[0];
-    // Propagate to left parent if its dependencies have been calculated
-    if let Some((ll_grandparent, lr_grandparent)) = op_to_dependencies.get_mut(&left_parent) {
-        let ll_grandparent_mutated = ll_grandparent.extend_parent_fields(&left_dependencies);
-        let lr_grandparent_mutated = lr_grandparent.extend_parent_fields(&left_dependencies);
-        if ll_grandparent_mutated || lr_grandparent_mutated {
-            mutated = true;
-            create_canonical_fields_node(None, left_parent, op_to_parents, op_to_dependencies);
-        }
-    }
-
-    // Right parent may not exist
-    if let Some(right_parent) = parents.get(1) {
-        if let Some((rl_grandparent, rr_grandparent)) = op_to_dependencies.get_mut(right_parent) {
-            let rl_grandparent_mutated = rl_grandparent.extend_parent_fields(&right_dependencies);
-            let rr_grandparent_mutated = rr_grandparent.extend_parent_fields(&right_dependencies);
-            if rl_grandparent_mutated || rr_grandparent_mutated {
+    // Propagate up each parent
+    for (i, parent) in op_to_parents.get(&id).unwrap().iter().enumerate() {
+        if let Some((l_grandparent, r_grandparent)) = op_to_dependencies.get_mut(parent) {
+            let l_grandparent_mutated = l_grandparent.extend_parent_fields(&dependencies[i]);
+            let r_grandparent_mutated = r_grandparent.extend_parent_fields(&dependencies[i]);
+            if l_grandparent_mutated || r_grandparent_mutated {
                 mutated = true;
                 create_canonical_fields_node(
                     None,
-                    *right_parent,
+                    *parent,
                     op_to_parents,
                     op_to_dependencies,
                 );
@@ -265,6 +254,8 @@ fn create_canonical_fields(
         }
         println!("Rerunning create_canonical_fields loop until fixpoint.");
     }
+
+    println!("Canonical fields: {:?}", op_to_dependencies);
 
     op_to_dependencies
 }
