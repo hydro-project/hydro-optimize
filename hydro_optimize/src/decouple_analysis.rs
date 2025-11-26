@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use crate::partition_ilp_analysis::partition_ilp_analysis;
-use crate::rewrites::op_id_to_parents;
+use crate::rewrites::{node_is_at_location, op_id_to_parents};
 use good_lp::solvers::highs::HighsSolution;
 use good_lp::{
     Constraint, Expression, ProblemVariables, Solution, SolverModel, Variable, constraint, highs,
@@ -367,37 +367,23 @@ fn decouple_analysis_root(
     add_tick_constraint(root.input_metadata(), op_id_to_parents, decoupling_metadata);
 }
 
-pub(crate) fn node_is_in_bottleneck(
-    node: &HydroNode,
-    op_id: usize,
-    network_type: &Option<NetworkType>,
-    decoupling_metadata: &RefCell<DecoupleILPMetadata>,
-) -> bool {
-    if let HydroNode::Network { .. } = node {
-        if let Some(network_type) = network_type {
-            decoupling_metadata
-                .borrow_mut()
-                .network_ids
-                .insert(op_id, network_type.clone());
-            return true;
-        } else {
-            return false;
-        }
-    }
-
-    // If it's not a network, then its location should == the bottleneck
-    decoupling_metadata.borrow().bottleneck == *node.metadata().location_kind.root()
-}
-
 fn decouple_analysis_node(
     node: &mut HydroNode,
     op_id: &mut usize,
     op_id_to_parents: &HashMap<usize, Vec<usize>>,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
-    let network_type = get_network_type(node, decoupling_metadata.borrow().bottleneck.root().raw_id());
-    if !node_is_in_bottleneck(node, *op_id, &network_type, decoupling_metadata) {
+    if !node_is_at_location(node, decoupling_metadata.borrow().bottleneck.root().raw_id()) {
         return;
+    }
+
+    // Store network type for later (when checking the solution)
+    let network_type = get_network_type(node, decoupling_metadata.borrow().bottleneck.root().raw_id());
+    if let Some(network_type) = network_type.clone() {
+        decoupling_metadata
+            .borrow_mut()
+            .network_ids
+            .insert(*op_id, network_type);
     }
 
     // Add decoupling overhead. For Tees of the same inner, even if multiple are decoupled, only penalize decoupling once

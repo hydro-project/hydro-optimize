@@ -11,10 +11,10 @@ use hydro_lang::{
 use syn::visit::Visit;
 
 use crate::{
-    decouple_analysis::{DecoupleILPMetadata, node_is_in_bottleneck},
+    decouple_analysis::DecoupleILPMetadata,
     partition_node_analysis::all_inputs,
     partition_syn_analysis::{AnalyzeClosure, StructOrTuple, StructOrTupleIndex},
-    rewrites::{op_id_to_parents, parent_ids},
+    rewrites::{node_is_at_location, op_id_to_parents, parent_ids},
 };
 
 /// Add id to dependent_nodes if its parent_id is already in dependent_nodes
@@ -54,7 +54,7 @@ fn nodes_dependent_on_inputs(
                 }
             },
             |node, next_stmt_id| {
-                if node.metadata().location_kind.root() == location.root() {
+                if node_is_at_location(node, location.root().raw_id()) {
                     for parent_id in parent_ids(node, Some(location), cycle_source_to_sink_parent) {
                         insert_dependent_node(&dependent_nodes, Some(parent_id), *next_stmt_id);
                     }
@@ -208,12 +208,7 @@ fn create_canonical_fields_node(
             let r_grandparent_mutated = r_grandparent.extend_parent_fields(&dependencies[i]);
             if l_grandparent_mutated || r_grandparent_mutated {
                 mutated = true;
-                create_canonical_fields_node(
-                    None,
-                    *parent,
-                    op_to_parents,
-                    op_to_dependencies,
-                );
+                create_canonical_fields_node(None, *parent, op_to_parents, op_to_dependencies);
             }
         }
     }
@@ -237,7 +232,7 @@ fn create_canonical_fields(
             ir,
             |_, _| {},
             |node, id| {
-                if node.metadata().location_kind.root() == location.root() {
+                if node_is_at_location(node, location.root().raw_id()) {
                     let mutated = create_canonical_fields_node(
                         Some(node),
                         *id,
@@ -377,7 +372,7 @@ fn node_persists(node: &HydroNode) -> bool {
 struct PartitionILPMetadata {
     op_id_to_field_vars: HashMap<usize, HashMap<StructOrTupleIndex, Variable>>, // op_id: field_name: variable
     op_id_to_partition_expr: HashMap<usize, Expression>, // op_id: 1 if the op is partitioned on any of its fields, 0 otherwise
-    num_relevant_operators: HashMap<usize, Expression>, // location: number of relevant operators
+    num_relevant_operators: HashMap<usize, Expression>,  // location: number of relevant operators
     partitionable_operators: HashMap<usize, Expression>, // location: number of partitionable operators. Partitioning is possible at the location if partitionable_operators == num_relevant_operators
     num_persist_operators: HashMap<usize, Expression>, // location: number of nodes where node_persists() == true. If 0, then partitioning is always possible
 }
@@ -530,7 +525,12 @@ fn constrain_field_vars_to_parents(
     // Get expr that is 1 if this node is an input, 0 otherwise
     let is_input_expr = add_is_input_expr(op_id, parents, decoupling_metadata);
 
-    let DecoupleILPMetadata { variables, constraints, op_id_to_var, .. } = &mut *decoupling_metadata.borrow_mut();
+    let DecoupleILPMetadata {
+        variables,
+        constraints,
+        op_id_to_var,
+        ..
+    } = &mut *decoupling_metadata.borrow_mut();
 
     let mut is_partitionable = Expression::default();
     for (field_name, field_var) in field_vars {
@@ -567,10 +567,11 @@ fn constrain_field_vars_to_parents(
                 for parent_var in parent_vars {
                     parent_var_sum = parent_var_sum + *parent_var;
                 }
-                constraints.push(constraint!(field_var <= parent_var_sum + is_input_expr.clone()));
+                constraints.push(constraint!(
+                    field_var <= parent_var_sum + is_input_expr.clone()
+                ));
             }
-        }
-        else {
+        } else {
             // At least 1 parent doesn't have a corresponding field. Can only partition on this field if this is an input node
             constraints.push(constraint!(field_var <= is_input_expr.clone()));
         }
@@ -584,7 +585,9 @@ fn constrain_field_vars_to_parents(
         let is_at_loc_and_partitionable = variables.add(variable().binary());
         let is_at_loc = op_id_to_var.get(&op_id).unwrap().get(loc).unwrap();
 
-        constraints.push(constraint!(is_at_loc_and_partitionable <= is_partitionable.clone()));
+        constraints.push(constraint!(
+            is_at_loc_and_partitionable <= is_partitionable.clone()
+        ));
         constraints.push(constraint!(is_at_loc_and_partitionable <= *is_at_loc));
 
         let temp_expr = std::mem::take(partitionable_expr);
@@ -601,12 +604,7 @@ fn partition_ilp_node_analysis(
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
     op_id_to_parents: &HashMap<usize, Vec<usize>>,
 ) {
-    let network_type = decoupling_metadata
-        .borrow()
-        .network_ids
-        .get(&op_id)
-        .cloned();
-    if !node_is_in_bottleneck(node, op_id, &network_type, decoupling_metadata) {
+    if !node_is_at_location(node, decoupling_metadata.borrow().bottleneck.root().raw_id()) {
         return;
     }
 

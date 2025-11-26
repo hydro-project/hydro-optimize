@@ -230,6 +230,16 @@ pub fn get_network_type(node: &HydroNode, location: usize) -> Option<NetworkType
     None
 }
 
+pub fn node_is_at_location(node: &HydroNode, location: usize) -> bool {
+    if let HydroNode::Network { .. } = node {
+        get_network_type(node, location).is_some()
+    }
+    else {
+        // If it's not a network, then its location should == the location
+        node.metadata().location_kind.root().raw_id() == location
+    }
+}
+
 fn get_this_crate() -> TokenStream {
     let hydro_lang_crate = proc_macro_crate::crate_name("hydro_lang")
         .expect("hydro_lang should be present in `Cargo.toml`");
