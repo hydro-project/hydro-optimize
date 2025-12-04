@@ -639,6 +639,16 @@ impl Visit<'_> for StructOrTupleUseRhs {
         }
     }
 
+    fn visit_expr_unary(&mut self, unary: &syn::ExprUnary) {
+        match unary.op {
+            syn::UnOp::Deref(_) => {
+                // Allow deref
+                self.visit_expr(&unary.expr);
+            }
+            _ => {}
+        }
+    }
+
     fn visit_expr(&mut self, expr: &syn::Expr) {
         match expr {
             syn::Expr::Path(path) => self.visit_expr_path(path),
@@ -651,6 +661,7 @@ impl Visit<'_> for StructOrTupleUseRhs {
             syn::Expr::If(if_expr) => self.visit_expr_if(if_expr),
             syn::Expr::Match(match_expr) => self.visit_expr_match(match_expr),
             syn::Expr::Call(call_expr) => self.visit_expr_call(call_expr),
+            syn::Expr::Unary(unary_expr) => self.visit_expr_unary(unary_expr),
             _ => println!(
                 "StructOrTupleUseRhs skipping unsupported RHS expression: {:?}",
                 expr

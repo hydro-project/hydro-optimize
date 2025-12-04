@@ -73,15 +73,17 @@ fn nodes_dependent_on_inputs(
     dependent_nodes.take()
 }
 
-/// Given a node type, return how its output fields is dependent on its left and right parents.
+/// Given a node type, return how its output fields is dependent on its parents.
+/// Must contain an entry for each parent, even if there is no dependency.
+/// Contains 1 entry if there are no parents.
 /// A node that has 2 parents is only partitionable if it can be partitioned on a field with a dependency to a field in each parent, and both parents can also be partitioned on those fields.
 /// TODO: If the node is a KeyedStream with TotalOrder, we need to restrict partitioning to only the key fields.
-fn output_to_parent_fields(node: &HydroNode) -> (StructOrTuple, StructOrTuple) {
+fn output_to_parent_fields(node: &HydroNode) -> Vec<StructOrTuple> {
     match node {
         HydroNode::Placeholder => {
             panic!()
         }
-        // Completely dependent on the left (or only) parent
+        // Completely dependent on the only parent, or no parent
         HydroNode::Cast { .. }
         | HydroNode::ObserveNonDet { .. }
         | HydroNode::Source { .. }
@@ -103,7 +105,7 @@ fn output_to_parent_fields(node: &HydroNode) -> (StructOrTuple, StructOrTuple) {
         | HydroNode::ExternalInput { .. }
         | HydroNode::Network { .. }
         | HydroNode::Counter { .. }
-        => (StructOrTuple::new_completely_dependent(), StructOrTuple::default()),
+        => vec![StructOrTuple::new_completely_dependent()],
         // Requires syn analysis
         HydroNode::Map { f, .. }
         | HydroNode::FilterMap { f, .. }
@@ -114,13 +116,13 @@ fn output_to_parent_fields(node: &HydroNode) -> (StructOrTuple, StructOrTuple) {
             // Keep topmost none field if this is FilterMap
             let keep_topmost_none_fields = matches!(node, HydroNode::FilterMap { .. });
             let parent_dependencies = analyzer.output_dependencies.remove_none_fields(keep_topmost_none_fields).unwrap_or_default();
-            (parent_dependencies, StructOrTuple::default())
+            vec![parent_dependencies]
         }
         // Output contains the entirety of both parents
         HydroNode::Chain { .. }
         | HydroNode::ChainFirst { .. }
         | HydroNode::Difference { .. } // Although output doesn't contain right parent, the parents join on all fields
-        => (StructOrTuple::new_completely_dependent(), StructOrTuple::new_completely_dependent()),
+        => vec![StructOrTuple::new_completely_dependent(), StructOrTuple::new_completely_dependent()],
         // Result is (left parent, right parent)
         HydroNode::CrossProduct { .. }
         | HydroNode::CrossSingleton { .. }
@@ -129,7 +131,7 @@ fn output_to_parent_fields(node: &HydroNode) -> (StructOrTuple, StructOrTuple) {
             left.add_dependency(&vec!["0".to_string()], vec![]);
             let mut right = StructOrTuple::default();
             right.add_dependency(&vec!["1".to_string()], vec![]);
-            (left, right)
+            vec![left, right]
         },
         // (k, (v1, v2))
         HydroNode::Join { .. }
@@ -140,52 +142,53 @@ fn output_to_parent_fields(node: &HydroNode) -> (StructOrTuple, StructOrTuple) {
             let mut right = StructOrTuple::default();
             right.add_dependency(&vec!["0".to_string()], vec!["0".to_string()]);
             right.add_dependency(&vec!["1".to_string(), "1".to_string()], vec!["1".to_string()]);
-            (left, right)
+            vec![left, right]
         },
         // Output contains only values from left parent, but is joined with the right parent on the key
         HydroNode::AntiJoin { .. }
         => {
             let mut right = StructOrTuple::default();
             right.add_dependency(&vec!["0".to_string()], vec![]);
-            (StructOrTuple::new_completely_dependent(), right)
+            vec![StructOrTuple::new_completely_dependent(), right]
         },
         // (index, input)
         HydroNode::Enumerate { .. }
         => {
-            let mut left = StructOrTuple::default();
-            left.add_dependency(&vec!["1".to_string()], vec![]);
-            (left, StructOrTuple::default())
+            let mut parent = StructOrTuple::default();
+            parent.add_dependency(&vec!["1".to_string()], vec![]);
+            vec![parent]
         }
         // Only the key is preserved
         HydroNode::FoldKeyed { .. }
         | HydroNode::ReduceKeyed { .. }
         | HydroNode::ReduceKeyedWatermark { .. }
         => {
-            let mut left = StructOrTuple::default();
-            left.add_dependency(&vec!["0".to_string()], vec!["0".to_string()]);
-            (left, StructOrTuple::default())
+            let mut parent = StructOrTuple::default();
+            parent.add_dependency(&vec!["0".to_string()], vec!["0".to_string()]);
+            vec![parent]
         }
         // No mapping
         HydroNode::FlatMap { .. }
         | HydroNode::Scan { .. }
         | HydroNode::Fold { .. }
         | HydroNode::Reduce { .. }
-        => (StructOrTuple::default(), StructOrTuple::default()),
+        => vec![StructOrTuple::default()],
     }
 }
 
-/// Returns whether any additional dependencies were added
+/// Returns whether any additional dependencies were added.
+/// node = None during recursion
 fn create_canonical_fields_node(
     node: Option<&HydroNode>,
     id: usize,
     op_to_parents: &HashMap<usize, Vec<usize>>,
-    op_to_dependencies: &mut HashMap<usize, (StructOrTuple, StructOrTuple)>,
+    op_to_dependencies: &mut HashMap<usize, Vec<StructOrTuple>>,
 ) -> bool {
     let mut mutated = false;
 
     // Compute per-operator dependencies
     let op_dependencies = op_to_dependencies.entry(id);
-    let (left_dependencies, right_dependencies) = match op_dependencies {
+    let dependencies = match op_dependencies {
         Entry::Occupied(entry) => entry.into_mut(),
         Entry::Vacant(entry) => {
             if let Some(node) = node {
@@ -199,17 +202,23 @@ fn create_canonical_fields_node(
         }
     }
     .clone();
-    let dependencies = vec![left_dependencies, right_dependencies];
+    println!("Found dependencies for op {}: {:?}", id, dependencies);
 
     // Propagate up each parent
     for (i, parent) in op_to_parents.get(&id).unwrap().iter().enumerate() {
-        if let Some((l_grandparent, r_grandparent)) = op_to_dependencies.get_mut(parent) {
-            let l_grandparent_mutated = l_grandparent.extend_parent_fields(&dependencies[i]);
-            let r_grandparent_mutated = r_grandparent.extend_parent_fields(&dependencies[i]);
-            if l_grandparent_mutated || r_grandparent_mutated {
-                mutated = true;
-                create_canonical_fields_node(None, *parent, op_to_parents, op_to_dependencies);
+        let mut parent_mutated = false;
+        // Find the dependency for the parent
+        let dependency = dependencies.get(i).unwrap();
+        // See if the parent's dependencies need to be updated
+        if let Some(parent_dependencies) = op_to_dependencies.get_mut(parent) {
+            for parent_dependency in parent_dependencies {
+                parent_mutated |= parent_dependency.extend_parent_fields(&dependency);
             }
+        }
+
+        if parent_mutated {
+            mutated = true;
+            create_canonical_fields_node(None, *parent, op_to_parents, op_to_dependencies);
         }
     }
 
@@ -222,7 +231,7 @@ fn create_canonical_fields(
     ir: &mut [HydroRoot],
     location: &LocationId,
     cycle_source_to_sink_parent: &HashMap<usize, usize>,
-) -> HashMap<usize, (StructOrTuple, StructOrTuple)> {
+) -> HashMap<usize, Vec<StructOrTuple>> {
     let op_to_parents = op_id_to_parents(ir, Some(location), cycle_source_to_sink_parent);
     let mut op_to_dependencies = HashMap::new();
 
@@ -435,7 +444,7 @@ fn add_is_input_expr(
 
 fn field_vars_from_op(
     op_id: usize,
-    canonical_fields: &HashMap<usize, (StructOrTuple, StructOrTuple)>,
+    canonical_fields: &HashMap<usize, Vec<StructOrTuple>>,
     op_id_to_field_vars: &mut HashMap<usize, HashMap<StructOrTupleIndex, Variable>>,
     op_id_to_partition_expr: &mut HashMap<usize, Expression>,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
@@ -444,9 +453,11 @@ fn field_vars_from_op(
         .entry(op_id)
         .or_insert_with(|| {
             // Find all fields that could possibly be referenced by this operator's children
-            let (l_dependencies, r_dependencies) = canonical_fields.get(&op_id).unwrap();
-            let mut field_names = l_dependencies.get_all_nested_fields();
-            field_names.extend(r_dependencies.get_all_nested_fields());
+            let dependencies = canonical_fields.get(&op_id).unwrap();
+            let mut field_names = dependencies[0].get_all_nested_fields();
+            for dep in &dependencies[1..] {
+                field_names.extend(dep.get_all_nested_fields());
+            }
 
             let mut field_to_var = HashMap::new();
             let mut sum_expr = Expression::default();
@@ -474,7 +485,7 @@ fn field_vars_from_op(
 fn constrain_field_vars_to_parents(
     op_id: usize,
     op_id_to_parents: &HashMap<usize, Vec<usize>>,
-    canonical_fields: &HashMap<usize, (StructOrTuple, StructOrTuple)>,
+    canonical_fields: &HashMap<usize, Vec<StructOrTuple>>,
     metadata: &mut PartitionILPMetadata,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
@@ -502,11 +513,7 @@ fn constrain_field_vars_to_parents(
     }
 
     // Only track r_parent if this node has 2 parents
-    let (l_parent_dependencies, r_parent_dependencies) = canonical_fields.get(&op_id).unwrap();
-    let mut parent_dependencies = vec![l_parent_dependencies];
-    if parents.len() == 2 {
-        parent_dependencies.push(r_parent_dependencies);
-    }
+    let parent_dependencies = canonical_fields.get(&op_id).unwrap();
 
     // Create parent field vars
     let parent_field_vars = parents
@@ -599,12 +606,15 @@ fn partition_ilp_node_analysis(
     node: &HydroNode,
     op_id: usize,
     idbs: &HashSet<usize>,
-    canonical_fields: &HashMap<usize, (StructOrTuple, StructOrTuple)>,
+    canonical_fields: &HashMap<usize, Vec<StructOrTuple>>,
     metadata: &mut PartitionILPMetadata,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
     op_id_to_parents: &HashMap<usize, Vec<usize>>,
 ) {
-    if !node_is_at_location(node, decoupling_metadata.borrow().bottleneck.root().raw_id()) {
+    if !node_is_at_location(
+        node,
+        decoupling_metadata.borrow().bottleneck.root().raw_id(),
+    ) {
         return;
     }
 
@@ -680,15 +690,15 @@ fn zero_cost_if_partitionable(
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
     max_num_ops: usize,
 ) {
-    let DecoupleILPMetadata {
-        variables,
-        constraints,
-        ..
-    } = &mut *decoupling_metadata.borrow_mut();
-
     let mut loc_to_difference = HashMap::new();
     for (loc, num_relevant) in num_relevant_operators {
         let num_partitionable = partitionable_operators.get(loc).unwrap();
+
+        let DecoupleILPMetadata {
+            variables,
+            constraints,
+            ..
+        } = &mut *decoupling_metadata.borrow_mut();
 
         // Difference > 0 if num_relevant != num_partitionable
         let difference_var = variables.add(variable());
