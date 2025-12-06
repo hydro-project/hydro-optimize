@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet, hash_map::Entry},
+    collections::{BTreeSet, HashMap, HashSet, hash_map::Entry},
 };
 
 use good_lp::{Expression, Variable, constraint, variable};
@@ -180,6 +180,7 @@ fn output_to_parent_fields(node: &HydroNode) -> Vec<StructOrTuple> {
 /// node = None during recursion
 fn create_canonical_fields_node(
     node: Option<&HydroNode>,
+    recurse_id: usize,
     id: usize,
     op_to_parents: &HashMap<usize, Vec<usize>>,
     op_to_dependencies: &mut HashMap<usize, Vec<StructOrTuple>>,
@@ -202,23 +203,69 @@ fn create_canonical_fields_node(
         }
     }
     .clone();
-    println!("Found dependencies for op {}: {:?}", id, dependencies);
+    // println!("Found dependencies for op {}: {:?}", id, dependencies);
+
+    let parents = op_to_parents.get(&id).unwrap();
+    // println!("Parents of op {}: {:?}", id, parents);
 
     // Propagate up each parent
-    for (i, parent) in op_to_parents.get(&id).unwrap().iter().enumerate() {
+    for (parent_index, parent) in parents.iter().enumerate() {
         let mut parent_mutated = false;
-        // Find the dependency for the parent
-        let dependency = dependencies.get(i).unwrap();
         // See if the parent's dependencies need to be updated
         if let Some(parent_dependencies) = op_to_dependencies.get_mut(parent) {
             for parent_dependency in parent_dependencies {
-                parent_mutated |= parent_dependency.extend_parent_fields(&dependency);
+                // println!(
+                //     "Found dependencies for parent {} of op {}: {:?}",
+                //     parent, id, parent_dependency
+                // );
+
+                let mut dependency = dependencies[parent_index].clone();
+                // println!(
+                //     "Parent fields of op {} for parent {}: {:?}",
+                //     id,
+                //     parent,
+                //     dependency.get_all_nested_dependencies()
+                // );
+                if parents.len() > 1 {
+                    // Project dependencies to the other parent onto this dependency, see if we can learn about some more fields
+                    // For example, if this is an AntiJoin, then we know that [] -> [] on the pos side and 0 -> [] on the neg side
+                    // We should then learn that for the pos side, 0 exists as a field
+                    let other_dependency_fields =
+                        dependencies[1 - parent_index].get_all_nested_fields();
+                    for field in other_dependency_fields {
+                        dependency.create_child(field);
+                    }
+                    // println!(
+                    //     "Parent fields of op {} for parent {} after projection: {:?}",
+                    //     id,
+                    //     parent,
+                    //     dependency.get_all_nested_dependencies()
+                    // );
+                }
+
+                for field in dependency.get_all_nested_dependencies() {
+                    let (_, mutated) = parent_dependency.create_child(field.clone());
+                    parent_mutated |= mutated;
+                }
+                // println!(
+                //     "New dependencies for parent {} of op {}: {:?}",
+                //     parent, id, parent_dependency
+                // );
             }
         }
 
         if parent_mutated {
             mutated = true;
-            create_canonical_fields_node(None, *parent, op_to_parents, op_to_dependencies);
+            // println!("Recursing from op {} to parent {}", recurse_id, parent);
+            create_canonical_fields_node(
+                None,
+                recurse_id,
+                *parent,
+                op_to_parents,
+                op_to_dependencies,
+            );
+        } else {
+            // println!("No mutation for parent {}, exiting {}", parent, id);
         }
     }
 
@@ -244,6 +291,7 @@ fn create_canonical_fields(
                 if node_is_at_location(node, location.root().raw_id()) {
                     let mutated = create_canonical_fields_node(
                         Some(node),
+                        *id,
                         *id,
                         &op_to_parents,
                         &mut op_to_dependencies,
@@ -511,11 +559,10 @@ fn constrain_field_vars_to_parents(
         // Must be a Source, no constraints
         return;
     }
+    // println!("Node id {}, parents {:?}", op_id, parents);
 
-    // Only track r_parent if this node has 2 parents
-    let parent_dependencies = canonical_fields.get(&op_id).unwrap();
-
-    // Create parent field vars
+    let dependencies_on_parents = canonical_fields.get(&op_id).unwrap();
+    // println!("Canonical fields: {:?}", dependencies_on_parents);
     let parent_field_vars = parents
         .iter()
         .map(|parent_id| {
@@ -528,6 +575,7 @@ fn constrain_field_vars_to_parents(
             )
         })
         .collect::<Vec<_>>();
+    // println!("Parent fields: {:?}", parent_field_vars);
 
     // Get expr that is 1 if this node is an input, 0 otherwise
     let is_input_expr = add_is_input_expr(op_id, parents, decoupling_metadata);
@@ -541,20 +589,28 @@ fn constrain_field_vars_to_parents(
 
     let mut is_partitionable = Expression::default();
     for (field_name, field_var) in field_vars {
+        // println!("Op field name: {:?}", field_name.join("."));
         // If there's a link from this field to all parents, constrain it to the corresponding field in all parents
         // Otherwise, only allow using this field for partitioning if this is an input node
         let mut corresponding_parent_field_vars = vec![vec![]; parents.len()];
-        for (left_or_right, parent_dependency) in parent_dependencies.iter().enumerate() {
-            // Does this field point to something in this parent? If so, find the vars
-            if let Some(corresponding_parent_nested_field) =
-                parent_dependency.get_dependencies(&field_name)
+        for (left_or_right, dependencies_on_parent) in dependencies_on_parents.iter().enumerate() {
+            // For this field and its children, what fields in the parent does it depend on?
+            // Note: We can't unwrap here, because
+            // 1. A field_name and field_var exists for each field of the op that depends on EITHER parent
+            // 2. dependencies_on_parent corresponds to only one of those parents, and may not contain field_name
+            if let Some(nested_dependencies_in_field) =
+                dependencies_on_parent.get_dependencies(&field_name)
             {
-                for parent_field in &corresponding_parent_nested_field.get_dependency() {
+                // For this field and NOT its children, what fields in the parent does it depend on?
+                let dependencies_in_field = nested_dependencies_in_field.get_dependency();
+                // println!("Corresponding parent fields: {:?}", dependencies_in_field);
+                for parent_field_name in &dependencies_in_field {
+                    // Add the corresponding parent field var
                     corresponding_parent_field_vars[left_or_right].push(
                         parent_field_vars
                             .get(left_or_right)
                             .unwrap()
-                            .get(parent_field)
+                            .get(parent_field_name)
                             .unwrap(),
                     );
                 }
