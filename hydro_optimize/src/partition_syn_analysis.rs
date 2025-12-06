@@ -28,7 +28,7 @@ impl StructOrTuple {
 
     /// Create the child field if necessary, and duplicate any general dependencies to the child field.
     /// Returns the child field, and whether any mutations were made.
-    fn create_child(&mut self, index: StructOrTupleIndex) -> (&mut StructOrTuple, bool) {
+    pub(crate) fn create_child(&mut self, index: StructOrTupleIndex) -> (&mut StructOrTuple, bool) {
         let mut deps = self.dependencies.clone();
         let mut child = self;
         let mut mutated = false;
@@ -118,14 +118,14 @@ impl StructOrTuple {
     /// Note: May return redundant dependencies; no easy fix given we can the same field can depend on multiple things
     pub(crate) fn get_dependencies(&self, index: &StructOrTupleIndex) -> Option<StructOrTuple> {
         let mut child = self.clone();
-        for (i, field) in index.iter().enumerate() {
+        for field in index {
             if let Some(grandchild) = child.fields.get(field) {
                 let mut temp_grandchild = *grandchild.clone();
-                temp_grandchild.add_dependencies(&child, &index[i..].to_vec());
+                temp_grandchild.add_dependencies(&child, &vec![field.clone()]);
                 child = temp_grandchild;
             } else if !child.dependencies.is_empty() {
                 let mut new_child = StructOrTuple::default();
-                new_child.add_dependencies(&child, &index[i..].to_vec());
+                new_child.add_dependencies(&child, &vec![field.clone()]);
                 return Some(new_child);
             } else {
                 return None; // No dependency or child
@@ -138,7 +138,7 @@ impl StructOrTuple {
         self.dependencies.clone()
     }
 
-    fn get_all_nested_dependencies(&self) -> BTreeSet<StructOrTupleIndex> {
+    pub(crate) fn get_all_nested_dependencies(&self) -> BTreeSet<StructOrTupleIndex> {
         let mut all_dependencies = self.dependencies.clone();
         for (_, child) in &self.fields {
             let child_dependencies = child.get_all_nested_dependencies();
@@ -375,6 +375,7 @@ impl StructOrTuple {
         if new_tuple.is_empty() {
             None
         } else {
+            println!("Unioned {:?} and {:?} into {:?}", tuple1, tuple2, new_tuple);
             Some(new_tuple)
         }
     }
@@ -416,20 +417,6 @@ impl StructOrTuple {
         } else {
             Some(new_child)
         }
-    }
-
-    /// For each field in the child that references a field in the parent (self), if the field in the parent doesn't exist, create that field in the parent.
-    /// If the parent had a value at a less specific field, duplicate the dependency to the more specific field.
-    /// Returns true if fields were added to the parent and false otherwise.
-    pub(crate) fn extend_parent_fields(&mut self, child: &StructOrTuple) -> bool {
-        let mut mutated = false;
-        for dependency in child.get_all_nested_dependencies() {
-            let (_, parent_mutated) = self.create_child(dependency);
-            if parent_mutated {
-                mutated = true;
-            }
-        }
-        mutated
     }
 }
 
@@ -709,14 +696,22 @@ impl Visit<'_> for TupleDeclareLhs {
                 }
             }
             syn::Pat::TupleStruct(tuple_struct) => {
-                if tuple_struct.path.is_ident("Some") {
-                    assert_eq!(tuple_struct.elems.len(), 1); // Some should have exactly one element
-                    self.visit_pat(tuple_struct.elems.first().unwrap());
-                } else {
-                    panic!(
-                        "TupleDeclareLhs does not support tuple structs: {:?}",
-                        tuple_struct
-                    );
+                match tuple_struct.path.get_ident() {
+                    Some(ident) if ident == "Some" => {
+                        assert_eq!(tuple_struct.elems.len(), 1); // Some should have exactly one element
+                        self.visit_pat(tuple_struct.elems.first().unwrap());
+                    }
+                    Some(ident) if ident == "Ok" => {
+                        assert_eq!(tuple_struct.elems.len(), 1); // Ok should have exactly one element
+                        self.visit_pat(tuple_struct.elems.first().unwrap());
+                    }
+                    Some(ident) if ident == "Err" => {} // Ignore dependencies from Err
+                    Some(_) | None => {
+                        panic!(
+                            "TupleDeclareLhs does not support generic tuple structs: {:?}",
+                            tuple_struct
+                        );
+                    }
                 }
             }
             syn::Pat::Wild(_) | syn::Pat::Lit(_) => {} // Ignore wildcards, literals
