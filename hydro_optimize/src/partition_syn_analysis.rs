@@ -1,8 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hash;
-
-use hydro_lang::compile::ir::{HydroRoot, traverse_dfir};
-use hydro_lang::deploy::HydroDeploy;
 use syn::visit::Visit;
 
 pub type StructOrTupleIndex = Vec<String>; // Ex: ["a", "b"] represents x.a.b
