@@ -10,18 +10,18 @@ use hydro_lang::deploy::TrybuildHost;
 
 /// What the user provides when creating ReusableHosts
 pub enum HostType {
-    GCP { project: String },
-    AWS,
+    Gcp { project: String },
+    Aws,
     Localhost,
 }
 
 /// Internal state with networks always initialized
 enum InitializedHostType {
-    GCP {
+    Gcp {
         project: String,
         network: Arc<GcpNetwork>,
     },
-    AWS {
+    Aws {
         network: Arc<AwsNetwork>,
     },
     Localhost,
@@ -32,18 +32,18 @@ pub struct ReusableHosts {
     host_type: InitializedHostType,
 }
 
-// Note: AWS AMIs vary by region. If you are changing the region, please also change the AMI.
+// Note: Aws AMIs vary by region. If you are changing the region, please also change the AMI.
 const AWS_REGION: &str = "us-east-1";
 const AWS_INSTANCE_AMI: &str = "ami-0e95a5e2743ec9ec9"; // Amazon Linux 2
 
 impl ReusableHosts {
     pub fn new(host_type: HostType) -> Self {
         let initialized = match host_type {
-            HostType::GCP { project } => InitializedHostType::GCP {
+            HostType::Gcp { project } => InitializedHostType::Gcp {
                 network: GcpNetwork::new(project.clone(), None),
                 project,
             },
-            HostType::AWS => InitializedHostType::AWS {
+            HostType::Aws => InitializedHostType::Aws {
                 network: AwsNetwork::new("us-east-1", None),
             },
             HostType::Localhost => InitializedHostType::Localhost,
@@ -64,7 +64,7 @@ impl ReusableHosts {
         self.hosts
             .entry(display_name.clone())
             .or_insert_with(|| match &self.host_type {
-                InitializedHostType::GCP { project, network } => deployment
+                InitializedHostType::Gcp { project, network } => deployment
                     .GcpComputeEngineHost()
                     .project(project.clone())
                     .machine_type("n2-standard-4")
@@ -75,7 +75,7 @@ impl ReusableHosts {
                     // Better performance than MUSL, perf reporting fewer unidentified stacks, but requires launching from Linux
                     .target_type(HostTargetType::Linux(LinuxCompileType::Glibc))
                     .add(),
-                InitializedHostType::AWS { network } => deployment
+                InitializedHostType::Aws { network } => deployment
                     .AwsEc2Host()
                     .region(AWS_REGION)
                     .instance_type("t3.micro")
@@ -95,7 +95,7 @@ impl ReusableHosts {
         display_name: String,
     ) -> TrybuildHost {
         let rustflags = match &self.host_type {
-            InitializedHostType::GCP { .. } | InitializedHostType::AWS { .. } => {
+            InitializedHostType::Gcp { .. } | InitializedHostType::Aws { .. } => {
                 "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off -C link-args=--no-rosegment"
             }
             InitializedHostType::Localhost => {
@@ -103,8 +103,8 @@ impl ReusableHosts {
             }
         };
         let setup_command = match &self.host_type {
-            InitializedHostType::GCP { .. } => DEBIAN_PERF_SETUP_COMMAND,
-            InitializedHostType::AWS { .. } => AL2_PERF_SETUP_COMMAND,
+            InitializedHostType::Gcp { .. } => DEBIAN_PERF_SETUP_COMMAND,
+            InitializedHostType::Aws { .. } => AL2_PERF_SETUP_COMMAND,
             InitializedHostType::Localhost => "", // Isn't run on localhost anyway
         };
         TrybuildHost::new(self.lazy_create_host(deployment, display_name.clone()))

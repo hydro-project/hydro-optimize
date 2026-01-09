@@ -298,7 +298,7 @@ impl StructOrTuple {
             if let Some(child2) = tuple2.get_dependencies(&vec![field.clone()]) {
                 // Recursively compute unions. If child2 is empty, then just keep child1
                 if let Some(new_child) = StructOrTuple::union(child1, &child2) {
-                    *child1 = Box::new(new_child);
+                    **child1 = new_child;
                 }
             }
         }

@@ -1,10 +1,7 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::sync::Arc;
 
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use hydro_deploy::Deployment;
-use hydro_deploy::gcp::GcpNetwork;
 use hydro_lang::location::Location;
 use hydro_lang::viz::config::GraphConfig;
 use hydro_optimize::decoupler;
@@ -13,7 +10,6 @@ use hydro_optimize::deploy_and_analyze::deploy_and_analyze;
 use hydro_test::cluster::kv_replica::Replica;
 use hydro_test::cluster::paxos::{Acceptor, CorePaxos, PaxosConfig, Proposer};
 use hydro_test::cluster::paxos_bench::{Aggregator, Client};
-use tokio::sync::RwLock;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, group(
@@ -21,17 +17,15 @@ use tokio::sync::RwLock;
         .args(&["gcp", "aws"])
         .multiple(false)
 ))]
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
 struct PerfPaxosArgs {
     #[command(flatten)]
     graph: GraphConfig,
 
-    /// Use GCP for deployment (provide project name)
+    /// Use Gcp for deployment (provide project name)
     #[arg(long)]
     gcp: Option<String>,
 
-    /// Use AWS, make sure credentials are set up
+    /// Use Aws, make sure credentials are set up
     #[arg(long, action = ArgAction::SetTrue)]
     aws: bool,
 }
@@ -42,9 +36,9 @@ async fn main() {
 
     let mut deployment = Deployment::new();
     let host_type: HostType = if let Some(project) = args.gcp {
-        HostType::GCP { project }
+        HostType::Gcp { project }
     } else if args.aws {
-        HostType::AWS
+        HostType::Aws
     } else {
         HostType::Localhost
     };

@@ -4,7 +4,8 @@ use clap::{ArgAction, Parser};
 use hydro_deploy::Deployment;
 use hydro_lang::location::Location;
 use hydro_lang::viz::config::GraphConfig;
-use hydro_optimize::decoupler;
+use hydro_optimize::debug;
+use hydro_optimize::decoupler::{self, Decoupler};
 use hydro_optimize::deploy::{HostType, ReusableHosts};
 use hydro_optimize::deploy_and_analyze::deploy_and_analyze;
 use hydro_test::cluster::compute_pi::{Leader, Worker};
@@ -15,17 +16,15 @@ use hydro_test::cluster::compute_pi::{Leader, Worker};
         .args(&["gcp", "aws"])
         .multiple(false)
 ))]
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
 struct Args {
     #[command(flatten)]
     graph: GraphConfig,
 
-    /// Use GCP for deployment (provide project name)
+    /// Use Gcp for deployment (provide project name)
     #[arg(long)]
     gcp: Option<String>,
 
-    /// Use AWS, make sure credentials are set up
+    /// Use Aws, make sure credentials are set up
     #[arg(long, action = ArgAction::SetTrue)]
     aws: bool,
 }
@@ -38,20 +37,20 @@ async fn main() {
     let mut deployment = Deployment::new();
 
     let host_type: HostType = if let Some(project) = args.gcp {
-        HostType::GCP { project }
+        HostType::Gcp { project }
     } else if args.aws {
-        HostType::AWS
+        HostType::Aws
     } else {
         HostType::Localhost
     };
 
     let mut reusable_hosts = ReusableHosts::new(host_type);
 
-    let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
+    let builder = hydro_lang::compile::builder::FlowBuilder::new();
     let num_cluster_nodes = 8;
     let (cluster, leader) = hydro_test::cluster::compute_pi::compute_pi(&builder, 8192);
 
-    let mut clusters = vec![(
+    let clusters = vec![(
         cluster.id().raw_id(),
         std::any::type_name::<Worker>().to_string(),
         num_cluster_nodes,
@@ -61,8 +60,6 @@ async fn main() {
         leader.id().raw_id(),
         std::any::type_name::<Leader>().to_string(),
     )];
-
-    let multi_run_metadata = RefCell::new(vec![]);
 
     let decoupler = Decoupler {
         // Decouple between these operators:
@@ -76,20 +73,17 @@ async fn main() {
     };
 
     let multi_run_metadata = RefCell::new(vec![]);
-    let _nodes = built
+    let built = builder
         .optimize_with(|roots| decoupler::decouple(roots, &decoupler, &multi_run_metadata, 0))
         .optimize_with(debug::print_id);
 
     let (rewritten_ir_builder, ir, _, _, _) = deploy_and_analyze(
         &mut reusable_hosts,
         &mut deployment,
-        builder.finalize(),
+        built,
         &clusters,
         &processes,
-        vec![
-            std::any::type_name::<Client>().to_string(),
-            std::any::type_name::<Aggregator>().to_string(),
-        ],
+        vec![],
         None,
         &multi_run_metadata,
         0,

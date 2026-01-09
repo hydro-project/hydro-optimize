@@ -982,7 +982,10 @@ mod tests {
             .values()
             .batch(&cluster2.tick(), nondet!(/** test */))
             .into_keyed()
-            .reduce_commutative(q!(|acc, b| *acc += b))
+            .reduce(q!(
+                |acc, b| *acc += b,
+                commutative = ManualProof(/* Addition is commutative */)
+            ))
             .entries()
             .all_ticks()
             .assume_ordering(nondet!(/** test */))
@@ -1004,10 +1007,13 @@ mod tests {
             .broadcast(&cluster2, TCP.bincode(), nondet!(/** test */))
             .values()
             .batch(&cluster2.tick(), nondet!(/** test */))
-            .reduce_commutative(q!(|(acc_a, acc_b), (a, b)| {
-                *acc_a += a;
-                *acc_b += b;
-            }))
+            .reduce(q!(
+                |(acc_a, acc_b), (a, b)| {
+                    *acc_a += a;
+                    *acc_b += b;
+                },
+                commutative = ManualProof(/* Addition is commutative */)
+            ))
             .all_ticks()
             .for_each(q!(|(a_sum, b_sum)| {
                 println!("a_sum: {}, b_sum: {}", a_sum, b_sum);

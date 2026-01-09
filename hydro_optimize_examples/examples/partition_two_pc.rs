@@ -15,17 +15,15 @@ use hydro_test::cluster::two_pc_bench::{Aggregator, Client};
         .args(&["gcp", "aws"])
         .multiple(false)
 ))]
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
 struct Args {
     #[command(flatten)]
     graph: GraphConfig,
 
-    /// Use GCP for deployment (provide project name)
+    /// Use Gcp for deployment (provide project name)
     #[arg(long)]
     gcp: Option<String>,
 
-    /// Use AWS, make sure credentials are set up
+    /// Use Aws, make sure credentials are set up
     #[arg(long, action = ArgAction::SetTrue)]
     aws: bool,
 }
@@ -36,9 +34,9 @@ async fn main() {
     let mut deployment = Deployment::new();
 
     let host_type: HostType = if let Some(project) = args.gcp {
-        HostType::GCP { project }
+        HostType::Gcp { project }
     } else if args.aws {
-        HostType::AWS
+        HostType::Aws
     } else {
         HostType::Localhost
     };
