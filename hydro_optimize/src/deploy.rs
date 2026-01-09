@@ -5,7 +5,7 @@ use hydro_deploy::gcp::GcpNetwork;
 use hydro_deploy::rust_crate::tracing_options::{
     AL2_PERF_SETUP_COMMAND, DEBIAN_PERF_SETUP_COMMAND, TracingOptions,
 };
-use hydro_deploy::{AwsNetwork, Deployment, Host};
+use hydro_deploy::{AwsNetwork, Deployment, Host, HostTargetType, LinuxCompileType};
 use hydro_lang::deploy::TrybuildHost;
 
 /// What the user provides when creating ReusableHosts
@@ -34,7 +34,7 @@ pub struct ReusableHosts {
 
 // Note: AWS AMIs vary by region. If you are changing the region, please also change the AMI.
 const AWS_REGION: &str = "us-east-1";
-const AWS_INSTANCE_AMI: &str = "ami-0e95a5e2743ec9ec9";
+const AWS_INSTANCE_AMI: &str = "ami-0e95a5e2743ec9ec9"; // Amazon Linux 2
 
 impl ReusableHosts {
     pub fn new(host_type: HostType) -> Self {
@@ -72,13 +72,17 @@ impl ReusableHosts {
                     .region("us-central1-c")
                     .network(network.clone())
                     .display_name(display_name)
+                    // Better performance than MUSL, perf reporting fewer unidentified stacks, but requires launching from Linux
+                    .target_type(HostTargetType::Linux(LinuxCompileType::Glibc))
                     .add(),
                 InitializedHostType::AWS { network } => deployment
                     .AwsEc2Host()
                     .region(AWS_REGION)
                     .instance_type("t3.micro")
-                    .ami(AWS_INSTANCE_AMI) // Amazon Linux 2
+                    .ami(AWS_INSTANCE_AMI)
                     .network(network.clone())
+                    // Better performance than MUSL, perf reporting fewer unidentified stacks, but requires launching from Linux
+                    .target_type(HostTargetType::Linux(LinuxCompileType::Glibc))
                     .add(),
                 InitializedHostType::Localhost => deployment.Localhost(),
             })
