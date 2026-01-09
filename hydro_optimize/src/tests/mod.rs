@@ -26,7 +26,7 @@ fn decoupled_compute_pi_ir() {
         orig_location: cluster.id().clone(),
     };
     let multi_run_metadata = RefCell::new(vec![]);
-    let built = builder
+    let mut built = builder
         .optimize_with(|roots| decoupler::decouple(roots, &decoupler, &multi_run_metadata, 0))
         .into_deploy::<HydroDeploy>();
 
@@ -51,7 +51,7 @@ fn partitioned_simple_cluster_ir() {
         location_id: cluster.id().raw_id(),
         new_cluster_id: None,
     };
-    let built = builder
+    let mut built = builder
         .optimize_with(|roots| crate::partitioner::partition(roots, &partitioner))
         .into_deploy::<HydroDeploy>();
 

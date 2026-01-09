@@ -1,8 +1,20 @@
 use std::cell::RefCell;
-use std::sync::Arc;
 
-use clap::Parser;
+use clap::{ArgAction, Parser};
+use hydro_deploy::Deployment;
+use hydro_lang::location::Location;
+use hydro_lang::viz::config::GraphConfig;
+use hydro_optimize::decoupler;
+use hydro_optimize::deploy::{HostType, ReusableHosts};
+use hydro_optimize::deploy_and_analyze::deploy_and_analyze;
+use hydro_test::cluster::compute_pi::{Leader, Worker};
 
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None, group(
+    clap::ArgGroup::new("cloud")
+        .args(&["gcp", "aws"])
+        .multiple(false)
+))]
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -12,55 +24,45 @@ struct Args {
     /// Use GCP for deployment (provide project name)
     #[arg(long)]
     gcp: Option<String>,
-}
-use hydro_deploy::gcp::GcpNetwork;
-use hydro_deploy::{Deployment, Host};
-use hydro_lang::deploy::TrybuildHost;
-use hydro_lang::location::Location;
-use hydro_lang::viz::config::GraphConfig;
-use hydro_optimize::debug;
-use hydro_optimize::decoupler::{self, Decoupler};
-use tokio::sync::RwLock;
 
-type HostCreator = Box<dyn Fn(&mut Deployment) -> Arc<dyn Host>>;
+    /// Use AWS, make sure credentials are set up
+    #[arg(long, action = ArgAction::SetTrue)]
+    aws: bool,
+}
 
 struct DecoupledCluster {}
 
-// run with no args for localhost, with `--gcp <GCP PROJECT>` for GCP
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
     let mut deployment = Deployment::new();
 
-    let (create_host, rustflags): (HostCreator, &'static str) = if let Some(project) = &args.gcp {
-        let network = Arc::new(RwLock::new(GcpNetwork::new(project, None)));
-        let project = project.clone();
-
-        (
-            Box::new(move |deployment| -> Arc<dyn Host> {
-                deployment
-                    .GcpComputeEngineHost()
-                    .project(&project)
-                    .machine_type("e2-micro")
-                    .image("debian-cloud/debian-11")
-                    .region("us-west1-a")
-                    .network(network.clone())
-                    .add()
-            }),
-            "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off",
-        )
+    let host_type: HostType = if let Some(project) = args.gcp {
+        HostType::GCP { project }
+    } else if args.aws {
+        HostType::AWS
     } else {
-        let localhost = deployment.Localhost();
-        (
-            Box::new(move |_| -> Arc<dyn Host> { localhost.clone() }),
-            "",
-        )
+        HostType::Localhost
     };
 
-    let builder = hydro_lang::compile::builder::FlowBuilder::new();
+    let mut reusable_hosts = ReusableHosts::new(host_type);
+
+    let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
+    let num_cluster_nodes = 8;
     let (cluster, leader) = hydro_test::cluster::compute_pi::compute_pi(&builder, 8192);
 
+    let mut clusters = vec![(
+        cluster.id().raw_id(),
+        std::any::type_name::<Worker>().to_string(),
+        num_cluster_nodes,
+    )];
     let decoupled_cluster = builder.cluster::<DecoupledCluster>();
+    let processes = vec![(
+        leader.id().raw_id(),
+        std::any::type_name::<Leader>().to_string(),
+    )];
+
+    let multi_run_metadata = RefCell::new(vec![]);
 
     let decoupler = Decoupler {
         // Decouple between these operators:
@@ -73,29 +75,29 @@ async fn main() {
         decoupled_location: decoupled_cluster.id().clone(),
     };
 
-    // Extract the IR BEFORE optimization
-    let built = builder.finalize();
-
-    // Generate graphs if requested
-    let _ = built.generate_graph_with_config(&args.graph, None);
-
     let multi_run_metadata = RefCell::new(vec![]);
     let _nodes = built
         .optimize_with(|roots| decoupler::decouple(roots, &decoupler, &multi_run_metadata, 0))
-        .optimize_with(debug::print_id)
-        .with_process(
-            &leader,
-            TrybuildHost::new(create_host(&mut deployment)).rustflags(rustflags),
-        )
-        .with_cluster(
-            &cluster,
-            (0..8).map(|_| TrybuildHost::new(create_host(&mut deployment)).rustflags(rustflags)),
-        )
-        .with_cluster(
-            &decoupled_cluster,
-            (0..8).map(|_| TrybuildHost::new(create_host(&mut deployment)).rustflags(rustflags)),
-        )
-        .deploy(&mut deployment);
+        .optimize_with(debug::print_id);
 
-    deployment.run_ctrl_c().await.unwrap();
+    let (rewritten_ir_builder, ir, _, _, _) = deploy_and_analyze(
+        &mut reusable_hosts,
+        &mut deployment,
+        builder.finalize(),
+        &clusters,
+        &processes,
+        vec![
+            std::any::type_name::<Client>().to_string(),
+            std::any::type_name::<Aggregator>().to_string(),
+        ],
+        None,
+        &multi_run_metadata,
+        0,
+    )
+    .await;
+
+    let built = rewritten_ir_builder.build_with(|_| ir).finalize();
+
+    // Generate graphs if requested
+    let _ = built.generate_graph_with_config(&args.graph, None);
 }

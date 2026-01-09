@@ -2,6 +2,7 @@ use core::panic;
 use std::collections::HashMap;
 
 use hydro_lang::compile::ir::{HydroNode, HydroRoot, traverse_dfir};
+use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::location::dynamic::LocationId;
 use serde::{Deserialize, Serialize};
 use syn::visit_mut::{self, VisitMut};
@@ -265,24 +266,6 @@ fn replace_process_location_id(
     }
 }
 
-fn replace_process_input_persist_location_id(
-    input: &mut Box<HydroNode>,
-    process_location: usize,
-    cluster_location: usize,
-) {
-    if let HydroNode::Persist {
-        metadata: persist_metadata,
-        ..
-    } = input.as_mut()
-    {
-        replace_process_location_id(
-            &mut persist_metadata.location_kind,
-            process_location,
-            cluster_location,
-        );
-    }
-}
-
 /// If we're partitioning a process into a cluster, we need to replace references to its location
 fn replace_process_node_location(node: &mut HydroNode, partitioner: &Partitioner) {
     let Partitioner {
@@ -293,27 +276,6 @@ fn replace_process_node_location(node: &mut HydroNode, partitioner: &Partitioner
 
     if let Some(new_id) = new_cluster_id {
         // Change any HydroNodes with a location field
-        match node {
-            // Update Persist's location as well (we won't see it during traversal)
-            HydroNode::CrossProduct { left, right, .. } | HydroNode::Join { left, right, .. } => {
-                replace_process_input_persist_location_id(left, *location_id, *new_id);
-                replace_process_input_persist_location_id(right, *location_id, *new_id);
-            }
-            HydroNode::Difference { pos, neg, .. } | HydroNode::AntiJoin { pos, neg, .. } => {
-                replace_process_input_persist_location_id(pos, *location_id, *new_id);
-                replace_process_input_persist_location_id(neg, *location_id, *new_id);
-            }
-            HydroNode::Fold { input, .. }
-            | HydroNode::FoldKeyed { input, .. }
-            | HydroNode::Reduce { input, .. }
-            | HydroNode::ReduceKeyed { input, .. }
-            | HydroNode::Scan { input, .. } => {
-                replace_process_input_persist_location_id(input, *location_id, *new_id);
-            }
-            _ => {}
-        }
-
-        // Modify the metadata
         replace_process_location_id(
             &mut node.metadata_mut().location_kind,
             *location_id,
@@ -359,7 +321,7 @@ fn partition_node(node: &mut HydroNode, partitioner: &Partitioner, next_stmt_id:
 
 /// Limitations: Can only partition sends to clusters (not processes). Can only partition sends to 1 cluster at a time. Assumes that the partitioned attribute can be casted to usize.
 pub fn partition(ir: &mut [HydroRoot], partitioner: &Partitioner) {
-    traverse_dfir(
+    traverse_dfir::<HydroDeploy>(
         ir,
         |_, _| {},
         |node, next_stmt_id| {
@@ -370,7 +332,7 @@ pub fn partition(ir: &mut [HydroRoot], partitioner: &Partitioner) {
     if partitioner.new_cluster_id.is_some() {
         // DANGER: Do not depend on the ID here, since nodes would've been injected
         // Fix network only after all IDs have been replaced, since get_network_type relies on it
-        traverse_dfir(
+        traverse_dfir::<HydroDeploy>(
             ir,
             |_, _| {},
             |node, next_stmt_id| {

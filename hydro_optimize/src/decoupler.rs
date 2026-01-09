@@ -6,6 +6,7 @@ use hydro_lang::compile::ir::{
     DebugInstantiate, HydroIrMetadata, HydroIrOpMetadata, HydroNode, HydroRoot, TeeNode,
     transform_bottom_up, traverse_dfir,
 };
+use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::location::dynamic::LocationId;
 use proc_macro2::Span;
 use serde::{Deserialize, Serialize};
@@ -254,7 +255,7 @@ pub fn decouple(
 ) {
     let tee_to_inner_id_before_rewrites = tee_to_inner_id(ir);
     let mut new_inners = HashMap::new();
-    traverse_dfir(
+    traverse_dfir::<HydroDeploy>(
         ir,
         |_, _| {},
         |node, next_stmt_id| {
@@ -305,7 +306,7 @@ mod tests {
     use hydro_lang::compile::ir;
     use hydro_lang::location::Location;
     use hydro_lang::nondet::nondet;
-    use hydro_lang::prelude::Cluster;
+    use hydro_lang::prelude::{Cluster, TCP};
     use stageleft::q;
 
     use crate::debug::{name_to_id_map, print_id};
@@ -331,7 +332,7 @@ mod tests {
             .source_iter(q!(0..10))
             .map(q!(|a| a + 1))
             .ir_node_named("map")
-            .broadcast_bincode(&recv_cluster, nondet!(/** test */))
+            .broadcast(&recv_cluster, TCP.bincode(), nondet!(/** test */))
             .values()
             .assume_ordering(nondet!(/** test */))
             .assume_retries(nondet!(/** test */))
@@ -397,7 +398,7 @@ mod tests {
         for member in recv_members {
             use hydro_lang::deploy::DeployCrateWrapper;
 
-            stdouts.push(member.stdout().await);
+            stdouts.push(member.stdout());
         }
 
         deployment.start().await.unwrap();

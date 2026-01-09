@@ -1,46 +1,49 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::sync::Arc;
 
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use hydro_deploy::Deployment;
-use hydro_deploy::gcp::GcpNetwork;
 use hydro_lang::location::Location;
-use hydro_optimize::deploy::ReusableHosts;
+use hydro_optimize::deploy::{HostType, ReusableHosts};
 use hydro_optimize::deploy_and_analyze::deploy_and_analyze;
 use hydro_test::cluster::kv_replica::Replica;
 use hydro_test::cluster::paxos::{Acceptor, CorePaxos, PaxosConfig, Proposer};
 use hydro_test::cluster::paxos_bench::{Aggregator, Client};
-use tokio::sync::RwLock;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None, group(
+    clap::ArgGroup::new("cloud")
+        .args(&["gcp", "aws"])
+        .multiple(false)
+))]
+#[derive(Debug, Parser)]
+#[command(author, version, about, long_about = None)]
+struct BenchmarkArgs {
+    #[command(flatten)]
+    graph: hydro_lang::viz::config::GraphConfig,
+
+    /// Use GCP for deployment (provide project name)
+    #[arg(long)]
+    gcp: Option<String>,
+
+    /// Use AWS, make sure credentials are set up
+    #[arg(long, action = ArgAction::SetTrue)]
+    aws: bool,
+}
 
 #[tokio::main]
 async fn main() {
-    #[derive(Debug, Parser)]
-    #[command(author, version, about, long_about = None)]
-    struct BenchmarkArgs {
-        #[command(flatten)]
-        graph: hydro_lang::viz::config::GraphConfig,
-
-        /// Use GCP for deployment (provide project name)
-        #[arg(long)]
-        gcp: Option<String>,
-    }
     let args = BenchmarkArgs::parse();
 
     let mut deployment = Deployment::new();
-    let (host_arg, project) = if let Some(project) = args.gcp {
-        ("gcp".to_string(), project)
+    let host_type: HostType = if let Some(project) = args.gcp {
+        HostType::GCP { project }
+    } else if args.aws {
+        HostType::AWS
     } else {
-        ("localhost".to_string(), String::new())
+        HostType::Localhost
     };
-    let network = Arc::new(RwLock::new(GcpNetwork::new(&project, None)));
 
-    let mut reusable_hosts = ReusableHosts {
-        hosts: HashMap::new(),
-        host_arg,
-        project: project.clone(),
-        network: network.clone(),
-    };
+    let mut reusable_hosts = ReusableHosts::new(host_type);
 
     let f = 1;
     let checkpoint_frequency = 1000; // Num log entries
@@ -127,7 +130,7 @@ async fn main() {
             let (rewritten_ir_builder, ir, _, _, _) = deploy_and_analyze(
                 &mut reusable_hosts,
                 &mut deployment,
-                builder,
+                builder.finalize(),
                 &clusters,
                 &processes,
                 vec![],

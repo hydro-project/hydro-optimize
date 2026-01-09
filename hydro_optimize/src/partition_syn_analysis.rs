@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hash;
 
+use hydro_lang::compile::ir::{HydroRoot, traverse_dfir};
+use hydro_lang::deploy::HydroDeploy;
 use syn::visit::Visit;
 
 pub type StructOrTupleIndex = Vec<String>; // Ex: ["a", "b"] represents x.a.b
@@ -818,7 +820,7 @@ mod tests {
 
     fn partition_analysis(ir: &mut [HydroRoot]) -> BTreeMap<usize, StructOrTuple> {
         let partitioning_metadata = RefCell::new(BTreeMap::new());
-        traverse_dfir(
+        traverse_dfir::<HydroDeploy>(
             ir,
             |leaf, next_stmt_id| {
                 partition_analysis_root(leaf, next_stmt_id, &partitioning_metadata);

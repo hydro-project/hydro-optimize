@@ -6,6 +6,7 @@ use hydro_lang::compile::ir::{
     BoundKind, CollectionKind, DebugType, HydroIrMetadata, HydroNode, HydroRoot,
     KeyedSingletonBoundKind, StreamOrder, StreamRetry, deep_clone, traverse_dfir,
 };
+use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::location::{Cluster, Location};
 use proc_macro2::{Span, TokenStream};
@@ -151,7 +152,7 @@ pub fn op_id_to_inputs(
 ) -> HashMap<usize, Vec<usize>> {
     let mapping = RefCell::new(HashMap::new());
 
-    traverse_dfir(
+    traverse_dfir::<HydroDeploy>(
         ir,
         |leaf, op_id| {
             let relevant_input_ids = relevant_inputs(vec![leaf.input_metadata()], location);
@@ -178,7 +179,7 @@ pub fn op_id_to_inputs(
 pub fn tee_to_inner_id(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
     let mut mapping = HashMap::new();
 
-    traverse_dfir(
+    traverse_dfir::<HydroDeploy>(
         ir,
         |_, _| {},
         |node, op_id| {

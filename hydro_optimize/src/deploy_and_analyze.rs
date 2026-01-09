@@ -3,12 +3,14 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use hydro_deploy::Deployment;
-use hydro_lang::compile::builder::{FlowBuilder, RewriteIrFlowBuilder};
+use hydro_lang::compile::builder::RewriteIrFlowBuilder;
+use hydro_lang::compile::built::BuiltFlow;
 use hydro_lang::compile::deploy::DeployResult;
 use hydro_lang::compile::ir::{HydroNode, HydroRoot, deep_clone, traverse_dfir};
 use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::deploy::deploy_graph::DeployCrateWrapper;
 use hydro_lang::location::dynamic::LocationId;
+use hydro_lang::prelude::FlowBuilder;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::decouple_analysis::decouple_analysis;
@@ -32,7 +34,6 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
         }
         HydroNode::Source { metadata, .. }
         | HydroNode::CycleSource { metadata, .. }
-        | HydroNode::Persist { metadata, .. }
         | HydroNode::Chain { metadata, .. } // Can technically be derived by summing parent cardinalities
         | HydroNode::ChainFirst { metadata, .. } // Can technically be derived by taking parent cardinality + 1
         | HydroNode::CrossSingleton { metadata, .. }
@@ -89,7 +90,7 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
 }
 
 fn insert_counter(ir: &mut [HydroRoot], duration: syn::Expr) {
-    traverse_dfir(
+    traverse_dfir::<HydroDeploy>(
         ir,
         |_, _| {},
         |node, next_stmt_id| {
@@ -102,8 +103,8 @@ async fn track_process_usage_cardinality(
     process: &impl DeployCrateWrapper,
 ) -> (UnboundedReceiver<String>, UnboundedReceiver<String>) {
     (
-        process.stdout_filter(CPU_USAGE_PREFIX).await,
-        process.stdout_filter(COUNTER_PREFIX).await,
+        process.stdout_filter(CPU_USAGE_PREFIX),
+        process.stdout_filter(COUNTER_PREFIX),
     )
 }
 
@@ -141,7 +142,7 @@ async fn track_cluster_usage_cardinality(
 pub async fn deploy_and_analyze<'a>(
     reusable_hosts: &mut ReusableHosts,
     deployment: &mut Deployment,
-    builder: FlowBuilder<'a>,
+    builder: BuiltFlow<'a>,
     clusters: &Vec<(usize, String, usize)>,
     processes: &Vec<(usize, String)>,
     exclude_from_decoupling: Vec<String>,
@@ -158,7 +159,7 @@ pub async fn deploy_and_analyze<'a>(
     let counter_output_duration = syn::parse_quote!(std::time::Duration::from_secs(1));
 
     // Rewrite with counter tracking
-    let rewritten_ir_builder = builder.rewritten_ir_builder();
+    let rewritten_ir_builder = FlowBuilder::rewritten_ir_builder(&builder);
     let optimized = builder.optimize_with(|leaf| {
         inject_id(leaf);
         insert_counter(leaf, counter_output_duration);

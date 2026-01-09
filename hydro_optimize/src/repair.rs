@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use hydro_lang::compile::ir::{
     HydroIrOpMetadata, HydroNode, HydroRoot, transform_bottom_up, traverse_dfir,
 };
+use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::location::dynamic::LocationId;
 use syn::Ident;
 
@@ -22,7 +23,7 @@ fn inject_id_metadata(
 pub fn inject_id(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
     let new_id_to_old_id = RefCell::new(HashMap::new());
 
-    traverse_dfir(
+    traverse_dfir::<HydroDeploy>(
         ir,
         |leaf, id| {
             inject_id_metadata(leaf.op_metadata_mut(), *id, &new_id_to_old_id);
@@ -84,16 +85,6 @@ pub fn cycle_source_to_sink_input(ir: &mut [HydroRoot]) -> HashMap<usize, usize>
     source_to_sink_input
 }
 
-fn inject_location_input_persist(input: &mut Box<HydroNode>, new_location: LocationId) {
-    if let HydroNode::Persist {
-        metadata: persist_metadata,
-        ..
-    } = input.as_mut()
-    {
-        persist_metadata.location_kind.swap_root(new_location);
-    }
-}
-
 // Returns whether location was missing for any node and requires another round of calculation (to reach fixpoint)
 fn inject_location_node(
     node: &mut HydroNode,
@@ -130,29 +121,6 @@ fn inject_location_node(
             if let Some(location) = location {
                 metadata.location_kind.swap_root(location.root().clone());
                 id_to_location.insert(op_id, metadata.location_kind.clone());
-
-                match node {
-                    // Update Persist's location as well (we won't see it during traversal)
-                    HydroNode::CrossProduct { left, right, .. }
-                    | HydroNode::Join { left, right, .. } => {
-                        inject_location_input_persist(left, location.root().clone());
-                        inject_location_input_persist(right, location.root().clone());
-                    }
-                    HydroNode::Difference { pos, neg, .. }
-                    | HydroNode::AntiJoin { pos, neg, .. } => {
-                        inject_location_input_persist(pos, location.root().clone());
-                        inject_location_input_persist(neg, location.root().clone());
-                    }
-                    HydroNode::Fold { input, .. }
-                    | HydroNode::FoldKeyed { input, .. }
-                    | HydroNode::Reduce { input, .. }
-                    | HydroNode::ReduceKeyed { input, .. }
-                    | HydroNode::ReduceKeyedWatermark { input, .. }
-                    | HydroNode::Scan { input, .. } => {
-                        inject_location_input_persist(input, location.root().clone());
-                    }
-                    _ => {}
-                }
                 return false;
             }
         }
@@ -200,5 +168,5 @@ fn remove_counter_node(node: &mut HydroNode, _next_stmt_id: &mut usize) {
 }
 
 pub fn remove_counter(ir: &mut [HydroRoot]) {
-    traverse_dfir(ir, |_, _| {}, remove_counter_node);
+    traverse_dfir::<HydroDeploy>(ir, |_, _| {}, remove_counter_node);
 }
