@@ -107,7 +107,7 @@ fn inject_perf_node(
 
 pub fn inject_perf(ir: &mut [HydroRoot], folded_data: Vec<u8>) -> f64 {
     let (id_to_usage, unidentified_usage) = parse_perf(String::from_utf8(folded_data).unwrap());
-    traverse_dfir(
+    traverse_dfir::<HydroDeploy>(
         ir,
         |root, next_stmt_id| {
             inject_perf_root(root, &id_to_usage, next_stmt_id);
@@ -140,7 +140,6 @@ fn inject_count_node(
         }
         HydroNode::Source { metadata, .. }
         | HydroNode::CycleSource { metadata, .. }
-        | HydroNode::Persist { metadata, .. }
         | HydroNode::Chain { metadata, .. } // Can technically be derived by summing parent cardinalities
         | HydroNode::ChainFirst { metadata, .. } // Can technically be derived by taking parent cardinality + 1
         | HydroNode::CrossSingleton { metadata, .. }
@@ -193,7 +192,7 @@ fn inject_count_node(
 }
 
 pub fn inject_count(ir: &mut [HydroRoot], op_to_count: &HashMap<usize, usize>) {
-    traverse_dfir(
+    traverse_dfir::<HydroDeploy>(
         ir,
         |_, _| {},
         |node, next_stmt_id| {
@@ -208,7 +207,7 @@ pub async fn analyze_process_results(
     op_to_count: &mut HashMap<usize, usize>,
     node_cardinality: &mut UnboundedReceiver<String>,
 ) -> f64 {
-    let perf_results = process.tracing_results().await.unwrap();
+    let perf_results = process.tracing_results().unwrap();
 
     // Inject perf usages into metadata
     let unidentified_usage = inject_perf(ir, perf_results.folded_data);
@@ -299,7 +298,7 @@ pub async fn get_usage(usage_out: &mut UnboundedReceiver<String>) -> f64 {
 
 // Track the max of each so we decouple conservatively
 pub fn analyze_send_recv_overheads(ir: &mut [HydroRoot], run_metadata: &mut RunMetadata) {
-    traverse_dfir(
+    traverse_dfir::<HydroDeploy>(
         ir,
         |_, _| {},
         |node, _| {
@@ -482,7 +481,7 @@ pub fn compare_expected_performance(
     print_id(ir);
 
     // Record run_metadata
-    traverse_dfir(
+    traverse_dfir::<HydroDeploy>(
         ir,
         |root, _| {
             record_metadata_root(

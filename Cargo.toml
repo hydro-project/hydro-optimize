@@ -8,16 +8,16 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-hydro_lang = { path = "../hydroflow/hydro_lang" }
-hydro_std = { path = "../hydroflow/hydro_std" }
-hydro_test = { path = "../hydroflow/hydro_test" }
-dfir_lang = { path = "../hydroflow/dfir_lang" }
-hydro_build_utils = { path = "../hydroflow/hydro_build_utils" }
-hydro_deploy = { path = "../hydroflow/hydro_deploy/core" }
-include_mdtests = { path = "../hydroflow/include_mdtests" }
+hydro_lang = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git" }
+hydro_std = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git" }
+hydro_test = { version = "0.0.0", git = "https://github.com/hydro-project/hydro.git" }
+dfir_lang = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git" }
+hydro_build_utils = { version = "0.0.1", git = "https://github.com/hydro-project/hydro.git" }
+hydro_deploy = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git" }
+include_mdtests = { version = "0.0.0", git = "https://github.com/hydro-project/hydro.git" }
 serde = { version = "1.0.197", features = ["derive"] }
-stageleft = "0.10.0"
-stageleft_tool = "0.10.0"
+stageleft = "0.11.0"
+stageleft_tool = "0.11.0"
 tokio = { version = "1.29.0", features = ["full"] }
 ctor = "0.2"
 clap = { version = "4.4", features = ["derive"] }
