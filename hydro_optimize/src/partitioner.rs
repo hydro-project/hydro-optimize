@@ -142,7 +142,7 @@ fn replace_sender_dest(node: &mut HydroNode, partitioner: &Partitioner, next_stm
                     let partition_val = ::std::hash::Hasher::finish(&s) as u32;
 
                     (
-                        ::hydro_lang::location::MemberId::<()>::from_raw((partition_val % #num_partitions as u32) as u32),
+                        ::hydro_lang::location::MemberId::<()>::from_raw_id((partition_val % #num_partitions as u32) as u32),
                         struct_or_tuple
                     )
                 }
@@ -157,7 +157,7 @@ fn replace_sender_dest(node: &mut HydroNode, partitioner: &Partitioner, next_stm
                     let partition_val = ::std::hash::Hasher::finish(&s) as u32;
 
                     (
-                        ::hydro_lang::location::MemberId::<()>::from_raw((orig_dest.raw_id * #num_partitions as u32) + (partition_val % #num_partitions as u32) as u32),
+                        ::hydro_lang::location::MemberId::<()>::from_raw_id((orig_dest.raw_id * #num_partitions as u32) + (partition_val % #num_partitions as u32) as u32),
                         struct_or_tuple
                     )
                 }
@@ -194,7 +194,7 @@ fn replace_receiver_src_id(node: &mut HydroNode, partitioner: &Partitioner, op_i
         let metadata = metadata.clone();
         let node_content = std::mem::replace(node, HydroNode::Placeholder);
         let f: syn::Expr = syn::parse_quote!(|(sender_id, b)| (
-            ::hydro_lang::location::MemberId::<_>::from_raw(sender_id.raw_id / #num_partitions as u32),
+            ::hydro_lang::location::MemberId::<_>::from_raw_id(sender_id.raw_id / #num_partitions as u32),
             b
         ));
 

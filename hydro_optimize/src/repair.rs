@@ -39,6 +39,11 @@ pub fn inject_id(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
 fn link_cycles_root(root: &mut HydroRoot, sink_inputs: &mut HashMap<Ident, usize>) {
     if let HydroRoot::CycleSink { ident, input, .. } = root {
         sink_inputs.insert(ident.clone(), input.op_metadata().id.unwrap());
+        println!(
+            "Cycle sink {:?} has input {:?}",
+            ident.clone(),
+            input.op_metadata().id.unwrap()
+        );
     }
 }
 
@@ -137,28 +142,30 @@ fn inject_location_node(
 pub fn inject_location(ir: &mut [HydroRoot], cycle_source_to_sink_input: &HashMap<usize, usize>) {
     let mut id_to_location = HashMap::new();
 
-    loop {
+    let mut prev_missing_locations = None;
+    let mut missing_locations = 0;
+    // Continue
+    while prev_missing_locations.is_none_or(|prev| prev != missing_locations) {
         println!("Attempting to inject location, looping until fixpoint...");
-        let mut missing_location = false;
+        prev_missing_locations = Some(missing_locations);
+        missing_locations = 0;
 
         transform_bottom_up(
             ir,
             &mut |_| {},
             &mut |node| {
-                missing_location |=
-                    inject_location_node(node, &mut id_to_location, cycle_source_to_sink_input);
+                if inject_location_node(node, &mut id_to_location, cycle_source_to_sink_input) {
+                    missing_locations += 1;
+                }
             },
             false,
         );
-
-        if !missing_location {
-            println!("Locations injected!");
-
-            // Check well-formedness here
-            transform_bottom_up(ir, &mut |_| {}, &mut |_| {}, true);
-            break;
-        }
     }
+
+    println!("Locations injected!");
+
+    // Check well-formedness here
+    transform_bottom_up(ir, &mut |_| {}, &mut |_| {}, true);
 }
 
 fn remove_counter_node(node: &mut HydroNode, _next_stmt_id: &mut usize) {
