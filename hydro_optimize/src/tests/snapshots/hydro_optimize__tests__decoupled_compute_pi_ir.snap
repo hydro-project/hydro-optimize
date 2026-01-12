@@ -26,7 +26,7 @@ expression: built.ir()
                                                             ),
                                                             instantiate_fn: <network instantiate>,
                                                             deserialize_fn: Some(
-                                                                | res | { let (id , b) = res . unwrap () ; (hydro_lang :: location :: MemberId :: < hydro_test :: __staged :: cluster :: compute_pi :: Worker > :: from_raw (id) , hydro_lang :: runtime_support :: bincode :: deserialize :: < (u64 , u64) > (& b) . unwrap ()) },
+                                                                | res | { let (id , b) = res . unwrap () ; (hydro_lang :: __staged :: location :: MemberId :: < hydro_test :: __staged :: cluster :: compute_pi :: Worker > :: from_tagless (id as hydro_lang :: __staged :: location :: TaglessMemberId) , hydro_lang :: runtime_support :: bincode :: deserialize :: < (u64 , u64) > (& b) . unwrap ()) },
                                                             ),
                                                             input: YieldConcat {
                                                                 inner: Cast {
@@ -39,14 +39,14 @@ expression: built.ir()
                                                                                 f: | (_ , b) | b,
                                                                                 input: Network {
                                                                                     serialize_fn: Some(
-                                                                                        :: hydro_lang :: runtime_support :: stageleft :: runtime_support :: fn1_type_hint :: < (hydro_lang :: location :: MemberId < _ > , (f64 , f64)) , _ > (| (id , data) | { (id . raw_id , hydro_lang :: runtime_support :: bincode :: serialize (& data) . unwrap () . into ()) }),
+                                                                                        :: hydro_lang :: runtime_support :: stageleft :: runtime_support :: fn1_type_hint :: < (hydro_lang :: location :: MemberId < _ > , (f64 , f64)) , _ > (| (id , data) | { (id . into_tagless () , hydro_lang :: runtime_support :: bincode :: serialize (& data) . unwrap () . into ()) }),
                                                                                     ),
                                                                                     instantiate_fn: <network instantiate>,
                                                                                     deserialize_fn: Some(
-                                                                                        | res | { let (id , b) = res . unwrap () ; (hydro_lang :: location :: MemberId :: < () > :: from_raw (id) , hydro_lang :: runtime_support :: bincode :: deserialize :: < (f64 , f64) > (& b) . unwrap ()) },
+                                                                                        | res | { let (id , b) = res . unwrap () ; (hydro_lang :: location :: MemberId :: < () > :: from_tagless (id as hydro_lang :: __staged :: location :: TaglessMemberId) , hydro_lang :: runtime_support :: bincode :: deserialize :: < (f64 , f64) > (& b) . unwrap ()) },
                                                                                     ),
                                                                                     input: Map {
-                                                                                        f: | b | (:: hydro_lang :: location :: MemberId :: < () > :: from_raw (__hydro_lang_cluster_self_id_0) , b),
+                                                                                        f: | b | (:: hydro_lang :: location :: MemberId :: < () > :: from_tagless (__hydro_lang_cluster_self_id_0 . clone ()) , b),
                                                                                         input: Map {
                                                                                             f: stageleft :: runtime_support :: fn1_type_hint :: < () , (f64 , f64) > ({ use hydro_test :: __staged :: __deps :: * ; use hydro_test :: __staged :: cluster :: compute_pi :: * ; | _ | rand :: random :: < (f64 , f64) > () }),
                                                                                             input: Batch {

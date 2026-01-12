@@ -10,6 +10,7 @@ use good_lp::{
 use hydro_lang::compile::ir::{
     HydroIrMetadata, HydroIrOpMetadata, HydroNode, HydroRoot, traverse_dfir,
 };
+use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::location::dynamic::LocationId;
 
 use super::rewrites::{NetworkType, get_network_type};
@@ -403,7 +404,7 @@ pub(crate) fn decouple_analysis(
     let op_id_to_inputs =
         op_id_to_inputs(ir, Some(cluster_to_decouple), cycle_source_to_sink_input);
 
-    traverse_dfir(
+    traverse_dfir::<HydroDeploy>(
         ir,
         |root, _| {
             decouple_analysis_root(root, &op_id_to_inputs, &model_metadata);

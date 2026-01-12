@@ -6,6 +6,7 @@ use hydro_lang::compile::ir::{
     BoundKind, CollectionKind, DebugType, HydroIrMetadata, HydroNode, HydroRoot,
     KeyedSingletonBoundKind, StreamOrder, StreamRetry, deep_clone, traverse_dfir,
 };
+use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::location::{Cluster, Location};
 use proc_macro2::{Span, TokenStream};
@@ -151,7 +152,7 @@ pub fn op_id_to_inputs(
 ) -> HashMap<usize, Vec<usize>> {
     let mapping = RefCell::new(HashMap::new());
 
-    traverse_dfir(
+    traverse_dfir::<HydroDeploy>(
         ir,
         |leaf, op_id| {
             let relevant_input_ids = relevant_inputs(vec![leaf.input_metadata()], location);
@@ -178,7 +179,7 @@ pub fn op_id_to_inputs(
 pub fn tee_to_inner_id(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
     let mut mapping = HashMap::new();
 
-    traverse_dfir(
+    traverse_dfir::<HydroDeploy>(
         ir,
         |_, _| {},
         |node, op_id| {
@@ -242,7 +243,7 @@ pub fn serialize_bincode_with_type(is_demux: bool, t_type: &syn::Type) -> syn::E
         parse_quote! {
             ::#root::runtime_support::stageleft::runtime_support::fn1_type_hint::<(#root::location::MemberId<_>, #t_type), _>(
                 |(id, data)| {
-                    (id.raw_id, #root::runtime_support::bincode::serialize(&data).unwrap().into())
+                    (id.into_tagless(), #root::runtime_support::bincode::serialize(&data).unwrap().into())
                 }
             )
         }
@@ -264,7 +265,7 @@ pub fn deserialize_bincode_with_type(tagged: Option<&syn::Type>, t_type: &syn::T
         parse_quote! {
             |res| {
                 let (id, b) = res.unwrap();
-                (#root::location::MemberId::<#c_type>::from_raw(id), #root::runtime_support::bincode::deserialize::<#t_type>(&b).unwrap())
+                (#root::location::MemberId::<#c_type>::from_tagless(id as #root::__staged::location::TaglessMemberId), #root::runtime_support::bincode::deserialize::<#t_type>(&b).unwrap())
             }
         }
     } else {
