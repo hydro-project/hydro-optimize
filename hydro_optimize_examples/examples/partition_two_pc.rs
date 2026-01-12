@@ -1,49 +1,54 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::cell::RefCell;
 
-use hydro_deploy::gcp::GcpNetwork;
-use hydro_deploy::{Deployment, Host};
-use hydro_lang::deploy::TrybuildHost;
+use clap::{ArgAction, Parser};
+use hydro_deploy::Deployment;
 use hydro_lang::location::Location;
-use hydro_optimize::partition_node_analysis::{nodes_to_partition, partitioning_analysis};
-use hydro_optimize::partitioner::{Partitioner, partition};
-use hydro_optimize::repair::{cycle_source_to_sink_input, inject_id, inject_location};
-use tokio::sync::RwLock;
+use hydro_lang::viz::config::GraphConfig;
+use hydro_optimize::deploy::{HostType, ReusableHosts};
+use hydro_optimize::deploy_and_analyze::deploy_and_analyze;
+use hydro_test::cluster::two_pc::{Coordinator, Participant};
+use hydro_test::cluster::two_pc_bench::{Aggregator, Client};
 
-type HostCreator = Box<dyn Fn(&mut Deployment) -> Arc<dyn Host>>;
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None, group(
+    clap::ArgGroup::new("cloud")
+        .args(&["gcp", "aws"])
+        .multiple(false)
+))]
+struct Args {
+    #[command(flatten)]
+    graph: GraphConfig,
+
+    /// Use Gcp for deployment (provide project name)
+    #[arg(long)]
+    gcp: Option<String>,
+
+    /// Use Aws, make sure credentials are set up
+    #[arg(long, action = ArgAction::SetTrue)]
+    aws: bool,
+}
 
 #[tokio::main]
 async fn main() {
+    let args = Args::parse();
     let mut deployment = Deployment::new();
-    let host_arg = std::env::args().nth(1).unwrap_or_default();
 
-    let create_host: HostCreator = if host_arg == *"gcp" {
-        let project = std::env::args().nth(2).unwrap();
-        let network = Arc::new(RwLock::new(GcpNetwork::new(&project, None)));
-
-        Box::new(move |deployment| -> Arc<dyn Host> {
-            deployment
-                .GcpComputeEngineHost()
-                .project(&project)
-                .machine_type("n2-standard-4")
-                .image("debian-cloud/debian-11")
-                .region("us-central1-c")
-                .network(network.clone())
-                .add()
-        })
+    let host_type: HostType = if let Some(project) = args.gcp {
+        HostType::Gcp { project }
+    } else if args.aws {
+        HostType::Aws
     } else {
-        let localhost = deployment.Localhost();
-        Box::new(move |_| -> Arc<dyn Host> { localhost.clone() })
+        HostType::Localhost
     };
+
+    let mut reusable_hosts = ReusableHosts::new(host_type);
 
     let builder = hydro_lang::compile::builder::FlowBuilder::new();
     let num_participants = 3;
-    let num_partitions = 3;
     let num_clients = 3;
-    let num_clients_per_node = 100; // Change based on experiment between 1, 50, 100.
+    let num_clients_per_node = 100;
 
     let coordinator = builder.process();
-    let partitioned_coordinator = builder.cluster::<()>();
     let participants = builder.cluster();
     let clients = builder.cluster();
     let client_aggregator = builder.process();
@@ -57,69 +62,49 @@ async fn main() {
         &client_aggregator,
     );
 
-    let mut cycle_data = HashMap::new();
-    let deployable = builder
-        .optimize_with(|ir| {
-            inject_id(ir);
-            cycle_data = cycle_source_to_sink_input(ir);
-            inject_location(ir, &cycle_data);
+    let clusters = vec![
+        (
+            participants.id().raw_id(),
+            std::any::type_name::<Participant>().to_string(),
+            num_participants,
+        ),
+        (
+            clients.id().raw_id(),
+            std::any::type_name::<Client>().to_string(),
+            num_clients,
+        ),
+    ];
+    let processes = vec![
+        (
+            coordinator.id().raw_id(),
+            std::any::type_name::<Coordinator>().to_string(),
+        ),
+        (
+            client_aggregator.id().raw_id(),
+            std::any::type_name::<Aggregator>().to_string(),
+        ),
+    ];
 
-            // Partition coordinator
-            let coordinator_partitioning =
-                partitioning_analysis(ir, &coordinator.id(), &cycle_data);
-            let coordinator_nodes_to_partition =
-                nodes_to_partition(coordinator_partitioning).unwrap();
-            let coordinator_partitioner = Partitioner {
-                nodes_to_partition: coordinator_nodes_to_partition,
-                num_partitions,
-                location_id: coordinator.id().raw_id(),
-                new_cluster_id: Some(partitioned_coordinator.id().raw_id()),
-            };
-            partition(ir, &coordinator_partitioner);
+    let multi_run_metadata = RefCell::new(vec![]);
 
-            // Partition participants
-            cycle_data = cycle_source_to_sink_input(ir); // Recompute since IDs have changed
-            let participant_partitioning =
-                partitioning_analysis(ir, &participants.id(), &cycle_data);
-            let participant_nodes_to_partition =
-                nodes_to_partition(participant_partitioning).unwrap();
-            let participant_partitioner = Partitioner {
-                nodes_to_partition: participant_nodes_to_partition,
-                num_partitions,
-                location_id: participants.id().raw_id(),
-                new_cluster_id: None,
-            };
-            partition(ir, &participant_partitioner);
-        })
-        .into_deploy();
+    let (rewritten_ir_builder, ir, _, _, _) = deploy_and_analyze(
+        &mut reusable_hosts,
+        &mut deployment,
+        builder.finalize(),
+        &clusters,
+        &processes,
+        vec![
+            std::any::type_name::<Client>().to_string(),
+            std::any::type_name::<Aggregator>().to_string(),
+        ],
+        None,
+        &multi_run_metadata,
+        0,
+    )
+    .await;
 
-    let rustflags = "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off";
+    let built = rewritten_ir_builder.build_with(|_| ir).finalize();
 
-    let _nodes = deployable
-        .with_cluster(
-            &partitioned_coordinator,
-            (0..num_partitions)
-                .map(|_| TrybuildHost::new(create_host(&mut deployment)).rustflags(rustflags)),
-        )
-        .with_cluster(
-            &participants,
-            (0..num_participants * num_partitions)
-                .map(|_| TrybuildHost::new(create_host(&mut deployment)).rustflags(rustflags)),
-        )
-        .with_cluster(
-            &clients,
-            (0..num_clients)
-                .map(|_| TrybuildHost::new(create_host(&mut deployment)).rustflags(rustflags)),
-        )
-        .with_process(
-            &client_aggregator,
-            TrybuildHost::new(create_host(&mut deployment)).rustflags(rustflags),
-        )
-        .deploy(&mut deployment);
-
-    deployment.deploy().await.unwrap();
-
-    deployment.start().await.unwrap();
-
-    tokio::signal::ctrl_c().await.unwrap();
+    // Generate graphs if requested
+    _ = built.generate_graph_with_config(&args.graph, None);
 }
