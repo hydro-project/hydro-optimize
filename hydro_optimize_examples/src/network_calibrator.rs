@@ -1,4 +1,8 @@
-use hydro_lang::{live_collections::stream::NoOrder, nondet::nondet, prelude::{Cluster, Process, Stream, Unbounded}};
+use hydro_lang::{
+    live_collections::stream::NoOrder,
+    nondet::nondet,
+    prelude::{Cluster, Process, Stream, TCP, Unbounded},
+};
 use hydro_std::bench_client::{bench_client, print_bench_results};
 
 use stageleft::q;
@@ -16,14 +20,12 @@ pub fn network_calibrator<'a>(
 ) {
     let bench_results = bench_client(
         clients,
-        |_client, payload_request| {
-            size_based_workload_generator(message_size, payload_request)
-        },
+        |_client, payload_request| size_based_workload_generator(message_size, payload_request),
         |payloads| {
             // Server just echoes the payload
             payloads
-                .broadcast_bincode(server, nondet!(/** Test */))
-                .demux_bincode(clients)
+                .broadcast(server, TCP.bincode(), nondet!(/** Test */))
+                .demux(clients, TCP.bincode())
                 .values()
         },
         num_clients_per_node,

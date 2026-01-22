@@ -1,7 +1,9 @@
+use std::time::SystemTime;
+
 use hydro_lang::{
     location::Location,
     nondet::nondet,
-    prelude::{Cluster, Process},
+    prelude::{Cluster, Process, TCP},
 };
 use hydro_std::bench_client::{bench_client, print_bench_results};
 
@@ -18,36 +20,60 @@ pub fn simple_kv_bench<'a>(
     clients: &Cluster<'a, Client>,
     client_aggregator: &Process<'a, Aggregator>,
 ) {
-    let bench_results = bench_client(
-        clients,
-        inc_u32_workload_generator,
-        |payloads| {
-            let k_tick = kv.tick();
-            let k_payloads = payloads.send_bincode(kv).batch(&k_tick, nondet!(/** TODO: Actually can use atomic() here, but there's no way to exit atomic in KeyedStreams? */));
+    // Set up client that auto-generates requests with virtual IDs
+    let (c_received_payloads_complete, c_received_payloads) = clients.forward_ref();
+    let c_new_payload_ids = bench_client(clients, num_clients_per_node, c_received_payloads);
 
-            // Insert each payload into the KV store
-            k_payloads
-                    .clone()
-                    .values()
-                    .assume_ordering(nondet!(/** Last writer wins. TODO: Technically, we only need to assume ordering over the keyed stream (ordering of values with different keys doesn't matter. But there's no .persist() for KeyedStreams) */))
-                    .persist()
-                    .into_keyed()
-                    .reduce(q!(|prev, new| {
-                        *prev = new;
-                    }))
-                    .entries()
-                    .all_ticks()
-                    .assume_ordering(nondet!(/** for_each does nothing, just need to end on a HydroLeaf */))
-                    .assume_retries(nondet!(/** for_each does nothing, just need to end on a HydroLeaf */))
-                    .for_each(q!(|_| {})); // Do nothing, just need to end on a HydroLeaf
+    // Attach payloads to requests
+    let c_payloads = c_new_payload_ids.map(q!(move |payload| {
+        let value = if let Some((counter, _time)) = payload {
+            counter + 1
+        } else {
+            0
+        };
+        // Record current time for latency
+        (value, SystemTime::now())
+    }));
 
-            // Send committed requests back to the original client
-            k_payloads.all_ticks().demux_bincode(clients).into()
-        },
-        num_clients_per_node,
-        nondet!(/** bench */),
-    );
+    // Protocol
+    let k_tick = kv.tick();
+    // Use atomic to prevent outputting to the client before values are inserted to the KV store
+    let k_payloads = c_payloads.send(kv, TCP.bincode()).atomic(&k_tick);
 
+    let for_each_tick = kv.tick();
+    // Insert each payload into the KV store
+    k_payloads
+        .clone()
+        .assume_ordering(nondet!(/** Last writer wins per key. */))
+        // Persist state across ticks
+        .reduce(q!(|prev, new| {
+            *prev = new;
+        }))
+        .end_atomic()
+        .snapshot(
+            &for_each_tick,
+            nondet!(/** for_each does nothing, just need to end on a HydroRoot */),
+        )
+        .entries()
+        .all_ticks()
+        .assume_ordering(nondet!(/** for_each does nothing, just need to end on a HydroRoot */))
+        .assume_retries(nondet!(/** for_each does nothing, just need to end on a HydroRoot */))
+        .for_each(q!(|_| {})); // Do nothing, just need to end on a HydroRoot
+
+    // Send committed requests back to the original client
+    let completed_payloads = k_payloads
+        .end_atomic()
+        .demux(clients, TCP.bincode())
+        .into_keyed();
+
+    // Send committed requests back to the original client
+    c_received_payloads_complete.complete(completed_payloads.clone());
+
+    // Create throughput/latency graphs
+    let latencies = completed_payloads.values().map(q!(move |(_counter, time)| {
+        SystemTime::now().duration_since(time).unwrap()
+    }));
+    let bench_results = compute_throughput_latency(clients, latencies, nondet!(/** bench */));
     print_bench_results(bench_results, client_aggregator, clients);
 }
 
@@ -76,7 +102,7 @@ mod tests {
         let client_aggregator = builder.process();
 
         simple_kv_bench(1, &kv, &clients, &client_aggregator);
-        let built = builder.with_default_optimize::<HydroDeploy>();
+        let mut built = builder.with_default_optimize::<HydroDeploy>();
 
         dbg_dedup_tee(|| {
             insta::assert_debug_snapshot!(built.ir());
@@ -118,7 +144,7 @@ mod tests {
         deployment.deploy().await.unwrap();
 
         let client_node = &nodes.get_process(&client_aggregator);
-        let client_out = client_node.stdout_filter("Throughput:").await;
+        let client_out = client_node.stdout_filter("Throughput:");
 
         deployment.start().await.unwrap();
 
