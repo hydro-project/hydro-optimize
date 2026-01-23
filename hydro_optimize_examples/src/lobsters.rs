@@ -6,9 +6,9 @@ use hydro_lang::{
     nondet::nondet,
     prelude::{Process, Stream, Unbounded},
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use stageleft::q;
-use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
 pub struct Server {}
@@ -28,7 +28,7 @@ impl PartialOrd for Story {
 
 /// Implementation of Lobsters, roughly based on API calls exposed here: https://lobste.rs/s/cqnzl5/lobste_rs_access_pattern_statistics_for#c_2op8by
 /// We expose the following APIs:
-/// - add_user (takes username, returns api_key, should only approve if user is admin but it's tautological so just approve everyone)
+/// - add_user (takes username, returns api_key. Rejects if the user already exists (returns None))
 /// - get_users (returns usernames)
 /// - add_story (takes api_key, title, timestamp, returns story_id)
 /// - add_comment (takes api_key, story_id, comment, timestamp, returns comment_id)
@@ -46,64 +46,71 @@ impl PartialOrd for Story {
 )]
 pub fn lobsters<'a, Client>(
     server: &Process<'a, Server>,
-    add_user: Stream<(MemberId<Client>, String), Process<'a, Server>, Unbounded, NoOrder>,
-    get_users: Stream<MemberId<Client>, Process<'a, Server>, Unbounded, NoOrder>,
-    add_story: Stream<
-        (MemberId<Client>, (String, String, Instant)),
+    add_user: KeyedStream<(MemberId<Client>, u32), String, Process<'a, Server>, Unbounded, NoOrder>,
+    get_users: Stream<(MemberId<Client>, u32), Process<'a, Server>, Unbounded, NoOrder>,
+    add_story: KeyedStream<
+        (MemberId<Client>, u32),
+        (String, String, Instant),
         Process<'a, Server>,
         Unbounded,
         NoOrder,
     >,
-    _add_comment: Stream<
-        (MemberId<Client>, (String, u32, String, Instant)),
+    _add_comment: KeyedStream<
+        (MemberId<Client>, u32),
+        (String, u32, String, Instant),
         Process<'a, Server>,
         Unbounded,
         NoOrder,
     >,
-    _upvote_story: Stream<
-        (MemberId<Client>, (String, u32)),
+    _upvote_story: KeyedStream<
+        (MemberId<Client>, u32),
+        (String, u32),
         Process<'a, Server>,
         Unbounded,
         NoOrder,
     >,
-    _upvote_comment: Stream<
-        (MemberId<Client>, (String, u32)),
+    _upvote_comment: KeyedStream<
+        (MemberId<Client>, u32),
+        (String, u32),
         Process<'a, Server>,
         Unbounded,
         NoOrder,
     >,
-    _get_stories: Stream<MemberId<Client>, Process<'a, Server>, Unbounded, NoOrder>,
-    _get_comments: Stream<MemberId<Client>, Process<'a, Server>, Unbounded, NoOrder>,
-    _get_story_comments: Stream<(MemberId<Client>, u32), Process<'a, Server>, Unbounded, NoOrder>,
+    _get_stories: Stream<(MemberId<Client>, u32), Process<'a, Server>, Unbounded, NoOrder>,
+    _get_comments: Stream<(MemberId<Client>, u32), Process<'a, Server>, Unbounded, NoOrder>,
+    _get_story_comments: KeyedStream<
+        (MemberId<Client>, u32),
+        u32,
+        Process<'a, Server>,
+        Unbounded,
+        NoOrder,
+    >,
+) -> (
+    KeyedStream<(MemberId<Client>, u32), Option<String>, Process<'a, Server>, Unbounded, NoOrder>, // add_user response
 ) {
     let user_auth_tick = server.tick();
     let stories_tick = server.tick();
 
-    // Add user
-    let add_user_with_api_key = add_user.map(q!(|(client_id, username)| {
-        let api_key = self::generate_api_key(username.clone());
-        (client_id, (username, api_key))
-    }));
-    let users_this_tick_with_api_key = add_user_with_api_key.batch(
-        &user_auth_tick,
-        nondet!(/** Snapshot current users to approve/deny access */),
-    );
     // Persisted users
-    let curr_users = users_this_tick_with_api_key
-        .clone()
-        .map(q!(|(_client_id, (username, api_key))| (api_key, username)))
-        .persist();
-    let curr_users_hashset = curr_users.clone().fold_commutative_idempotent(
-        q!(|| HashSet::new()),
-        q!(|set, (_api_key, username)| {
-            set.insert(username);
-        }),
-    );
+    let curr_users = add_user
+        .map(q!(|(_client_id, username)| (
+            username,
+            self::generate_api_key(username.clone())
+        )))
+        .into_keyed()
+        .assume_ordering(nondet!(/** First user wins */))
+        .first();
     // Send response back to client. Only done after the tick to ensure that once the client gets the response, the user has been added
-    let _add_user_response =
-        users_this_tick_with_api_key
-            .all_ticks()
-            .map(q!(|(client_id, (_api_key, _username))| (client_id, ())));
+    let add_user_response = sliced! {
+        let new_users = use(add_user_with_api_key, nondet!(/** New users requests this tick */));
+        let curr_users = use(curr_users, nondet!(/** Current users this tick */));
+        new_users
+            .map(q!(|(client_id, (username, api_key))| {
+                (username, (client_id, api_key))
+            }))
+            .into_keyed()
+
+    };
 
     // Get users
     let _get_users_response = get_users
@@ -153,6 +160,8 @@ pub fn lobsters<'a, Client>(
             }
         ),
     );
+
+    (add_user_response,)
 }
 
 fn generate_api_key(email: String) -> String {

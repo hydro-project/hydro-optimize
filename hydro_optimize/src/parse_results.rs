@@ -207,10 +207,11 @@ pub async fn analyze_process_results(
     op_to_count: &mut HashMap<usize, usize>,
     node_cardinality: &mut UnboundedReceiver<String>,
 ) -> f64 {
-    let perf_results = process.tracing_results().unwrap();
+    let underlying = process.underlying();
+    let perf_results = underlying.tracing_results().unwrap();
 
     // Inject perf usages into metadata
-    let unidentified_usage = inject_perf(ir, perf_results.folded_data);
+    let unidentified_usage = inject_perf(ir, perf_results.folded_data.clone());
 
     // Get cardinality data. Allow later values to overwrite earlier ones
     while let Some(measurement) = node_cardinality.recv().await {
@@ -234,7 +235,7 @@ pub async fn analyze_cluster_results(
     let mut max_usage_cluster_name = String::new();
     let mut max_usage_overall = 0f64;
     let mut op_to_count = HashMap::new();
-
+    
     for (id, name, cluster) in nodes.get_all_clusters() {
         println!("Analyzing cluster {:?}: {}", id, name);
 

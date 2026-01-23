@@ -50,9 +50,9 @@ async fn main() {
     let i_am_leader_check_timeout_delay_multiplier = 15;
 
     // Benchmark parameters
-    let num_clients = [1, 2];
-    let num_clients_per_node = vec![1, 500, 1000, 2000, 3000];
-    let run_seconds = 60;
+    let num_clients = [1, 2, 3, 4, 5];
+    let num_clients_per_node = vec![1, 50, 100];
+    let run_seconds = 30;
 
     let multi_run_metadata = RefCell::new(vec![]);
     let mut iteration = 0;

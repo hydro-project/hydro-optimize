@@ -1,13 +1,11 @@
-use std::time::SystemTime;
-
 use hydro_lang::{
     location::Location,
     nondet::nondet,
     prelude::{Cluster, Process, TCP},
 };
-use hydro_std::bench_client::{bench_client, print_bench_results};
+use hydro_std::bench_client::{bench_client, compute_throughput_latency, print_bench_results};
 
-use hydro_test::cluster::paxos_bench::inc_u32_workload_generator;
+use hydro_test::cluster::paxos_bench::inc_i32_workload_generator;
 use stageleft::q;
 
 pub struct Kv;
@@ -20,59 +18,37 @@ pub fn simple_kv_bench<'a>(
     clients: &Cluster<'a, Client>,
     client_aggregator: &Process<'a, Aggregator>,
 ) {
-    // Set up client that auto-generates requests with virtual IDs
-    let (c_received_payloads_complete, c_received_payloads) = clients.forward_ref();
-    let c_new_payload_ids = bench_client(clients, num_clients_per_node, c_received_payloads);
+    let latencies = bench_client(clients, num_clients_per_node, inc_i32_workload_generator, |input| {
+        let k_tick = kv.tick();
+        // Use atomic to prevent outputting to the client before values are inserted to the KV store
+        let k_payloads = input.send(kv, TCP.bincode()).atomic(&k_tick);
 
-    // Attach payloads to requests
-    let c_payloads = c_new_payload_ids.map(q!(move |payload| {
-        let value = if let Some((counter, _time)) = payload {
-            counter + 1
-        } else {
-            0
-        };
-        // Record current time for latency
-        (value, SystemTime::now())
-    }));
+        let for_each_tick = kv.tick();
+        // Insert each payload into the KV store
+        k_payloads
+            .clone()
+            .assume_ordering(nondet!(/** Last writer wins per key. */))
+            // Persist state across ticks
+            .reduce(q!(|prev, new| {
+                *prev = new;
+            }))
+            .end_atomic()
+            .snapshot(
+                &for_each_tick,
+                nondet!(/** for_each does nothing, just need to end on a HydroRoot */),
+            )
+            .entries()
+            .all_ticks()
+            .assume_ordering(nondet!(/** for_each does nothing, just need to end on a HydroRoot */))
+            .assume_retries(nondet!(/** for_each does nothing, just need to end on a HydroRoot */))
+            .for_each(q!(|_| {})); // Do nothing, just need to end on a HydroRoot
 
-    // Protocol
-    let k_tick = kv.tick();
-    // Use atomic to prevent outputting to the client before values are inserted to the KV store
-    let k_payloads = c_payloads.send(kv, TCP.bincode()).atomic(&k_tick);
+        // Send committed requests back to the original client
+        k_payloads
+            .end_atomic()
+            .demux(clients, TCP.bincode())
+    }).values().map(q!(|(_value, latency)| latency));
 
-    let for_each_tick = kv.tick();
-    // Insert each payload into the KV store
-    k_payloads
-        .clone()
-        .assume_ordering(nondet!(/** Last writer wins per key. */))
-        // Persist state across ticks
-        .reduce(q!(|prev, new| {
-            *prev = new;
-        }))
-        .end_atomic()
-        .snapshot(
-            &for_each_tick,
-            nondet!(/** for_each does nothing, just need to end on a HydroRoot */),
-        )
-        .entries()
-        .all_ticks()
-        .assume_ordering(nondet!(/** for_each does nothing, just need to end on a HydroRoot */))
-        .assume_retries(nondet!(/** for_each does nothing, just need to end on a HydroRoot */))
-        .for_each(q!(|_| {})); // Do nothing, just need to end on a HydroRoot
-
-    // Send committed requests back to the original client
-    let completed_payloads = k_payloads
-        .end_atomic()
-        .demux(clients, TCP.bincode())
-        .into_keyed();
-
-    // Send committed requests back to the original client
-    c_received_payloads_complete.complete(completed_payloads.clone());
-
-    // Create throughput/latency graphs
-    let latencies = completed_payloads.values().map(q!(move |(_counter, time)| {
-        SystemTime::now().duration_since(time).unwrap()
-    }));
     let bench_results = compute_throughput_latency(clients, latencies, nondet!(/** bench */));
     print_bench_results(bench_results, client_aggregator, clients);
 }
