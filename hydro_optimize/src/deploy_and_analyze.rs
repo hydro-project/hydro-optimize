@@ -11,6 +11,7 @@ use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::deploy::deploy_graph::DeployCrateWrapper;
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::prelude::FlowBuilder;
+use hydro_lang::telemetry::Sidecar;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::decouple_analysis::decouple_analysis;
@@ -133,6 +134,40 @@ async fn track_cluster_usage_cardinality(
     (usage_out, cardinality_out)
 }
 
+struct ScriptSidecar {
+    script: String,
+}
+
+impl Sidecar for ScriptSidecar {
+    fn to_expr(
+        &self,
+        _flow_name: &str,
+        location_key: hydro_lang::location::LocationKey,
+        _location_type: hydro_lang::location::LocationType,
+        _location_name: &str,
+        _dfir_ident: &syn::Ident,
+    ) -> syn::Expr {
+        let script = &self.script;
+        let location_key_str = format!("{:?}", location_key);
+
+        syn::parse_quote! {
+            async {
+                let output = tokio::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(#script)
+                    .output()
+                    .await
+                    .expect(&format!("Failed to run sidecar script: {}", #script));
+
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    println!("{}: {}", #location_key_str, line);
+                }
+            }
+        }
+    }
+}
+
 /// TODO: Return type should be changed to also include Partitioner
 #[expect(clippy::too_many_arguments, reason = "Optimizer internal function")]
 #[expect(
@@ -182,7 +217,12 @@ pub async fn deploy_and_analyze<'a>(
             reusable_hosts.get_process_hosts(deployment, name.clone()),
         );
     }
-    let nodes = deployable.deploy(deployment);
+    let network_sidecar = ScriptSidecar {
+        script: "sar -n DEV 1".to_string(),
+    };
+    let nodes = deployable
+        .with_sidecar_all(&network_sidecar) // Measure network usage
+        .deploy(deployment);
     deployment.deploy().await.unwrap();
 
     let (mut usage_out, mut cardinality_out) = track_cluster_usage_cardinality(&nodes).await;
