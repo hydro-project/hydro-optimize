@@ -31,7 +31,7 @@ pub struct Decoupler {
 
 fn add_network(node: &mut HydroNode, new_location: &LocationId) {
     let metadata = node.metadata().clone();
-    let parent_id = metadata.location_kind.root().raw_id();
+    let parent_id = metadata.location_id.root().key();
     let node_content = std::mem::replace(node, HydroNode::Placeholder);
 
     // Map from b to (MemberId, b), where MemberId is the id of the decoupled (or original) node we're sending to
@@ -52,7 +52,7 @@ fn add_network(node: &mut HydroNode, new_location: &LocationId) {
         f: f.into(),
         input: Box::new(node_content),
         metadata: HydroIrMetadata {
-            location_kind: metadata.location_kind.root().clone(), // Remove any ticks
+            location_id: metadata.location_id.root().clone(), // Remove any ticks
             collection_kind: new_collection_kind.clone(),
             cardinality: None,
             tag: None,
@@ -68,6 +68,7 @@ fn add_network(node: &mut HydroNode, new_location: &LocationId) {
     // Set up the network node
     let output_debug_type = collection_kind_to_debug_type(&original_collection_kind);
     let network_node = HydroNode::Network {
+        name: None,
         serialize_fn: Some(serialize_bincode_with_type(true, &output_debug_type)).map(|e| e.into()),
         instantiate_fn: DebugInstantiate::Building,
         deserialize_fn: Some(deserialize_bincode_with_type(
@@ -77,7 +78,7 @@ fn add_network(node: &mut HydroNode, new_location: &LocationId) {
         .map(|e| e.into()),
         input: Box::new(mapped_node),
         metadata: HydroIrMetadata {
-            location_kind: new_location.clone(),
+            location_id: new_location.clone(),
             collection_kind: new_collection_kind,
             cardinality: None,
             tag: None,
@@ -96,7 +97,7 @@ fn add_network(node: &mut HydroNode, new_location: &LocationId) {
         f: f.into(),
         input: Box::new(network_node),
         metadata: HydroIrMetadata {
-            location_kind: new_location.clone(),
+            location_id: new_location.clone(),
             collection_kind: original_collection_kind,
             cardinality: None,
             tag: None,
@@ -157,12 +158,12 @@ fn decouple_node(
             | HydroNode::Network { metadata, .. } => {
                 println!(
                     "Changing source/network destination from {:?} to location {:?}, id: {}",
-                    metadata.location_kind,
+                    metadata.location_id,
                     decoupler.decoupled_location.clone(),
                     next_stmt_id
                 );
                 metadata
-                    .location_kind
+                    .location_id
                     .swap_root(decoupler.decoupled_location.clone());
             }
             _ => {
@@ -226,7 +227,7 @@ fn fix_cluster_self_id_root(root: &mut HydroRoot, mut locations: ClusterSelfIdRe
         decoupled_cluster_id,
         ..
     } = locations
-        && root.input_metadata().location_kind.root().raw_id() == decoupled_cluster_id
+        && root.input_metadata().location_id.root().key() == decoupled_cluster_id
     {
         root.visit_debug_expr(|expr| {
             locations.visit_expr_mut(&mut expr.0);
@@ -239,7 +240,7 @@ fn fix_cluster_self_id_node(node: &mut HydroNode, mut locations: ClusterSelfIdRe
         decoupled_cluster_id,
         ..
     } = locations
-        && node.metadata().location_kind.root().raw_id() == decoupled_cluster_id
+        && node.metadata().location_id.root().key() == decoupled_cluster_id
     {
         node.visit_debug_expr(|expr| {
             locations.visit_expr_mut(&mut expr.0);
@@ -279,8 +280,8 @@ pub fn decouple(
     inject_location(ir, &cycle_source_to_sink_input);
     // Fix CLUSTER_SELF_ID for the decoupled node
     let locations = ClusterSelfIdReplace::Decouple {
-        orig_cluster_id: decoupler.orig_location.raw_id(),
-        decoupled_cluster_id: decoupler.decoupled_location.raw_id(),
+        orig_cluster_id: decoupler.orig_location.key(),
+        decoupled_cluster_id: decoupler.decoupled_location.key(),
     };
     transform_bottom_up(
         ir,
@@ -323,7 +324,7 @@ mod tests {
         Cluster<'a, ()>,
         BuiltFlow<'a>,
     ) {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let send_cluster = builder.cluster::<()>();
         let recv_cluster = builder.cluster::<()>();
         let decoupled_cluster = builder.cluster::<()>();

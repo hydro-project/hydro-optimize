@@ -90,7 +90,7 @@ fn add_tick_constraint(
         ..
     } = &mut *model_metadata.borrow_mut();
 
-    if let LocationId::Tick(tick_id, _) = metadata.location_kind {
+    if let LocationId::Tick(tick_id, _) = metadata.location_id {
         // Set each input = to the last input
         let mut inputs = op_id_to_inputs
             .get(&metadata.op.id.unwrap())
@@ -291,7 +291,7 @@ fn decouple_analysis_root(
     model_metadata: &RefCell<ModelMetadata>,
 ) {
     // Ignore nodes that are not in the cluster to decouple
-    if model_metadata.borrow().cluster_to_decouple != *root.input_metadata().location_kind.root() {
+    if model_metadata.borrow().cluster_to_decouple != *root.input_metadata().location_id.root() {
         return;
     }
 
@@ -306,7 +306,7 @@ fn decouple_analysis_node(
 ) {
     let network_type = get_network_type(
         node,
-        model_metadata.borrow().cluster_to_decouple.root().raw_id(),
+        &model_metadata.borrow().cluster_to_decouple.root().key(),
     );
     if let HydroNode::Network { .. } = node {
         // If this is a network and we're not involved, ignore
@@ -317,7 +317,7 @@ fn decouple_analysis_node(
             .borrow_mut()
             .network_ids
             .insert(*op_id, network_type.clone().unwrap());
-    } else if model_metadata.borrow().cluster_to_decouple != *node.metadata().location_kind.root() {
+    } else if model_metadata.borrow().cluster_to_decouple != *node.metadata().location_id.root() {
         // If it's not a network and the operator isn't on the cluster, ignore
         return;
     }
@@ -402,7 +402,7 @@ pub(crate) fn decouple_analysis(
         network_ids: HashMap::new(),
     });
     let op_id_to_inputs =
-        op_id_to_inputs(ir, Some(cluster_to_decouple), cycle_source_to_sink_input);
+        op_id_to_inputs(ir, Some(&cluster_to_decouple.key()), cycle_source_to_sink_input);
 
     traverse_dfir::<HydroDeploy>(
         ir,

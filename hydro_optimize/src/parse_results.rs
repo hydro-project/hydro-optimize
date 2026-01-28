@@ -307,8 +307,8 @@ pub fn analyze_send_recv_overheads(ir: &mut [HydroRoot], run_metadata: &mut RunM
                 input, metadata, ..
             } = node
             {
-                let sender = input.metadata().location_kind.root();
-                let receiver = metadata.location_kind.root();
+                let sender = input.metadata().location_id.root();
+                let receiver = metadata.location_id.root();
 
                 // Use cardinality from the network's input, not the network itself.
                 // Reason: Cardinality is measured at ONE recipient, but the sender may be sending to MANY machines.
@@ -421,7 +421,7 @@ fn record_metadata_root(root: &mut HydroRoot, run_metadata: &mut RunMetadata) {
     let input = root.input_metadata();
     run_metadata
         .op_id_to_location
-        .insert(id, input.location_kind.root().clone());
+        .insert(id, input.location_id.root().clone());
     if let Some(cardinality) = input.cardinality {
         run_metadata.op_id_to_cardinality.insert(id, cardinality);
     }
@@ -434,7 +434,7 @@ fn record_metadata_node(node: &mut HydroNode, run_metadata: &mut RunMetadata) {
     let metadata = node.metadata();
     run_metadata
         .op_id_to_location
-        .insert(id, metadata.location_kind.root().clone());
+        .insert(id, metadata.location_id.root().clone());
     if let Some(cardinality) = metadata.cardinality {
         run_metadata.op_id_to_cardinality.insert(id, cardinality);
     }

@@ -8,7 +8,7 @@ use hydro_lang::compile::ir::{
 };
 use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::location::dynamic::LocationId;
-use hydro_lang::location::{Cluster, Location};
+use hydro_lang::location::{Cluster, Location, LocationKey};
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use serde::{Deserialize, Serialize};
@@ -37,46 +37,44 @@ pub type Rewrites = Vec<RewriteMetadata>;
 /// Returns Vec(Cluster, number of nodes) for each created cluster and a new FlowBuilder
 pub fn replay<'a>(
     rewrites: &mut Rewrites,
-    builder: RewriteIrFlowBuilder<'a>,
+    builder: FlowBuilder<'a>,
     ir: &[HydroRoot],
 ) -> (Vec<(Cluster<'a, ()>, usize)>, FlowBuilder<'a>) {
     let mut new_clusters = vec![];
 
     let multi_run_metadata = RefCell::new(vec![]);
-    let new_builder = builder.build_with(|builder| {
-        let mut ir = deep_clone(ir);
+    let mut ir = deep_clone(ir);
 
-        // Apply decoupling/partitioning in order
-        for rewrite_metadata in rewrites.iter_mut() {
-            let new_cluster = builder.cluster::<()>();
-            match &mut rewrite_metadata.rewrite {
-                Rewrite::Decouple(decoupler) => {
-                    decoupler.decoupled_location = new_cluster.id().clone();
-                    decoupler::decouple(&mut ir, decoupler, &multi_run_metadata, 0);
-                }
-                Rewrite::Partition(_partitioner) => {
-                    panic!("Partitioning is not yet replayable");
-                }
+    // Apply decoupling/partitioning in order
+    for rewrite_metadata in rewrites.iter_mut() {
+        let new_cluster = builder.cluster::<()>();
+        match &mut rewrite_metadata.rewrite {
+            Rewrite::Decouple(decoupler) => {
+                decoupler.decoupled_location = new_cluster.id().clone();
+                decoupler::decouple(&mut ir, decoupler, &multi_run_metadata, 0);
             }
-            new_clusters.push((new_cluster, rewrite_metadata.num_nodes));
+            Rewrite::Partition(_partitioner) => {
+                panic!("Partitioning is not yet replayable");
+            }
         }
+        new_clusters.push((new_cluster, rewrite_metadata.num_nodes));
+    }
 
-        ir
-    });
+    builder.force_roots(ir);
 
-    (new_clusters, new_builder)
+    (new_clusters, builder)
 }
 
 /// Replace CLUSTER_SELF_ID with the ID of the original node the partition is assigned to
 #[derive(Copy, Clone)]
 pub enum ClusterSelfIdReplace {
     Decouple {
-        orig_cluster_id: usize,
-        decoupled_cluster_id: usize,
+        orig_cluster_id: LocationKey,
+        decoupled_cluster_id: LocationKey,
     },
     Partition {
         num_partitions: usize,
-        partitioned_cluster_id: usize,
+        partitioned_cluster_id: LocationKey,
         op_id: usize,
     },
 }
@@ -128,13 +126,13 @@ impl VisitMut for ClusterSelfIdReplace {
 /// Converts input metadata to IDs, filtering by location if provided
 pub fn relevant_inputs(
     input_metadatas: Vec<&HydroIrMetadata>,
-    location: Option<&LocationId>,
+    location: Option<&LocationKey>,
 ) -> Vec<usize> {
     input_metadatas
         .iter()
         .filter_map(|input_metadata| {
             if let Some(location) = location
-                && input_metadata.location_kind.root() != location
+                && input_metadata.location_id.root().key() != *location
             {
                 None
             } else {
@@ -147,7 +145,7 @@ pub fn relevant_inputs(
 /// Creates a mapping from op_id to its input op_ids, filtered by location if provided
 pub fn op_id_to_inputs(
     ir: &mut [HydroRoot],
-    location: Option<&LocationId>,
+    location: Option<&LocationKey>,
     cycle_source_to_sink_input: &HashMap<usize, usize>,
 ) -> HashMap<usize, Vec<usize>> {
     let mapping = RefCell::new(HashMap::new());
@@ -199,15 +197,15 @@ pub enum NetworkType {
     SendRecv,
 }
 
-pub fn get_network_type(node: &HydroNode, location: usize) -> Option<NetworkType> {
+pub fn get_network_type(node: &HydroNode, location: &LocationKey) -> Option<NetworkType> {
     let mut is_to_us = false;
     let mut is_from_us = false;
 
     if let HydroNode::Network { input, .. } = node {
-        if input.metadata().location_kind.root().raw_id() == location {
+        if input.metadata().location_id.root().key() == *location {
             is_from_us = true;
         }
-        if node.metadata().location_kind.root().raw_id() == location {
+        if node.metadata().location_id.root().key() == *location {
             is_to_us = true;
         }
 

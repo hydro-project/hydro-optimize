@@ -103,7 +103,7 @@ fn inject_location_node(
             | HydroNode::ExternalInput { metadata, .. }
             | HydroNode::Network { metadata, .. } => {
                 // Get location sources from the nodes must have it be correct: Source and Network
-                id_to_location.insert(op_id, metadata.location_kind.clone());
+                id_to_location.insert(op_id, metadata.location_id.clone());
                 return false;
             }
             HydroNode::Tee { inner, .. } => {
@@ -124,8 +124,8 @@ fn inject_location_node(
         for input in inputs {
             let location = id_to_location.get(&input).cloned();
             if let Some(location) = location {
-                metadata.location_kind.swap_root(location.root().clone());
-                id_to_location.insert(op_id, metadata.location_kind.clone());
+                metadata.location_id.swap_root(location.root().clone());
+                id_to_location.insert(op_id, metadata.location_id.clone());
                 return false;
             }
         }

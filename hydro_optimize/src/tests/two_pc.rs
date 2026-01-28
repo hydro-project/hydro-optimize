@@ -1,4 +1,4 @@
-tuse std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap};
 
 use hydro_build_utils::insta;
 use hydro_lang::compile::ir::deep_clone;
@@ -33,7 +33,7 @@ fn create_two_pc<'a>(
 
 #[test]
 fn two_pc_partition_coordinator() {
-    let builder = FlowBuilder::new();
+    let mut builder = FlowBuilder::new();
     let coordinator = builder.process();
     let partitioned_coordinator = builder.cluster::<()>();
     let participants = builder.cluster();
@@ -79,8 +79,8 @@ fn two_pc_partition_coordinator() {
     let coordinator_partitioner = Partitioner {
         nodes_to_partition: coordinator_nodes_to_partition,
         num_partitions: 3,
-        location_id: coordinator.id().raw_id(),
-        new_cluster_id: Some(partitioned_coordinator.id().raw_id()),
+        location_id: coordinator.id().key(),
+        new_cluster_id: Some(partitioned_coordinator.id().key()),
     };
     partition(&mut ir, &coordinator_partitioner);
 
@@ -89,7 +89,7 @@ fn two_pc_partition_coordinator() {
 
 #[test]
 fn two_pc_partition_participant() {
-    let builder = FlowBuilder::new();
+    let mut builder = FlowBuilder::new();
     let coordinator = builder.process();
     let participants = builder.cluster();
     let clients = builder.cluster();
@@ -129,7 +129,7 @@ fn two_pc_partition_participant() {
     let participant_partitioner = Partitioner {
         nodes_to_partition: participant_nodes_to_partition,
         num_partitions: 3,
-        location_id: participants.id().raw_id(),
+        location_id: participants.id().key(),
         new_cluster_id: None,
     };
     partition(&mut ir, &participant_partitioner);
