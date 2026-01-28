@@ -4,7 +4,9 @@ use clap::{ArgAction, Parser};
 use hydro_deploy::Deployment;
 use hydro_lang::location::Location;
 use hydro_optimize::deploy::{HostType, ReusableHosts};
-use hydro_optimize::deploy_and_analyze::deploy_and_optimize;
+use hydro_optimize::deploy_and_analyze::{
+    Optimizations, ReusableClusters, ReusableProcesses, deploy_and_optimize,
+};
 use hydro_test::cluster::kv_replica::Replica;
 use hydro_test::cluster::paxos::{Acceptor, CorePaxos, PaxosConfig, Proposer};
 use hydro_test::cluster::paxos_bench::{Aggregator, Client};
@@ -54,7 +56,6 @@ async fn main() {
     let num_clients_per_node = vec![1, 50, 100];
     let run_seconds = 30;
 
-    let multi_run_metadata = RefCell::new(vec![]);
     let mut iteration = 0;
     let max_num_clients_per_node = num_clients_per_node.iter().max().unwrap();
     for (i, num_clients) in num_clients.iter().enumerate() {
@@ -98,49 +99,20 @@ async fn main() {
                 &replicas,
             );
 
-            let clusters = vec![
-                (
-                    proposers.id().key(),
-                    std::any::type_name::<Proposer>().to_string(),
-                    f + 1,
-                ),
-                (
-                    acceptors.id().key(),
-                    std::any::type_name::<Acceptor>().to_string(),
-                    2 * f + 1,
-                ),
-                (
-                    clients.id().key(),
-                    std::any::type_name::<Client>().to_string(),
-                    *num_clients,
-                ),
-                (
-                    replicas.id().key(),
-                    std::any::type_name::<Replica>().to_string(),
-                    f + 1,
-                ),
-            ];
-            let processes = vec![(
-                client_aggregator.id().key(),
-                std::any::type_name::<Aggregator>().to_string(),
-            )];
-
-            let (rewritten_ir_builder, ir, _, _, _) = deploy_and_optimize(
+            deploy_and_optimize(
                 &mut reusable_hosts,
                 &mut deployment,
                 builder.finalize(),
-                &clusters,
-                &processes,
-                vec![],
+                ReusableClusters::new()
+                    .with_cluster(proposers, f + 1)
+                    .with_cluster(acceptors, 2 * f + 1)
+                    .with_cluster(clients, *num_clients)
+                    .with_cluster(replicas, f + 1),
+                ReusableProcesses::new().with_process(client_aggregator),
+                Optimizations::new(),
                 Some(run_seconds),
-                &multi_run_metadata,
-                iteration,
             )
             .await;
-
-            // Cleanup and generate graphs if requested
-            let built = rewritten_ir_builder.build_with(|_| ir).finalize();
-            _ = built.generate_graph_with_config(&args.graph, None);
 
             iteration += 1;
         }

@@ -37,12 +37,11 @@ pub type Rewrites = Vec<RewriteMetadata>;
 /// Returns Vec(Cluster, number of nodes) for each created cluster and a new FlowBuilder
 pub fn replay<'a>(
     rewrites: &mut Rewrites,
-    builder: FlowBuilder<'a>,
+    builder: &mut FlowBuilder<'a>,
     ir: &[HydroRoot],
-) -> (Vec<(Cluster<'a, ()>, usize)>, FlowBuilder<'a>) {
+) -> Vec<(Cluster<'a, ()>, usize)> {
     let mut new_clusters = vec![];
 
-    let multi_run_metadata = RefCell::new(vec![]);
     let mut ir = deep_clone(ir);
 
     // Apply decoupling/partitioning in order
@@ -51,7 +50,7 @@ pub fn replay<'a>(
         match &mut rewrite_metadata.rewrite {
             Rewrite::Decouple(decoupler) => {
                 decoupler.decoupled_location = new_cluster.id().clone();
-                decoupler::decouple(&mut ir, decoupler, &multi_run_metadata, 0);
+                decoupler::decouple(&mut ir, decoupler);
             }
             Rewrite::Partition(_partitioner) => {
                 panic!("Partitioning is not yet replayable");
@@ -60,9 +59,9 @@ pub fn replay<'a>(
         new_clusters.push((new_cluster, rewrite_metadata.num_nodes));
     }
 
-    builder.force_roots(ir);
+    builder.replace_ir(ir);
 
-    (new_clusters, builder)
+    new_clusters
 }
 
 /// Replace CLUSTER_SELF_ID with the ID of the original node the partition is assigned to

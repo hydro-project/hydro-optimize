@@ -13,8 +13,7 @@ use serde::{Deserialize, Serialize};
 use stageleft::quote_type;
 use syn::visit_mut::VisitMut;
 
-use crate::parse_results::{MultiRunMetadata, get_or_append_run_metadata};
-use crate::repair::{cycle_source_to_sink_input, inject_id, inject_location};
+use crate::repair::{cycle_source_to_sink_input, inject_location};
 use crate::rewrites::{
     ClusterSelfIdReplace, collection_kind_to_debug_type, deserialize_bincode_with_type,
     prepend_member_id_to_collection_kind, serialize_bincode_with_type, tee_to_inner_id,
@@ -262,8 +261,6 @@ fn fix_cluster_self_id_node(node: &mut HydroNode, mut locations: ClusterSelfIdRe
 pub fn decouple(
     ir: &mut [HydroRoot],
     decoupler: &Decoupler,
-    multi_run_metadata: &RefCell<MultiRunMetadata>,
-    iteration: usize,
 ) {
     let tee_to_inner_id_before_rewrites = tee_to_inner_id(ir);
     let mut new_inners = HashMap::new();
@@ -281,11 +278,6 @@ pub fn decouple(
         },
     );
 
-    // Fix IDs since we injected nodes
-    let new_id_to_old_id = inject_id(ir);
-    let mut mut_multi_run_metadata = multi_run_metadata.borrow_mut();
-    let run_metadata = get_or_append_run_metadata(&mut mut_multi_run_metadata, iteration + 1);
-    run_metadata.op_id_to_prev_iteration_op_id = new_id_to_old_id;
     // Fix locations since we changed some
     let cycle_source_to_sink_input = cycle_source_to_sink_input(ir);
     inject_location(ir, &cycle_source_to_sink_input);
@@ -308,7 +300,6 @@ pub fn decouple(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
     use std::collections::HashSet;
 
     use hydro_build_utils::insta;
@@ -350,8 +341,6 @@ mod tests {
             .assume_retries(nondet!(/** test */))
             .for_each(q!(|a| println!("Got it: {}", a)));
 
-        let multi_run_metadata = RefCell::new(vec![]);
-        let iteration = 0;
         let built = builder.optimize_with(|ir| {
             inject_id(ir);
             print_id(ir);
@@ -381,7 +370,7 @@ mod tests {
                 decoupled_location: decoupled_cluster.id().clone(),
                 orig_location: send_cluster.id().clone(),
             };
-            decouple(ir, &decoupler, &multi_run_metadata, iteration)
+            decouple(ir, &decoupler);
         });
         (send_cluster, recv_cluster, decoupled_cluster, built)
     }

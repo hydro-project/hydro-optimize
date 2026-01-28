@@ -1,12 +1,11 @@
-use std::cell::RefCell;
-
 use clap::{ArgAction, Parser};
 use hydro_deploy::Deployment;
 use hydro_lang::location::Location;
 use hydro_lang::viz::config::GraphConfig;
-use hydro_optimize::decoupler;
 use hydro_optimize::deploy::{HostType, ReusableHosts};
-use hydro_optimize::deploy_and_analyze::{Optimizations, deploy_and_optimize};
+use hydro_optimize::deploy_and_analyze::{
+    Optimizations, ReusableClusters, ReusableProcesses, deploy_and_optimize,
+};
 use hydro_test::cluster::kv_replica::Replica;
 use hydro_test::cluster::paxos::{Acceptor, CorePaxos, PaxosConfig, Proposer};
 use hydro_test::cluster::paxos_bench::{Aggregator, Client};
@@ -78,62 +77,27 @@ async fn main() {
         &replicas,
     );
 
-    let mut clusters = vec![
-        (
-            proposers.id().key(),
-            std::any::type_name::<Proposer>().to_string(),
-            f + 1,
-        ),
-        (
-            acceptors.id().key(),
-            std::any::type_name::<Acceptor>().to_string(),
-            2 * f + 1,
-        ),
-        (
-            clients.id().key(),
-            std::any::type_name::<Client>().to_string(),
-            num_clients,
-        ),
-        (
-            replicas.id().key(),
-            std::any::type_name::<Replica>().to_string(),
-            f + 1,
-        ),
-    ];
-    let processes = vec![(
-        client_aggregator.id().key(),
-        std::any::type_name::<Aggregator>().to_string(),
-    )];
-
     // Deploy
     let mut reusable_hosts = ReusableHosts::new(host_type);
-
-    let multi_run_metadata = RefCell::new(vec![]);
     let num_times_to_optimize = 2;
+    let run_seconds = 30;
 
-    for i in 0..num_times_to_optimize {
-        let new_builder = deploy_and_optimize(
-            &mut reusable_hosts,
-            &mut deployment,
-            builder.finalize(),
-            &mut clusters,
-            &processes,
-            vec![
-                std::any::type_name::<Client>().to_string(),
-                std::any::type_name::<Aggregator>().to_string(),
-            ],
-         Optimizations::new().with_decoupling(),
-            None,
-            &multi_run_metadata,
-            i,
-        )
-        .await;
-
-        builder = new_builder;
-    }
-
-    let built = builder.finalize();
-
-    // Generate graphs if requested
-    _ = built.generate_graph_with_config(&args.graph, None);
+    deploy_and_optimize(
+        &mut reusable_hosts,
+        &mut deployment,
+        builder.finalize(),
+        ReusableClusters::new()
+            .with_cluster(proposers, f + 1)
+            .with_cluster(acceptors, 2 * f + 1)
+            .with_cluster(clients, num_clients)
+            .with_cluster(replicas, f + 1),
+        ReusableProcesses::new().with_process(client_aggregator),
+        Optimizations::new()
+            .with_decoupling()
+            .excluding::<Client>()
+            .excluding::<Aggregator>()
+            .with_iterations(num_times_to_optimize),
+        Some(run_seconds),
+    )
+    .await;
 }

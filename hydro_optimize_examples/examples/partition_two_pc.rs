@@ -5,7 +5,9 @@ use hydro_deploy::Deployment;
 use hydro_lang::location::Location;
 use hydro_lang::viz::config::GraphConfig;
 use hydro_optimize::deploy::{HostType, ReusableHosts};
-use hydro_optimize::deploy_and_analyze::deploy_and_optimize;
+use hydro_optimize::deploy_and_analyze::{
+    Optimizations, ReusableClusters, ReusableProcesses, deploy_and_optimize,
+};
 use hydro_test::cluster::two_pc::{Coordinator, Participant};
 use hydro_test::cluster::two_pc_bench::{Aggregator, Client};
 
@@ -62,49 +64,21 @@ async fn main() {
         &client_aggregator,
     );
 
-    let clusters = vec![
-        (
-            participants.id().key(),
-            std::any::type_name::<Participant>().to_string(),
-            num_participants,
-        ),
-        (
-            clients.id().key(),
-            std::any::type_name::<Client>().to_string(),
-            num_clients,
-        ),
-    ];
-    let processes = vec![
-        (
-            coordinator.id().key(),
-            std::any::type_name::<Coordinator>().to_string(),
-        ),
-        (
-            client_aggregator.id().key(),
-            std::any::type_name::<Aggregator>().to_string(),
-        ),
-    ];
-
-    let multi_run_metadata = RefCell::new(vec![]);
-
-    let (rewritten_ir_builder, ir, _, _, _) = deploy_and_optimize(
+    deploy_and_optimize(
         &mut reusable_hosts,
         &mut deployment,
         builder.finalize(),
-        &clusters,
-        &processes,
-        vec![
-            std::any::type_name::<Client>().to_string(),
-            std::any::type_name::<Aggregator>().to_string(),
-        ],
+        ReusableClusters::new()
+            .with_cluster(participants, num_participants)
+            .with_cluster(clients, num_clients),
+        ReusableProcesses::new()
+            .with_process(coordinator)
+            .with_process(client_aggregator),
+        Optimizations::new()
+            .with_partitioning()
+            .excluding::<Client>()
+            .excluding::<Aggregator>(),
         None,
-        &multi_run_metadata,
-        0,
     )
     .await;
-
-    let built = rewritten_ir_builder.build_with(|_| ir).finalize();
-
-    // Generate graphs if requested
-    _ = built.generate_graph_with_config(&args.graph, None);
 }
