@@ -5,7 +5,7 @@ use hydro_deploy::Deployment;
 use hydro_lang::location::Location;
 use hydro_lang::viz::config::GraphConfig;
 use hydro_optimize::deploy::{HostType, ReusableHosts};
-use hydro_optimize::deploy_and_analyze::deploy_and_analyze;
+use hydro_optimize::deploy_and_analyze::deploy_and_optimize;
 use hydro_test::cluster::two_pc::{Coordinator, Participant};
 use hydro_test::cluster::two_pc_bench::{Aggregator, Client};
 
@@ -64,30 +64,30 @@ async fn main() {
 
     let clusters = vec![
         (
-            participants.id().raw_id(),
+            participants.id().key(),
             std::any::type_name::<Participant>().to_string(),
             num_participants,
         ),
         (
-            clients.id().raw_id(),
+            clients.id().key(),
             std::any::type_name::<Client>().to_string(),
             num_clients,
         ),
     ];
     let processes = vec![
         (
-            coordinator.id().raw_id(),
+            coordinator.id().key(),
             std::any::type_name::<Coordinator>().to_string(),
         ),
         (
-            client_aggregator.id().raw_id(),
+            client_aggregator.id().key(),
             std::any::type_name::<Aggregator>().to_string(),
         ),
     ];
 
     let multi_run_metadata = RefCell::new(vec![]);
 
-    let (rewritten_ir_builder, ir, _, _, _) = deploy_and_analyze(
+    let (rewritten_ir_builder, ir, _, _, _) = deploy_and_optimize(
         &mut reusable_hosts,
         &mut deployment,
         builder.finalize(),

@@ -1,8 +1,8 @@
 use hydro_lang::{
-    live_collections::stream::NoOrder,
+    live_collections::{sliced::sliced, stream::NoOrder},
     location::{Location, MemberId},
     nondet::nondet,
-    prelude::{KeyedStream, Process, Unbounded},
+    prelude::{KeyedStream, Process, Stream, Unbounded},
 };
 use stageleft::q;
 
@@ -26,60 +26,54 @@ pub fn lock_server<'a, Client>(
     KeyedStream<MemberId<Client>, (u32, u32), Process<'a, Server>, Unbounded, NoOrder>,
 ) {
     let server_tick = server.tick();
-    let keyed_payloads = payloads
+    let mapped_acquires = acquires
+        .clone()
         .entries()
-        .map(q!(|(client_id, (virt_client_id, lock_id, acquire))| (
+        .map(q!(|(client_id, (virtual_client_id, lock_id))| (
             lock_id,
-            (client_id, virt_client_id, acquire)
+            (client_id, virtual_client_id)
+        )))
+        .into_keyed();
+    let mapped_releases = releases
+        .clone()
+        .entries()
+        .map(q!(|(client_id, (virtual_client_id, lock_id))| (
+            lock_id,
+            (client_id, virtual_client_id)
         )))
         .into_keyed();
 
-    let batched_payloads = keyed_payloads
-        .assume_ordering(nondet!(/** For each key, the first to acquire the lock wins */));
-    let lock_state = batched_payloads.clone().across_ticks(|stream| {
-        stream.reduce(q!(
-            |(curr_client_id, curr_virt_client_id, is_held_by_client),
-             (client_id, virt_client_id, acquire)| {
-                if acquire {
-                    // If the lock is currently held by the server, give the client the lock
-                    if !*is_held_by_client {
-                        *curr_client_id = client_id;
-                        *curr_virt_client_id = virt_client_id;
-                        *is_held_by_client = true;
-                    }
-                } else {
-                    // If the client is releasing the lock and it holds it, give the lock back to the server
-                    if *is_held_by_client
-                        && *curr_virt_client_id == virt_client_id
-                        && *curr_client_id == client_id
-                    {
-                        *is_held_by_client = false;
-                    }
-                }
-            }
-        ))
-    });
-    let results = batched_payloads
-        .cross_singleton(lock_state)
-        .all_ticks()
-        .map(q!(|(
-            lock_id,
-            (
-                (client_id, virt_client_id, acquire),
-                (curr_client_id, curr_virt_client_id, is_held_by_client),
-            ),
-        )| {
-            if acquire {
-                let acquired = is_held_by_client
-                    && curr_client_id == client_id
-                    && curr_virt_client_id == virt_client_id;
-                (client_id, (virt_client_id, lock_id, acquired))
-            } else {
-                // Releasing always succeeds
-                (client_id, (virt_client_id, lock_id, true))
-            }
-        }));
-    results
+    sliced! {
+        let mapped_acquires = use(mapped_acquires, nondet!(/** For each lock, pick a random acquire as the winner */));
+        let mapped_releases = use(mapped_releases, nondet!(/** For each lock, only one release should succeed (the owner of the lock) */));
+
+        // lock_id
+        let mut free_locks = use::state_null::<Stream<u32, _, _, _>>();
+        // (lock_id, (client_id, virtual_client_id))
+        let mut acquired_locks = use::state_null::<Stream<(u32, (MemberId<Client>, u32)), _, _, _>>();
+        let keyed_acquired_locks = acquired_locks.into_keyed().first();
+        // For each lock, pick a random acquire as the winner
+
+        // Always process releases first
+        let new_free_locks = keyed_acquired_locks
+            .clone()
+            .get_many_if_present(mapped_releases)
+            .filter(q!(|((holder_client_id, holder_virtual_client_id), (client_id, virtual_client_id))|
+                holder_client_id == client_id && holder_virtual_client_id == virtual_client_id
+            ))
+            .keys()
+            .chain(free_locks);
+
+        let winning_acquires = mapped_acquires.assume_ordering(nondet!(/** Randomly pick one acquire to be the winner */)).first();
+
+        // Process acquires for locks that exist
+        // TODO: Requires join_stream
+
+        // Create new locks if it's not currently free or acquired
+        let created_locks = winning_acquires
+            .filter_key_not_in(new_free_locks)
+            .filter_key_not_in(keyed_acquired_locks.keys());
+    };
 }
 
 /// Lock server implementation as described in https://dl.acm.org/doi/pdf/10.1145/3341301.3359651, with the difference being that each server can hold multiple locks.
@@ -120,6 +114,7 @@ pub fn assume_order_lock_server<'a, Client>(
     let payloads = atomic_acquires.interleave(atomic_releases).into_keyed();
 
     let lock_state = payloads
+        .clone()
         .assume_ordering(nondet!(/** Process in arrival order */))
         .fold(
             q!(|| None),
@@ -145,13 +140,21 @@ pub fn assume_order_lock_server<'a, Client>(
 
     // TODO
     let acquire_results = sliced! {
-        let payloads = use::atomic(payloads, nondet!(/** Payloads at this tick */));
+        let payloads = use::atomic(payloads.clone(), nondet!(/** Payloads at this tick */));
         let locks_snapshot = use::atomic(lock_state, nondet!(/** Snapshot of lock state at this tick */));
 
-        payloads.clone()
-            .filter(q!(|(_, (_, _, acquire))| acquire))
-            .cross_singleton(locks_snapshot)
-    };
+        let acquires = payloads.filter(q!(|(_, _, acquire)| *acquire));
+        locks_snapshot.get_many_if_present(acquires)
+    }
+    .map(q!(|(curr_holder, (client_id, virtual_client_id, _acquire))| {
+        let lock_acquired = curr_holder.is_some_and(|(holder_client_id, holder_virtual_client_id)| {
+            holder_client_id == client_id && holder_virtual_client_id == virtual_client_id
+        });
+        (client_id, virtual_client_id, lock_acquired)
+    }))
+    .entries()
+    .map(q!(|(lock_id, (client_id, virtual_client_id, acquired))| (client_id, (virtual_client_id, lock_id, acquired))))
+    .into_keyed();
 
     let release_results = payloads
         .end_atomic()

@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use hydro_lang::compile::builder::{FlowBuilder, RewriteIrFlowBuilder};
+use hydro_lang::compile::builder::FlowBuilder;
 use hydro_lang::compile::ir::{
     BoundKind, CollectionKind, DebugType, HydroIrMetadata, HydroNode, HydroRoot,
     KeyedSingletonBoundKind, StreamOrder, StreamRetry, deep_clone, traverse_dfir,

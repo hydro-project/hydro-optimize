@@ -3,19 +3,19 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use hydro_deploy::Deployment;
-use hydro_lang::compile::builder::RewriteIrFlowBuilder;
 use hydro_lang::compile::built::BuiltFlow;
 use hydro_lang::compile::deploy::DeployResult;
 use hydro_lang::compile::ir::{HydroNode, HydroRoot, deep_clone, traverse_dfir};
 use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::deploy::deploy_graph::DeployCrateWrapper;
+use hydro_lang::location::LocationKey;
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::prelude::FlowBuilder;
 use hydro_lang::telemetry::Sidecar;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::decouple_analysis::decouple_analysis;
-use crate::decoupler::Decoupler;
+use crate::decoupler::{self, Decoupler};
 use crate::deploy::ReusableHosts;
 use crate::parse_results::{
     MultiRunMetadata, analyze_cluster_results, analyze_send_recv_overheads,
@@ -168,33 +168,64 @@ impl Sidecar for ScriptSidecar {
     }
 }
 
-/// TODO: Return type should be changed to also include Partitioner
+pub struct Optimizations {
+    decoupling: bool,
+    partitioning: bool,
+    iterations: usize, // Performs no optimizations if iterations = 0
+}
+
+impl Optimizations {
+    pub fn new() -> Self {
+        Self {
+            decoupling: false,
+            partitioning: false,
+            iterations: 0,
+        }
+    }
+
+    pub fn with_decoupling(mut self) -> Self {
+        self.decoupling = true;
+        if self.iterations == 0 {
+            self.iterations = 1;
+        }
+        self
+    }
+
+    pub fn with_partitioning(mut self) -> Self {
+        self.partitioning = true;
+        if self.iterations == 0 {
+            self.iterations = 1;
+        }
+        self
+    }
+    
+    pub fn with_iterations(mut self, iterations: usize) -> Self {
+        self.iterations = iterations;
+        self
+    }
+}
+
 #[expect(clippy::too_many_arguments, reason = "Optimizer internal function")]
 #[expect(
     clippy::await_holding_refcell_ref,
     reason = "Await function needs to write to data in RefCell"
 )]
-pub async fn deploy_and_analyze<'a>(
+pub async fn deploy_and_optimize<'a>(
     reusable_hosts: &mut ReusableHosts,
     deployment: &mut Deployment,
     builder: BuiltFlow<'a>,
-    clusters: &Vec<(usize, String, usize)>,
-    processes: &Vec<(usize, String)>,
-    exclude_from_decoupling: Vec<String>,
+    clusters: &mut Vec<(LocationKey, String, usize)>,
+    processes: &Vec<(LocationKey, String)>,
+    exclude_from_rewrites: Vec<String>,
+    optimizations: Optimizations,
     num_seconds: Option<usize>,
     multi_run_metadata: &RefCell<MultiRunMetadata>,
     iteration: usize, // Starts at 0, how many times this function has been called
-) -> (
-    RewriteIrFlowBuilder<'a>,
-    Vec<HydroRoot>,
-    Decoupler,
-    String,
-    usize,
-) {
+) -> FlowBuilder<'a> {
     let counter_output_duration = syn::parse_quote!(std::time::Duration::from_secs(1));
 
     // Rewrite with counter tracking
-    let rewritten_ir_builder = FlowBuilder::rewritten_ir_builder(&builder);
+    let mut post_rewrite_builder = FlowBuilder::from_built(&builder);
     let optimized = builder.optimize_with(|leaf| {
         inject_id(leaf);
         insert_counter(leaf, counter_output_duration);
@@ -204,16 +235,14 @@ pub async fn deploy_and_analyze<'a>(
     // Insert all clusters & processes
     let mut deployable = optimized.into_deploy();
     for (cluster_id, name, num_hosts) in clusters {
-        deployable = deployable.with_cluster_id_name(
+        deployable = deployable.with_cluster_erased(
             *cluster_id,
-            name.clone(),
             reusable_hosts.get_cluster_hosts(deployment, name.clone(), *num_hosts),
         );
     }
     for (process_id, name) in processes {
-        deployable = deployable.with_process_id_name(
+        deployable = deployable.with_process_erased(
             *process_id,
-            name.clone(),
             reusable_hosts.get_process_hosts(deployment, name.clone()),
         );
     }
@@ -256,7 +285,7 @@ pub async fn deploy_and_analyze<'a>(
         &mut usage_out,
         &mut cardinality_out,
         run_metadata,
-        exclude_from_decoupling,
+        exclude_from_rewrites,
     )
     .await;
     // Remove HydroNode::Counter (since we don't want to consider decoupling those)
@@ -280,27 +309,41 @@ pub async fn deploy_and_analyze<'a>(
     std::mem::drop(mut_multi_run_metadata); // Release borrow
     compare_expected_performance(&mut ir, multi_run_metadata, iteration);
 
-    let (orig_to_decoupled, decoupled_to_orig, place_on_decoupled) = decouple_analysis(
-        &mut ir,
-        &bottleneck,
-        send_overhead,
-        recv_overhead,
-        &cycle_source_to_sink_input,
-    );
+    if optimizations.decoupling {
+        let decision = decouple_analysis(
+            &mut ir,
+            &bottleneck,
+            send_overhead,
+            recv_overhead,
+            &cycle_source_to_sink_input,
+        );
 
-    // TODO: Save decoupling decision to file
+        // Apply decoupling
+        let mut decoupled_cluster = None;
+        let new_cluster = post_rewrite_builder.cluster::<()>();
+        let decouple_with_location = Decoupler {
+            decision,
+            orig_location: bottleneck,
+            decoupled_location: new_cluster.id().clone(),
+        };
+        decoupler::decouple(
+            &mut ir,
+            &decouple_with_location,
+            &multi_run_metadata,
+            iteration,
+        );
+        post_rewrite_builder.replace_ir(ir);
+        decoupled_cluster = Some(new_cluster);
 
-    (
-        rewritten_ir_builder,
-        ir,
-        Decoupler {
-            output_to_decoupled_machine_after: orig_to_decoupled,
-            output_to_original_machine_after: decoupled_to_orig,
-            place_on_decoupled_machine: place_on_decoupled,
-            orig_location: bottleneck.clone(),
-            decoupled_location: LocationId::Process(0), // Placeholder, must replace
-        },
-        bottleneck_name,
-        bottleneck_num_nodes,
-    )
+        if let Some(new_cluster) = decoupled_cluster {
+            clusters.push((
+                new_cluster.id().key(),
+                format!("{}-decouple-{}", bottleneck_name, iteration),
+                bottleneck_num_nodes,
+            ));
+        }
+        // TODO: Save decoupling decision to file
+    }
+
+    post_rewrite_builder
 }

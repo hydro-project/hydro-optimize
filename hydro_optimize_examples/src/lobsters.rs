@@ -1,10 +1,8 @@
-use std::collections::HashSet;
-
 use hydro_lang::{
-    live_collections::stream::NoOrder,
+    live_collections::{sliced::sliced, stream::NoOrder},
     location::{Location, MemberId},
     nondet::nondet,
-    prelude::{Process, Stream, Unbounded},
+    prelude::{KeyedStream, Process, Unbounded},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -46,63 +44,65 @@ impl PartialOrd for Story {
 )]
 pub fn lobsters<'a, Client>(
     server: &Process<'a, Server>,
-    add_user: KeyedStream<(MemberId<Client>, u32), String, Process<'a, Server>, Unbounded, NoOrder>,
-    get_users: Stream<(MemberId<Client>, u32), Process<'a, Server>, Unbounded, NoOrder>,
+    add_user: KeyedStream<MemberId<Client>, (u32, String), Process<'a, Server>, Unbounded, NoOrder>,
+    get_users: KeyedStream<MemberId<Client>, u32, Process<'a, Server>, Unbounded, NoOrder>,
     add_story: KeyedStream<
-        (MemberId<Client>, u32),
-        (String, String, Instant),
+        MemberId<Client>,
+        (u32, String, String, Instant),
         Process<'a, Server>,
         Unbounded,
         NoOrder,
     >,
     _add_comment: KeyedStream<
-        (MemberId<Client>, u32),
-        (String, u32, String, Instant),
+        MemberId<Client>,
+        (u32, String, u32, String, Instant),
         Process<'a, Server>,
         Unbounded,
         NoOrder,
     >,
     _upvote_story: KeyedStream<
-        (MemberId<Client>, u32),
-        (String, u32),
+        MemberId<Client>,
+        (u32, String, u32),
         Process<'a, Server>,
         Unbounded,
         NoOrder,
     >,
     _upvote_comment: KeyedStream<
-        (MemberId<Client>, u32),
-        (String, u32),
+        MemberId<Client>,
+        (u32, String, u32),
         Process<'a, Server>,
         Unbounded,
         NoOrder,
     >,
-    _get_stories: Stream<(MemberId<Client>, u32), Process<'a, Server>, Unbounded, NoOrder>,
-    _get_comments: Stream<(MemberId<Client>, u32), Process<'a, Server>, Unbounded, NoOrder>,
+    _get_stories: KeyedStream<MemberId<Client>, u32, Process<'a, Server>, Unbounded, NoOrder>,
+    _get_comments: KeyedStream<MemberId<Client>, u32, Process<'a, Server>, Unbounded, NoOrder>,
     _get_story_comments: KeyedStream<
-        (MemberId<Client>, u32),
-        u32,
+        MemberId<Client>,
+        (u32, u32),
         Process<'a, Server>,
         Unbounded,
         NoOrder,
     >,
 ) -> (
-    KeyedStream<(MemberId<Client>, u32), Option<String>, Process<'a, Server>, Unbounded, NoOrder>, // add_user response
+    KeyedStream<MemberId<Client>, (u32, Option<String>), Process<'a, Server>, Unbounded, NoOrder>, // add_user response
 ) {
     let user_auth_tick = server.tick();
     let stories_tick = server.tick();
 
+    let atomic_add_user = add_user.atomic(&user_auth_tick);
     // Persisted users
-    let curr_users = add_user
-        .map(q!(|(_client_id, username)| (
-            username,
-            self::generate_api_key(username.clone())
+    let curr_users = atomic_add_user
+        .entries()
+        .map(q!(|(_client_id, (virtual_client_id, username))| (
+            username.clone(),
+            (self::generate_api_key(username), virtual_client_id)
         )))
         .into_keyed()
         .assume_ordering(nondet!(/** First user wins */))
         .first();
     // Send response back to client. Only done after the tick to ensure that once the client gets the response, the user has been added
     let add_user_response = sliced! {
-        let new_users = use(add_user_with_api_key, nondet!(/** New users requests this tick */));
+        let new_users = use(atomic_add_user, nondet!(/** New users requests this tick */));
         let curr_users = use(curr_users, nondet!(/** Current users this tick */));
         new_users
             .map(q!(|(client_id, (username, api_key))| {
@@ -122,9 +122,10 @@ pub fn lobsters<'a, Client>(
         .all_ticks();
 
     // Add story
-    let add_story_pre_join = add_story.map(q!(|(client_id, (api_key, title, timestamp))| {
-        (api_key, (client_id, title, timestamp))
-    }));
+    let add_story_pre_join =
+        add_story.map(q!(|(client_id, (req_id, api_key, title, timestamp))| {
+            (api_key, (client_id, req_id, title, timestamp))
+        }));
     let stories = add_story_pre_join
         .batch(
             &user_auth_tick,
@@ -150,7 +151,7 @@ pub fn lobsters<'a, Client>(
     let _top_stories = curr_stories.clone().persist().fold_commutative_idempotent(
         q!(|| vec![]),
         q!(
-            |vec, (_api_key, ((_client_id, title, timestamp), username))| {
+            |vec, (_api_key, ((_client_id, _req_id, title, timestamp), username))| {
                 let new_elem = (title, timestamp, username);
                 // TODO: Use a binary heap
                 // TODO: Create a struct that is ordered by timestamp

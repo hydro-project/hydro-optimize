@@ -20,11 +20,16 @@ use crate::rewrites::{
     prepend_member_id_to_collection_kind, serialize_bincode_with_type, tee_to_inner_id,
 };
 
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Decoupler {
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct DecoupleDecision {
     pub output_to_decoupled_machine_after: Vec<usize>, /* The output of the operator at this index should be sent to the decoupled machine */
     pub output_to_original_machine_after: Vec<usize>, /* The output of the operator at this index should be sent to the original machine */
     pub place_on_decoupled_machine: Vec<usize>, /* This operator should be placed on the decoupled machine. Only for sources */
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Decoupler {
+    pub decision: DecoupleDecision,
     pub orig_location: LocationId,
     pub decoupled_location: LocationId,
 }
@@ -151,7 +156,11 @@ fn decouple_node(
     tee_to_inner_id_before_rewrites: &HashMap<usize, usize>,
 ) {
     // Replace location of sources, if necessary
-    if decoupler.place_on_decoupled_machine.contains(next_stmt_id) {
+    if decoupler
+        .decision
+        .place_on_decoupled_machine
+        .contains(next_stmt_id)
+    {
         match node {
             HydroNode::Source { metadata, .. }
             | HydroNode::SingletonSource { metadata, .. }
@@ -178,11 +187,13 @@ fn decouple_node(
 
     // Otherwise, replace where the outputs go
     let new_location = if decoupler
+        .decision
         .output_to_decoupled_machine_after
         .contains(next_stmt_id)
     {
         &decoupler.decoupled_location
     } else if decoupler
+        .decision
         .output_to_original_machine_after
         .contains(next_stmt_id)
     {
@@ -311,7 +322,7 @@ mod tests {
     use stageleft::q;
 
     use crate::debug::{name_to_id_map, print_id};
-    use crate::decoupler::{Decoupler, decouple};
+    use crate::decoupler::{DecoupleDecision, Decoupler, decouple};
     use crate::repair::inject_id;
 
     fn decouple_mini_program<'a>(
@@ -347,24 +358,26 @@ mod tests {
             // Convert named nodes to IDs, accounting for the offset
             let name_to_id = name_to_id_map(ir);
             let decoupler = Decoupler {
-                output_to_decoupled_machine_after: output_to_decoupled_machine_after
-                    .into_iter()
-                    .map(|(name, offset)| {
-                        (name_to_id.get(name).cloned().unwrap() as i32 + offset) as usize
-                    })
-                    .collect(),
-                output_to_original_machine_after: output_to_original_machine_after
-                    .into_iter()
-                    .map(|(name, offset)| {
-                        (name_to_id.get(name).cloned().unwrap() as i32 + offset) as usize
-                    })
-                    .collect(),
-                place_on_decoupled_machine: place_on_decoupled_machine
-                    .into_iter()
-                    .map(|(name, offset)| {
-                        (name_to_id.get(name).cloned().unwrap() as i32 + offset) as usize
-                    })
-                    .collect(),
+                decision: DecoupleDecision {
+                    output_to_decoupled_machine_after: output_to_decoupled_machine_after
+                        .into_iter()
+                        .map(|(name, offset)| {
+                            (name_to_id.get(name).cloned().unwrap() as i32 + offset) as usize
+                        })
+                        .collect(),
+                    output_to_original_machine_after: output_to_original_machine_after
+                        .into_iter()
+                        .map(|(name, offset)| {
+                            (name_to_id.get(name).cloned().unwrap() as i32 + offset) as usize
+                        })
+                        .collect(),
+                    place_on_decoupled_machine: place_on_decoupled_machine
+                        .into_iter()
+                        .map(|(name, offset)| {
+                            (name_to_id.get(name).cloned().unwrap() as i32 + offset) as usize
+                        })
+                        .collect(),
+                },
                 decoupled_location: decoupled_cluster.id().clone(),
                 orig_location: send_cluster.id().clone(),
             };

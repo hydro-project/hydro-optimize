@@ -1,7 +1,7 @@
 use hydro_lang::{
     live_collections::stream::NoOrder,
     nondet::nondet,
-    prelude::{Cluster, KeyedStream, Process, Stream, TCP, Unbounded},
+    prelude::{Cluster, KeyedStream, Process, TCP, Unbounded},
 };
 use hydro_std::bench_client::{bench_client, compute_throughput_latency, print_bench_results};
 
@@ -21,15 +21,17 @@ pub fn network_calibrator<'a>(
     let latencies = bench_client(
         clients,
         num_clients_per_node,
-        |_client, ids_and_prev_payloads| {
+        |ids_and_prev_payloads| {
             size_based_workload_generator(message_size, ids_and_prev_payloads)
         },
         |payloads| {
             // Server just echoes the payload
             payloads
+                .entries()
                 .broadcast(server, TCP.bincode(), nondet!(/** Test */))
                 .demux(clients, TCP.bincode())
                 .values()
+                .into_keyed()
         },
     ).values().map(q!(|(_client_id, latency)| latency));
 

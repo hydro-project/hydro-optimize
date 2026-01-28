@@ -228,7 +228,7 @@ pub async fn analyze_cluster_results(
     usage_out: &mut HashMap<(LocationId, String, usize), UnboundedReceiver<String>>,
     cardinality_out: &mut HashMap<(LocationId, String, usize), UnboundedReceiver<String>>,
     run_metadata: &mut RunMetadata,
-    exclude_from_decoupling: Vec<String>,
+    exclude: Vec<String>,
 ) -> (LocationId, String, usize) {
     let mut max_usage_cluster_id = None;
     let mut max_usage_cluster_size = 0;
@@ -273,7 +273,7 @@ pub async fn analyze_cluster_results(
                 .insert(id.clone(), unidentified_perf);
 
             // Update cluster with max usage
-            if max_usage_overall < usage && !exclude_from_decoupling.contains(&name) {
+            if max_usage_overall < usage && !exclude.contains(&name) {
                 max_usage_cluster_id = Some(id);
                 max_usage_cluster_name = name.clone();
                 max_usage_cluster_size = cluster.members().len();

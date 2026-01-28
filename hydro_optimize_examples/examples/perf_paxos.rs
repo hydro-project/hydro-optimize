@@ -6,7 +6,7 @@ use hydro_lang::location::Location;
 use hydro_lang::viz::config::GraphConfig;
 use hydro_optimize::decoupler;
 use hydro_optimize::deploy::{HostType, ReusableHosts};
-use hydro_optimize::deploy_and_analyze::deploy_and_analyze;
+use hydro_optimize::deploy_and_analyze::{Optimizations, deploy_and_optimize};
 use hydro_test::cluster::kv_replica::Replica;
 use hydro_test::cluster::paxos::{Acceptor, CorePaxos, PaxosConfig, Proposer};
 use hydro_test::cluster::paxos_bench::{Aggregator, Client};
@@ -80,28 +80,28 @@ async fn main() {
 
     let mut clusters = vec![
         (
-            proposers.id().raw_id(),
+            proposers.id().key(),
             std::any::type_name::<Proposer>().to_string(),
             f + 1,
         ),
         (
-            acceptors.id().raw_id(),
+            acceptors.id().key(),
             std::any::type_name::<Acceptor>().to_string(),
             2 * f + 1,
         ),
         (
-            clients.id().raw_id(),
+            clients.id().key(),
             std::any::type_name::<Client>().to_string(),
             num_clients,
         ),
         (
-            replicas.id().raw_id(),
+            replicas.id().key(),
             std::any::type_name::<Replica>().to_string(),
             f + 1,
         ),
     ];
     let processes = vec![(
-        client_aggregator.id().raw_id(),
+        client_aggregator.id().key(),
         std::any::type_name::<Aggregator>().to_string(),
     )];
 
@@ -112,40 +112,24 @@ async fn main() {
     let num_times_to_optimize = 2;
 
     for i in 0..num_times_to_optimize {
-        let (rewritten_ir_builder, mut ir, mut decoupler, bottleneck_name, bottleneck_num_nodes) =
-            deploy_and_analyze(
-                &mut reusable_hosts,
-                &mut deployment,
-                builder.finalize(),
-                &clusters,
-                &processes,
-                vec![
-                    std::any::type_name::<Client>().to_string(),
-                    std::any::type_name::<Aggregator>().to_string(),
-                ],
-                None,
-                &multi_run_metadata,
-                i,
-            )
-            .await;
+        let new_builder = deploy_and_optimize(
+            &mut reusable_hosts,
+            &mut deployment,
+            builder.finalize(),
+            &mut clusters,
+            &processes,
+            vec![
+                std::any::type_name::<Client>().to_string(),
+                std::any::type_name::<Aggregator>().to_string(),
+            ],
+         Optimizations::new().with_decoupling(),
+            None,
+            &multi_run_metadata,
+            i,
+        )
+        .await;
 
-        // Apply decoupling
-        let mut decoupled_cluster = None;
-        builder = rewritten_ir_builder.build_with(|builder| {
-            let new_cluster = builder.cluster::<()>();
-            decoupler.decoupled_location = new_cluster.id().clone();
-            decoupler::decouple(&mut ir, &decoupler, &multi_run_metadata, i);
-            decoupled_cluster = Some(new_cluster);
-
-            ir
-        });
-        if let Some(new_cluster) = decoupled_cluster {
-            clusters.push((
-                new_cluster.id().raw_id(),
-                format!("{}-decouple-{}", bottleneck_name, i),
-                bottleneck_num_nodes,
-            ));
-        }
+        builder = new_builder;
     }
 
     let built = builder.finalize();

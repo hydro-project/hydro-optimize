@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use crate::decoupler::DecoupleDecision;
 use crate::rewrites::op_id_to_inputs;
 use good_lp::solvers::highs::HighsSolution;
 use good_lp::{
@@ -387,7 +388,7 @@ pub(crate) fn decouple_analysis(
     send_overhead: f64,
     recv_overhead: f64,
     cycle_source_to_sink_input: &HashMap<usize, usize>,
-) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+) -> DecoupleDecision {
     let model_metadata = RefCell::new(ModelMetadata {
         cluster_to_decouple: cluster_to_decouple.clone(),
         decoupling_send_overhead: send_overhead,
@@ -401,8 +402,11 @@ pub(crate) fn decouple_analysis(
         tee_inner_to_decoupled_vars: HashMap::new(),
         network_ids: HashMap::new(),
     });
-    let op_id_to_inputs =
-        op_id_to_inputs(ir, Some(&cluster_to_decouple.key()), cycle_source_to_sink_input);
+    let op_id_to_inputs = op_id_to_inputs(
+        ir,
+        Some(&cluster_to_decouple.key()),
+        cycle_source_to_sink_input,
+    );
 
     traverse_dfir::<HydroDeploy>(
         ir,
@@ -433,9 +437,7 @@ pub(crate) fn decouple_analysis(
 
     let mut orig_machine = vec![];
     let mut decoupled_machine = vec![];
-    let mut orig_to_decoupled = vec![];
-    let mut decoupled_to_orig = vec![];
-    let mut place_on_decoupled = vec![];
+    let mut decision = DecoupleDecision::default();
 
     for (op_id, inputs) in op_id_to_inputs {
         if let Some(op_var) = op_id_to_var.get(&op_id) {
@@ -457,10 +459,10 @@ pub(crate) fn decouple_analysis(
                 // Figure out if we should insert Network nodes
                 match (input_unwrapped, op_value) {
                     (0.0, 1.0) => {
-                        orig_to_decoupled.push(op_id);
+                        decision.output_to_decoupled_machine_after.push(op_id);
                     }
                     (1.0, 0.0) => {
-                        decoupled_to_orig.push(op_id);
+                        decision.output_to_original_machine_after.push(op_id);
                     }
                     _ => {}
                 }
@@ -477,7 +479,7 @@ pub(crate) fn decouple_analysis(
                     decoupled_machine.push(op_id);
                     // Don't modify the destination if we're sending to someone else
                     if !network_type.is_some_and(|t| *t == NetworkType::Send) {
-                        place_on_decoupled.push(op_id);
+                        decision.place_on_decoupled_machine.push(op_id);
                     }
                 }
             }
@@ -488,18 +490,21 @@ pub(crate) fn decouple_analysis(
     decoupled_machine.sort();
     println!("Original: {:?}", orig_machine);
     println!("Decoupling: {:?}", decoupled_machine);
-    orig_to_decoupled.sort();
-    decoupled_to_orig.sort();
-    place_on_decoupled.sort();
+    decision.output_to_decoupled_machine_after.sort();
+    decision.output_to_original_machine_after.sort();
+    decision.place_on_decoupled_machine.sort();
     println!(
         "Original outputting to decoupled after: {:?}",
-        orig_to_decoupled
+        decision.output_to_decoupled_machine_after
     );
     println!(
         "Decoupled outputting to original after: {:?}",
-        decoupled_to_orig
+        decision.output_to_original_machine_after
     );
-    println!("Placing on decoupled: {:?}", place_on_decoupled);
+    println!(
+        "Placing on decoupled: {:?}",
+        decision.place_on_decoupled_machine
+    );
 
-    (orig_to_decoupled, decoupled_to_orig, place_on_decoupled)
+    decision
 }

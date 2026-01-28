@@ -4,7 +4,7 @@ use clap::{ArgAction, Parser};
 use hydro_deploy::Deployment;
 use hydro_lang::location::Location;
 use hydro_optimize::deploy::{HostType, ReusableHosts};
-use hydro_optimize::deploy_and_analyze::deploy_and_analyze;
+use hydro_optimize::deploy_and_analyze::deploy_and_optimize;
 use hydro_test::cluster::kv_replica::Replica;
 use hydro_test::cluster::paxos::{Acceptor, CorePaxos, PaxosConfig, Proposer};
 use hydro_test::cluster::paxos_bench::{Aggregator, Client};
@@ -100,32 +100,32 @@ async fn main() {
 
             let clusters = vec![
                 (
-                    proposers.id().raw_id(),
+                    proposers.id().key(),
                     std::any::type_name::<Proposer>().to_string(),
                     f + 1,
                 ),
                 (
-                    acceptors.id().raw_id(),
+                    acceptors.id().key(),
                     std::any::type_name::<Acceptor>().to_string(),
                     2 * f + 1,
                 ),
                 (
-                    clients.id().raw_id(),
+                    clients.id().key(),
                     std::any::type_name::<Client>().to_string(),
                     *num_clients,
                 ),
                 (
-                    replicas.id().raw_id(),
+                    replicas.id().key(),
                     std::any::type_name::<Replica>().to_string(),
                     f + 1,
                 ),
             ];
             let processes = vec![(
-                client_aggregator.id().raw_id(),
+                client_aggregator.id().key(),
                 std::any::type_name::<Aggregator>().to_string(),
             )];
 
-            let (rewritten_ir_builder, ir, _, _, _) = deploy_and_analyze(
+            let (rewritten_ir_builder, ir, _, _, _) = deploy_and_optimize(
                 &mut reusable_hosts,
                 &mut deployment,
                 builder.finalize(),

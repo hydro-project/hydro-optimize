@@ -5,11 +5,11 @@ use std::sync::Arc;
 use clap::Parser;
 use hydro_deploy::Deployment;
 use hydro_deploy::gcp::GcpNetwork;
-use hydro_lang::viz::config::GraphConfig;
 use hydro_lang::location::Location;
 use hydro_lang::prelude::FlowBuilder;
+use hydro_lang::viz::config::GraphConfig;
 use hydro_optimize::deploy::ReusableHosts;
-use hydro_optimize::deploy_and_analyze::deploy_and_analyze;
+use hydro_optimize::deploy_and_analyze::deploy_and_optimize;
 use hydro_optimize_examples::network_calibrator::{Aggregator, Client, Server, network_calibrator};
 use tokio::sync::RwLock;
 
@@ -60,22 +60,25 @@ async fn main() {
 
         let clusters = vec![
             (
-                server.id().raw_id(),
+                server.id().key(),
                 std::any::type_name::<Server>().to_string(),
                 1,
             ),
             (
-                clients.id().raw_id(),
+                clients.id().key(),
                 std::any::type_name::<Client>().to_string(),
                 num_clients,
             ),
         ];
         let processes = vec![(
-            client_aggregator.id().raw_id(),
+            client_aggregator.id().key(),
             std::any::type_name::<Aggregator>().to_string(),
         )];
 
-        println!("Running network calibrator with message size: {} bytes, num clients: {}", message_size, num_clients);
+        println!(
+            "Running network calibrator with message size: {} bytes, num clients: {}",
+            message_size, num_clients
+        );
         network_calibrator(
             num_clients_per_node,
             message_size,
@@ -84,22 +87,21 @@ async fn main() {
             &client_aggregator,
         );
 
-        let (rewritten_ir_builder, ir, _, _, _) =
-            deploy_and_analyze(
-                &mut reusable_hosts,
-                &mut deployment,
-                builder.finalize(),
-                &clusters,
-                &processes,
-                vec![
-                    std::any::type_name::<Client>().to_string(),
-                    std::any::type_name::<Aggregator>().to_string(),
-                ],
-                num_seconds_to_profile,
-                &multi_run_metadata,
-                0, // Set to 0 to turn off comparisons between iterations
-            )
-            .await;
+        let (rewritten_ir_builder, ir, _, _, _) = deploy_and_optimize(
+            &mut reusable_hosts,
+            &mut deployment,
+            builder.finalize(),
+            &clusters,
+            &processes,
+            vec![
+                std::any::type_name::<Client>().to_string(),
+                std::any::type_name::<Aggregator>().to_string(),
+            ],
+            num_seconds_to_profile,
+            &multi_run_metadata,
+            0, // Set to 0 to turn off comparisons between iterations
+        )
+        .await;
 
         let built = rewritten_ir_builder.build_with(|_| ir).finalize();
 
