@@ -231,7 +231,7 @@ pub async fn analyze_cluster_results(
         let mut max_usage = None;
         for (idx, _) in cluster.members().iter().enumerate() {
             let usage =
-                get_usage(usage_out.get_mut(&(id.clone(), name.clone(), idx)).unwrap()).await;
+                get_usage(usage_out.get_mut(&(id.clone(), name.to_string(), idx)).unwrap()).await;
             println!("Node {} usage: {}", idx, usage);
             if let Some((prev_usage, _)) = max_usage {
                 if usage > prev_usage {
@@ -245,7 +245,7 @@ pub async fn analyze_cluster_results(
         if let Some((usage, idx)) = max_usage {
             // Modify IR with perf & cardinality numbers
             let node_cardinality = cardinality_out
-                .get_mut(&(id.clone(), name.clone(), idx))
+                .get_mut(&(id.clone(), name.to_string(), idx))
                 .unwrap();
             let unidentified_perf = analyze_process_results(
                 cluster.members().get(idx).unwrap(),
@@ -261,9 +261,9 @@ pub async fn analyze_cluster_results(
                 .insert(id.clone(), unidentified_perf);
 
             // Update cluster with max usage
-            if max_usage_overall < usage && !exclude.contains(&name) {
+            if max_usage_overall < usage && !exclude.contains(&name.to_string()) {
                 max_usage_cluster_id = Some(id);
-                max_usage_cluster_name = name.clone();
+                max_usage_cluster_name = name.to_string();
                 max_usage_cluster_size = cluster.members().len();
                 max_usage_overall = usage;
                 println!("The bottleneck is {}", name);

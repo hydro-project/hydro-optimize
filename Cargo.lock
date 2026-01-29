@@ -739,9 +739,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.5.55"
+version = "4.5.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e34525d5bbbd55da2bb745d34b36121baac88d07619a9a09cfcf4a6c0832785"
+checksum = "a75ca66430e33a14957acc24c5077b503e7d374151b2b4b3a10c83b4ceb4be0e"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -749,9 +749,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.5.55"
+version = "4.5.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59a20016a20a3da95bef50ec7238dbd09baeef4311dcdd38ec15aba69812fb61"
+checksum = "793207c7fa6300a0608d1080b858e5fdbe713cdc1c8db9fb17777d8a13e63df0"
 dependencies = [
  "anstream",
  "anstyle",
@@ -895,7 +895,7 @@ dependencies = [
 [[package]]
 name = "copy_span"
 version = "0.1.0"
-source = "git+https://github.com/hydro-project/hydro.git#30167649b29b1c199a14daabc796950d1a588297"
+source = "git+https://github.com/hydro-project/hydro.git#0fafcf4bcf932a90f3b489a254246ce2d3e75b9f"
 dependencies = [
  "proc-macro2",
  "syn",
@@ -1114,7 +1114,7 @@ dependencies = [
 [[package]]
 name = "dfir_lang"
 version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git#30167649b29b1c199a14daabc796950d1a588297"
+source = "git+https://github.com/hydro-project/hydro.git#0fafcf4bcf932a90f3b489a254246ce2d3e75b9f"
 dependencies = [
  "auto_impl",
  "documented",
@@ -1780,7 +1780,7 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 [[package]]
 name = "hydro_build_utils"
 version = "0.0.1"
-source = "git+https://github.com/hydro-project/hydro.git#30167649b29b1c199a14daabc796950d1a588297"
+source = "git+https://github.com/hydro-project/hydro.git#0fafcf4bcf932a90f3b489a254246ce2d3e75b9f"
 dependencies = [
  "insta",
  "rustc_version",
@@ -1789,7 +1789,7 @@ dependencies = [
 [[package]]
 name = "hydro_deploy"
 version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git#30167649b29b1c199a14daabc796950d1a588297"
+source = "git+https://github.com/hydro-project/hydro.git#0fafcf4bcf932a90f3b489a254246ce2d3e75b9f"
 dependencies = [
  "anyhow",
  "append-only-vec",
@@ -1825,7 +1825,7 @@ dependencies = [
 [[package]]
 name = "hydro_deploy_integration"
 version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git#30167649b29b1c199a14daabc796950d1a588297"
+source = "git+https://github.com/hydro-project/hydro.git#0fafcf4bcf932a90f3b489a254246ce2d3e75b9f"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -1843,7 +1843,7 @@ dependencies = [
 [[package]]
 name = "hydro_lang"
 version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git#30167649b29b1c199a14daabc796950d1a588297"
+source = "git+https://github.com/hydro-project/hydro.git#0fafcf4bcf932a90f3b489a254246ce2d3e75b9f"
 dependencies = [
  "auto_impl",
  "backtrace",
@@ -1934,7 +1934,7 @@ dependencies = [
 [[package]]
 name = "hydro_std"
 version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git#30167649b29b1c199a14daabc796950d1a588297"
+source = "git+https://github.com/hydro-project/hydro.git#0fafcf4bcf932a90f3b489a254246ce2d3e75b9f"
 dependencies = [
  "hdrhistogram",
  "hydro_lang",
@@ -1946,7 +1946,7 @@ dependencies = [
 [[package]]
 name = "hydro_test"
 version = "0.0.0"
-source = "git+https://github.com/hydro-project/hydro.git#30167649b29b1c199a14daabc796950d1a588297"
+source = "git+https://github.com/hydro-project/hydro.git#0fafcf4bcf932a90f3b489a254246ce2d3e75b9f"
 dependencies = [
  "bytes",
  "colored",
@@ -2156,7 +2156,7 @@ dependencies = [
 [[package]]
 name = "include_mdtests"
 version = "0.0.0"
-source = "git+https://github.com/hydro-project/hydro.git#30167649b29b1c199a14daabc796950d1a588297"
+source = "git+https://github.com/hydro-project/hydro.git#0fafcf4bcf932a90f3b489a254246ce2d3e75b9f"
 dependencies = [
  "glob",
  "proc-macro2",
@@ -4005,7 +4005,7 @@ checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 [[package]]
 name = "sinktools"
 version = "0.0.1"
-source = "git+https://github.com/hydro-project/hydro.git#30167649b29b1c199a14daabc796950d1a588297"
+source = "git+https://github.com/hydro-project/hydro.git#0fafcf4bcf932a90f3b489a254246ce2d3e75b9f"
 dependencies = [
  "futures-util",
  "pin-project-lite",
@@ -4789,7 +4789,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 [[package]]
 name = "variadics"
 version = "0.0.10"
-source = "git+https://github.com/hydro-project/hydro.git#30167649b29b1c199a14daabc796950d1a588297"
+source = "git+https://github.com/hydro-project/hydro.git#0fafcf4bcf932a90f3b489a254246ce2d3e75b9f"
 dependencies = [
  "hashbrown 0.14.5",
  "hydro_build_utils",
@@ -5429,18 +5429,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.35"
+version = "0.8.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdea86ddd5568519879b8187e1cf04e24fce28f7fe046ceecbce472ff19a2572"
+checksum = "dafd85c832c1b68bbb4ec0c72c7f6f4fc5179627d2bc7c26b30e4c0cc11e76cc"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.35"
+version = "0.8.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c15e1b46eff7c6c91195752e0eeed8ef040e391cdece7c25376957d5f15df22"
+checksum = "7cb7e4e8436d9db52fbd6625dbf2f45243ab84994a72882ec8227b99e72b439a"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -45,7 +45,7 @@ async fn main() {
 
     let mut reusable_hosts = ReusableHosts::new(host_type);
 
-    let builder = hydro_lang::compile::builder::FlowBuilder::new();
+    let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
     let num_participants = 3;
     let num_clients = 3;
     let num_clients_per_node = 100;

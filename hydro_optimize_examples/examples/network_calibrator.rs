@@ -48,7 +48,7 @@ async fn main() {
     let num_seconds_to_profile = Some(60);
 
     for message_size in message_sizes {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let server = builder.cluster();
         let clients = builder.cluster();
         let client_aggregator = builder.process();

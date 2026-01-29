@@ -118,15 +118,15 @@ async fn track_cluster_usage_cardinality(
         for (idx, node) in cluster.members().iter().enumerate() {
             let (node_usage_out, node_cardinality_out) =
                 track_process_usage_cardinality(node).await;
-            usage_out.insert((id.clone(), name.clone(), idx), node_usage_out);
-            cardinality_out.insert((id.clone(), name.clone(), idx), node_cardinality_out);
+            usage_out.insert((id.clone(), name.to_string(), idx), node_usage_out);
+            cardinality_out.insert((id.clone(), name.to_string(), idx), node_cardinality_out);
         }
     }
     for (id, name, process) in nodes.get_all_processes() {
         let (process_usage_out, process_cardinality_out) =
             track_process_usage_cardinality(process).await;
-        usage_out.insert((id.clone(), name.clone(), 0), process_usage_out);
-        cardinality_out.insert((id.clone(), name.clone(), 0), process_cardinality_out);
+        usage_out.insert((id.clone(), name.to_string(), 0), process_usage_out);
+        cardinality_out.insert((id.clone(), name.to_string(), 0), process_cardinality_out);
     }
     (usage_out, cardinality_out)
 }

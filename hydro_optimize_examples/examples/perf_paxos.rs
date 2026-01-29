@@ -1,13 +1,11 @@
 use clap::{ArgAction, Parser};
 use hydro_deploy::Deployment;
-use hydro_lang::location::Location;
 use hydro_lang::viz::config::GraphConfig;
 use hydro_optimize::deploy::{HostType, ReusableHosts};
 use hydro_optimize::deploy_and_analyze::{
     Optimizations, ReusableClusters, ReusableProcesses, deploy_and_optimize,
 };
-use hydro_test::cluster::kv_replica::Replica;
-use hydro_test::cluster::paxos::{Acceptor, CorePaxos, PaxosConfig, Proposer};
+use hydro_test::cluster::paxos::{CorePaxos, PaxosConfig};
 use hydro_test::cluster::paxos_bench::{Aggregator, Client};
 
 #[derive(Parser, Debug)]
@@ -45,7 +43,7 @@ async fn main() {
     let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
     let f = 1;
     let num_clients = 3;
-    let num_clients_per_node = 500; // Change based on experiment between 1, 50, 100.
+    let num_clients_per_node = 100; // Change based on experiment between 1, 50, 100.
     let checkpoint_frequency = 1000; // Num log entries
     let i_am_leader_send_timeout = 5; // Sec
     let i_am_leader_check_timeout = 10; // Sec
