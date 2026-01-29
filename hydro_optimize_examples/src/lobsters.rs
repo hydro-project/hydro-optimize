@@ -93,7 +93,9 @@ pub fn lobsters<'a, Client>(
     let stories_tick = server.tick();
 
     // Add users
-    let user_key_add_user = add_user
+    let atomic_add_user = add_user.atomic(&user_auth_tick);
+    let user_key_add_user = atomic_add_user
+        .clone()
         .entries()
         .map(q!(|(client_id, (virtual_client_id, username))| (
             username.clone(),
@@ -104,7 +106,11 @@ pub fn lobsters<'a, Client>(
             )
         )))
         .into_keyed();
-    let atomic_add_user = user_key_add_user.atomic(&user_auth_tick);
+    let add_user_request = atomic_add_user
+        .entries()
+        .map(q!(|(client_id, (virtual_client_id, username))| ((client_id, virtual_client_id), username)))
+        .into_keyed();
+    
     // Add story
     let api_key_add_story = add_story
         .entries()
@@ -118,20 +124,21 @@ pub fn lobsters<'a, Client>(
         .into_keyed();
 
     // Persisted users
-    let curr_users = atomic_add_user
+    let curr_users = user_key_add_user 
         .assume_ordering(nondet!(/** First user wins */))
         .first();
     // Anything to do with persisted users
     let (add_user_response, get_users_response, add_story_valid_api_key) = sliced! {
-        let new_users = use::atomic(atomic_add_user, nondet!(/** New users requests this tick */));
+        let add_user = use::atomic(add_user_request, nondet!(/** New users requests this tick */));
         let get_users = use(get_users, nondet!(/** Order of processing affects which users will be retrieved */));
         let add_story = use(api_key_add_story, nondet!(/** Add story requests sent before user's creation will fail */));
 
         let curr_users = use::atomic(curr_users, nondet!(/** Current users this tick */));
+        let curr_api_keys = curr_users.entries().map(q!(|(_username, (api_key, _client_id, _virtual_client_id))| (api_key, ()))).into_keyed().assume_ordering(nondet!(/** Actually KeyedSingleton, assuming API key generation is unique */)).first();
 
-        let add_users_response = new_users; // TODO
+        let add_users_response = add_user.lookup_keyed_singleton(curr_users);
         let get_users_response = get_users.cross_singleton(curr_users.into_singleton());
-        let add_story_valid_api_key = add_story; // TODO
+        let add_story_valid_api_key = add_story.join_keyed_singleton(curr_api_keys);
         (add_users_response, get_users_response, add_story_valid_api_key)
     };
 

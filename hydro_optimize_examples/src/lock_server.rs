@@ -1,16 +1,17 @@
 use hydro_lang::{
     live_collections::{sliced::sliced, stream::NoOrder},
-    location::{Location, MemberId},
+    location::Location,
     nondet::nondet,
     prelude::{KeyedStream, Process, Stream, Unbounded},
 };
 use stageleft::q;
+use std::hash::Hash;
 
 pub struct Server {}
 
 /// Lock server implementation as described in https://dl.acm.org/doi/pdf/10.1145/3341301.3359651, with the difference being that each server can hold multiple locks.
-/// * `acquires`: Stream of (virt_client_id, lock_id), requesting a lock from the server. If the server currently holds the lock, it returns (virt_client_id, lock_id, true). Otherwise, it returns (virt_client_id, lock_id, false).
-/// * `releases`: Stream of (virt_client_id, lock_id), releasing a lock back to the server. Returns (virt_client_id, lock_id).
+/// * `acquires`: Stream of (client, lock_id), requesting a lock from the server. If the server currently holds the lock, it returns (client, lock_id, true). Otherwise, it returns (client, lock_id, false).
+/// * `releases`: Stream of (client, lock_id), releasing a lock back to the server. Returns (client, lock_id).
 ///
 /// Assumptions:
 /// - No client will send a release message before it knows it has acquired the lock.
@@ -19,26 +20,23 @@ pub struct Server {}
 #[expect(clippy::type_complexity, reason = "internal Lock Server code // TODO")]
 pub fn lock_server<'a, Client>(
     server: &Process<'a, Server>,
-    acquires: KeyedStream<MemberId<Client>, (u32, u32), Process<'a, Server>, Unbounded, NoOrder>,
-    releases: KeyedStream<MemberId<Client>, (u32, u32), Process<'a, Server>, Unbounded, NoOrder>,
+    acquires: KeyedStream<Client, u32, Process<'a, Server>, Unbounded, NoOrder>,
+    releases: KeyedStream<Client, u32, Process<'a, Server>, Unbounded, NoOrder>,
 ) -> (
-    KeyedStream<MemberId<Client>, (u32, u32, bool), Process<'a, Server>, Unbounded, NoOrder>,
-    KeyedStream<MemberId<Client>, (u32, u32), Process<'a, Server>, Unbounded, NoOrder>,
-) {
+    KeyedStream<Client, (u32, bool), Process<'a, Server>, Unbounded, NoOrder>,
+    KeyedStream<Client, u32, Process<'a, Server>, Unbounded, NoOrder>,
+)
+where
+    Client: Eq + Hash + Clone,
+{
     let server_tick = server.tick();
     let mapped_acquires = acquires
         .clone()
         .entries()
-        .map(q!(|(client_id, (virtual_client_id, lock_id))| (
-            lock_id,
-            (client_id, virtual_client_id)
-        )))
+        .map(q!(|(client, lock_id)| (lock_id, client)))
         .into_keyed();
     let atomic_releases = releases.atomic(&server_tick);
-    let mapped_releases = atomic_releases
-        .clone()
-        .entries()
-        .map(q!(|(_client_id, (_virtual_client_id, lock_id))| lock_id));
+    let mapped_releases = atomic_releases.clone().values();
 
     let acquire_results = sliced! {
         let mapped_acquires = use(mapped_acquires, nondet!(/** For each lock, pick a random acquire as the winner */));
@@ -47,7 +45,7 @@ pub fn lock_server<'a, Client>(
         // lock_id
         // TODO: Replace with KeyedSingleton when support is added
         // (lock_id, (client_id, virtual_client_id))
-        let mut acquired_locks = use::state_null::<Stream<(u32, (MemberId<Client>, u32)), _, _, NoOrder>>();
+        let mut acquired_locks = use::state_null::<Stream<(u32, Client), _, _, NoOrder>>();
         let keyed_acquired_locks = acquired_locks.into_keyed().assume_ordering(nondet!(/** Actually KeyedSingleton */)).first();
 
         // Always process releases first. Find out which locks still can't be acquired
@@ -62,15 +60,13 @@ pub fn lock_server<'a, Client>(
         let newly_acquired_locks = winning_acquires.filter_key_not_in(curr_acquired_locks.clone().keys());
         acquired_locks = curr_acquired_locks.entries().chain(newly_acquired_locks.clone().entries());
 
-        let acquire_requests = mapped_acquires.entries().map(q!(|(lock_id, (client_id, virtual_client_id))| ((client_id, virtual_client_id), lock_id))).into_keyed();
+        let acquire_requests = mapped_acquires.entries().map(q!(|(lock_id, client)| (client, lock_id))).into_keyed();
         acquire_requests.lookup_keyed_singleton(newly_acquired_locks)
     }
     .entries()
-    .map(q!(|((client_id, virtual_client_id), (lock_id, curr_holder))| {
-        let lock_acquired = curr_holder.is_some_and(|(holder_client_id, holder_virtual_client_id)| {
-            holder_client_id == client_id && holder_virtual_client_id == virtual_client_id
-        });
-        (client_id, (virtual_client_id, lock_id, lock_acquired))
+    .map(q!(|(client, (lock_id, curr_holder))| {
+        let lock_acquired = curr_holder.is_some_and(|curr_client| client == curr_client);
+        (client, (lock_id, lock_acquired))
     }))
     .into_keyed();
 
@@ -78,8 +74,8 @@ pub fn lock_server<'a, Client>(
 }
 
 /// Lock server implementation as described in https://dl.acm.org/doi/pdf/10.1145/3341301.3359651, with the difference being that each server can hold multiple locks.
-/// * `acquires`: Stream of (virt_client_id, lock_id), requesting a lock from the server. If the server currently holds the lock, it returns (virt_client_id, lock_id, true). Otherwise, it returns (virt_client_id, lock_id, false).
-/// * `releases`: Stream of (virt_client_id, lock_id), releasing a lock back to the server. Returns (virt_client_id, lock_id).
+/// * `acquires`: Stream of (client, lock_id), requesting a lock from the server. If the server currently holds the lock, it returns (client, lock_id, true). Otherwise, it returns (client, lock_id, false).
+/// * `releases`: Stream of (client, lock_id), releasing a lock back to the server. Returns (client, lock_id).
 ///
 /// Assumptions:
 /// - No client will send a release message before it knows it has acquired the lock.
@@ -89,29 +85,26 @@ pub fn lock_server<'a, Client>(
 #[expect(clippy::type_complexity, reason = "internal Lock Server code // TODO")]
 pub fn assume_order_lock_server<'a, Client>(
     server: &Process<'a, Server>,
-    acquires: KeyedStream<MemberId<Client>, (u32, u32), Process<'a, Server>, Unbounded, NoOrder>,
-    releases: KeyedStream<MemberId<Client>, (u32, u32), Process<'a, Server>, Unbounded, NoOrder>,
+    acquires: KeyedStream<Client, u32, Process<'a, Server>, Unbounded, NoOrder>,
+    releases: KeyedStream<Client, u32, Process<'a, Server>, Unbounded, NoOrder>,
 ) -> (
-    KeyedStream<MemberId<Client>, (u32, u32, bool), Process<'a, Server>, Unbounded, NoOrder>,
-    KeyedStream<MemberId<Client>, (u32, u32), Process<'a, Server>, Unbounded, NoOrder>,
-) {
+    KeyedStream<Client, (u32, bool), Process<'a, Server>, Unbounded, NoOrder>,
+    KeyedStream<Client, u32, Process<'a, Server>, Unbounded, NoOrder>,
+)
+where
+    Client: Eq + Hash + Clone,
+{
     let server_tick = server.tick();
     let atomic_acquires = acquires.atomic(&server_tick);
     let lock_id_acquires = atomic_acquires
         .entries()
-        .map(q!(|(client_id, (virtual_client_id, lock_id))| (
-            lock_id,
-            (client_id, virtual_client_id, true)
-        )))
+        .map(q!(|(client, lock_id)| (lock_id, (client, true))))
         .into_keyed();
     let atomic_releases = releases.atomic(&server_tick);
     let lock_id_releases = atomic_releases
         .clone()
         .entries()
-        .map(q!(|(client_id, (virtual_client_id, lock_id))| (
-            lock_id,
-            (client_id, virtual_client_id, false)
-        )))
+        .map(q!(|(client, lock_id)| (lock_id, (client, false))))
         .into_keyed();
 
     let lock_state = lock_id_acquires
@@ -120,21 +113,19 @@ pub fn assume_order_lock_server<'a, Client>(
         .assume_ordering(nondet!(/** Process in arrival order */))
         .fold(
             q!(|| None),
-            q!(|curr_holder, (client_id, virtual_client_id, acquire)| {
+            q!(|curr_holder, (client, acquire)| {
                 if acquire {
                     // If the lock is currently held by the server, give the client the lock
                     if curr_holder.is_none() {
-                        *curr_holder = Some((client_id.clone(), virtual_client_id.clone()));
+                        *curr_holder = Some(client.clone());
                     }
                 } else {
                     // If the client is releasing the lock and it holds it, give the lock back to the server
-                    if let Some((holder_client_id, holder_virtual_client_id)) = curr_holder.as_ref()
+                    if curr_holder
+                        .as_ref()
+                        .is_some_and(|curr_client| client == *curr_client)
                     {
-                        if *holder_client_id == client_id
-                            && *holder_virtual_client_id == virtual_client_id
-                        {
-                            *curr_holder = None;
-                        }
+                        *curr_holder = None;
                     }
                 }
             }),
@@ -149,11 +140,9 @@ pub fn assume_order_lock_server<'a, Client>(
         acquires.join_keyed_singleton(locks_snapshot)
     }
     .entries()
-    .map(q!(|(lock_id, ((client_id, virtual_client_id, _acquire), curr_holder))| {
-        let lock_acquired = curr_holder.is_some_and(|(holder_client_id, holder_virtual_client_id)| {
-            holder_client_id == client_id && holder_virtual_client_id == virtual_client_id
-        });
-        (client_id, (virtual_client_id, lock_id, lock_acquired))
+    .map(q!(|(lock_id, ((client, _acquire), curr_holder))| {
+        let lock_acquired = curr_holder.is_some_and(|curr_client| client == curr_client);
+        (client, (lock_id, lock_acquired))
     }))
     .into_keyed();
 
