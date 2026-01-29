@@ -1,8 +1,11 @@
 use hydro_lang::{
-    live_collections::{sliced::sliced, stream::NoOrder},
+    live_collections::{
+        sliced::sliced,
+        stream::{NoOrder, TotalOrder},
+    },
     location::{Location, MemberId},
     nondet::nondet,
-    prelude::{KeyedStream, Process, Unbounded},
+    prelude::{Bounded, KeyedSingleton, KeyedStream, Process, Singleton, Stream, Unbounded},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -60,7 +63,7 @@ pub fn lobsters<'a, Client>(
         Unbounded,
         NoOrder,
     >,
-    _upvote_story: KeyedStream<
+    upvote_story: KeyedStream<
         MemberId<Client>,
         (u32, String, u32),
         Process<'a, Server>,
@@ -74,7 +77,7 @@ pub fn lobsters<'a, Client>(
         Unbounded,
         NoOrder,
     >,
-    _get_stories: KeyedStream<MemberId<Client>, u32, Process<'a, Server>, Unbounded, NoOrder>,
+    get_stories: KeyedStream<MemberId<Client>, u32, Process<'a, Server>, Unbounded, NoOrder>,
     _get_comments: KeyedStream<MemberId<Client>, u32, Process<'a, Server>, Unbounded, NoOrder>,
     _get_story_comments: KeyedStream<
         MemberId<Client>,
@@ -89,64 +92,71 @@ pub fn lobsters<'a, Client>(
     let user_auth_tick = server.tick();
     let stories_tick = server.tick();
 
-    let atomic_add_user = add_user.atomic(&user_auth_tick);
+    // Add users
+    let user_key_add_user = add_user
+        .entries()
+        .map(q!(|(client_id, (virtual_client_id, username))| (
+            username.clone(),
+            (
+                self::generate_api_key(username),
+                client_id,
+                virtual_client_id
+            )
+        )))
+        .into_keyed();
+    let atomic_add_user = user_key_add_user.atomic(&user_auth_tick);
+    // Add story
+    let api_key_add_story = add_story
+        .entries()
+        .map(q!(|(
+            client_id,
+            (virtual_client_id, api_key, title, timestamp),
+        )| (
+            api_key,
+            (client_id, virtual_client_id, title, timestamp)
+        )))
+        .into_keyed();
+
     // Persisted users
     let curr_users = atomic_add_user
-        .entries()
-        .map(q!(|(_client_id, (virtual_client_id, username))| (
-            username.clone(),
-            (self::generate_api_key(username), virtual_client_id)
-        )))
-        .into_keyed()
         .assume_ordering(nondet!(/** First user wins */))
         .first();
-    // Send response back to client. Only done after the tick to ensure that once the client gets the response, the user has been added
-    let add_user_response = sliced! {
-        let new_users = use(atomic_add_user, nondet!(/** New users requests this tick */));
-        let curr_users = use(curr_users, nondet!(/** Current users this tick */));
-        new_users
-            .map(q!(|(client_id, (username, api_key))| {
-                (username, (client_id, api_key))
-            }))
-            .into_keyed()
+    // Anything to do with persisted users
+    let (add_user_response, get_users_response, add_story_valid_api_key) = sliced! {
+        let new_users = use::atomic(atomic_add_user, nondet!(/** New users requests this tick */));
+        let get_users = use(get_users, nondet!(/** Order of processing affects which users will be retrieved */));
+        let add_story = use(api_key_add_story, nondet!(/** Add story requests sent before user's creation will fail */));
 
+        let curr_users = use::atomic(curr_users, nondet!(/** Current users this tick */));
+
+        let add_users_response = new_users; // TODO
+        let get_users_response = get_users.cross_singleton(curr_users.into_singleton());
+        let add_story_valid_api_key = add_story; // TODO
+        (add_users_response, get_users_response, add_story_valid_api_key)
     };
 
-    // Get users
-    let _get_users_response = get_users
-        .batch(
-            &user_auth_tick,
-            nondet!(/** Snapshot against current users */),
-        )
-        .cross_singleton(curr_users_hashset)
-        .all_ticks();
+    let valid_add_story = add_story_valid_api_key.values();
+    // Anything to do with persisted stories
+    let (add_story_with_id, upvote_story_response, get_stories_response) = sliced! {
+        let add_story = use(valid_add_story, nondet!(/** Add new incoming story requests this tick */));
+        let get_stories = use(get_stories, nondet!(/** Order of processing affects which stories will be retrieved */));
+        // TODO: Replace with KeyedSingleton once that is supported
+        // ID, client_id, virtual_client_id, title, timestamp
+        let mut stories = use::state_null::<Stream<(u32, MemberId<Client>, u32, String, Instant), _, Bounded, NoOrder>>();
+        let mut next_story_id = use::state::<Singleton<u32, _, Bounded>>(|l| l.singleton(q!(0)));
 
-    // Add story
-    let add_story_pre_join =
-        add_story.map(q!(|(client_id, (req_id, api_key, title, timestamp))| {
-            (api_key, (client_id, req_id, title, timestamp))
-        }));
-    let stories = add_story_pre_join
-        .batch(
-            &user_auth_tick,
-            nondet!(/** Compare against current users to approve/deny access */),
-        )
-        .join(curr_users.clone())
-        .all_ticks();
-    let curr_stories = stories.batch(&stories_tick, nondet!(/** Snapshot of current stories */)).assume_ordering(nondet!(/** In order to use enumerate to assign a unique ID, we need total ordering. */));
-    // Assign each story a unique ID
-    let (story_id_complete_cycle, story_id) =
-        stories_tick.cycle_with_initial(stories_tick.singleton(q!(0)));
-    let _indexed_curr_stories = curr_stories
-        .clone()
-        .enumerate()
-        .cross_singleton(story_id.clone())
-        .map(q!(|((index, story), story_id)| (index + story_id, story)));
-    let num_curr_stories = curr_stories.clone().count();
-    let new_story_id = num_curr_stories
-        .zip(story_id)
-        .map(q!(|(num_stories, story_id)| num_stories + story_id));
-    story_id_complete_cycle.complete_next_tick(new_story_id);
+        let new_stories = add_story.clone().assume_ordering(nondet!(/** Stories are assigned an ID in arbitrary order */))
+            .enumerate()
+            .cross_singleton(next_story_id)
+            .map(q!(|((index, (client_id, virtual_client_id, title, timestamp)), curr_id)| (index as u32 + curr_id, client_id, virtual_client_id, title, timestamp)));
+        next_story_id = next_story_id.zip(add_story.count()).map(q!(|(curr_id, count)| curr_id + count as u32));
+
+        stories.
+
+        stories = stories.chain(new_stories);
+
+        (new_stories, )
+    };
 
     let _top_stories = curr_stories.clone().persist().fold_commutative_idempotent(
         q!(|| vec![]),
@@ -162,7 +172,10 @@ pub fn lobsters<'a, Client>(
         ),
     );
 
-    (add_user_response,)
+    (
+        add_user_response.end_atomic(),
+        get_users_response.end_atomic(),
+    )
 }
 
 fn generate_api_key(email: String) -> String {

@@ -8,13 +8,13 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-hydro_lang = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git", branch = "david-fixes" }
-hydro_std = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git", branch = "david-fixes" }
-hydro_test = { version = "0.0.0", git = "https://github.com/hydro-project/hydro.git", branch = "david-fixes" }
-dfir_lang = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git", branch = "david-fixes" }
-hydro_build_utils = { version = "0.0.1", git = "https://github.com/hydro-project/hydro.git", branch = "david-fixes" }
-hydro_deploy = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git", branch = "david-fixes", features = ["profile-folding"] }
-include_mdtests = { version = "0.0.0", git = "https://github.com/hydro-project/hydro.git", branch = "david-fixes" }
+hydro_lang = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git" }
+hydro_std = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git" }
+hydro_test = { version = "0.0.0", git = "https://github.com/hydro-project/hydro.git" }
+dfir_lang = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git" }
+hydro_build_utils = { version = "0.0.1", git = "https://github.com/hydro-project/hydro.git" }
+hydro_deploy = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git", features = ["profile-folding"] }
+include_mdtests = { version = "0.0.0", git = "https://github.com/hydro-project/hydro.git" }
 serde = { version = "1.0.197", features = ["derive"] }
 stageleft = "0.13.0"
 stageleft_tool = "0.13.0"

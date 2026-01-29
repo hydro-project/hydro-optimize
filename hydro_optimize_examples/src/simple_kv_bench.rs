@@ -72,7 +72,7 @@ mod tests {
 
     #[test]
     fn simple_kv_ir() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let kv = builder.process();
         let clients = builder.cluster();
         let client_aggregator = builder.process();
@@ -100,7 +100,7 @@ mod tests {
 
     #[tokio::test]
     async fn simple_kv_some_throughput() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let kv = builder.process();
         let clients = builder.cluster();
         let client_aggregator = builder.process();

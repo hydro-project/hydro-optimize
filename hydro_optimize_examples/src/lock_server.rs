@@ -34,46 +34,47 @@ pub fn lock_server<'a, Client>(
             (client_id, virtual_client_id)
         )))
         .into_keyed();
-    let mapped_releases = releases
+    let atomic_releases = releases.atomic(&server_tick);
+    let mapped_releases = atomic_releases
         .clone()
         .entries()
-        .map(q!(|(client_id, (virtual_client_id, lock_id))| (
-            lock_id,
-            (client_id, virtual_client_id)
-        )))
-        .into_keyed();
+        .map(q!(|(_client_id, (_virtual_client_id, lock_id))| lock_id));
 
-    sliced! {
+    let acquire_results = sliced! {
         let mapped_acquires = use(mapped_acquires, nondet!(/** For each lock, pick a random acquire as the winner */));
-        let mapped_releases = use(mapped_releases, nondet!(/** For each lock, only one release should succeed (the owner of the lock) */));
+        let mapped_releases = use::atomic(mapped_releases, nondet!(/** For each lock, only one release should succeed (the owner of the lock) */));
 
         // lock_id
-        let mut free_locks = use::state_null::<Stream<u32, _, _, _>>();
+        // TODO: Replace with KeyedSingleton when support is added
         // (lock_id, (client_id, virtual_client_id))
-        let mut acquired_locks = use::state_null::<Stream<(u32, (MemberId<Client>, u32)), _, _, _>>();
-        let keyed_acquired_locks = acquired_locks.into_keyed().first();
-        // For each lock, pick a random acquire as the winner
+        let mut acquired_locks = use::state_null::<Stream<(u32, (MemberId<Client>, u32)), _, _, NoOrder>>();
+        let keyed_acquired_locks = acquired_locks.into_keyed().assume_ordering(nondet!(/** Actually KeyedSingleton */)).first();
 
-        // Always process releases first
-        let new_free_locks = keyed_acquired_locks
+        // Always process releases first. Find out which locks still can't be acquired
+        let curr_acquired_locks = keyed_acquired_locks
             .clone()
-            .get_many_if_present(mapped_releases)
-            .filter(q!(|((holder_client_id, holder_virtual_client_id), (client_id, virtual_client_id))|
-                holder_client_id == client_id && holder_virtual_client_id == virtual_client_id
-            ))
-            .keys()
-            .chain(free_locks);
+            .filter_key_not_in(mapped_releases); // Only correct if non-lock holders don't release locks they don't own
 
-        let winning_acquires = mapped_acquires.assume_ordering(nondet!(/** Randomly pick one acquire to be the winner */)).first();
+        // For each lock, pick a random acquire as the winner
+        let winning_acquires = mapped_acquires.clone().assume_ordering(nondet!(/** Randomly pick one acquire to be the winner */)).first();
 
-        // Process acquires for locks that exist
-        // TODO: Requires join_stream
+        // Acquires win for all non-acquired locks, even ones that don't exist yet
+        let newly_acquired_locks = winning_acquires.filter_key_not_in(curr_acquired_locks.clone().keys());
+        acquired_locks = curr_acquired_locks.entries().chain(newly_acquired_locks.clone().entries());
 
-        // Create new locks if it's not currently free or acquired
-        let created_locks = winning_acquires
-            .filter_key_not_in(new_free_locks)
-            .filter_key_not_in(keyed_acquired_locks.keys());
-    };
+        let acquire_requests = mapped_acquires.entries().map(q!(|(lock_id, (client_id, virtual_client_id))| ((client_id, virtual_client_id), lock_id))).into_keyed();
+        acquire_requests.lookup_keyed_singleton(newly_acquired_locks)
+    }
+    .entries()
+    .map(q!(|((client_id, virtual_client_id), (lock_id, curr_holder))| {
+        let lock_acquired = curr_holder.is_some_and(|(holder_client_id, holder_virtual_client_id)| {
+            holder_client_id == client_id && holder_virtual_client_id == virtual_client_id
+        });
+        (client_id, (virtual_client_id, lock_id, lock_acquired))
+    }))
+    .into_keyed();
+
+    (acquire_results, atomic_releases.end_atomic())
 }
 
 /// Lock server implementation as described in https://dl.acm.org/doi/pdf/10.1145/3341301.3359651, with the difference being that each server can hold multiple locks.
@@ -95,26 +96,27 @@ pub fn assume_order_lock_server<'a, Client>(
     KeyedStream<MemberId<Client>, (u32, u32), Process<'a, Server>, Unbounded, NoOrder>,
 ) {
     let server_tick = server.tick();
-    let atomic_acquires = acquires
-        .clone()
+    let atomic_acquires = acquires.atomic(&server_tick);
+    let lock_id_acquires = atomic_acquires
         .entries()
         .map(q!(|(client_id, (virtual_client_id, lock_id))| (
             lock_id,
             (client_id, virtual_client_id, true)
         )))
-        .atomic(&server_tick);
-    let atomic_releases = releases
+        .into_keyed();
+    let atomic_releases = releases.atomic(&server_tick);
+    let lock_id_releases = atomic_releases
         .clone()
         .entries()
         .map(q!(|(client_id, (virtual_client_id, lock_id))| (
             lock_id,
             (client_id, virtual_client_id, false)
         )))
-        .atomic(&server_tick);
-    let payloads = atomic_acquires.interleave(atomic_releases).into_keyed();
+        .into_keyed();
 
-    let lock_state = payloads
+    let lock_state = lock_id_acquires
         .clone()
+        .interleave(lock_id_releases)
         .assume_ordering(nondet!(/** Process in arrival order */))
         .fold(
             q!(|| None),
@@ -138,34 +140,22 @@ pub fn assume_order_lock_server<'a, Client>(
             }),
         );
 
-    // TODO
+    // Check if acquires succeeded
     let acquire_results = sliced! {
-        let payloads = use::atomic(payloads.clone(), nondet!(/** Payloads at this tick */));
+        let acquires = use::atomic(lock_id_acquires, nondet!(/** Payloads at this tick */));
         let locks_snapshot = use::atomic(lock_state, nondet!(/** Snapshot of lock state at this tick */));
 
-        let acquires = payloads.filter(q!(|(_, _, acquire)| *acquire));
-        locks_snapshot.get_many_if_present(acquires)
+        // Note: join_keyed_singleton is guaranteed to not miss, since an acquire/release must've been processed first
+        acquires.join_keyed_singleton(locks_snapshot)
     }
-    .map(q!(|(curr_holder, (client_id, virtual_client_id, _acquire))| {
+    .entries()
+    .map(q!(|(lock_id, ((client_id, virtual_client_id, _acquire), curr_holder))| {
         let lock_acquired = curr_holder.is_some_and(|(holder_client_id, holder_virtual_client_id)| {
             holder_client_id == client_id && holder_virtual_client_id == virtual_client_id
         });
-        (client_id, virtual_client_id, lock_acquired)
+        (client_id, (virtual_client_id, lock_id, lock_acquired))
     }))
-    .entries()
-    .map(q!(|(lock_id, (client_id, virtual_client_id, acquired))| (client_id, (virtual_client_id, lock_id, acquired))))
     .into_keyed();
 
-    let release_results = payloads
-        .end_atomic()
-        .entries()
-        .filter_map(q!(|(lock_id, (client_id, virtual_client_id, acquire))| {
-            if !acquire {
-                Some((client_id, (virtual_client_id, lock_id)))
-            } else {
-                None
-            }
-        }))
-        .into_keyed();
-    (acquire_results, release_results)
+    (acquire_results, atomic_releases.end_atomic())
 }

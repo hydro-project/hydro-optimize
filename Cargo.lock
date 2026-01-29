@@ -895,7 +895,7 @@ dependencies = [
 [[package]]
 name = "copy_span"
 version = "0.1.0"
-source = "git+https://github.com/hydro-project/hydro.git?branch=david-fixes#29a0e22223a35cbfdbf58ea5ef8472c604662d8c"
+source = "git+https://github.com/hydro-project/hydro.git#30167649b29b1c199a14daabc796950d1a588297"
 dependencies = [
  "proc-macro2",
  "syn",
@@ -1114,7 +1114,7 @@ dependencies = [
 [[package]]
 name = "dfir_lang"
 version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git?branch=david-fixes#29a0e22223a35cbfdbf58ea5ef8472c604662d8c"
+source = "git+https://github.com/hydro-project/hydro.git#30167649b29b1c199a14daabc796950d1a588297"
 dependencies = [
  "auto_impl",
  "documented",
@@ -1780,7 +1780,7 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 [[package]]
 name = "hydro_build_utils"
 version = "0.0.1"
-source = "git+https://github.com/hydro-project/hydro.git?branch=david-fixes#29a0e22223a35cbfdbf58ea5ef8472c604662d8c"
+source = "git+https://github.com/hydro-project/hydro.git#30167649b29b1c199a14daabc796950d1a588297"
 dependencies = [
  "insta",
  "rustc_version",
@@ -1789,7 +1789,7 @@ dependencies = [
 [[package]]
 name = "hydro_deploy"
 version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git?branch=david-fixes#29a0e22223a35cbfdbf58ea5ef8472c604662d8c"
+source = "git+https://github.com/hydro-project/hydro.git#30167649b29b1c199a14daabc796950d1a588297"
 dependencies = [
  "anyhow",
  "append-only-vec",
@@ -1825,7 +1825,7 @@ dependencies = [
 [[package]]
 name = "hydro_deploy_integration"
 version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git?branch=david-fixes#29a0e22223a35cbfdbf58ea5ef8472c604662d8c"
+source = "git+https://github.com/hydro-project/hydro.git#30167649b29b1c199a14daabc796950d1a588297"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -1843,7 +1843,7 @@ dependencies = [
 [[package]]
 name = "hydro_lang"
 version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git?branch=david-fixes#29a0e22223a35cbfdbf58ea5ef8472c604662d8c"
+source = "git+https://github.com/hydro-project/hydro.git#30167649b29b1c199a14daabc796950d1a588297"
 dependencies = [
  "auto_impl",
  "backtrace",
@@ -1934,7 +1934,7 @@ dependencies = [
 [[package]]
 name = "hydro_std"
 version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git?branch=david-fixes#29a0e22223a35cbfdbf58ea5ef8472c604662d8c"
+source = "git+https://github.com/hydro-project/hydro.git#30167649b29b1c199a14daabc796950d1a588297"
 dependencies = [
  "hdrhistogram",
  "hydro_lang",
@@ -1946,7 +1946,7 @@ dependencies = [
 [[package]]
 name = "hydro_test"
 version = "0.0.0"
-source = "git+https://github.com/hydro-project/hydro.git?branch=david-fixes#29a0e22223a35cbfdbf58ea5ef8472c604662d8c"
+source = "git+https://github.com/hydro-project/hydro.git#30167649b29b1c199a14daabc796950d1a588297"
 dependencies = [
  "bytes",
  "colored",
@@ -2156,7 +2156,7 @@ dependencies = [
 [[package]]
 name = "include_mdtests"
 version = "0.0.0"
-source = "git+https://github.com/hydro-project/hydro.git?branch=david-fixes#29a0e22223a35cbfdbf58ea5ef8472c604662d8c"
+source = "git+https://github.com/hydro-project/hydro.git#30167649b29b1c199a14daabc796950d1a588297"
 dependencies = [
  "glob",
  "proc-macro2",
@@ -4005,7 +4005,7 @@ checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 [[package]]
 name = "sinktools"
 version = "0.0.1"
-source = "git+https://github.com/hydro-project/hydro.git?branch=david-fixes#29a0e22223a35cbfdbf58ea5ef8472c604662d8c"
+source = "git+https://github.com/hydro-project/hydro.git#30167649b29b1c199a14daabc796950d1a588297"
 dependencies = [
  "futures-util",
  "pin-project-lite",
@@ -4789,7 +4789,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 [[package]]
 name = "variadics"
 version = "0.0.10"
-source = "git+https://github.com/hydro-project/hydro.git?branch=david-fixes#29a0e22223a35cbfdbf58ea5ef8472c604662d8c"
+source = "git+https://github.com/hydro-project/hydro.git#30167649b29b1c199a14daabc796950d1a588297"
 dependencies = [
  "hashbrown 0.14.5",
  "hydro_build_utils",
