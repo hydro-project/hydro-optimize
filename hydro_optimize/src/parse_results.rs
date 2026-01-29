@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 
 use hydro_lang::compile::deploy::DeployResult;
-use hydro_lang::compile::ir::{
-    HydroNode, HydroRoot, traverse_dfir,
-};
+use hydro_lang::compile::ir::{HydroNode, HydroRoot, traverse_dfir};
 use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::deploy::deploy_graph::DeployCrateWrapper;
 use hydro_lang::location::dynamic::LocationId;
 use regex::Regex;
 use tokio::sync::mpsc::UnboundedReceiver;
+
+use crate::deploy_and_analyze::Metrics;
 
 #[derive(Default)]
 pub struct RunMetadata {
@@ -193,7 +193,7 @@ pub async fn analyze_process_results(
     process: &impl DeployCrateWrapper,
     ir: &mut [HydroRoot],
     op_to_count: &mut HashMap<usize, usize>,
-    node_cardinality: &mut UnboundedReceiver<String>,
+    metrics: &mut Metrics,
 ) -> f64 {
     let underlying = process.underlying();
     let perf_results = underlying.tracing_results().unwrap();
@@ -202,9 +202,12 @@ pub async fn analyze_process_results(
     let unidentified_usage = inject_perf(ir, perf_results.folded_data.clone());
 
     // Get cardinality data. Allow later values to overwrite earlier ones
-    while let Some(measurement) = node_cardinality.recv().await {
+    while let Some(measurement) = metrics.counters.recv().await {
         let (op_id, count) = parse_counter_usage(measurement.clone());
         op_to_count.insert(op_id, count);
+    }
+    while let Some(network_usage) = metrics.network.recv().await {
+        println!("Network: {}", network_usage);
     }
 
     unidentified_usage
@@ -213,8 +216,7 @@ pub async fn analyze_process_results(
 pub async fn analyze_cluster_results(
     nodes: &DeployResult<'_, HydroDeploy>,
     ir: &mut [HydroRoot],
-    usage_out: &mut HashMap<(LocationId, String, usize), UnboundedReceiver<String>>,
-    cardinality_out: &mut HashMap<(LocationId, String, usize), UnboundedReceiver<String>>,
+    mut cluster_metrics: HashMap<(LocationId, String, usize), Metrics>,
     run_metadata: &mut RunMetadata,
     exclude: &Vec<String>,
 ) -> (LocationId, String, usize) {
@@ -223,15 +225,20 @@ pub async fn analyze_cluster_results(
     let mut max_usage_cluster_name = String::new();
     let mut max_usage_overall = 0f64;
     let mut op_to_count = HashMap::new();
-    
+
     for (id, name, cluster) in nodes.get_all_clusters() {
         println!("Analyzing cluster {:?}: {}", id, name);
 
         // Iterate through nodes' usages and keep the max usage one
         let mut max_usage = None;
         for (idx, _) in cluster.members().iter().enumerate() {
-            let usage =
-                get_usage(usage_out.get_mut(&(id.clone(), name.to_string(), idx)).unwrap()).await;
+            let usage = get_usage(
+                &mut cluster_metrics
+                    .get_mut(&(id.clone(), name.to_string(), idx))
+                    .unwrap()
+                    .cpu,
+            )
+            .await;
             println!("Node {} usage: {}", idx, usage);
             if let Some((prev_usage, _)) = max_usage {
                 if usage > prev_usage {
@@ -244,14 +251,15 @@ pub async fn analyze_cluster_results(
 
         if let Some((usage, idx)) = max_usage {
             // Modify IR with perf & cardinality numbers
-            let node_cardinality = cardinality_out
+            let metrics = cluster_metrics
                 .get_mut(&(id.clone(), name.to_string(), idx))
                 .unwrap();
+            println!("{} measurements", idx);
             let unidentified_perf = analyze_process_results(
                 cluster.members().get(idx).unwrap(),
                 ir,
                 &mut op_to_count,
-                node_cardinality,
+                metrics,
             )
             .await;
 

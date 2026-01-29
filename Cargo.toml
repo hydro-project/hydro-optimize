@@ -22,3 +22,14 @@ tokio = { version = "1.29.0", features = ["full"] }
 ctor = "0.2"
 clap = { version = "4.4", features = ["derive"] }
 regex = "1.11.1"
+
+
+# Uncomment to use local hydroflow checkout (change path as needed)
+# [patch."https://github.com/hydro-project/hydro.git"]
+# hydro_lang = { path = "/local/home/chudc/hydroflow/hydro_lang" }
+# hydro_std = { path = "/local/home/chudc/hydroflow/hydro_std" }
+# hydro_test = { path = "/local/home/chudc/hydroflow/hydro_test" }
+# dfir_lang = { path = "/local/home/chudc/hydroflow/dfir_lang" }
+# hydro_build_utils = { path = "/local/home/chudc/hydroflow/hydro_build_utils" }
+# hydro_deploy = { path = "/local/home/chudc/hydroflow/hydro_deploy/core" }
+# include_mdtests = { path = "/local/home/chudc/hydroflow/include_mdtests" }

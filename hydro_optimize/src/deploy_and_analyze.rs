@@ -22,6 +22,7 @@ use crate::repair::{cycle_source_to_sink_input, inject_id, remove_counter};
 
 const COUNTER_PREFIX: &str = "_optimize_counter";
 pub(crate) const CPU_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_CPU:";
+pub(crate) const NETWORK_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_NET:";
 
 // Note: Ensure edits to the match arms are consistent with inject_count_node
 fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration: syn::Expr) {
@@ -97,38 +98,35 @@ fn insert_counter(ir: &mut [HydroRoot], duration: &syn::Expr) {
     );
 }
 
-async fn track_process_usage_cardinality(
-    process: &impl DeployCrateWrapper,
-) -> (UnboundedReceiver<String>, UnboundedReceiver<String>) {
-    (
-        process.stdout_filter(CPU_USAGE_PREFIX),
-        process.stdout_filter(COUNTER_PREFIX),
-    )
+pub struct Metrics {
+    pub cpu: UnboundedReceiver<String>,
+    pub network: UnboundedReceiver<String>,
+    pub counters: UnboundedReceiver<String>,
 }
 
-async fn track_cluster_usage_cardinality(
+async fn track_process_metrics(process: &impl DeployCrateWrapper) -> Metrics {
+    Metrics {
+        cpu: process.stdout_filter(CPU_USAGE_PREFIX),
+        network: process.stdout_filter(NETWORK_USAGE_PREFIX),
+        counters: process.stdout_filter(COUNTER_PREFIX),
+    }
+}
+
+async fn track_cluster_metrics(
     nodes: &DeployResult<'_, HydroDeploy>,
-) -> (
-    HashMap<(LocationId, String, usize), UnboundedReceiver<String>>,
-    HashMap<(LocationId, String, usize), UnboundedReceiver<String>>,
-) {
-    let mut usage_out = HashMap::new();
-    let mut cardinality_out = HashMap::new();
+) -> HashMap<(LocationId, String, usize), Metrics> {
+    let mut cluster_to_metrics = HashMap::new();
     for (id, name, cluster) in nodes.get_all_clusters() {
         for (idx, node) in cluster.members().iter().enumerate() {
-            let (node_usage_out, node_cardinality_out) =
-                track_process_usage_cardinality(node).await;
-            usage_out.insert((id.clone(), name.to_string(), idx), node_usage_out);
-            cardinality_out.insert((id.clone(), name.to_string(), idx), node_cardinality_out);
+            let metrics = track_process_metrics(node).await;
+            cluster_to_metrics.insert((id.clone(), name.to_string(), idx), metrics);
         }
     }
     for (id, name, process) in nodes.get_all_processes() {
-        let (process_usage_out, process_cardinality_out) =
-            track_process_usage_cardinality(process).await;
-        usage_out.insert((id.clone(), name.to_string(), 0), process_usage_out);
-        cardinality_out.insert((id.clone(), name.to_string(), 0), process_cardinality_out);
+        let metrics = track_process_metrics(process).await;
+        cluster_to_metrics.insert((id.clone(), name.to_string(), 0), metrics);
     }
-    (usage_out, cardinality_out)
+    cluster_to_metrics
 }
 
 struct ScriptSidecar {
@@ -294,7 +292,7 @@ pub async fn deploy_and_optimize<'a>(
             .deploy(deployment);
         deployment.deploy().await.unwrap();
 
-        let (mut usage_out, mut cardinality_out) = track_cluster_usage_cardinality(&nodes).await;
+        let metrics = track_cluster_metrics(&nodes).await;
 
         // Wait for user to input a newline
         deployment
@@ -321,8 +319,7 @@ pub async fn deploy_and_optimize<'a>(
         let (bottleneck, bottleneck_name, bottleneck_num_nodes) = analyze_cluster_results(
             &nodes,
             &mut ir,
-            &mut usage_out,
-            &mut cardinality_out,
+            metrics,
             &mut run_metadata,
             &optimizations.exclude,
         )

@@ -1,14 +1,11 @@
-use std::cell::RefCell;
 
 use clap::{ArgAction, Parser};
 use hydro_deploy::Deployment;
-use hydro_lang::location::Location;
 use hydro_lang::viz::config::GraphConfig;
 use hydro_optimize::deploy::{HostType, ReusableHosts};
 use hydro_optimize::deploy_and_analyze::{
     Optimizations, ReusableClusters, ReusableProcesses, deploy_and_optimize,
 };
-use hydro_test::cluster::two_pc::{Coordinator, Participant};
 use hydro_test::cluster::two_pc_bench::{Aggregator, Client};
 
 #[derive(Parser, Debug)]

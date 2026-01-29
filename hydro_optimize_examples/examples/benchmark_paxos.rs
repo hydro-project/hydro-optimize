@@ -1,15 +1,11 @@
-use std::cell::RefCell;
 
 use clap::{ArgAction, Parser};
 use hydro_deploy::Deployment;
-use hydro_lang::location::Location;
 use hydro_optimize::deploy::{HostType, ReusableHosts};
 use hydro_optimize::deploy_and_analyze::{
     Optimizations, ReusableClusters, ReusableProcesses, deploy_and_optimize,
 };
-use hydro_test::cluster::kv_replica::Replica;
-use hydro_test::cluster::paxos::{Acceptor, CorePaxos, PaxosConfig, Proposer};
-use hydro_test::cluster::paxos_bench::{Aggregator, Client};
+use hydro_test::cluster::paxos::{CorePaxos, PaxosConfig};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, group(
@@ -56,7 +52,6 @@ async fn main() {
     let num_clients_per_node = vec![1, 50, 100];
     let run_seconds = 30;
 
-    let mut iteration = 0;
     let max_num_clients_per_node = num_clients_per_node.iter().max().unwrap();
     for (i, num_clients) in num_clients.iter().enumerate() {
         // For the 1st client, test a variable number of virtual clients. For the rest, use the max number.
@@ -113,8 +108,6 @@ async fn main() {
                 Some(run_seconds),
             )
             .await;
-
-            iteration += 1;
         }
     }
 }

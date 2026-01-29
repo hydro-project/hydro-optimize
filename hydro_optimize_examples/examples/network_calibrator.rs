@@ -1,13 +1,12 @@
 use clap::{ArgAction, Parser};
 use hydro_deploy::Deployment;
-use hydro_lang::location::Location;
 use hydro_lang::prelude::FlowBuilder;
 use hydro_lang::viz::config::GraphConfig;
 use hydro_optimize::deploy::{HostType, ReusableHosts};
 use hydro_optimize::deploy_and_analyze::{
     Optimizations, ReusableClusters, ReusableProcesses, deploy_and_optimize,
 };
-use hydro_optimize_examples::network_calibrator::{Aggregator, Client, Server, network_calibrator};
+use hydro_optimize_examples::network_calibrator::{Aggregator, Client, network_calibrator};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, group(
