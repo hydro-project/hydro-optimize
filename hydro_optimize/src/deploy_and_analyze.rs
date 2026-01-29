@@ -131,6 +131,7 @@ async fn track_cluster_metrics(
 
 struct ScriptSidecar {
     script: String,
+    prefix: String,
 }
 
 impl Sidecar for ScriptSidecar {
@@ -143,21 +144,29 @@ impl Sidecar for ScriptSidecar {
         _dfir_ident: &syn::Ident,
     ) -> syn::Expr {
         let script = &self.script;
+        let prefix = &self.prefix;
         let location_key_str = format!("{:?}", location_key);
 
         syn::parse_quote! {
             async {
-                let output = tokio::process::Command::new("sh")
+                use tokio::process::Command;
+                use tokio::io::{BufReader, AsyncBufReadExt};
+                use std::process::Stdio;
+
+                let mut child = Command::new("sh")
                     .arg("-c")
                     .arg(#script)
-                    .output()
-                    .await
-                    .expect(&format!("Failed to run sidecar script: {}", #script));
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .expect("Failed to spawn sidecar");
 
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for line in stdout.lines() {
-                    println!("{}: {}", #location_key_str, line);
+                let stdout = child.stdout.take().expect("Failed to open sidecar stdout");
+                let mut reader = BufReader::new(stdout).lines();
+                while let Some(line) = reader.next_line().await.expect("Failed to read line from sidecar") {
+                    println!("{}{}: {}", #prefix, #location_key_str, line);
                 }
+
+                child.wait().await.expect("Failed to wait for sidecar");
             }
         }
     }
@@ -286,6 +295,7 @@ pub async fn deploy_and_optimize<'a>(
         }
         let network_sidecar = ScriptSidecar {
             script: "sar -n DEV 1".to_string(),
+            prefix: NETWORK_USAGE_PREFIX.to_string(),
         };
         let nodes = deployable
             .with_sidecar_all(&network_sidecar) // Measure network usage
