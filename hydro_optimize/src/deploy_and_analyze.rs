@@ -20,6 +20,7 @@ use crate::deploy::ReusableHosts;
 use crate::parse_results::{RunMetadata, analyze_cluster_results, analyze_send_recv_overheads};
 use crate::repair::{cycle_source_to_sink_input, inject_id, remove_counter};
 
+pub(crate) const METRIC_INTERVAL_SECS: usize = 1;
 const COUNTER_PREFIX: &str = "_optimize_counter";
 pub(crate) const CPU_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_CPU:";
 pub(crate) const NETWORK_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_NET:";
@@ -264,7 +265,7 @@ pub async fn deploy_and_optimize<'a>(
     optimizations: Optimizations,
     num_seconds: Option<usize>,
 ) {
-    let counter_output_duration = syn::parse_quote!(std::time::Duration::from_secs(1));
+    let counter_output_duration = syn::parse_quote!(std::time::Duration::from_secs(#METRIC_INTERVAL_SECS));
 
     if optimizations.iterations > 1 && num_seconds.is_none() {
         panic!("Cannot specify multiple iterations without bounding run time");

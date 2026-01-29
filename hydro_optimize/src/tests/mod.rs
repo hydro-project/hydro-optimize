@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 
 use hydro_build_utils::insta;
@@ -6,7 +5,7 @@ use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::location::Location;
 use hydro_lang::prelude::*;
 
-use crate::decoupler;
+use crate::decoupler::{self, DecoupleDecision};
 use crate::partitioner::Partitioner;
 
 mod two_pc;
@@ -19,15 +18,16 @@ fn decoupled_compute_pi_ir() {
     let (cluster, _) = hydro_test::cluster::compute_pi::compute_pi(&mut builder, 8192);
     let decoupled_cluster = builder.cluster::<DecoupledCluster>();
     let decoupler = decoupler::Decoupler {
-        output_to_decoupled_machine_after: vec![4],
-        output_to_original_machine_after: vec![],
-        place_on_decoupled_machine: vec![],
+        decision: DecoupleDecision {
+            output_to_decoupled_machine_after: vec![4],
+            output_to_original_machine_after: vec![],
+            place_on_decoupled_machine: vec![],
+        },
         decoupled_location: decoupled_cluster.id().clone(),
         orig_location: cluster.id().clone(),
     };
-    let multi_run_metadata = RefCell::new(vec![]);
     let mut built = builder
-        .optimize_with(|roots| decoupler::decouple(roots, &decoupler, &multi_run_metadata, 0))
+        .optimize_with(|roots| decoupler::decouple(roots, &decoupler))
         .into_deploy::<HydroDeploy>();
 
     insta::assert_debug_snapshot!(built.ir());

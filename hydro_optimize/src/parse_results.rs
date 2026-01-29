@@ -10,12 +10,82 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::deploy_and_analyze::Metrics;
 
+/// Network usage statistics with percentile values
+#[derive(Debug, Default, Clone)]
+pub struct NetworkStats {
+    pub rx_packets_per_sec: PercentileStats,
+    pub tx_packets_per_sec: PercentileStats,
+    pub rx_bytes_per_sec: PercentileStats,
+    pub tx_bytes_per_sec: PercentileStats,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PercentileStats {
+    pub p50: f64,
+    pub p99: f64,
+    pub p999: f64,
+}
+
+impl PercentileStats {
+    fn from_samples(samples: &mut [f64]) -> Self {
+        if samples.is_empty() {
+            return Self::default();
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let len = samples.len();
+        Self {
+            p50: samples[len * 50 / 100],
+            p99: samples[len * 99 / 100],
+            p999: samples[len.saturating_sub(1).min(len * 999 / 1000)],
+        }
+    }
+}
+
+/// Parses `sar -n DEV` output lines and computes p50, p99, p999 for network metrics.
+/// Only considers eth0 interface data.
+pub fn parse_network_usage(lines: Vec<String>) -> NetworkStats {
+    let mut rx_pkt_samples = Vec::new();
+    let mut tx_pkt_samples = Vec::new();
+    let mut rx_kb_samples = Vec::new();
+    let mut tx_kb_samples = Vec::new();
+
+    // sar output format: TIME IFACE rxpck/s txpck/s rxkB/s txkB/s ...
+    // We look for lines containing "eth0" with numeric data
+    let eth0_regex =
+        Regex::new(r"eth0\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)").unwrap();
+
+    for line in &lines {
+        if let Some(caps) = eth0_regex.captures(line) {
+            if let (Ok(rx_pkt), Ok(tx_pkt), Ok(rx_kb), Ok(tx_kb)) = (
+                caps[1].parse::<f64>(),
+                caps[2].parse::<f64>(),
+                caps[3].parse::<f64>(),
+                caps[4].parse::<f64>(),
+            ) {
+                rx_pkt_samples.push(rx_pkt);
+                tx_pkt_samples.push(tx_pkt);
+                // Convert kB/s to bytes/s
+                rx_kb_samples.push(rx_kb * 1024.0);
+                tx_kb_samples.push(tx_kb * 1024.0);
+            }
+        }
+    }
+
+    NetworkStats {
+        rx_packets_per_sec: PercentileStats::from_samples(&mut rx_pkt_samples),
+        tx_packets_per_sec: PercentileStats::from_samples(&mut tx_pkt_samples),
+        rx_bytes_per_sec: PercentileStats::from_samples(&mut rx_kb_samples),
+        tx_bytes_per_sec: PercentileStats::from_samples(&mut tx_kb_samples),
+    }
+}
+
 #[derive(Default)]
 pub struct RunMetadata {
     pub send_overhead: HashMap<LocationId, f64>,
     pub recv_overhead: HashMap<LocationId, f64>,
     pub unaccounted_perf: HashMap<LocationId, f64>, // % of perf samples not mapped to any operator
     pub total_usage: HashMap<LocationId, f64>,      // 100% CPU = 1.0
+    pub network_stats: HashMap<LocationId, NetworkStats>,
 }
 
 pub fn parse_cpu_usage(measurement: String) -> f64 {
@@ -194,7 +264,7 @@ pub async fn analyze_process_results(
     ir: &mut [HydroRoot],
     op_to_count: &mut HashMap<usize, usize>,
     metrics: &mut Metrics,
-) -> f64 {
+) -> (f64, NetworkStats) {
     let underlying = process.underlying();
     let perf_results = underlying.tracing_results().unwrap();
 
@@ -206,11 +276,15 @@ pub async fn analyze_process_results(
         let (op_id, count) = parse_counter_usage(measurement.clone());
         op_to_count.insert(op_id, count);
     }
-    while let Some(network_usage) = metrics.network.recv().await {
-        println!("Network: {}", network_usage);
-    }
 
-    unidentified_usage
+    // Collect and parse network usage data
+    let mut network_lines = Vec::new();
+    while let Some(network_usage) = metrics.network.recv().await {
+        network_lines.push(network_usage);
+    }
+    let network_stats = parse_network_usage(network_lines);
+
+    (unidentified_usage, network_stats)
 }
 
 pub async fn analyze_cluster_results(
@@ -254,8 +328,7 @@ pub async fn analyze_cluster_results(
             let metrics = cluster_metrics
                 .get_mut(&(id.clone(), name.to_string(), idx))
                 .unwrap();
-            println!("{} measurements", idx);
-            let unidentified_perf = analyze_process_results(
+            let (unidentified_perf, network_stats) = analyze_process_results(
                 cluster.members().get(idx).unwrap(),
                 ir,
                 &mut op_to_count,
@@ -267,6 +340,8 @@ pub async fn analyze_cluster_results(
             run_metadata
                 .unaccounted_perf
                 .insert(id.clone(), unidentified_perf);
+            run_metadata.network_stats.insert(id.clone(), network_stats.clone());
+            println!("Network stats for {}: {:?}", idx, network_stats);
 
             // Update cluster with max usage
             if max_usage_overall < usage && !exclude.contains(&name.to_string()) {
