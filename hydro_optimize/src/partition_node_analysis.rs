@@ -35,7 +35,7 @@ fn all_inputs(ir: &mut [HydroRoot], location: &LocationId) -> Vec<usize> {
     traverse_dfir::<HydroDeploy>(
         ir,
         |_, _| {},
-        |node, next_stmt_id| match get_network_type(node, location.root().raw_id()) {
+        |node, next_stmt_id| match get_network_type(node, &location.root().key()) {
             Some(NetworkType::Recv) | Some(NetworkType::SendRecv) => {
                 inputs.push(*next_stmt_id);
             }
@@ -87,7 +87,7 @@ fn input_dependency_analysis_node(
     metadata: &mut InputDependencyMetadata,
 ) {
     // Filter unrelated nodes
-    if metadata.location != *node.metadata().location_kind.root() {
+    if metadata.location != *node.metadata().location_id.root() {
         return;
     }
 
@@ -606,7 +606,7 @@ pub fn partitioning_analysis(
     Vec<BTreeMap<usize, StructOrTupleIndex>>,
     BTreeMap<usize, usize>,
 )> {
-    let op_id_to_parents = op_id_to_inputs(ir, Some(location), cycle_source_to_sink_input);
+    let op_id_to_parents = op_id_to_inputs(ir, Some(&location.key()), cycle_source_to_sink_input);
     let dependency_metadata = input_dependency_analysis(ir, location, op_id_to_parents);
     let mut possible_partitionings = BTreeMap::new();
 
@@ -793,7 +793,7 @@ mod tests {
 
     #[test]
     fn test_map_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         cluster1
@@ -812,7 +812,7 @@ mod tests {
 
     #[test]
     fn test_map_complex_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         cluster1
@@ -832,7 +832,7 @@ mod tests {
 
     #[test]
     fn test_filter_map_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         cluster1
@@ -851,7 +851,7 @@ mod tests {
 
     #[test]
     fn test_filter_map_remove_none_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         cluster1
@@ -878,7 +878,7 @@ mod tests {
 
     #[test]
     fn test_chain_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         let input = cluster1
@@ -903,7 +903,7 @@ mod tests {
 
     #[test]
     fn test_cross_product_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         let input = cluster1
@@ -928,7 +928,7 @@ mod tests {
 
     #[test]
     fn test_join_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         let input = cluster1
@@ -954,7 +954,7 @@ mod tests {
 
     #[test]
     fn test_enumerate_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         cluster1
@@ -972,7 +972,7 @@ mod tests {
 
     #[test]
     fn test_reduce_keyed_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         cluster1
@@ -999,7 +999,7 @@ mod tests {
 
     #[test]
     fn test_reduce_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         cluster1
@@ -1024,7 +1024,7 @@ mod tests {
 
     #[test]
     fn test_cycle_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         let input = cluster1
@@ -1055,7 +1055,7 @@ mod tests {
 
     #[test]
     fn test_nested_cycle_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         let input = cluster1
@@ -1090,7 +1090,7 @@ mod tests {
 
     #[test]
     fn test_source_iter_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         let input = cluster1
@@ -1115,7 +1115,7 @@ mod tests {
 
     #[test]
     fn test_multiple_inputs_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         let input1 = cluster1
@@ -1158,7 +1158,7 @@ mod tests {
 
     #[test]
     fn test_difference_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         let input1 = cluster1

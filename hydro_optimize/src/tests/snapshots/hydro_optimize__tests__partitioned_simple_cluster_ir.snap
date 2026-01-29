@@ -45,7 +45,7 @@ expression: built.ir()
                                                                         ),
                                                                     ),
                                                                     metadata: HydroIrMetadata {
-                                                                        location_kind: Process(
+                                                                        location_id: Process(
                                                                             0,
                                                                         ),
                                                                         collection_kind: Stream {
@@ -57,7 +57,7 @@ expression: built.ir()
                                                                     },
                                                                 },
                                                                 metadata: HydroIrMetadata {
-                                                                    location_kind: Process(
+                                                                    location_id: Process(
                                                                         0,
                                                                     ),
                                                                     collection_kind: Stream {
@@ -69,7 +69,7 @@ expression: built.ir()
                                                                 },
                                                             },
                                                             metadata: HydroIrMetadata {
-                                                                location_kind: Process(
+                                                                location_id: Process(
                                                                     0,
                                                                 ),
                                                                 collection_kind: KeyedStream {
@@ -82,7 +82,7 @@ expression: built.ir()
                                                             },
                                                         },
                                                         metadata: HydroIrMetadata {
-                                                            location_kind: Process(
+                                                            location_id: Process(
                                                                 0,
                                                             ),
                                                             collection_kind: Stream {
@@ -94,7 +94,7 @@ expression: built.ir()
                                                         },
                                                     },
                                                     metadata: HydroIrMetadata {
-                                                        location_kind: Process(
+                                                        location_id: Process(
                                                             0,
                                                         ),
                                                         collection_kind: Stream {
@@ -112,7 +112,7 @@ expression: built.ir()
                                                             stageleft :: runtime_support :: type_hint :: < std :: ops :: Range < i32 > > ({ use hydro_test :: __staged :: __deps :: * ; use hydro_test :: __staged :: cluster :: simple_cluster :: * ; 0 .. 5 }),
                                                         ),
                                                         metadata: HydroIrMetadata {
-                                                            location_kind: Process(
+                                                            location_id: Process(
                                                                 0,
                                                             ),
                                                             collection_kind: Stream {
@@ -124,7 +124,7 @@ expression: built.ir()
                                                         },
                                                     },
                                                     metadata: HydroIrMetadata {
-                                                        location_kind: Process(
+                                                        location_id: Process(
                                                             0,
                                                         ),
                                                         collection_kind: Stream {
@@ -136,7 +136,7 @@ expression: built.ir()
                                                     },
                                                 },
                                                 metadata: HydroIrMetadata {
-                                                    location_kind: Process(
+                                                    location_id: Process(
                                                         0,
                                                     ),
                                                     collection_kind: Stream {
@@ -148,7 +148,7 @@ expression: built.ir()
                                                 },
                                             },
                                             metadata: HydroIrMetadata {
-                                                location_kind: Process(
+                                                location_id: Process(
                                                     0,
                                                 ),
                                                 collection_kind: Stream {
@@ -160,7 +160,7 @@ expression: built.ir()
                                             },
                                         },
                                         metadata: HydroIrMetadata {
-                                            location_kind: Process(
+                                            location_id: Process(
                                                 0,
                                             ),
                                             collection_kind: KeyedStream {
@@ -173,7 +173,7 @@ expression: built.ir()
                                         },
                                     },
                                     metadata: HydroIrMetadata {
-                                        location_kind: Cluster(
+                                        location_id: Cluster(
                                             1,
                                         ),
                                         collection_kind: Stream {
@@ -185,7 +185,7 @@ expression: built.ir()
                                     },
                                 },
                                 metadata: HydroIrMetadata {
-                                    location_kind: Cluster(
+                                    location_id: Cluster(
                                         1,
                                     ),
                                     collection_kind: Stream {
@@ -197,7 +197,7 @@ expression: built.ir()
                                 },
                             },
                             metadata: HydroIrMetadata {
-                                location_kind: Process(
+                                location_id: Process(
                                     0,
                                 ),
                                 collection_kind: Stream {
@@ -209,7 +209,7 @@ expression: built.ir()
                             },
                         },
                         metadata: HydroIrMetadata {
-                            location_kind: Process(
+                            location_id: Process(
                                 0,
                             ),
                             collection_kind: Stream {
@@ -221,7 +221,7 @@ expression: built.ir()
                         },
                     },
                     metadata: HydroIrMetadata {
-                        location_kind: Process(
+                        location_id: Process(
                             0,
                         ),
                         collection_kind: KeyedStream {
@@ -234,7 +234,7 @@ expression: built.ir()
                     },
                 },
                 metadata: HydroIrMetadata {
-                    location_kind: Process(
+                    location_id: Process(
                         0,
                     ),
                     collection_kind: Stream {
@@ -247,7 +247,7 @@ expression: built.ir()
             },
             trusted: false,
             metadata: HydroIrMetadata {
-                location_kind: Process(
+                location_id: Process(
                     0,
                 ),
                 collection_kind: Stream {

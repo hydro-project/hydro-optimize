@@ -15,8 +15,8 @@ struct DecoupledCluster;
 
 #[test]
 fn decoupled_compute_pi_ir() {
-    let builder = FlowBuilder::new();
-    let (cluster, _) = hydro_test::cluster::compute_pi::compute_pi(&builder, 8192);
+    let mut builder = FlowBuilder::new();
+    let (cluster, _) = hydro_test::cluster::compute_pi::compute_pi(&mut builder, 8192);
     let decoupled_cluster = builder.cluster::<DecoupledCluster>();
     let decoupler = decoupler::Decoupler {
         output_to_decoupled_machine_after: vec![4],
@@ -43,12 +43,12 @@ fn decoupled_compute_pi_ir() {
 
 #[test]
 fn partitioned_simple_cluster_ir() {
-    let builder = FlowBuilder::new();
-    let (_, cluster) = hydro_test::cluster::simple_cluster::simple_cluster(&builder);
+    let mut builder = FlowBuilder::new();
+    let (_, cluster) = hydro_test::cluster::simple_cluster::simple_cluster(&mut builder);
     let partitioner = Partitioner {
         nodes_to_partition: HashMap::from([(5, vec!["1".to_string()])]),
         num_partitions: 3,
-        location_id: cluster.id().raw_id(),
+        location_id: cluster.id().key(),
         new_cluster_id: None,
     };
     let mut built = builder

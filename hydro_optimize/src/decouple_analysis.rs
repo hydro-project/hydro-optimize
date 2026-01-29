@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use crate::decoupler::DecoupleDecision;
 use crate::rewrites::op_id_to_inputs;
 use good_lp::solvers::highs::HighsSolution;
 use good_lp::{
@@ -90,7 +91,7 @@ fn add_tick_constraint(
         ..
     } = &mut *model_metadata.borrow_mut();
 
-    if let LocationId::Tick(tick_id, _) = metadata.location_kind {
+    if let LocationId::Tick(tick_id, _) = metadata.location_id {
         // Set each input = to the last input
         let mut inputs = op_id_to_inputs
             .get(&metadata.op.id.unwrap())
@@ -291,7 +292,7 @@ fn decouple_analysis_root(
     model_metadata: &RefCell<ModelMetadata>,
 ) {
     // Ignore nodes that are not in the cluster to decouple
-    if model_metadata.borrow().cluster_to_decouple != *root.input_metadata().location_kind.root() {
+    if model_metadata.borrow().cluster_to_decouple != *root.input_metadata().location_id.root() {
         return;
     }
 
@@ -306,7 +307,7 @@ fn decouple_analysis_node(
 ) {
     let network_type = get_network_type(
         node,
-        model_metadata.borrow().cluster_to_decouple.root().raw_id(),
+        &model_metadata.borrow().cluster_to_decouple.root().key(),
     );
     if let HydroNode::Network { .. } = node {
         // If this is a network and we're not involved, ignore
@@ -317,7 +318,7 @@ fn decouple_analysis_node(
             .borrow_mut()
             .network_ids
             .insert(*op_id, network_type.clone().unwrap());
-    } else if model_metadata.borrow().cluster_to_decouple != *node.metadata().location_kind.root() {
+    } else if model_metadata.borrow().cluster_to_decouple != *node.metadata().location_id.root() {
         // If it's not a network and the operator isn't on the cluster, ignore
         return;
     }
@@ -387,7 +388,7 @@ pub(crate) fn decouple_analysis(
     send_overhead: f64,
     recv_overhead: f64,
     cycle_source_to_sink_input: &HashMap<usize, usize>,
-) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+) -> DecoupleDecision {
     let model_metadata = RefCell::new(ModelMetadata {
         cluster_to_decouple: cluster_to_decouple.clone(),
         decoupling_send_overhead: send_overhead,
@@ -401,8 +402,11 @@ pub(crate) fn decouple_analysis(
         tee_inner_to_decoupled_vars: HashMap::new(),
         network_ids: HashMap::new(),
     });
-    let op_id_to_inputs =
-        op_id_to_inputs(ir, Some(cluster_to_decouple), cycle_source_to_sink_input);
+    let op_id_to_inputs = op_id_to_inputs(
+        ir,
+        Some(&cluster_to_decouple.key()),
+        cycle_source_to_sink_input,
+    );
 
     traverse_dfir::<HydroDeploy>(
         ir,
@@ -433,9 +437,7 @@ pub(crate) fn decouple_analysis(
 
     let mut orig_machine = vec![];
     let mut decoupled_machine = vec![];
-    let mut orig_to_decoupled = vec![];
-    let mut decoupled_to_orig = vec![];
-    let mut place_on_decoupled = vec![];
+    let mut decision = DecoupleDecision::default();
 
     for (op_id, inputs) in op_id_to_inputs {
         if let Some(op_var) = op_id_to_var.get(&op_id) {
@@ -457,10 +459,10 @@ pub(crate) fn decouple_analysis(
                 // Figure out if we should insert Network nodes
                 match (input_unwrapped, op_value) {
                     (0.0, 1.0) => {
-                        orig_to_decoupled.push(op_id);
+                        decision.output_to_decoupled_machine_after.push(op_id);
                     }
                     (1.0, 0.0) => {
-                        decoupled_to_orig.push(op_id);
+                        decision.output_to_original_machine_after.push(op_id);
                     }
                     _ => {}
                 }
@@ -477,7 +479,7 @@ pub(crate) fn decouple_analysis(
                     decoupled_machine.push(op_id);
                     // Don't modify the destination if we're sending to someone else
                     if !network_type.is_some_and(|t| *t == NetworkType::Send) {
-                        place_on_decoupled.push(op_id);
+                        decision.place_on_decoupled_machine.push(op_id);
                     }
                 }
             }
@@ -488,18 +490,21 @@ pub(crate) fn decouple_analysis(
     decoupled_machine.sort();
     println!("Original: {:?}", orig_machine);
     println!("Decoupling: {:?}", decoupled_machine);
-    orig_to_decoupled.sort();
-    decoupled_to_orig.sort();
-    place_on_decoupled.sort();
+    decision.output_to_decoupled_machine_after.sort();
+    decision.output_to_original_machine_after.sort();
+    decision.place_on_decoupled_machine.sort();
     println!(
         "Original outputting to decoupled after: {:?}",
-        orig_to_decoupled
+        decision.output_to_decoupled_machine_after
     );
     println!(
         "Decoupled outputting to original after: {:?}",
-        decoupled_to_orig
+        decision.output_to_original_machine_after
     );
-    println!("Placing on decoupled: {:?}", place_on_decoupled);
+    println!(
+        "Placing on decoupled: {:?}",
+        decision.place_on_decoupled_machine
+    );
 
-    (orig_to_decoupled, decoupled_to_orig, place_on_decoupled)
+    decision
 }
