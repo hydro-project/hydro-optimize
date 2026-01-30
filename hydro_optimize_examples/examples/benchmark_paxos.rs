@@ -94,7 +94,7 @@ async fn main() {
                 &replicas,
             );
 
-            deploy_and_optimize(
+            let run_metadata = deploy_and_optimize(
                 &mut reusable_hosts,
                 &mut deployment,
                 builder.finalize(),

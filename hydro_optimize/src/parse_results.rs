@@ -8,15 +8,26 @@ use hydro_lang::location::dynamic::LocationId;
 use regex::Regex;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::deploy_and_analyze::Metrics;
+use crate::deploy_and_analyze::MetricLogs;
 
-/// Network usage statistics with percentile values
-#[derive(Debug, Default, Clone)]
-pub struct NetworkStats {
-    pub rx_packets_per_sec: PercentileStats,
-    pub tx_packets_per_sec: PercentileStats,
-    pub rx_bytes_per_sec: PercentileStats,
-    pub tx_bytes_per_sec: PercentileStats,
+#[derive(Default)]
+pub struct RunMetadata {
+    pub throughput: (f64, f64, f64), // mean - 2 std, mean, mean + 2 std
+    pub latencies: (f64, f64, f64, u64), // p50, p99, p999, count
+    pub send_overhead: HashMap<LocationId, f64>,
+    pub recv_overhead: HashMap<LocationId, f64>,
+    pub unaccounted_perf: HashMap<LocationId, f64>, // % of perf samples not mapped to any operator
+    pub total_usage: HashMap<LocationId, f64>,      // 100% CPU = 1.0
+    pub network_stats: HashMap<LocationId, NetworkStats>,
+}
+
+pub fn parse_cpu_usage(measurement: String) -> f64 {
+    let regex = Regex::new(r"Total (\d+\.\d+)%").unwrap();
+    regex
+        .captures_iter(&measurement)
+        .last()
+        .map(|cap| cap[1].parse::<f64>().unwrap())
+        .unwrap_or(0f64)
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -24,6 +35,14 @@ pub struct PercentileStats {
     pub p50: f64,
     pub p99: f64,
     pub p999: f64,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct NetworkStats {
+    pub rx_packets_per_sec: PercentileStats,
+    pub tx_packets_per_sec: PercentileStats,
+    pub rx_bytes_per_sec: PercentileStats,
+    pub tx_bytes_per_sec: PercentileStats,
 }
 
 impl PercentileStats {
@@ -79,22 +98,12 @@ pub fn parse_network_usage(lines: Vec<String>) -> NetworkStats {
     }
 }
 
-#[derive(Default)]
-pub struct RunMetadata {
-    pub send_overhead: HashMap<LocationId, f64>,
-    pub recv_overhead: HashMap<LocationId, f64>,
-    pub unaccounted_perf: HashMap<LocationId, f64>, // % of perf samples not mapped to any operator
-    pub total_usage: HashMap<LocationId, f64>,      // 100% CPU = 1.0
-    pub network_stats: HashMap<LocationId, NetworkStats>,
+pub fn parse_throughput(lines: Vec<String>) -> (f64, f64, f64) {
+    todo!()
 }
 
-pub fn parse_cpu_usage(measurement: String) -> f64 {
-    let regex = Regex::new(r"Total (\d+\.\d+)%").unwrap();
-    regex
-        .captures_iter(&measurement)
-        .last()
-        .map(|cap| cap[1].parse::<f64>().unwrap())
-        .unwrap_or(0f64)
+pub fn parse_latency(lines: Vec<String>) -> (f64, f64, f64, u64) {
+    todo!()
 }
 
 /// Returns a map from (operator ID, is network receiver) to percentage of total samples, and the percentage of samples that are unaccounted
@@ -263,7 +272,7 @@ pub async fn analyze_process_results(
     process: &impl DeployCrateWrapper,
     ir: &mut [HydroRoot],
     op_to_count: &mut HashMap<usize, usize>,
-    metrics: &mut Metrics,
+    metrics: &mut MetricLogs,
 ) -> (f64, NetworkStats) {
     let underlying = process.underlying();
     let perf_results = underlying.tracing_results().unwrap();
@@ -290,7 +299,7 @@ pub async fn analyze_process_results(
 pub async fn analyze_cluster_results(
     nodes: &DeployResult<'_, HydroDeploy>,
     ir: &mut [HydroRoot],
-    mut cluster_metrics: HashMap<(LocationId, String, usize), Metrics>,
+    mut cluster_metrics: HashMap<(LocationId, String, usize), MetricLogs>,
     run_metadata: &mut RunMetadata,
     exclude: &Vec<String>,
 ) -> (LocationId, String, usize) {
@@ -340,7 +349,9 @@ pub async fn analyze_cluster_results(
             run_metadata
                 .unaccounted_perf
                 .insert(id.clone(), unidentified_perf);
-            run_metadata.network_stats.insert(id.clone(), network_stats.clone());
+            run_metadata
+                .network_stats
+                .insert(id.clone(), network_stats.clone());
             println!("Network stats for {}: {:?}", idx, network_stats);
 
             // Update cluster with max usage

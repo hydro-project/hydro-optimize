@@ -20,7 +20,7 @@ use crate::deploy::ReusableHosts;
 use crate::parse_results::{RunMetadata, analyze_cluster_results, analyze_send_recv_overheads};
 use crate::repair::{cycle_source_to_sink_input, inject_id, remove_counter};
 
-pub(crate) const METRIC_INTERVAL_SECS: usize = 1;
+pub(crate) const METRIC_INTERVAL_SECS: u64 = 1;
 const COUNTER_PREFIX: &str = "_optimize_counter";
 pub(crate) const CPU_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_CPU:";
 pub(crate) const NETWORK_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_NET:";
@@ -99,14 +99,14 @@ fn insert_counter(ir: &mut [HydroRoot], duration: &syn::Expr) {
     );
 }
 
-pub struct Metrics {
+pub struct MetricLogs {
     pub cpu: UnboundedReceiver<String>,
     pub network: UnboundedReceiver<String>,
     pub counters: UnboundedReceiver<String>,
 }
 
-async fn track_process_metrics(process: &impl DeployCrateWrapper) -> Metrics {
-    Metrics {
+async fn track_process_metrics(process: &impl DeployCrateWrapper) -> MetricLogs {
+    MetricLogs {
         cpu: process.stdout_filter(CPU_USAGE_PREFIX),
         network: process.stdout_filter(NETWORK_USAGE_PREFIX),
         counters: process.stdout_filter(COUNTER_PREFIX),
@@ -115,7 +115,7 @@ async fn track_process_metrics(process: &impl DeployCrateWrapper) -> Metrics {
 
 async fn track_cluster_metrics(
     nodes: &DeployResult<'_, HydroDeploy>,
-) -> HashMap<(LocationId, String, usize), Metrics> {
+) -> HashMap<(LocationId, String, usize), MetricLogs> {
     let mut cluster_to_metrics = HashMap::new();
     for (id, name, cluster) in nodes.get_all_clusters() {
         for (idx, node) in cluster.members().iter().enumerate() {
@@ -264,12 +264,14 @@ pub async fn deploy_and_optimize<'a>(
     processes: ReusableProcesses,
     optimizations: Optimizations,
     num_seconds: Option<usize>,
-) {
-    let counter_output_duration = syn::parse_quote!(std::time::Duration::from_secs(#METRIC_INTERVAL_SECS));
-
+) -> RunMetadata {
     if optimizations.iterations > 1 && num_seconds.is_none() {
         panic!("Cannot specify multiple iterations without bounding run time");
     }
+
+    let counter_output_duration =
+        syn::parse_quote!(std::time::Duration::from_secs(#METRIC_INTERVAL_SECS));
+    let mut run_metadata = RunMetadata::default();
 
     for iteration in 0..optimizations.iterations {
         // Rewrite with counter tracking
@@ -325,8 +327,8 @@ pub async fn deploy_and_optimize<'a>(
             .await
             .unwrap();
 
-        // Add metadata for this run
-        let mut run_metadata = RunMetadata::default();
+        // Add metadata for this run, clearing the metadata from the previous run
+        run_metadata = RunMetadata::default();
         let (bottleneck, bottleneck_name, bottleneck_num_nodes) = analyze_cluster_results(
             &nodes,
             &mut ir,
@@ -382,4 +384,6 @@ pub async fn deploy_and_optimize<'a>(
 
         builder = post_rewrite_builder.finalize();
     }
+
+    run_metadata
 }
