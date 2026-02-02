@@ -24,6 +24,8 @@ pub(crate) const METRIC_INTERVAL_SECS: u64 = 1;
 const COUNTER_PREFIX: &str = "_optimize_counter";
 pub(crate) const CPU_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_CPU:";
 pub(crate) const NETWORK_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_NET:";
+pub(crate) const LATENCY_PREFIX: &str = "HYDRO_OPTIMIZE_LAT:";
+pub(crate) const THROUGHPUT_PREFIX: &str = "HYDRO_OPTIMIZE_THR:";
 
 // Note: Ensure edits to the match arms are consistent with inject_count_node
 fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration: syn::Expr) {
@@ -100,6 +102,8 @@ fn insert_counter(ir: &mut [HydroRoot], duration: &syn::Expr) {
 }
 
 pub struct MetricLogs {
+    pub throughputs: UnboundedReceiver<String>,
+    pub latencies: UnboundedReceiver<String>,
     pub cpu: UnboundedReceiver<String>,
     pub network: UnboundedReceiver<String>,
     pub counters: UnboundedReceiver<String>,
@@ -107,6 +111,8 @@ pub struct MetricLogs {
 
 async fn track_process_metrics(process: &impl DeployCrateWrapper) -> MetricLogs {
     MetricLogs {
+        throughputs: process.stdout_filter(THROUGHPUT_PREFIX),
+        latencies: process.stdout_filter(LATENCY_PREFIX),
         cpu: process.stdout_filter(CPU_USAGE_PREFIX),
         network: process.stdout_filter(NETWORK_USAGE_PREFIX),
         counters: process.stdout_filter(COUNTER_PREFIX),

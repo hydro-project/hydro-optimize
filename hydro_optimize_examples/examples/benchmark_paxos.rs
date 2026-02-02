@@ -1,4 +1,3 @@
-
 use clap::{ArgAction, Parser};
 use hydro_deploy::Deployment;
 use hydro_optimize::deploy::{HostType, ReusableHosts};
@@ -46,6 +45,7 @@ async fn main() {
     let i_am_leader_send_timeout = 5; // Sec
     let i_am_leader_check_timeout = 10; // Sec
     let i_am_leader_check_timeout_delay_multiplier = 15;
+    let print_result_frequency = 1000; // Millis
 
     // Benchmark parameters
     let num_clients = [1, 2, 3, 4, 5];
@@ -92,6 +92,8 @@ async fn main() {
                 &clients,
                 &client_aggregator,
                 &replicas,
+                print_result_frequency,
+                hydro_std::bench_client::pretty_print_bench_results,
             );
 
             let run_metadata = deploy_and_optimize(

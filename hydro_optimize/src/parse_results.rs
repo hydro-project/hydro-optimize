@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::deploy_and_analyze::{LATENCY_PREFIX, THROUGHPUT_PREFIX};
 use hydro_lang::compile::deploy::DeployResult;
 use hydro_lang::compile::ir::{HydroNode, HydroRoot, traverse_dfir};
 use hydro_lang::deploy::HydroDeploy;
@@ -98,12 +99,88 @@ pub fn parse_network_usage(lines: Vec<String>) -> NetworkStats {
     }
 }
 
-pub fn parse_throughput(lines: Vec<String>) -> (f64, f64, f64) {
-    todo!()
+pub fn print_parseable_bench_results<'a, Aggregator>(
+    aggregate_results: AggregateBenchResult<'a, Aggregator>,
+    interval_millis: u64,
+) {
+    aggregate_results
+        .throughput
+        .filter_map(q!(move |(throughputs, num_client_machines)| {
+            if let Some((lower, upper)) = throughputs.confidence_interval_99() {
+                Some((
+                    lower * num_client_machines as f64,
+                    throughputs.sample_mean() * num_client_machines as f64,
+                    upper * num_client_machines as f64,
+                ))
+            } else {
+                None
+            }
+        }))
+        .for_each(q!(|(lower, mean, upper)| {
+            println!(
+                "{} {:.2} - {:.2} - {:.2} requests/s",
+                THROUGHPUT_PREFIX, lower, mean, upper,
+            );
+        }));
+    aggregate_results
+        .latency
+        .map(q!(move |latencies| (
+            Duration::from_nanos(latencies.value_at_quantile(0.5)).as_micros() as f64
+                / interval_millis as f64,
+            Duration::from_nanos(latencies.value_at_quantile(0.99)).as_micros() as f64
+                / interval_millis as f64,
+            Duration::from_nanos(latencies.value_at_quantile(0.999)).as_micros() as f64
+                / interval_millis as f64,
+            latencies.len(),
+        )))
+        .for_each(q!(move |(p50, p99, p999, num_samples)| {
+            println!(
+                "{} p50: {:.3} | p99 {:.3} | p999 {:.3} ms ({:} samples)",
+                LATENCY_PREFIX, p50, p99, p999, num_samples
+            );
+        }));
 }
 
+/// Parses throughput output from `print_parseable_bench_results`.
+/// Format: "HYDRO_OPTIMIZE_THR: {lower:.2} - {mean:.2} - {upper:.2} requests/s"
+/// Returns the last (lower, mean, upper) tuple found.
+pub fn parse_throughput(lines: Vec<String>) -> (f64, f64, f64) {
+    let regex =
+        Regex::new(r"(\d+\.?\d*)\s*-\s*(\d+\.?\d*)\s*-\s*(\d+\.?\d*)\s*requests/s").unwrap();
+    lines
+        .iter()
+        .filter_map(|line| {
+            regex.captures(line).map(|cap| {
+                (
+                    cap[1].parse::<f64>().unwrap(),
+                    cap[2].parse::<f64>().unwrap(),
+                    cap[3].parse::<f64>().unwrap(),
+                )
+            })
+        })
+        .last()
+        .unwrap()
+}
+
+/// Parses latency output from `print_parseable_bench_results`.
+/// Format: "HYDRO_OPTIMIZE_LAT: p50: {p50:.3} | p99 {p99:.3} | p999 {p999:.3} ms ({num_samples} samples)"
+/// Returns the last (p50, p99, p999, num_samples) tuple found.
 pub fn parse_latency(lines: Vec<String>) -> (f64, f64, f64, u64) {
-    todo!()
+    let regex = Regex::new(r"p50:\s*(\d+\.?\d*)\s*\|\s*p99\s+(\d+\.?\d*)\s*\|\s*p999\s+(\d+\.?\d*)\s*ms\s*\((\d+)\s*samples\)").unwrap();
+    lines
+        .iter()
+        .filter_map(|line| {
+            regex.captures(line).map(|cap| {
+                (
+                    cap[1].parse::<f64>().unwrap(),
+                    cap[2].parse::<f64>().unwrap(),
+                    cap[3].parse::<f64>().unwrap(),
+                    cap[4].parse::<u64>().unwrap(),
+                )
+            })
+        })
+        .last()
+        .unwrap()
 }
 
 /// Returns a map from (operator ID, is network receiver) to percentage of total samples, and the percentage of samples that are unaccounted
@@ -187,12 +264,14 @@ pub fn inject_perf(ir: &mut [HydroRoot], folded_data: Vec<u8>) -> f64 {
 }
 
 /// Returns (op_id, count)
-pub fn parse_counter_usage(measurement: String) -> (usize, usize) {
-    let regex = Regex::new(r"\((\d+)\): (\d+)").unwrap();
-    let matches = regex.captures_iter(&measurement).last().unwrap();
-    let op_id = matches[1].parse::<usize>().unwrap();
-    let count = matches[2].parse::<usize>().unwrap();
-    (op_id, count)
+pub fn parse_counter_usage(lines: Vec<String>, op_to_count: &mut HashMap<usize, usize>) {
+    for measurement in lines {
+        let regex = Regex::new(r"\((\d+)\): (\d+)").unwrap();
+        let matches = regex.captures_iter(&measurement).last().unwrap();
+        let op_id = matches[1].parse::<usize>().unwrap();
+        let count = matches[2].parse::<usize>().unwrap();
+        op_to_count.insert(op_id, count);
+    }
 }
 
 // Note: Ensure edits to the match arms are consistent with insert_counter_node
@@ -268,32 +347,31 @@ pub fn inject_count(ir: &mut [HydroRoot], op_to_count: &HashMap<usize, usize>) {
     );
 }
 
+/// Drains all messages from a receiver into a Vec.
+async fn drain_receiver(receiver: &mut UnboundedReceiver<String>) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Some(line) = receiver.recv().await {
+        lines.push(line);
+    }
+    lines
+}
+
 pub async fn analyze_process_results(
     process: &impl DeployCrateWrapper,
     ir: &mut [HydroRoot],
     op_to_count: &mut HashMap<usize, usize>,
     metrics: &mut MetricLogs,
-) -> (f64, NetworkStats) {
+) -> (u64, NetworkStats) {
     let underlying = process.underlying();
     let perf_results = underlying.tracing_results().unwrap();
 
     // Inject perf usages into metadata
-    let unidentified_usage = inject_perf(ir, perf_results.folded_data.clone());
+    let unidentified_perf = inject_perf(ir, perf_results.folded_data.clone());
 
-    // Get cardinality data. Allow later values to overwrite earlier ones
-    while let Some(measurement) = metrics.counters.recv().await {
-        let (op_id, count) = parse_counter_usage(measurement.clone());
-        op_to_count.insert(op_id, count);
-    }
-
-    // Collect and parse network usage data
-    let mut network_lines = Vec::new();
-    while let Some(network_usage) = metrics.network.recv().await {
-        network_lines.push(network_usage);
-    }
-    let network_stats = parse_network_usage(network_lines);
-
-    (unidentified_usage, network_stats)
+    // Parse all metric streams
+    parse_counter_usage(drain_receiver(&mut metrics.counters).await, op_to_count);
+    let network_stats = parse_network_usage(drain_receiver(&mut metrics.network).await);
+    (unidentified_perf, network_stats)
 }
 
 pub async fn analyze_cluster_results(
@@ -348,7 +426,7 @@ pub async fn analyze_cluster_results(
             run_metadata.total_usage.insert(id.clone(), usage);
             run_metadata
                 .unaccounted_perf
-                .insert(id.clone(), unidentified_perf);
+                .insert(id.clone(), unidentified_perf as f64);
             run_metadata
                 .network_stats
                 .insert(id.clone(), network_stats.clone());
@@ -364,6 +442,9 @@ pub async fn analyze_cluster_results(
             }
         }
     }
+
+    run_metadata.throughput = parse_throughput(drain_receiver(&mut metrics.throughputs).await);
+    run_metadata.latencies = parse_latency(drain_receiver(&mut metrics.latencies).await);
 
     inject_count(ir, &op_to_count);
 
