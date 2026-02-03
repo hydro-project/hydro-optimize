@@ -379,7 +379,6 @@ pub async fn deploy_and_optimize<'a>(
                 decoupled_location: new_cluster.id().clone(),
             };
             decoupler::decouple(&mut ir, &decouple_with_location);
-            post_rewrite_builder.replace_ir(ir);
             clusters.named_clusters.push((
                 new_cluster.id().key(),
                 format!("{}-decouple-{}", bottleneck_name, iteration),
@@ -388,6 +387,7 @@ pub async fn deploy_and_optimize<'a>(
             // TODO: Save decoupling decision to file
         }
 
+        post_rewrite_builder.replace_ir(ir);
         builder = post_rewrite_builder.finalize();
     }
 
