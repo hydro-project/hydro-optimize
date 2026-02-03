@@ -101,15 +101,36 @@ async fn run_benchmark(
     let (p50_latency, p99_latency, p999_latency, latency_samples) = run_metadata.latencies;
 
     println!(
-        "Result: throughput={:.2} req/s (99% CI: {:.2} - {:.2}), latency p50={:.3} ms, p99={:.3} ms, p999={:.3} ms ({} samples)",
-        throughput_mean,
-        throughput_lower,
-        throughput_upper,
-        p50_latency,
-        p99_latency,
-        p999_latency,
-        latency_samples
+        "Throughput: {:.2} - {:.2} - {:.2} requests/s",
+        throughput_lower, throughput_mean, throughput_upper
     );
+    println!(
+        "Latency: p50: {:.3} | p99 {:.3} | p999 {:.3} ms ({:} samples)",
+        p50_latency, p99_latency, p999_latency, latency_samples
+    );
+    run_metadata
+        .total_usage
+        .iter()
+        .for_each(|(location, usage)| println!("{:?} CPU: {:.2}%", location, usage * 100.0));
+
+    // Print network stats summary
+    for (location, stats) in &run_metadata.network_stats {
+        let tx_packets = stats.tx_packets_per_sec.p50;
+        let rx_packets = stats.rx_packets_per_sec.p50;
+        let tx_bytes = stats.tx_bytes_per_sec.p50;
+        let rx_bytes = stats.rx_bytes_per_sec.p50;
+
+        println!(
+            "{:?} Network: msgs sent={:.0}, recv={:.0}, total={:.0} | GB sent={:.3}, recv={:.3}, total={:.3}",
+            location,
+            tx_packets,
+            rx_packets,
+            tx_packets + rx_packets,
+            tx_bytes / 1e9,
+            rx_bytes / 1e9,
+            (tx_bytes + rx_bytes) / 1e9
+        );
+    }
 
     BenchResult {
         virtual_clients: num_clients_per_node,
