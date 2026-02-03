@@ -45,6 +45,7 @@ async fn main() {
     let num_clients_per_node = 1000;
     let message_sizes = vec![1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
     let num_seconds_to_profile = Some(60);
+    let interval_millis = 1000;
 
     for message_size in message_sizes {
         let mut builder = FlowBuilder::new();
@@ -62,6 +63,7 @@ async fn main() {
             &server,
             &clients,
             &client_aggregator,
+            interval_millis,
         );
 
         deploy_and_optimize(

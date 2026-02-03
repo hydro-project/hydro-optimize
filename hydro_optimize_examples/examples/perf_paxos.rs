@@ -5,7 +5,7 @@ use hydro_optimize::deploy::{HostType, ReusableHosts};
 use hydro_optimize::deploy_and_analyze::{
     Optimizations, ReusableClusters, ReusableProcesses, deploy_and_optimize,
 };
-use hydro_optimize::parse_results::print_parseable_bench_results;
+use hydro_std::bench_client::pretty_print_bench_results;
 use hydro_test::cluster::paxos::{CorePaxos, PaxosConfig};
 use hydro_test::cluster::paxos_bench::{Aggregator, Client};
 
@@ -76,7 +76,7 @@ async fn main() {
         &client_aggregator,
         &replicas,
         print_result_frequency,
-        print_parseable_bench_results,
+        pretty_print_bench_results, // Note: Throughput/latency numbers won't be accessible to deploy_and_optimize
     );
 
     // Deploy

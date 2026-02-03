@@ -37,4 +37,5 @@ clap.workspace = true
 include_mdtests.workspace = true
 
 [build-dependencies]
+stageleft_tool.workspace = true
 hydro_build_utils.workspace = true

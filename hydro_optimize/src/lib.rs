@@ -1,3 +1,5 @@
+stageleft::stageleft_no_entry_crate!();
+
 pub mod debug;
 pub mod decouple_analysis;
 pub mod decoupler;
@@ -9,9 +11,6 @@ pub mod partition_syn_analysis;
 pub mod partitioner;
 pub mod repair;
 pub mod rewrites;
-
-#[cfg(test)]
-mod tests;
 
 #[doc(hidden)]
 #[cfg(doctest)]
