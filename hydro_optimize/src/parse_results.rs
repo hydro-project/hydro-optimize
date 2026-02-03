@@ -1,12 +1,17 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use crate::deploy_and_analyze::{LATENCY_PREFIX, THROUGHPUT_PREFIX};
+use hdrhistogram::Histogram;
 use hydro_lang::compile::deploy::DeployResult;
 use hydro_lang::compile::ir::{HydroNode, HydroRoot, traverse_dfir};
 use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::deploy::deploy_graph::DeployCrateWrapper;
 use hydro_lang::location::dynamic::LocationId;
+use hydro_std::bench_client::AggregateBenchResult;
+use hydro_std::bench_client::rolling_average::RollingAverage;
 use regex::Regex;
+use stageleft::q;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::deploy_and_analyze::MetricLogs;
@@ -105,7 +110,10 @@ pub fn print_parseable_bench_results<'a, Aggregator>(
 ) {
     aggregate_results
         .throughput
-        .filter_map(q!(move |(throughputs, num_client_machines)| {
+        .filter_map(q!(move |(throughputs, num_client_machines): (
+            RollingAverage,
+            usize
+        )| {
             if let Some((lower, upper)) = throughputs.confidence_interval_99() {
                 Some((
                     lower * num_client_machines as f64,
@@ -116,7 +124,7 @@ pub fn print_parseable_bench_results<'a, Aggregator>(
                 None
             }
         }))
-        .for_each(q!(|(lower, mean, upper)| {
+        .for_each(q!(move |(lower, mean, upper)| {
             println!(
                 "{} {:.2} - {:.2} - {:.2} requests/s",
                 THROUGHPUT_PREFIX, lower, mean, upper,
@@ -124,7 +132,7 @@ pub fn print_parseable_bench_results<'a, Aggregator>(
         }));
     aggregate_results
         .latency
-        .map(q!(move |latencies| (
+        .map(q!(move |latencies: Histogram<u64>| (
             Duration::from_nanos(latencies.value_at_quantile(0.5)).as_micros() as f64
                 / interval_millis as f64,
             Duration::from_nanos(latencies.value_at_quantile(0.99)).as_micros() as f64
@@ -362,7 +370,7 @@ pub async fn analyze_process_results(
     ir: &mut [HydroRoot],
     op_to_count: &mut HashMap<usize, usize>,
     metrics: &mut MetricLogs,
-) -> (u64, NetworkStats) {
+) -> (f64, NetworkStats) {
     let underlying = process.underlying();
     let perf_results = underlying.tracing_results().unwrap();
 
@@ -427,7 +435,7 @@ pub async fn analyze_cluster_results(
             run_metadata.total_usage.insert(id.clone(), usage);
             run_metadata
                 .unaccounted_perf
-                .insert(id.clone(), unidentified_perf as f64);
+                .insert(id.clone(), unidentified_perf);
             run_metadata
                 .network_stats
                 .insert(id.clone(), network_stats.clone());

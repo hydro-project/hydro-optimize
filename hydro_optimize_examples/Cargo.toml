@@ -11,6 +11,7 @@ all-features = true
 hydro_lang.workspace = true
 hydro_std.workspace = true
 hydro_test.workspace = true
+hydro_optimize = { path = "../hydro_optimize" }
 serde.workspace = true
 sha2 = "0.10.9"
 stageleft.workspace = true
@@ -22,8 +23,7 @@ clap.workspace = true
 dfir_lang.workspace = true
 hydro_build_utils.workspace = true
 hydro_deploy.workspace = true
-hydro_lang = { workspace = true, features = ["deploy", "viz"] }
-hydro_optimize = { path = "../hydro_optimize" }
+hydro_lang = { workspace = true, features = ["deploy", "viz", "sim"] }
 regex.workspace = true
 
 [build-dependencies]

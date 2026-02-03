@@ -11,8 +11,10 @@ all-features = true
 
 [dependencies]
 good_lp = { version = "1.14.0", features = ["highs"], default-features = false }
+hdrhistogram = "7.5.4"
 hydro_deploy.workspace = true
 hydro_lang = { workspace = true, features = ["deploy"] }
+hydro_std.workspace = true
 proc-macro2 = "1.0.95"
 regex.workspace = true
 serde.workspace = true
@@ -31,7 +33,6 @@ ctor.workspace = true
 hydro_build_utils.workspace = true
 hydro_lang = { workspace = true, features = ["viz"] }
 hydro_test.workspace = true
-hydro_std.workspace = true
 clap.workspace = true
 include_mdtests.workspace = true
 

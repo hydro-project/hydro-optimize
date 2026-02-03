@@ -3,7 +3,8 @@ use hydro_lang::{
     nondet::nondet,
     prelude::{Cluster, KeyedStream, Process, TCP, Unbounded},
 };
-use hydro_std::bench_client::{bench_client, compute_throughput_latency, print_bench_results};
+use hydro_optimize::parse_results::print_parseable_bench_results;
+use hydro_std::bench_client::{aggregate_bench_results, bench_client, compute_throughput_latency};
 
 use stageleft::q;
 
@@ -17,6 +18,7 @@ pub fn network_calibrator<'a>(
     server: &Cluster<'a, Server>,
     clients: &Cluster<'a, Client>,
     client_aggregator: &Process<'a, Aggregator>,
+    interval_millis: u64,
 ) {
     let latencies = bench_client(
         clients,
@@ -36,7 +38,8 @@ pub fn network_calibrator<'a>(
     ).values().map(q!(|(_client_id, latency)| latency));
 
     let bench_results = compute_throughput_latency(clients, latencies, nondet!(/** bench */));
-    print_bench_results(bench_results, client_aggregator, clients);
+    let aggregate_results = aggregate_bench_results(bench_results, client_aggregator, clients, interval_millis);
+    print_parseable_bench_results(aggregate_results, interval_millis);
 }
 
 /// Generates an incrementing u32 for each virtual client ID, starting at 0
