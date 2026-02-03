@@ -347,10 +347,11 @@ pub fn inject_count(ir: &mut [HydroRoot], op_to_count: &HashMap<usize, usize>) {
     );
 }
 
-/// Drains all messages from a receiver into a Vec.
-async fn drain_receiver(receiver: &mut UnboundedReceiver<String>) -> Vec<String> {
+/// Drains all currently available messages from a receiver into a Vec.
+/// Uses try_recv() to avoid blocking if the channel is empty but not closed.
+fn drain_receiver(receiver: &mut UnboundedReceiver<String>) -> Vec<String> {
     let mut lines = Vec::new();
-    while let Some(line) = receiver.recv().await {
+    while let Ok(line) = receiver.try_recv() {
         lines.push(line);
     }
     lines
@@ -369,8 +370,8 @@ pub async fn analyze_process_results(
     let unidentified_perf = inject_perf(ir, perf_results.folded_data.clone());
 
     // Parse all metric streams
-    parse_counter_usage(drain_receiver(&mut metrics.counters).await, op_to_count);
-    let network_stats = parse_network_usage(drain_receiver(&mut metrics.network).await);
+    parse_counter_usage(drain_receiver(&mut metrics.counters), op_to_count);
+    let network_stats = parse_network_usage(drain_receiver(&mut metrics.network));
     (unidentified_perf, network_stats)
 }
 
@@ -443,8 +444,17 @@ pub async fn analyze_cluster_results(
         }
     }
 
-    run_metadata.throughput = parse_throughput(drain_receiver(&mut metrics.throughputs).await);
-    run_metadata.latencies = parse_latency(drain_receiver(&mut metrics.latencies).await);
+    // Collect throughput/latency from all processes (aggregator outputs these)
+    for metrics in cluster_metrics.values_mut() {
+        // Filter metrics until we find the Aggregator
+        let throughputs = drain_receiver(&mut metrics.throughputs);
+        if throughputs.is_empty() {
+            continue;
+        }
+
+        run_metadata.throughput = parse_throughput(throughputs);
+        run_metadata.latencies = parse_latency(drain_receiver(&mut metrics.latencies));
+    }
 
     inject_count(ir, &op_to_count);
 

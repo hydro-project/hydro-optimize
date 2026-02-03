@@ -75,7 +75,7 @@ async fn main() {
         &client_aggregator,
         &replicas,
         print_result_frequency,
-        hydro_std::bench_client::pretty_print_bench_results,
+        print_parseable_bench_results,
     );
 
     // Deploy
