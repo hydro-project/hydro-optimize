@@ -4,7 +4,7 @@ use hydro_optimize::deploy::{HostType, ReusableHosts};
 use hydro_optimize::deploy_and_analyze::{
     Optimizations, ReusableClusters, ReusableProcesses, deploy_and_optimize,
 };
-use hydro_optimize::parse_results::print_parseable_bench_results;
+use hydro_optimize_examples::print_parseable_bench_results;
 use hydro_test::cluster::paxos::{CorePaxos, PaxosConfig};
 
 #[derive(Parser, Debug)]

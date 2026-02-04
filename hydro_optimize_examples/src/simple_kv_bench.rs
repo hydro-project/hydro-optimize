@@ -3,11 +3,12 @@ use hydro_lang::{
     nondet::nondet,
     prelude::{Cluster, Process, TCP},
 };
-use hydro_optimize::parse_results::print_parseable_bench_results;
 use hydro_std::bench_client::{aggregate_bench_results, bench_client, compute_throughput_latency};
 
 use hydro_test::cluster::paxos_bench::inc_i32_workload_generator;
 use stageleft::q;
+
+use crate::print_parseable_bench_results;
 
 pub struct Kv;
 pub struct Client;

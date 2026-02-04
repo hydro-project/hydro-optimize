@@ -1,17 +1,11 @@
 use std::collections::HashMap;
-use std::time::Duration;
 
-use crate::deploy_and_analyze::{LATENCY_PREFIX, THROUGHPUT_PREFIX};
-use hdrhistogram::Histogram;
 use hydro_lang::compile::deploy::DeployResult;
 use hydro_lang::compile::ir::{HydroNode, HydroRoot, traverse_dfir};
 use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::deploy::deploy_graph::DeployCrateWrapper;
 use hydro_lang::location::dynamic::LocationId;
-use hydro_std::bench_client::AggregateBenchResult;
-use hydro_std::bench_client::rolling_average::RollingAverage;
 use regex::Regex;
-use stageleft::q;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::deploy_and_analyze::MetricLogs;
@@ -102,51 +96,6 @@ pub fn parse_network_usage(lines: Vec<String>) -> NetworkStats {
         rx_bytes_per_sec: PercentileStats::from_samples(&mut rx_kb_samples),
         tx_bytes_per_sec: PercentileStats::from_samples(&mut tx_kb_samples),
     }
-}
-
-pub fn print_parseable_bench_results<'a, Aggregator>(
-    aggregate_results: AggregateBenchResult<'a, Aggregator>,
-    interval_millis: u64,
-) {
-    aggregate_results
-        .throughput
-        .filter_map(q!(move |(throughputs, num_client_machines): (
-            RollingAverage,
-            usize
-        )| {
-            if let Some((lower, upper)) = throughputs.confidence_interval_99() {
-                Some((
-                    lower * num_client_machines as f64,
-                    throughputs.sample_mean() * num_client_machines as f64,
-                    upper * num_client_machines as f64,
-                ))
-            } else {
-                None
-            }
-        }))
-        .for_each(q!(move |(lower, mean, upper)| {
-            println!(
-                "{} {:.2} - {:.2} - {:.2} requests/s",
-                THROUGHPUT_PREFIX, lower, mean, upper,
-            );
-        }));
-    aggregate_results
-        .latency
-        .map(q!(move |latencies: Histogram<u64>| (
-            Duration::from_nanos(latencies.value_at_quantile(0.5)).as_micros() as f64
-                / interval_millis as f64,
-            Duration::from_nanos(latencies.value_at_quantile(0.99)).as_micros() as f64
-                / interval_millis as f64,
-            Duration::from_nanos(latencies.value_at_quantile(0.999)).as_micros() as f64
-                / interval_millis as f64,
-            latencies.len(),
-        )))
-        .for_each(q!(move |(p50, p99, p999, num_samples)| {
-            println!(
-                "{} p50: {:.3} | p99 {:.3} | p999 {:.3} ms ({:} samples)",
-                LATENCY_PREFIX, p50, p99, p999, num_samples
-            );
-        }));
 }
 
 /// Parses throughput output from `print_parseable_bench_results`.

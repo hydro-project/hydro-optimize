@@ -25,7 +25,7 @@ const COUNTER_PREFIX: &str = "_optimize_counter";
 pub(crate) const CPU_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_CPU:";
 pub(crate) const NETWORK_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_NET:";
 pub(crate) const LATENCY_PREFIX: &str = "HYDRO_OPTIMIZE_LAT:";
-pub const THROUGHPUT_PREFIX: &str = "HYDRO_OPTIMIZE_THR:";
+pub(crate) const THROUGHPUT_PREFIX: &str = "HYDRO_OPTIMIZE_THR:";
 
 // Note: Ensure edits to the match arms are consistent with inject_count_node
 fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration: syn::Expr) {

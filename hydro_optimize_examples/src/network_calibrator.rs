@@ -3,10 +3,11 @@ use hydro_lang::{
     nondet::nondet,
     prelude::{Cluster, KeyedStream, Process, TCP, Unbounded},
 };
-use hydro_optimize::parse_results::print_parseable_bench_results;
 use hydro_std::bench_client::{aggregate_bench_results, bench_client, compute_throughput_latency};
 
 use stageleft::q;
+
+use crate::print_parseable_bench_results;
 
 pub struct Client;
 pub struct Server;
