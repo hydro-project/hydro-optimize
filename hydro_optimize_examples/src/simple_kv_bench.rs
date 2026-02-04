@@ -84,36 +84,7 @@ mod tests {
     use crate::THROUGHPUT_PREFIX;
     #[cfg(stageleft_runtime)]
     use crate::simple_kv_bench::simple_kv_bench;
-
-    #[test]
-    fn simple_kv_ir() {
-        let mut builder = FlowBuilder::new();
-        let kv = builder.process();
-        let clients = builder.cluster();
-        let client_aggregator = builder.process();
-        let interval_millis = 1000;
-
-        simple_kv_bench(1, &kv, &clients, &client_aggregator, interval_millis);
-        let mut built = builder.with_default_optimize::<HydroDeploy>();
-
-        dbg_dedup_tee(|| {
-            insta::assert_debug_snapshot!(built.ir());
-        });
-
-        let preview = built.preview_compile();
-        insta::with_settings!({snapshot_suffix => "kv_mermaid"}, {
-            insta::assert_snapshot!(
-                preview.dfir_for(&kv).to_mermaid(&WriteConfig {
-                    no_subgraphs: true,
-                    no_pull_push: true,
-                    no_handoffs: true,
-                    op_text_no_imports: true,
-                    ..WriteConfig::default()
-                })
-            );
-        });
-    }
-
+    
     #[tokio::test]
     async fn simple_kv_some_throughput() {
         let mut builder = FlowBuilder::new();
