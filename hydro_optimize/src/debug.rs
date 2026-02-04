@@ -21,10 +21,9 @@ fn print_id_node(node: &mut HydroNode, next_stmt_id: &mut usize) {
         .map(|m| m.op.id)
         .collect::<Vec<Option<usize>>>();
     println!(
-        "{} Node {}, Backtrace: {:?}, {:?}, Cardinality: {:?}, CPU Usage: {:?}, Network Recv CPU Usage: {:?}, Inputs: {:?}",
+        "{} Node {}, {:?}, Cardinality: {:?}, CPU Usage: {:?}, Network Recv CPU Usage: {:?}, Inputs: {:?}",
         next_stmt_id,
         node.print_root(),
-        metadata.op.backtrace.elements(),
         metadata,
         metadata.cardinality,
         metadata.op.cpu_usage,

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 
 use hydro_lang::compile::ir::{HydroNode, HydroRoot, traverse_dfir};
 use hydro_lang::deploy::HydroDeploy;
+use hydro_lang::location::LocationKey;
 use hydro_lang::location::dynamic::LocationId;
 use serde::{Deserialize, Serialize};
 use syn::visit_mut::{self, VisitMut};
@@ -19,14 +20,14 @@ use crate::rewrites::{
 pub struct Partitioner {
     pub nodes_to_partition: HashMap<usize, StructOrTupleIndex>, /* ID of node right before a Network -> what to partition on */
     pub num_partitions: usize,
-    pub location_id: usize,
-    pub new_cluster_id: Option<usize>, /* If we're partitioning a process, then a new cluster will be created and we'll need to substitute the old ID with this one */
+    pub location_id: LocationKey,
+    pub new_cluster_id: Option<LocationKey>, /* If we're partitioning a process, then a new cluster will be created and we'll need to substitute the old ID with this one */
 }
 
 /// Don't expose partition members to the cluster
 pub struct ClusterMembersReplace {
     pub num_partitions: usize,
-    pub location_id: usize,
+    pub location_id: LocationKey,
     pub op_id: usize,
 }
 
@@ -71,20 +72,20 @@ fn replace_membership_info(node: &mut HydroNode, partitioner: &Partitioner, op_i
         num_partitions,
         location_id,
         ..
-    } = *partitioner;
+    } = partitioner;
 
     node.visit_debug_expr(|expr| {
         let mut visitor = ClusterMembersReplace {
-            num_partitions,
-            location_id,
+            num_partitions: *num_partitions,
+            location_id: *location_id,
             op_id,
         };
         visitor.visit_expr_mut(&mut expr.0);
     });
     node.visit_debug_expr(|expr| {
         let mut visitor = ClusterSelfIdReplace::Partition {
-            num_partitions,
-            partitioned_cluster_id: location_id,
+            num_partitions: *num_partitions,
+            partitioned_cluster_id: *location_id,
             op_id,
         };
         visitor.visit_expr_mut(&mut expr.0);
@@ -184,7 +185,7 @@ fn replace_receiver_src_id(node: &mut HydroNode, partitioner: &Partitioner, op_i
     if let HydroNode::Network {
         input, metadata, ..
     } = node
-        && input.metadata().location_kind.root().raw_id() == *location_id
+        && input.metadata().location_id.root().key() == *location_id
     {
         println!(
             "Rewriting network on op {} so the sender's ID is mapped from the partition to the original sender",
@@ -211,7 +212,7 @@ fn replace_receiver_src_id(node: &mut HydroNode, partitioner: &Partitioner, op_i
 fn replace_network_serialization(node: &mut HydroNode, partitioner: &Partitioner, op_id: usize) {
     let Partitioner { new_cluster_id, .. } = partitioner;
 
-    if let Some(network_type) = get_network_type(node, new_cluster_id.unwrap()) {
+    if let Some(network_type) = get_network_type(node, new_cluster_id.as_ref().unwrap()) {
         let HydroNode::Network {
             serialize_fn,
             deserialize_fn,
@@ -256,16 +257,6 @@ fn replace_network_serialization(node: &mut HydroNode, partitioner: &Partitioner
     }
 }
 
-fn replace_process_location_id(
-    location: &mut LocationId,
-    process_location: usize,
-    cluster_location: usize,
-) {
-    if location.root().raw_id() == process_location {
-        location.swap_root(LocationId::Cluster(cluster_location));
-    }
-}
-
 /// If we're partitioning a process into a cluster, we need to replace references to its location
 fn replace_process_node_location(node: &mut HydroNode, partitioner: &Partitioner) {
     let Partitioner {
@@ -276,11 +267,10 @@ fn replace_process_node_location(node: &mut HydroNode, partitioner: &Partitioner
 
     if let Some(new_id) = new_cluster_id {
         // Change any HydroNodes with a location field
-        replace_process_location_id(
-            &mut node.metadata_mut().location_kind,
-            *location_id,
-            *new_id,
-        );
+        let location = &mut node.metadata_mut().location_id;
+        if location.root().key() == *location_id {
+            location.swap_root(LocationId::Cluster(*new_id));
+        }
     }
 }
 
@@ -288,7 +278,7 @@ fn replace_process_node_location(node: &mut HydroNode, partitioner: &Partitioner
 fn remove_sender_id_from_receiver(node: &mut HydroNode, partitioner: &Partitioner, op_id: usize) {
     let Partitioner { new_cluster_id, .. } = partitioner;
 
-    let network_type = get_network_type(node, new_cluster_id.unwrap());
+    let network_type = get_network_type(node, new_cluster_id.as_ref().unwrap());
     match network_type {
         Some(NetworkType::Send) | Some(NetworkType::SendRecv) => {
             println!("Removing sender ID from receiver for op {}", op_id);

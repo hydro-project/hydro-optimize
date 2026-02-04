@@ -8,6 +8,7 @@ edition = "2024"
 all-features = true
 
 [dependencies]
+hdrhistogram = "7.5.4"
 hydro_lang.workspace = true
 hydro_std.workspace = true
 hydro_test.workspace = true
@@ -22,7 +23,7 @@ clap.workspace = true
 dfir_lang.workspace = true
 hydro_build_utils.workspace = true
 hydro_deploy.workspace = true
-hydro_lang = { workspace = true, features = ["deploy", "viz"] }
+hydro_lang = { workspace = true, features = ["deploy", "viz", "sim"] }
 hydro_optimize = { path = "../hydro_optimize" }
 regex.workspace = true
 
