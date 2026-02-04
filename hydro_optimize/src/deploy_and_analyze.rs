@@ -23,7 +23,7 @@ use crate::repair::{cycle_source_to_sink_input, inject_id, remove_counter};
 pub(crate) const METRIC_INTERVAL_SECS: u64 = 1;
 const COUNTER_PREFIX: &str = "_optimize_counter";
 pub(crate) const CPU_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_CPU:";
-pub(crate) const NETWORK_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_NET:";
+pub(crate) const SAR_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_SAR:";
 pub(crate) const LATENCY_PREFIX: &str = "HYDRO_OPTIMIZE_LAT:";
 pub(crate) const THROUGHPUT_PREFIX: &str = "HYDRO_OPTIMIZE_THR:";
 
@@ -105,7 +105,7 @@ pub struct MetricLogs {
     pub throughputs: UnboundedReceiver<String>,
     pub latencies: UnboundedReceiver<String>,
     pub cpu: UnboundedReceiver<String>,
-    pub network: UnboundedReceiver<String>,
+    pub sar: UnboundedReceiver<String>,
     pub counters: UnboundedReceiver<String>,
 }
 
@@ -114,7 +114,7 @@ async fn track_process_metrics(process: &impl DeployCrateWrapper) -> MetricLogs 
         throughputs: process.stdout_filter(THROUGHPUT_PREFIX),
         latencies: process.stdout_filter(LATENCY_PREFIX),
         cpu: process.stdout_filter(CPU_USAGE_PREFIX),
-        network: process.stdout_filter(NETWORK_USAGE_PREFIX),
+        sar: process.stdout_filter(SAR_USAGE_PREFIX),
         counters: process.stdout_filter(COUNTER_PREFIX),
     }
 }
@@ -289,12 +289,14 @@ pub async fn deploy_and_optimize<'a>(
                 reusable_hosts.get_process_hosts(deployment, name.clone()),
             );
         }
-        let network_sidecar = ScriptSidecar {
-            script: "sar -n DEV 1".to_string(),
-            prefix: NETWORK_USAGE_PREFIX.to_string(),
+
+        // Measure network (-n DEV) and CPU (-u) usage
+        let sar_sidecar = ScriptSidecar {
+            script: "sar -n DEV -u 1".to_string(),
+            prefix: SAR_USAGE_PREFIX.to_string(),
         };
         let nodes = deployable
-            .with_sidecar_all(&network_sidecar) // Measure network usage
+            .with_sidecar_all(&sar_sidecar) // Measure network usage
             .deploy(deployment);
         deployment.deploy().await.unwrap();
 
@@ -320,59 +322,38 @@ pub async fn deploy_and_optimize<'a>(
             .await
             .unwrap();
 
-        // Add metadata for this run, clearing the metadata from the previous run
-        run_metadata = RunMetadata::default();
-        let (bottleneck, bottleneck_name, bottleneck_num_nodes) = analyze_cluster_results(
-            &nodes,
-            &mut ir,
-            metrics,
-            &mut run_metadata,
-            &optimizations.exclude,
-        )
-        .await;
+        // Parse results to get metrics
+        run_metadata = analyze_cluster_results(&nodes, &mut ir, metrics).await;
         // Remove HydroNode::Counter (since we don't want to consider decoupling those)
         remove_counter(&mut ir);
 
         // Create a mapping from each CycleSink to its corresponding CycleSource
-        let cycle_source_to_sink_input = cycle_source_to_sink_input(&mut ir);
-        analyze_send_recv_overheads(&mut ir, &mut run_metadata);
-        let send_overhead = run_metadata
-            .send_overhead
-            .get(&bottleneck)
-            .cloned()
-            .unwrap_or_default();
-        let recv_overhead = run_metadata
-            .recv_overhead
-            .get(&bottleneck)
-            .cloned()
-            .unwrap_or_default();
+        // let cycle_source_to_sink_input = cycle_source_to_sink_input(&mut ir);
 
-        // TODO: Output overheads to file
+        // if optimizations.decoupling {
+        //     let decision = decouple_analysis(
+        //         &mut ir,
+        //         &bottleneck,
+        //         send_overhead,
+        //         recv_overhead,
+        //         &cycle_source_to_sink_input,
+        //     );
 
-        if optimizations.decoupling {
-            let decision = decouple_analysis(
-                &mut ir,
-                &bottleneck,
-                send_overhead,
-                recv_overhead,
-                &cycle_source_to_sink_input,
-            );
-
-            // Apply decoupling
-            let new_cluster = post_rewrite_builder.cluster::<()>();
-            let decouple_with_location = Decoupler {
-                decision,
-                orig_location: bottleneck,
-                decoupled_location: new_cluster.id().clone(),
-            };
-            decoupler::decouple(&mut ir, &decouple_with_location);
-            clusters.named_clusters.push((
-                new_cluster.id().key(),
-                format!("{}-decouple-{}", bottleneck_name, iteration),
-                bottleneck_num_nodes,
-            ));
-            // TODO: Save decoupling decision to file
-        }
+        //     // Apply decoupling
+        //     let new_cluster = post_rewrite_builder.cluster::<()>();
+        //     let decouple_with_location = Decoupler {
+        //         decision,
+        //         orig_location: bottleneck,
+        //         decoupled_location: new_cluster.id().clone(),
+        //     };
+        //     decoupler::decouple(&mut ir, &decouple_with_location);
+        //     clusters.named_clusters.push((
+        //         new_cluster.id().key(),
+        //         format!("{}-decouple-{}", bottleneck_name, iteration),
+        //         bottleneck_num_nodes,
+        //     ));
+        //     // TODO: Save decoupling decision to file
+        // }
 
         post_rewrite_builder.replace_ir(ir);
         builder = post_rewrite_builder.finalize();

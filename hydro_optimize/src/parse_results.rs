@@ -17,8 +17,7 @@ pub struct RunMetadata {
     pub send_overhead: HashMap<LocationId, f64>,
     pub recv_overhead: HashMap<LocationId, f64>,
     pub unaccounted_perf: HashMap<LocationId, f64>, // % of perf samples not mapped to any operator
-    pub total_usage: HashMap<LocationId, f64>,      // 100% CPU = 1.0
-    pub network_stats: HashMap<LocationId, NetworkStats>,
+    pub sar_stats: HashMap<LocationId, Vec<SarStats>>,
 }
 
 pub fn parse_cpu_usage(measurement: String) -> f64 {
@@ -30,72 +29,109 @@ pub fn parse_cpu_usage(measurement: String) -> f64 {
         .unwrap_or(0f64)
 }
 
+/// Per-second CPU statistics from sar -u output
 #[derive(Debug, Default, Clone, Copy)]
-pub struct PercentileStats {
-    pub p50: f64,
-    pub p99: f64,
-    pub p999: f64,
+pub struct CPUStats {
+    pub user: f64,
+    pub system: f64,
+    pub idle: f64,
 }
 
-#[derive(Debug, Default, Clone)]
+/// Per-second network statistics from sar -n DEV output (eth0 only)
+#[derive(Debug, Default, Clone, Copy)]
 pub struct NetworkStats {
-    pub rx_packets_per_sec: PercentileStats,
-    pub tx_packets_per_sec: PercentileStats,
-    pub rx_bytes_per_sec: PercentileStats,
-    pub tx_bytes_per_sec: PercentileStats,
+    pub rx_packets_per_sec: f64,
+    pub tx_packets_per_sec: f64,
+    pub rx_bytes_per_sec: f64,
+    pub tx_bytes_per_sec: f64,
 }
 
-impl PercentileStats {
-    fn from_samples(samples: &mut [f64]) -> Self {
-        if samples.is_empty() {
-            return Self::default();
-        }
-        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let len = samples.len();
-        Self {
-            p50: samples[len * 50 / 100],
-            p99: samples[len * 99 / 100],
-            p999: samples[len.saturating_sub(1).min(len * 999 / 1000)],
-        }
-    }
+/// Combined per-second sar statistics
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SarStats {
+    pub cpu: CPUStats,
+    pub network: NetworkStats,
 }
 
-/// Parses `sar -n DEV` output lines and computes p50, p99, p999 for network metrics.
-/// Only considers eth0 interface data.
-pub fn parse_network_usage(lines: Vec<String>) -> NetworkStats {
-    let mut rx_pkt_samples = Vec::new();
-    let mut tx_pkt_samples = Vec::new();
-    let mut rx_kb_samples = Vec::new();
-    let mut tx_kb_samples = Vec::new();
+/// Parses a single CPU line from sar -u output.
+/// Format: "HH:MM:SS AM/PM CPU %user %nice %system %iowait %steal %idle"
+fn parse_cpu_line(line: &str) -> Option<CPUStats> {
+    let cpu_regex = Regex::new(
+        r"all\s+(\d+\.?\d*)\s+\d+\.?\d*\s+(\d+\.?\d*)\s+\d+\.?\d*\s+\d+\.?\d*\s+(\d+\.?\d*)",
+    )
+    .unwrap();
 
-    // sar output format: TIME IFACE rxpck/s txpck/s rxkB/s txkB/s ...
-    // We look for lines containing "eth0" with numeric data
+    cpu_regex.captures(line).and_then(|caps| {
+        let user = caps[1].parse::<f64>().ok()?;
+        let system = caps[2].parse::<f64>().ok()?;
+        let idle = caps[3].parse::<f64>().ok()?;
+        Some(CPUStats { user, system, idle })
+    })
+}
+
+/// Parses a single network line from sar -n DEV output (eth0 only).
+/// Format: "HH:MM:SS AM/PM IFACE rxpck/s txpck/s rxkB/s txkB/s ..."
+fn parse_network_line(line: &str) -> Option<NetworkStats> {
     let eth0_regex =
         Regex::new(r"eth0\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)").unwrap();
 
+    eth0_regex.captures(line).and_then(|caps| {
+        let rx_pkt = caps[1].parse::<f64>().ok()?;
+        let tx_pkt = caps[2].parse::<f64>().ok()?;
+        let rx_kb = caps[3].parse::<f64>().ok()?;
+        let tx_kb = caps[4].parse::<f64>().ok()?;
+        Some(NetworkStats {
+            rx_packets_per_sec: rx_pkt,
+            tx_packets_per_sec: tx_pkt,
+            rx_bytes_per_sec: rx_kb * 1024.0,
+            tx_bytes_per_sec: tx_kb * 1024.0,
+        })
+    })
+}
+
+/// Parses `sar -n DEV -u` output lines and returns per-second SarStats.
+/// Pairs CPU and network stats by matching timestamps.
+pub fn parse_sar_output(lines: Vec<String>) -> Vec<SarStats> {
+    let mut cpu_by_time: HashMap<String, CPUStats> = HashMap::new();
+    let mut network_by_time: HashMap<String, NetworkStats> = HashMap::new();
+
+    // Extract timestamp from the beginning of each line (e.g., "09:48:43 PM")
+    let time_regex = Regex::new(r"^(\d{2}:\d{2}:\d{2}\s+[AP]M)").unwrap();
+
     for line in &lines {
-        if let Some(caps) = eth0_regex.captures(line)
-            && let (Ok(rx_pkt), Ok(tx_pkt), Ok(rx_kb), Ok(tx_kb)) = (
-                caps[1].parse::<f64>(),
-                caps[2].parse::<f64>(),
-                caps[3].parse::<f64>(),
-                caps[4].parse::<f64>(),
-            )
-        {
-            rx_pkt_samples.push(rx_pkt);
-            tx_pkt_samples.push(tx_pkt);
-            // Convert kB/s to bytes/s
-            rx_kb_samples.push(rx_kb * 1024.0);
-            tx_kb_samples.push(tx_kb * 1024.0);
+        if let Some(time_cap) = time_regex.captures(line) {
+            let timestamp = time_cap[1].to_string();
+
+            if let Some(cpu) = parse_cpu_line(line) {
+                cpu_by_time.insert(timestamp.clone(), cpu);
+            }
+            if let Some(network) = parse_network_line(line) {
+                network_by_time.insert(timestamp.clone(), network);
+            }
         }
     }
 
-    NetworkStats {
-        rx_packets_per_sec: PercentileStats::from_samples(&mut rx_pkt_samples),
-        tx_packets_per_sec: PercentileStats::from_samples(&mut tx_pkt_samples),
-        rx_bytes_per_sec: PercentileStats::from_samples(&mut rx_kb_samples),
-        tx_bytes_per_sec: PercentileStats::from_samples(&mut tx_kb_samples),
-    }
+    // Combine CPU and network stats for matching timestamps
+    let mut results: Vec<SarStats> = cpu_by_time
+        .into_iter()
+        .filter_map(|(time, cpu)| {
+            network_by_time.get(&time).map(|network| SarStats {
+                cpu,
+                network: *network,
+            })
+        })
+        .collect();
+
+    // Sort by some consistent order (we don't have timestamps in the struct, so just return as-is)
+    // The order doesn't matter much since these are per-second samples
+    results.sort_by(|a, b| {
+        a.cpu
+            .user
+            .partial_cmp(&b.cpu.user)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    results
 }
 
 /// Parses throughput output from `print_parseable_bench_results`.
@@ -314,90 +350,67 @@ fn drain_receiver(receiver: &mut UnboundedReceiver<String>) -> Vec<String> {
     lines
 }
 
-pub async fn analyze_process_results(
-    process: &impl DeployCrateWrapper,
-    ir: &mut [HydroRoot],
-    op_to_count: &mut HashMap<usize, usize>,
-    metrics: &mut MetricLogs,
-) -> (f64, NetworkStats) {
+pub async fn analyze_perf(process: &impl DeployCrateWrapper, ir: &mut [HydroRoot]) -> f64 {
     let underlying = process.underlying();
     let perf_results = underlying.tracing_results().unwrap();
 
-    // Inject perf usages into metadata
-    let unidentified_perf = inject_perf(ir, perf_results.folded_data.clone());
-
-    // Parse all metric streams
-    parse_counter_usage(drain_receiver(&mut metrics.counters), op_to_count);
-    let network_stats = parse_network_usage(drain_receiver(&mut metrics.network));
-    (unidentified_perf, network_stats)
+    // Inject perf usages into metadata, return unidentified perf
+    inject_perf(ir, perf_results.folded_data.clone())
 }
 
 pub async fn analyze_cluster_results(
     nodes: &DeployResult<'_, HydroDeploy>,
     ir: &mut [HydroRoot],
     mut cluster_metrics: HashMap<(LocationId, String, usize), MetricLogs>,
-    run_metadata: &mut RunMetadata,
-    exclude: &[String],
-) -> (LocationId, String, usize) {
-    let mut max_usage_cluster_id = None;
-    let mut max_usage_cluster_size = 0;
-    let mut max_usage_cluster_name = String::new();
-    let mut max_usage_overall = 0f64;
+) -> RunMetadata {
+    let mut run_metadata = RunMetadata::default();
     let mut op_to_count = HashMap::new();
 
     for (id, name, cluster) in nodes.get_all_clusters() {
         println!("Analyzing cluster {:?}: {}", id, name);
 
-        // Iterate through nodes' usages and keep the max usage one
-        let mut max_usage = None;
+        // Iterate through nodes' usages and only consider the max usage one
+        let mut sar_stats = HashMap::new();
         for (idx, _) in cluster.members().iter().enumerate() {
-            let usage = get_usage(
-                &mut cluster_metrics
-                    .get_mut(&(id.clone(), name.to_string(), idx))
-                    .unwrap()
-                    .cpu,
-            )
-            .await;
-            println!("Node {} usage: {}", idx, usage);
-            if let Some((prev_usage, _)) = max_usage {
-                if usage > prev_usage {
-                    max_usage = Some((usage, idx));
-                }
-            } else {
-                max_usage = Some((usage, idx));
-            }
-        }
-
-        if let Some((usage, idx)) = max_usage {
-            // Modify IR with perf & cardinality numbers
             let metrics = cluster_metrics
                 .get_mut(&(id.clone(), name.to_string(), idx))
                 .unwrap();
-            let (unidentified_perf, network_stats) = analyze_process_results(
-                cluster.members().get(idx).unwrap(),
-                ir,
-                &mut op_to_count,
-                metrics,
-            )
-            .await;
+            sar_stats.insert(idx, parse_sar_output(drain_receiver(&mut metrics.sar)));
+        }
 
-            run_metadata.total_usage.insert(id.clone(), usage);
-            run_metadata
-                .unaccounted_perf
-                .insert(id.clone(), unidentified_perf);
-            run_metadata
-                .network_stats
-                .insert(id.clone(), network_stats.clone());
-            println!("Network stats for {}: {:?}", idx, network_stats);
+        let max_usage_sar_stat =
+            sar_stats
+                .iter()
+                .reduce(|(max_usage_idx, max_usage_sar_stat), (idx, sar_stat)| {
+                    if let Some(last_stat) = sar_stat.last() {
+                        println!(
+                            "Node {} Usage {}%",
+                            idx,
+                            last_stat.cpu.user + last_stat.cpu.system
+                        );
+                        let max_last_stat = max_usage_sar_stat.last().unwrap().cpu;
+                        if last_stat.cpu.user + last_stat.cpu.system
+                            > max_last_stat.user + max_last_stat.system
+                        {
+                            return (idx, sar_stat);
+                        }
+                    }
+                    (max_usage_idx, max_usage_sar_stat)
+                });
 
-            // Update cluster with max usage
-            if max_usage_overall < usage && !exclude.contains(&name.to_string()) {
-                max_usage_cluster_id = Some(id);
-                max_usage_cluster_name = name.to_string();
-                max_usage_cluster_size = cluster.members().len();
-                max_usage_overall = usage;
-                println!("The bottleneck is {}", name);
-            }
+        if let Some((idx, max_sar_stat)) = max_usage_sar_stat {
+            let metrics = cluster_metrics
+                .get_mut(&(id.clone(), name.to_string(), *idx))
+                .unwrap();
+            // Parse perf
+            // let unidentified_perf = analyze_perf(cluster.members().get(*idx).unwrap(), ir).await;
+            // Parse counters for each op and add to op_to_count
+            parse_counter_usage(drain_receiver(&mut metrics.counters), &mut op_to_count);
+
+            // run_metadata
+            //     .unaccounted_perf
+            //     .insert(id.clone(), unidentified_perf);
+            run_metadata.sar_stats.insert(id.clone(), max_sar_stat.clone());
         }
     }
 
@@ -414,12 +427,7 @@ pub async fn analyze_cluster_results(
     }
 
     inject_count(ir, &op_to_count);
-
-    (
-        max_usage_cluster_id.unwrap(),
-        max_usage_cluster_name,
-        max_usage_cluster_size,
-    )
+    run_metadata
 }
 
 pub async fn get_usage(usage_out: &mut UnboundedReceiver<String>) -> f64 {

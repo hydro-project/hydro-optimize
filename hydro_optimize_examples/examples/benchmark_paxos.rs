@@ -1,11 +1,19 @@
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+
 use clap::{ArgAction, Parser};
 use hydro_deploy::Deployment;
+use hydro_lang::location::Location;
+use hydro_lang::location::dynamic::LocationId;
 use hydro_optimize::deploy::{HostType, ReusableHosts};
 use hydro_optimize::deploy_and_analyze::{
     Optimizations, ReusableClusters, ReusableProcesses, deploy_and_optimize,
 };
+use hydro_optimize::parse_results::SarStats;
 use hydro_optimize_examples::print_parseable_bench_results;
 use hydro_test::cluster::paxos::{CorePaxos, PaxosConfig};
+use plotters::prelude::*;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, group(
@@ -31,6 +39,115 @@ struct BenchResult {
     virtual_clients: usize,
     throughput_mean: f64,
     p99_latency: f64,
+}
+
+/// Generates graphs for sar stats in the given output directory
+fn generate_sar_graphs(
+    output_dir: &Path,
+    sar_stats: &HashMap<LocationId, Vec<SarStats>>,
+    location_id_to_cluster: HashMap<LocationId, &'static str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(output_dir)?;
+
+    for (location, stats) in sar_stats {
+        if stats.is_empty() {
+            continue;
+        }
+
+        let location_name = location_id_to_cluster.get(location).unwrap_or(&"unknown");
+        let filename = output_dir.join(format!("{}.png", location_name));
+
+        let root = BitMapBackend::new(&filename, (1024, 768)).into_drawing_area();
+        root.fill(&WHITE)?;
+
+        let time_max = stats.len() as f64;
+        let net_max = stats
+            .iter()
+            .map(|s| (s.network.tx_bytes_per_sec + s.network.rx_bytes_per_sec) / 1e9)
+            .fold(0.0f64, |a, b| a.max(b))
+            * 1.1;
+
+        let mut chart = ChartBuilder::on(&root)
+            .caption(format!("Location: {}", location_name), ("sans-serif", 20))
+            .margin(10)
+            .x_label_area_size(40)
+            .y_label_area_size(50)
+            .right_y_label_area_size(50)
+            .build_cartesian_2d(0f64..time_max, 0f64..100f64)?
+            .set_secondary_coord(0f64..time_max, 0f64..net_max);
+
+        chart
+            .configure_mesh()
+            .x_desc("Time (s)")
+            .y_desc("CPU (%)")
+            .draw()?;
+
+        chart
+            .configure_secondary_axes()
+            .y_desc("Network (GB/s)")
+            .draw()?;
+
+        // CPU User
+        chart
+            .draw_series(LineSeries::new(
+                stats
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (i as f64, s.cpu.user)),
+                &RED,
+            ))?
+            .label("CPU User")
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], RED));
+
+        // CPU System
+        chart
+            .draw_series(LineSeries::new(
+                stats
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (i as f64, s.cpu.system)),
+                &BLUE,
+            ))?
+            .label("CPU System")
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], BLUE));
+
+        // CPU Idle
+        chart
+            .draw_series(LineSeries::new(
+                stats
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (i as f64, s.cpu.idle)),
+                &GREEN,
+            ))?
+            .label("CPU Idle")
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], GREEN));
+
+        // Network GB/s (on secondary axis)
+        chart
+            .draw_secondary_series(LineSeries::new(
+                stats.iter().enumerate().map(|(i, s)| {
+                    (
+                        i as f64,
+                        (s.network.tx_bytes_per_sec + s.network.rx_bytes_per_sec) / 1e9,
+                    )
+                }),
+                &MAGENTA,
+            ))?
+            .label("Network GB/s")
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], MAGENTA));
+
+        chart
+            .configure_series_labels()
+            .background_style(WHITE.mix(0.8))
+            .border_style(BLACK)
+            .draw()?;
+
+        root.present()?;
+        println!("Generated graph: {}", filename.display());
+    }
+
+    Ok(())
 }
 
 /// Runs a single Paxos benchmark with the given parameters
@@ -59,6 +176,13 @@ async fn run_benchmark(
     let clients = builder.cluster();
     let client_aggregator = builder.process();
     let replicas = builder.cluster();
+    let location_id_to_cluster = HashMap::from([
+        (proposers.id(), "proposer"),
+        (acceptors.id(), "acceptor"),
+        (clients.id(), "client"),
+        (replicas.id(), "replica"),
+        (client_aggregator.id(), "client_aggregator"),
+    ]);
 
     hydro_test::cluster::paxos_bench::paxos_bench(
         num_clients_per_node,
@@ -109,27 +233,30 @@ async fn run_benchmark(
         p50_latency, p99_latency, p999_latency, latency_samples
     );
     run_metadata
-        .total_usage
+        .sar_stats
         .iter()
-        .for_each(|(location, usage)| println!("{:?} CPU: {:.2}%", location, usage * 100.0));
+        .for_each(|(location, sar_stats)| {
+            println!(
+                "{} CPU: {:.2}%",
+                location_id_to_cluster.get(location).unwrap(),
+                sar_stats
+                    .last()
+                    .and_then(|stats| Some(stats.cpu.user + stats.cpu.system))
+                    .unwrap_or_default()
+            )
+        });
 
-    // Print network stats summary
-    for (location, stats) in &run_metadata.network_stats {
-        let tx_packets = stats.tx_packets_per_sec.p50;
-        let rx_packets = stats.rx_packets_per_sec.p50;
-        let tx_bytes = stats.tx_bytes_per_sec.p50;
-        let rx_bytes = stats.rx_bytes_per_sec.p50;
-
-        println!(
-            "{:?} Network: msgs sent={:.0}, recv={:.0}, total={:.0} | GB sent={:.3}, recv={:.3}, total={:.3}",
-            location,
-            tx_packets,
-            rx_packets,
-            tx_packets + rx_packets,
-            tx_bytes / 1e9,
-            rx_bytes / 1e9,
-            (tx_bytes + rx_bytes) / 1e9
-        );
+    // Generate graphs for sar stats
+    let output_dir = format!(
+        "benchmark_results/c{}_vc{}_thr{:.0}_p99{:.1}ms",
+        num_clients, num_clients_per_node, throughput_mean, p99_latency
+    );
+    if let Err(e) = generate_sar_graphs(
+        Path::new(&output_dir),
+        &run_metadata.sar_stats,
+        location_id_to_cluster,
+    ) {
+        eprintln!("Failed to generate graphs: {}", e);
     }
 
     BenchResult {
