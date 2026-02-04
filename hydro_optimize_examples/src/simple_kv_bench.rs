@@ -77,11 +77,11 @@ mod tests {
         deploy::{DeployCrateWrapper, HydroDeploy, TrybuildHost},
         prelude::FlowBuilder,
     };
-    use hydro_optimize::deploy_and_analyze::THROUGHPUT_PREFIX;
     use std::str::FromStr;
 
     use regex::Regex;
 
+    use crate::THROUGHPUT_PREFIX;
     #[cfg(stageleft_runtime)]
     use crate::simple_kv_bench::simple_kv_bench;
 
