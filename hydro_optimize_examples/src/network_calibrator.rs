@@ -24,9 +24,7 @@ pub fn network_calibrator<'a>(
     let latencies = bench_client(
         clients,
         num_clients_per_node,
-        |ids_and_prev_payloads| {
-            size_based_workload_generator(message_size, ids_and_prev_payloads)
-        },
+        |ids_and_prev_payloads| size_based_workload_generator(message_size, ids_and_prev_payloads),
         |payloads| {
             // Server just echoes the payload
             payloads
@@ -36,10 +34,13 @@ pub fn network_calibrator<'a>(
                 .values()
                 .into_keyed()
         },
-    ).values().map(q!(|(_client_id, latency)| latency));
+    )
+    .values()
+    .map(q!(|(_client_id, latency)| latency));
 
     let bench_results = compute_throughput_latency(clients, latencies, nondet!(/** bench */));
-    let aggregate_results = aggregate_bench_results(bench_results, client_aggregator, clients, interval_millis);
+    let aggregate_results =
+        aggregate_bench_results(bench_results, client_aggregator, clients, interval_millis);
     print_parseable_bench_results(aggregate_results, interval_millis);
 }
 
@@ -55,11 +56,11 @@ pub fn size_based_workload_generator<'a, Client>(
     >,
 ) -> KeyedStream<u32, Vec<u8>, Cluster<'a, Client>, Unbounded, NoOrder> {
     ids_and_prev_payloads.map(q!(move |payload| {
-        if let Some(mut payload) = payload {
-            if let Some(last) = payload.last_mut() {
-                *last += 1;
-                return payload;
-            }
+        if let Some(mut payload) = payload
+            && let Some(last) = payload.last_mut()
+        {
+            *last += 1;
+            return payload;
         }
 
         // Temp fix for macro stuff that isn't supported by stageleft I guess

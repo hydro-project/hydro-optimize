@@ -1,16 +1,16 @@
 #[cfg(stageleft_runtime)]
 hydro_lang::setup!();
 
+pub mod lock_server;
 pub mod network_calibrator;
 pub mod simple_kv_bench;
-pub mod lock_server;
 // pub mod lobsters;
 // pub mod web_submit;
 
-use std::time::Duration;
 use hdrhistogram::Histogram;
 use hydro_std::bench_client::{AggregateBenchResult, rolling_average::RollingAverage};
 use stageleft::q;
+use std::time::Duration;
 
 /// Note: Must remain synchronized with definitions in hydro_optimize/deploy_and_analyze.
 /// Redefined here because we don't want to import hydro_optimize as a dependency.

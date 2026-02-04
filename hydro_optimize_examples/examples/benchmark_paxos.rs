@@ -86,13 +86,13 @@ async fn run_benchmark(
         reusable_hosts,
         deployment,
         builder.finalize(),
-        ReusableClusters::new()
+        ReusableClusters::default()
             .with_cluster(proposers, f + 1)
             .with_cluster(acceptors, 2 * f + 1)
             .with_cluster(clients, num_clients)
             .with_cluster(replicas, f + 1),
-        ReusableProcesses::new().with_process(client_aggregator),
-        Optimizations::new(),
+        ReusableProcesses::default().with_process(client_aggregator),
+        Optimizations::default(),
         Some(run_seconds),
     )
     .await;

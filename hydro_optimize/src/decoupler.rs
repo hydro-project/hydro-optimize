@@ -258,10 +258,7 @@ fn fix_cluster_self_id_node(node: &mut HydroNode, mut locations: ClusterSelfIdRe
     }
 }
 
-pub fn decouple(
-    ir: &mut [HydroRoot],
-    decoupler: &Decoupler,
-) {
+pub fn decouple(ir: &mut [HydroRoot], decoupler: &Decoupler) {
     let tee_to_inner_id_before_rewrites = tee_to_inner_id(ir);
     let mut new_inners = HashMap::new();
     traverse_dfir::<HydroDeploy>(

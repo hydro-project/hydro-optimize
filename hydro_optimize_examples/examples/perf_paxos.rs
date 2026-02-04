@@ -88,13 +88,13 @@ async fn main() {
         &mut reusable_hosts,
         &mut deployment,
         builder.finalize(),
-        ReusableClusters::new()
+        ReusableClusters::default()
             .with_cluster(proposers, f + 1)
             .with_cluster(acceptors, 2 * f + 1)
             .with_cluster(clients, num_clients)
             .with_cluster(replicas, f + 1),
-        ReusableProcesses::new().with_process(client_aggregator),
-        Optimizations::new()
+        ReusableProcesses::default().with_process(client_aggregator),
+        Optimizations::default()
             .with_decoupling()
             .excluding::<Client>()
             .excluding::<Aggregator>()

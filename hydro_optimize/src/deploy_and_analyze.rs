@@ -179,17 +179,12 @@ impl Sidecar for ScriptSidecar {
     }
 }
 
+#[derive(Default)]
 pub struct ReusableClusters {
     named_clusters: Vec<(LocationKey, String, usize)>,
 }
 
 impl ReusableClusters {
-    pub fn new() -> Self {
-        Self {
-            named_clusters: vec![],
-        }
-    }
-
     pub fn with_cluster<C>(mut self, cluster: Cluster<'_, C>, num_members: usize) -> Self {
         self.named_clusters.push((
             cluster.id().key(),
@@ -200,17 +195,12 @@ impl ReusableClusters {
     }
 }
 
+#[derive(Default)]
 pub struct ReusableProcesses {
     named_processes: Vec<(LocationKey, String)>,
 }
 
 impl ReusableProcesses {
-    pub fn new() -> Self {
-        Self {
-            named_processes: vec![],
-        }
-    }
-
     pub fn with_process<P>(mut self, process: Process<'_, P>) -> Self {
         self.named_processes
             .push((process.id().key(), std::any::type_name::<P>().to_string()));
@@ -225,16 +215,18 @@ pub struct Optimizations {
     iterations: usize, // Must be at least 1
 }
 
-impl Optimizations {
-    pub fn new() -> Self {
+impl Default for Optimizations {
+    fn default() -> Self {
         Self {
-            decoupling: false,
-            partitioning: false,
+            decoupling: true,
+            partitioning: true,
             exclude: vec![],
             iterations: 1,
         }
     }
+}
 
+impl Optimizations {
     pub fn with_decoupling(mut self) -> Self {
         self.decoupling = true;
         self
@@ -257,11 +249,6 @@ impl Optimizations {
     }
 }
 
-#[expect(clippy::too_many_arguments, reason = "Optimizer internal function")]
-#[expect(
-    clippy::await_holding_refcell_ref,
-    reason = "Await function needs to write to data in RefCell"
-)]
 pub async fn deploy_and_optimize<'a>(
     reusable_hosts: &mut ReusableHosts,
     deployment: &mut Deployment,

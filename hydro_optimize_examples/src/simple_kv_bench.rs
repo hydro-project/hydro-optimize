@@ -69,12 +69,9 @@ pub fn simple_kv_bench<'a>(
 
 #[cfg(test)]
 mod tests {
-    use dfir_lang::graph::WriteConfig;
-    use hydro_build_utils::insta;
     use hydro_deploy::Deployment;
     use hydro_lang::{
-        compile::ir::dbg_dedup_tee,
-        deploy::{DeployCrateWrapper, HydroDeploy, TrybuildHost},
+        deploy::{DeployCrateWrapper, TrybuildHost},
         prelude::FlowBuilder,
     };
     use std::str::FromStr;
@@ -84,7 +81,7 @@ mod tests {
     use crate::THROUGHPUT_PREFIX;
     #[cfg(stageleft_runtime)]
     use crate::simple_kv_bench::simple_kv_bench;
-    
+
     #[tokio::test]
     async fn simple_kv_some_throughput() {
         let mut builder = FlowBuilder::new();
@@ -112,19 +109,19 @@ mod tests {
 
         deployment.start().await.unwrap();
 
-        let re = Regex::new(r"(\d+\.?\d*)\s*-\s*(\d+\.?\d*)\s*-\s*(\d+\.?\d*)\s*requests/s").unwrap();
+        let re =
+            Regex::new(r"(\d+\.?\d*)\s*-\s*(\d+\.?\d*)\s*-\s*(\d+\.?\d*)\s*requests/s").unwrap();
         let mut found = 0;
         let mut client_out = client_out;
         while let Some(line) = client_out.recv().await {
-            if let Some(caps) = re.captures(&line) {
-                if let Ok(lower) = f64::from_str(&caps[1]) {
-                    if lower > 0.0 {
-                        println!("Found throughput lower-bound: {}", lower);
-                        found += 1;
-                        if found == 2 {
-                            break;
-                        }
-                    }
+            if let Some(caps) = re.captures(&line)
+                && let Ok(lower) = f64::from_str(&caps[1])
+                && lower > 0.0
+            {
+                println!("Found throughput lower-bound: {}", lower);
+                found += 1;
+                if found == 2 {
+                    break;
                 }
             }
         }

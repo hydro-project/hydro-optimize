@@ -70,11 +70,11 @@ async fn main() {
             &mut reusable_hosts,
             &mut deployment,
             builder.finalize(),
-            ReusableClusters::new()
+            ReusableClusters::default()
                 .with_cluster(server, 1)
                 .with_cluster(clients, num_clients),
-            ReusableProcesses::new().with_process(client_aggregator),
-            Optimizations::new()
+            ReusableProcesses::default().with_process(client_aggregator),
+            Optimizations::default()
                 .excluding::<Client>()
                 .excluding::<Aggregator>(),
             num_seconds_to_profile,

@@ -1,4 +1,3 @@
-
 use clap::{ArgAction, Parser};
 use hydro_deploy::Deployment;
 use hydro_lang::viz::config::GraphConfig;
@@ -69,13 +68,13 @@ async fn main() {
         &mut reusable_hosts,
         &mut deployment,
         builder.finalize(),
-        ReusableClusters::new()
+        ReusableClusters::default()
             .with_cluster(participants, num_participants)
             .with_cluster(clients, num_clients),
-        ReusableProcesses::new()
+        ReusableProcesses::default()
             .with_process(coordinator)
             .with_process(client_aggregator),
-        Optimizations::new()
+        Optimizations::default()
             .with_partitioning()
             .excluding::<Client>()
             .excluding::<Aggregator>(),

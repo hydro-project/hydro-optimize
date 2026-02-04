@@ -77,7 +77,7 @@ fn replace_membership_info(node: &mut HydroNode, partitioner: &Partitioner, op_i
     node.visit_debug_expr(|expr| {
         let mut visitor = ClusterMembersReplace {
             num_partitions: *num_partitions,
-            location_id: location_id.clone(),
+            location_id: *location_id,
             op_id,
         };
         visitor.visit_expr_mut(&mut expr.0);
@@ -85,7 +85,7 @@ fn replace_membership_info(node: &mut HydroNode, partitioner: &Partitioner, op_i
     node.visit_debug_expr(|expr| {
         let mut visitor = ClusterSelfIdReplace::Partition {
             num_partitions: *num_partitions,
-            partitioned_cluster_id: location_id.clone(),
+            partitioned_cluster_id: *location_id,
             op_id,
         };
         visitor.visit_expr_mut(&mut expr.0);

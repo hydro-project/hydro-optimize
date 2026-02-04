@@ -74,19 +74,19 @@ pub fn parse_network_usage(lines: Vec<String>) -> NetworkStats {
         Regex::new(r"eth0\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)").unwrap();
 
     for line in &lines {
-        if let Some(caps) = eth0_regex.captures(line) {
-            if let (Ok(rx_pkt), Ok(tx_pkt), Ok(rx_kb), Ok(tx_kb)) = (
+        if let Some(caps) = eth0_regex.captures(line)
+            && let (Ok(rx_pkt), Ok(tx_pkt), Ok(rx_kb), Ok(tx_kb)) = (
                 caps[1].parse::<f64>(),
                 caps[2].parse::<f64>(),
                 caps[3].parse::<f64>(),
                 caps[4].parse::<f64>(),
-            ) {
-                rx_pkt_samples.push(rx_pkt);
-                tx_pkt_samples.push(tx_pkt);
-                // Convert kB/s to bytes/s
-                rx_kb_samples.push(rx_kb * 1024.0);
-                tx_kb_samples.push(tx_kb * 1024.0);
-            }
+            )
+        {
+            rx_pkt_samples.push(rx_pkt);
+            tx_pkt_samples.push(tx_pkt);
+            // Convert kB/s to bytes/s
+            rx_kb_samples.push(rx_kb * 1024.0);
+            tx_kb_samples.push(tx_kb * 1024.0);
         }
     }
 
@@ -115,7 +115,7 @@ pub fn parse_throughput(lines: Vec<String>) -> (f64, f64, f64) {
                 )
             })
         })
-        .last()
+        .next_back()
         .unwrap()
 }
 
@@ -136,7 +136,7 @@ pub fn parse_latency(lines: Vec<String>) -> (f64, f64, f64, u64) {
                 )
             })
         })
-        .last()
+        .next_back()
         .unwrap()
 }
 
@@ -222,8 +222,8 @@ pub fn inject_perf(ir: &mut [HydroRoot], folded_data: Vec<u8>) -> f64 {
 
 /// Returns (op_id, count)
 pub fn parse_counter_usage(lines: Vec<String>, op_to_count: &mut HashMap<usize, usize>) {
+    let regex = Regex::new(r"\((\d+)\): (\d+)").unwrap();
     for measurement in lines {
-        let regex = Regex::new(r"\((\d+)\): (\d+)").unwrap();
         let matches = regex.captures_iter(&measurement).last().unwrap();
         let op_id = matches[1].parse::<usize>().unwrap();
         let count = matches[2].parse::<usize>().unwrap();
@@ -337,7 +337,7 @@ pub async fn analyze_cluster_results(
     ir: &mut [HydroRoot],
     mut cluster_metrics: HashMap<(LocationId, String, usize), MetricLogs>,
     run_metadata: &mut RunMetadata,
-    exclude: &Vec<String>,
+    exclude: &[String],
 ) -> (LocationId, String, usize) {
     let mut max_usage_cluster_id = None;
     let mut max_usage_cluster_size = 0;
