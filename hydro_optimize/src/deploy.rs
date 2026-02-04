@@ -33,8 +33,8 @@ pub struct ReusableHosts {
 }
 
 // Note: Aws AMIs vary by region. If you are changing the region, please also change the AMI.
-const AWS_REGION: &str = "us-east-1";
-const AWS_INSTANCE_AMI: &str = "ami-0e95a5e2743ec9ec9"; // Amazon Linux 2
+const AWS_REGION: &str = "us-west-2";
+const AWS_INSTANCE_AMI: &str = "ami-055a9df0c8c9f681c"; // Amazon Linux 2
 
 impl ReusableHosts {
     pub fn new(host_type: HostType) -> Self {
@@ -44,7 +44,7 @@ impl ReusableHosts {
                 project,
             },
             HostType::Aws => InitializedHostType::Aws {
-                network: AwsNetwork::new("us-east-1", None),
+                network: AwsNetwork::new(AWS_REGION, None),
             },
             HostType::Localhost => InitializedHostType::Localhost,
         };

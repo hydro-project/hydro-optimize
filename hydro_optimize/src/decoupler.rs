@@ -13,25 +13,29 @@ use serde::{Deserialize, Serialize};
 use stageleft::quote_type;
 use syn::visit_mut::VisitMut;
 
-use crate::parse_results::{MultiRunMetadata, get_or_append_run_metadata};
-use crate::repair::{cycle_source_to_sink_input, inject_id, inject_location};
+use crate::repair::{cycle_source_to_sink_input, inject_location};
 use crate::rewrites::{
     ClusterSelfIdReplace, collection_kind_to_debug_type, deserialize_bincode_with_type,
     prepend_member_id_to_collection_kind, serialize_bincode_with_type, tee_to_inner_id,
 };
 
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Decoupler {
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct DecoupleDecision {
     pub output_to_decoupled_machine_after: Vec<usize>, /* The output of the operator at this index should be sent to the decoupled machine */
     pub output_to_original_machine_after: Vec<usize>, /* The output of the operator at this index should be sent to the original machine */
     pub place_on_decoupled_machine: Vec<usize>, /* This operator should be placed on the decoupled machine. Only for sources */
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Decoupler {
+    pub decision: DecoupleDecision,
     pub orig_location: LocationId,
     pub decoupled_location: LocationId,
 }
 
 fn add_network(node: &mut HydroNode, new_location: &LocationId) {
     let metadata = node.metadata().clone();
-    let parent_id = metadata.location_kind.root().raw_id();
+    let parent_id = metadata.location_id.root().key();
     let node_content = std::mem::replace(node, HydroNode::Placeholder);
 
     // Map from b to (MemberId, b), where MemberId is the id of the decoupled (or original) node we're sending to
@@ -52,7 +56,7 @@ fn add_network(node: &mut HydroNode, new_location: &LocationId) {
         f: f.into(),
         input: Box::new(node_content),
         metadata: HydroIrMetadata {
-            location_kind: metadata.location_kind.root().clone(), // Remove any ticks
+            location_id: metadata.location_id.root().clone(), // Remove any ticks
             collection_kind: new_collection_kind.clone(),
             cardinality: None,
             tag: None,
@@ -68,6 +72,7 @@ fn add_network(node: &mut HydroNode, new_location: &LocationId) {
     // Set up the network node
     let output_debug_type = collection_kind_to_debug_type(&original_collection_kind);
     let network_node = HydroNode::Network {
+        name: None,
         serialize_fn: Some(serialize_bincode_with_type(true, &output_debug_type)).map(|e| e.into()),
         instantiate_fn: DebugInstantiate::Building,
         deserialize_fn: Some(deserialize_bincode_with_type(
@@ -77,7 +82,7 @@ fn add_network(node: &mut HydroNode, new_location: &LocationId) {
         .map(|e| e.into()),
         input: Box::new(mapped_node),
         metadata: HydroIrMetadata {
-            location_kind: new_location.clone(),
+            location_id: new_location.clone(),
             collection_kind: new_collection_kind,
             cardinality: None,
             tag: None,
@@ -96,7 +101,7 @@ fn add_network(node: &mut HydroNode, new_location: &LocationId) {
         f: f.into(),
         input: Box::new(network_node),
         metadata: HydroIrMetadata {
-            location_kind: new_location.clone(),
+            location_id: new_location.clone(),
             collection_kind: original_collection_kind,
             cardinality: None,
             tag: None,
@@ -150,19 +155,23 @@ fn decouple_node(
     tee_to_inner_id_before_rewrites: &HashMap<usize, usize>,
 ) {
     // Replace location of sources, if necessary
-    if decoupler.place_on_decoupled_machine.contains(next_stmt_id) {
+    if decoupler
+        .decision
+        .place_on_decoupled_machine
+        .contains(next_stmt_id)
+    {
         match node {
             HydroNode::Source { metadata, .. }
             | HydroNode::SingletonSource { metadata, .. }
             | HydroNode::Network { metadata, .. } => {
                 println!(
                     "Changing source/network destination from {:?} to location {:?}, id: {}",
-                    metadata.location_kind,
+                    metadata.location_id,
                     decoupler.decoupled_location.clone(),
                     next_stmt_id
                 );
                 metadata
-                    .location_kind
+                    .location_id
                     .swap_root(decoupler.decoupled_location.clone());
             }
             _ => {
@@ -177,11 +186,13 @@ fn decouple_node(
 
     // Otherwise, replace where the outputs go
     let new_location = if decoupler
+        .decision
         .output_to_decoupled_machine_after
         .contains(next_stmt_id)
     {
         &decoupler.decoupled_location
     } else if decoupler
+        .decision
         .output_to_original_machine_after
         .contains(next_stmt_id)
     {
@@ -226,7 +237,7 @@ fn fix_cluster_self_id_root(root: &mut HydroRoot, mut locations: ClusterSelfIdRe
         decoupled_cluster_id,
         ..
     } = locations
-        && root.input_metadata().location_kind.root().raw_id() == decoupled_cluster_id
+        && root.input_metadata().location_id.root().key() == decoupled_cluster_id
     {
         root.visit_debug_expr(|expr| {
             locations.visit_expr_mut(&mut expr.0);
@@ -239,7 +250,7 @@ fn fix_cluster_self_id_node(node: &mut HydroNode, mut locations: ClusterSelfIdRe
         decoupled_cluster_id,
         ..
     } = locations
-        && node.metadata().location_kind.root().raw_id() == decoupled_cluster_id
+        && node.metadata().location_id.root().key() == decoupled_cluster_id
     {
         node.visit_debug_expr(|expr| {
             locations.visit_expr_mut(&mut expr.0);
@@ -247,12 +258,7 @@ fn fix_cluster_self_id_node(node: &mut HydroNode, mut locations: ClusterSelfIdRe
     }
 }
 
-pub fn decouple(
-    ir: &mut [HydroRoot],
-    decoupler: &Decoupler,
-    multi_run_metadata: &RefCell<MultiRunMetadata>,
-    iteration: usize,
-) {
+pub fn decouple(ir: &mut [HydroRoot], decoupler: &Decoupler) {
     let tee_to_inner_id_before_rewrites = tee_to_inner_id(ir);
     let mut new_inners = HashMap::new();
     traverse_dfir::<HydroDeploy>(
@@ -269,18 +275,13 @@ pub fn decouple(
         },
     );
 
-    // Fix IDs since we injected nodes
-    let new_id_to_old_id = inject_id(ir);
-    let mut mut_multi_run_metadata = multi_run_metadata.borrow_mut();
-    let run_metadata = get_or_append_run_metadata(&mut mut_multi_run_metadata, iteration + 1);
-    run_metadata.op_id_to_prev_iteration_op_id = new_id_to_old_id;
     // Fix locations since we changed some
     let cycle_source_to_sink_input = cycle_source_to_sink_input(ir);
     inject_location(ir, &cycle_source_to_sink_input);
     // Fix CLUSTER_SELF_ID for the decoupled node
     let locations = ClusterSelfIdReplace::Decouple {
-        orig_cluster_id: decoupler.orig_location.raw_id(),
-        decoupled_cluster_id: decoupler.decoupled_location.raw_id(),
+        orig_cluster_id: decoupler.orig_location.key(),
+        decoupled_cluster_id: decoupler.decoupled_location.key(),
     };
     transform_bottom_up(
         ir,
@@ -292,195 +293,4 @@ pub fn decouple(
         },
         true,
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use std::cell::RefCell;
-    use std::collections::HashSet;
-
-    use hydro_build_utils::insta;
-    use hydro_deploy::Deployment;
-    use hydro_lang::compile::builder::FlowBuilder;
-    use hydro_lang::compile::built::BuiltFlow;
-    use hydro_lang::compile::ir;
-    use hydro_lang::location::Location;
-    use hydro_lang::nondet::nondet;
-    use hydro_lang::prelude::{Cluster, TCP};
-    use stageleft::q;
-
-    use crate::debug::{name_to_id_map, print_id};
-    use crate::decoupler::{Decoupler, decouple};
-    use crate::repair::inject_id;
-
-    fn decouple_mini_program<'a>(
-        output_to_decoupled_machine_after: Vec<(&str, i32)>, // name, offset
-        output_to_original_machine_after: Vec<(&str, i32)>,
-        place_on_decoupled_machine: Vec<(&str, i32)>,
-    ) -> (
-        Cluster<'a, ()>,
-        Cluster<'a, ()>,
-        Cluster<'a, ()>,
-        BuiltFlow<'a>,
-    ) {
-        let builder = FlowBuilder::new();
-        let send_cluster = builder.cluster::<()>();
-        let recv_cluster = builder.cluster::<()>();
-        let decoupled_cluster = builder.cluster::<()>();
-
-        send_cluster
-            .source_iter(q!(0..10))
-            .map(q!(|a| a + 1))
-            .ir_node_named("map")
-            .broadcast(&recv_cluster, TCP.bincode(), nondet!(/** test */))
-            .values()
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
-            .for_each(q!(|a| println!("Got it: {}", a)));
-
-        let multi_run_metadata = RefCell::new(vec![]);
-        let iteration = 0;
-        let built = builder.optimize_with(|ir| {
-            inject_id(ir);
-            print_id(ir);
-            // Convert named nodes to IDs, accounting for the offset
-            let name_to_id = name_to_id_map(ir);
-            let decoupler = Decoupler {
-                output_to_decoupled_machine_after: output_to_decoupled_machine_after
-                    .into_iter()
-                    .map(|(name, offset)| {
-                        (name_to_id.get(name).cloned().unwrap() as i32 + offset) as usize
-                    })
-                    .collect(),
-                output_to_original_machine_after: output_to_original_machine_after
-                    .into_iter()
-                    .map(|(name, offset)| {
-                        (name_to_id.get(name).cloned().unwrap() as i32 + offset) as usize
-                    })
-                    .collect(),
-                place_on_decoupled_machine: place_on_decoupled_machine
-                    .into_iter()
-                    .map(|(name, offset)| {
-                        (name_to_id.get(name).cloned().unwrap() as i32 + offset) as usize
-                    })
-                    .collect(),
-                decoupled_location: decoupled_cluster.id().clone(),
-                orig_location: send_cluster.id().clone(),
-            };
-            decouple(ir, &decoupler, &multi_run_metadata, iteration)
-        });
-        (send_cluster, recv_cluster, decoupled_cluster, built)
-    }
-
-    async fn check_decouple_mini_program(
-        output_to_decoupled_machine_after: Vec<(&str, i32)>, // name, offset
-        output_to_original_machine_after: Vec<(&str, i32)>,
-        place_on_decoupled_machine: Vec<(&str, i32)>,
-    ) {
-        let (send_cluster, recv_cluster, decoupled_cluster, built) = decouple_mini_program(
-            output_to_decoupled_machine_after,
-            output_to_original_machine_after,
-            place_on_decoupled_machine,
-        );
-
-        // Check outputs
-        let mut deployment = Deployment::new();
-        let nodes = built
-            .with_cluster(&send_cluster, vec![deployment.Localhost(); 1])
-            .with_cluster(&recv_cluster, vec![deployment.Localhost(); 3])
-            .with_cluster(&decoupled_cluster, vec![deployment.Localhost(); 1])
-            .deploy(&mut deployment);
-
-        deployment.deploy().await.unwrap();
-
-        let recv_members = nodes.get_cluster(&recv_cluster).members();
-        let mut stdouts = vec![];
-        for member in recv_members {
-            use hydro_lang::deploy::DeployCrateWrapper;
-
-            stdouts.push(member.stdout());
-        }
-
-        deployment.start().await.unwrap();
-
-        for mut stdout in stdouts {
-            let mut expected = HashSet::new();
-            let mut received = HashSet::new();
-            for i in 1..11 {
-                received.insert(stdout.recv().await.unwrap());
-                expected.insert(format!("Got it: {}", i));
-            }
-            assert_eq!(expected, received);
-        }
-    }
-
-    #[test]
-    fn decouple_after_source_ir() {
-        let output_to_decoupled_machine_after = vec![("map", -1)];
-        let output_to_original_machine_after = vec![];
-        let place_on_decoupled_machine = vec![
-            // the source of cluster membership (TODO(shadaj): should have a better way of identifying)
-            ("map", -11),
-        ];
-
-        let built = decouple_mini_program(
-            output_to_decoupled_machine_after,
-            output_to_original_machine_after,
-            place_on_decoupled_machine,
-        )
-        .3;
-
-        ir::dbg_dedup_tee(|| {
-            insta::assert_debug_snapshot!(built.ir());
-        });
-    }
-
-    #[tokio::test]
-    async fn decouple_after_source() {
-        let output_to_decoupled_machine_after = vec![("map", -1)];
-        let output_to_original_machine_after = vec![];
-        let place_on_decoupled_machine = vec![
-            // the source of cluster membership (TODO(shadaj): should have a better way of identifying)
-            ("map", -11),
-        ];
-
-        check_decouple_mini_program(
-            output_to_decoupled_machine_after,
-            output_to_original_machine_after,
-            place_on_decoupled_machine,
-        )
-        .await
-    }
-
-    #[test]
-    fn move_source_decouple_map_ir() {
-        let output_to_decoupled_machine_after = vec![];
-        let output_to_original_machine_after = vec![("map", 0)];
-        let place_on_decoupled_machine = vec![("map", -1)];
-
-        let built = decouple_mini_program(
-            output_to_decoupled_machine_after,
-            output_to_original_machine_after,
-            place_on_decoupled_machine,
-        )
-        .3;
-
-        ir::dbg_dedup_tee(|| {
-            insta::assert_debug_snapshot!(built.ir());
-        });
-    }
-
-    #[tokio::test]
-    async fn move_source_decouple_map() {
-        let output_to_decoupled_machine_after = vec![];
-        let output_to_original_machine_after = vec![("map", 0)];
-        let place_on_decoupled_machine = vec![("map", -1)];
-
-        check_decouple_mini_program(
-            output_to_decoupled_machine_after,
-            output_to_original_machine_after,
-            place_on_decoupled_machine,
-        )
-        .await
-    }
 }

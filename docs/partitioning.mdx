@@ -160,7 +160,7 @@ Imagine `Chain` then joins with another stream, as in the following program.
 ```rust
 # use hydro_lang::prelude::*;
 fn chain_parents_same_input<'a, L>(
-    flow: FlowBuilder<'a>,
+    mut flow: FlowBuilder<'a>,
     input1: Stream<(usize, usize), Process<'a, L>, Unbounded>,
     input2: Stream<(usize, usize), Process<'a, L>, Unbounded>,
 ) {
@@ -198,7 +198,7 @@ Imagine `Chain` then joins with another stream, as in the following program.
 ```rust
 # use hydro_lang::prelude::*;
 fn chain_parents_different_inputs<'a, L>(
-    flow: FlowBuilder<'a>,
+    mut flow: FlowBuilder<'a>,
     input1: Stream<(usize, usize), Process<'a, L>, Unbounded>,
     input2: Stream<(usize, usize), Process<'a, L>, Unbounded>,
 ) {

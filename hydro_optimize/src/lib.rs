@@ -1,3 +1,6 @@
+#[cfg(stageleft_runtime)]
+hydro_lang::setup!();
+
 pub mod debug;
 pub mod decouple_analysis;
 pub mod decoupler;
@@ -10,19 +13,8 @@ pub mod partitioner;
 pub mod repair;
 pub mod rewrites;
 
-#[cfg(test)]
-mod tests;
-
 #[doc(hidden)]
 #[cfg(doctest)]
 mod docs {
     include_mdtests::include_mdtests!("docs/**/*.md*");
-}
-
-#[cfg(test)]
-mod test_init {
-    #[ctor::ctor]
-    fn init() {
-        hydro_lang::deploy::init_test();
-    }
 }

@@ -860,7 +860,7 @@ mod tests {
 
     #[test]
     fn test_tuple_input_assignment() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -873,7 +873,7 @@ mod tests {
 
     #[test]
     fn test_tuple_input_implicit_nesting() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -886,7 +886,7 @@ mod tests {
 
     #[test]
     fn test_tuple_assignment() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -902,7 +902,7 @@ mod tests {
 
     #[test]
     fn test_tuple_creation() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -918,7 +918,7 @@ mod tests {
 
     #[test]
     fn test_tuple_output_implicit_nesting() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -934,7 +934,7 @@ mod tests {
 
     #[test]
     fn test_tuple_input_output_implicit_nesting() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -950,7 +950,7 @@ mod tests {
 
     #[test]
     fn test_tuple_no_block() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -963,7 +963,7 @@ mod tests {
 
     #[test]
     fn test_if_shared_intersection() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -980,7 +980,7 @@ mod tests {
 
     #[test]
     fn test_if_conflicting_intersection() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -996,7 +996,7 @@ mod tests {
 
     #[test]
     fn test_if_implicit_expansion() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1011,7 +1011,7 @@ mod tests {
 
     #[test]
     fn test_if_let() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1036,7 +1036,7 @@ mod tests {
 
     #[test]
     fn test_else_if() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1064,7 +1064,7 @@ mod tests {
 
     #[test]
     fn test_if_option() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1077,7 +1077,7 @@ mod tests {
 
     #[test]
     fn test_match() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1099,7 +1099,7 @@ mod tests {
 
     #[test]
     fn test_match_assign() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1120,7 +1120,7 @@ mod tests {
 
     #[test]
     fn test_block() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1140,7 +1140,7 @@ mod tests {
 
     #[test]
     fn test_nested_block() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1163,7 +1163,7 @@ mod tests {
 
     #[test]
     fn test_block_shadowing() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1186,7 +1186,7 @@ mod tests {
 
     #[test]
     fn test_full_assignment() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1243,7 +1243,7 @@ mod tests {
 
     #[test]
     fn test_nested_struct() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([TestStruct {
@@ -1275,7 +1275,7 @@ mod tests {
 
     #[test]
     fn test_nested_struct_declaration() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([TestStruct {
@@ -1305,7 +1305,7 @@ mod tests {
 
     #[test]
     fn test_struct_implicit_field() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([TestStruct {
