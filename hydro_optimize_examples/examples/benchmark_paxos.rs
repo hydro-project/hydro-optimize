@@ -39,7 +39,6 @@ fn write_sar_csv(
     output_dir: &Path,
     sar_stats: &HashMap<LocationId, Vec<SarStats>>,
     location_id_to_cluster: &HashMap<LocationId, String>,
-    iteration: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(output_dir)?;
 
@@ -49,7 +48,7 @@ fn write_sar_csv(
         }
 
         let location_name = location_id_to_cluster.get(location).unwrap();
-        let filename = output_dir.join(format!("{}_{}.csv", location_name, iteration));
+        let filename = output_dir.join(format!("{}.csv", location_name));
 
         let mut file = File::create(&filename)?;
         writeln!(
@@ -81,7 +80,6 @@ fn write_sar_csv(
 /// Writes summary stats (throughput, latency) to a text file for each location
 fn write_summary_txt(
     output_dir: &Path,
-    iteration: usize,
     throughput: (f64, f64, f64),
     latencies: (f64, f64, f64, u64),
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -90,7 +88,7 @@ fn write_summary_txt(
     let (throughput_lower, throughput_mean, throughput_upper) = throughput;
     let (p50_latency, p99_latency, p999_latency, latency_samples) = latencies;
 
-    let filename = output_dir.join(format!("{}.txt", iteration));
+    let filename = output_dir.join("summary.txt");
 
     let mut file = File::create(&filename)?;
     writeln!(file, "=== Benchmark Summary ===")?;
@@ -191,7 +189,6 @@ async fn output_metrics(
     run_metadata: RunMetadata,
     location_id_to_cluster: &HashMap<LocationId, String>,
     output_dir: String,
-    iteration: usize,
 ) {
     let (throughput_lower, throughput_mean, throughput_upper) = run_metadata.throughput;
     let (p50_latency, p99_latency, p999_latency, latency_samples) = run_metadata.latencies;
@@ -223,13 +220,11 @@ async fn output_metrics(
         Path::new(&output_dir),
         &run_metadata.sar_stats,
         &location_id_to_cluster,
-        iteration,
     ) {
         eprintln!("Failed to write CSV: {}", e);
     }
     if let Err(e) = write_summary_txt(
         Path::new(&output_dir),
-        iteration,
         run_metadata.throughput,
         run_metadata.latencies,
     ) {
@@ -260,7 +255,6 @@ async fn main() {
     // Binary search for optimal virtual clients
     let mut low = 1usize;
     let mut high = 200usize;
-    let mut iteration = 0usize;
 
     // First run at low to establish baseline latency
     let (run_metadata, location_id_to_cluster, output_dir) = run_benchmark(
@@ -272,22 +266,21 @@ async fn main() {
     )
     .await;
     let baseline_p99 = run_metadata.latencies.1.max(0.001); // Avoid division by zero
-    output_metrics(run_metadata, &location_id_to_cluster, output_dir, iteration).await;
+    output_metrics(run_metadata, &location_id_to_cluster, output_dir).await;
 
     // Binary search to find the point where p99 latency spikes
     while high - low > 10 {
         let mid = (low + high) / 2;
-        iteration += 1;
         let (run_metadata, location_id_to_cluster, output_dir) = run_benchmark(
             &mut reusable_hosts,
             &mut deployment,
             NUM_CLIENTS,
-            low,
+            mid,
             RUN_SECONDS,
         )
         .await;
         let p99_latency = run_metadata.latencies.1;
-        output_metrics(run_metadata, &location_id_to_cluster, output_dir, iteration).await;
+        output_metrics(run_metadata, &location_id_to_cluster, output_dir).await;
 
         let latency_ratio = p99_latency / baseline_p99;
         println!(
@@ -306,5 +299,5 @@ async fn main() {
 
     // Print summary
     println!("\n=== Benchmark Summary ===");
-    println!("Optimal virtual clients: {}", low);
+    println!("Optimal virtual clients: low {} high {} ", low, high);
 }

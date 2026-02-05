@@ -286,7 +286,7 @@ pub async fn deploy_and_optimize<'a>(
         for (process_id, name) in processes.named_processes.iter() {
             deployable = deployable.with_process_erased(
                 *process_id,
-                reusable_hosts.get_process_hosts(deployment, name.clone()),
+                reusable_hosts.get_no_perf_process_hosts(deployment, name.clone()),
             );
         }
 
