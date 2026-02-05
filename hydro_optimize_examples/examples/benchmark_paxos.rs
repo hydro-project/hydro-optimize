@@ -55,9 +55,9 @@ fn generate_sar_graphs(
         }
 
         let location_name = location_id_to_cluster.get(location).unwrap_or(&"unknown");
-        let filename = output_dir.join(format!("{}.png", location_name));
+        let filename = output_dir.join(format!("{}.svg", location_name));
 
-        let root = BitMapBackend::new(&filename, (1024, 768)).into_drawing_area();
+        let root = SVGBackend::new(&filename, (1024, 768)).into_drawing_area();
         root.fill(&WHITE)?;
 
         let time_max = stats.len() as f64;
@@ -123,6 +123,18 @@ fn generate_sar_graphs(
             .label("CPU Idle")
             .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], GREEN));
 
+        // CPU Non-Idle (User + System)
+        chart
+            .draw_series(LineSeries::new(
+                stats
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (i as f64, s.cpu.user + s.cpu.system)),
+                BLACK.stroke_width(3),
+            ))?
+            .label("CPU Non-Idle")
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], BLACK.stroke_width(3)));
+
         // Network GB/s (on secondary axis)
         chart
             .draw_secondary_series(LineSeries::new(
@@ -132,10 +144,10 @@ fn generate_sar_graphs(
                         (s.network.tx_bytes_per_sec + s.network.rx_bytes_per_sec) / 1e9,
                     )
                 }),
-                &MAGENTA,
+                MAGENTA.stroke_width(3),
             ))?
             .label("Network GB/s")
-            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], MAGENTA));
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], MAGENTA.stroke_width(3)));
 
         chart
             .configure_series_labels()

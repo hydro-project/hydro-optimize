@@ -92,46 +92,28 @@ fn parse_network_line(line: &str) -> Option<NetworkStats> {
 /// Parses `sar -n DEV -u` output lines and returns per-second SarStats.
 /// Pairs CPU and network stats by matching timestamps.
 pub fn parse_sar_output(lines: Vec<String>) -> Vec<SarStats> {
-    let mut cpu_by_time: HashMap<String, CPUStats> = HashMap::new();
-    let mut network_by_time: HashMap<String, NetworkStats> = HashMap::new();
-
-    // Extract timestamp from the beginning of each line (e.g., "09:48:43 PM")
-    let time_regex = Regex::new(r"^(\d{2}:\d{2}:\d{2}\s+[AP]M)").unwrap();
+    let mut cpu_usages = vec![];
+    let mut network_usages = vec![];
 
     for line in &lines {
-        if let Some(time_cap) = time_regex.captures(line) {
-            let timestamp = time_cap[1].to_string();
-
-            if let Some(cpu) = parse_cpu_line(line) {
-                cpu_by_time.insert(timestamp.clone(), cpu);
-            }
-            if let Some(network) = parse_network_line(line) {
-                network_by_time.insert(timestamp.clone(), network);
-            }
+        if let Some(cpu) = parse_cpu_line(line) {
+            cpu_usages.push(cpu);
+        }
+        else if let Some(network) = parse_network_line(line) {
+            network_usages.push(network);
         }
     }
 
-    // Combine CPU and network stats for matching timestamps
-    let mut results: Vec<SarStats> = cpu_by_time
-        .into_iter()
-        .filter_map(|(time, cpu)| {
-            network_by_time.get(&time).map(|network| SarStats {
-                cpu,
-                network: *network,
-            })
-        })
-        .collect();
+    // Combine
+    let mut stats = vec![];
+    for i in 0..cpu_usages.len() {
+        stats.push(SarStats {
+            cpu: cpu_usages[i],
+            network: network_usages[i],
+        });
+    }
 
-    // Sort by some consistent order (we don't have timestamps in the struct, so just return as-is)
-    // The order doesn't matter much since these are per-second samples
-    results.sort_by(|a, b| {
-        a.cpu
-            .user
-            .partial_cmp(&b.cpu.user)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    results
+    stats
 }
 
 /// Parses throughput output from `print_parseable_bench_results`.
@@ -410,7 +392,9 @@ pub async fn analyze_cluster_results(
             // run_metadata
             //     .unaccounted_perf
             //     .insert(id.clone(), unidentified_perf);
-            run_metadata.sar_stats.insert(id.clone(), max_sar_stat.clone());
+            run_metadata
+                .sar_stats
+                .insert(id.clone(), max_sar_stat.clone());
         }
     }
 
