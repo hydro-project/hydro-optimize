@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::Path;
 
 use clap::{ArgAction, Parser};
@@ -10,10 +11,9 @@ use hydro_optimize::deploy::{HostType, ReusableHosts};
 use hydro_optimize::deploy_and_analyze::{
     Optimizations, ReusableClusters, ReusableProcesses, deploy_and_optimize,
 };
-use hydro_optimize::parse_results::SarStats;
+use hydro_optimize::parse_results::{RunMetadata, SarStats};
 use hydro_optimize_examples::print_parseable_bench_results;
 use hydro_test::cluster::paxos::{CorePaxos, PaxosConfig};
-use plotters::prelude::*;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, group(
@@ -34,18 +34,12 @@ struct BenchmarkArgs {
     aws: bool,
 }
 
-/// Result of a single benchmark run
-struct BenchResult {
-    virtual_clients: usize,
-    throughput_mean: f64,
-    p99_latency: f64,
-}
-
-/// Generates graphs for sar stats in the given output directory
-fn generate_sar_graphs(
+/// Writes per-second CPU and network stats to CSV files for each location
+fn write_sar_csv(
     output_dir: &Path,
     sar_stats: &HashMap<LocationId, Vec<SarStats>>,
-    location_id_to_cluster: HashMap<LocationId, &'static str>,
+    location_id_to_cluster: &HashMap<LocationId, String>,
+    iteration: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(output_dir)?;
 
@@ -54,110 +48,63 @@ fn generate_sar_graphs(
             continue;
         }
 
-        let location_name = location_id_to_cluster.get(location).unwrap_or(&"unknown");
-        let filename = output_dir.join(format!("{}.svg", location_name));
+        let location_name = location_id_to_cluster.get(location).unwrap();
+        let filename = output_dir.join(format!("{}_{}.csv", location_name, iteration));
 
-        let root = SVGBackend::new(&filename, (1024, 768)).into_drawing_area();
-        root.fill(&WHITE)?;
+        let mut file = File::create(&filename)?;
+        writeln!(
+            file,
+            "time_s,cpu_user,cpu_system,cpu_idle,network_tx_bytes_per_sec,network_rx_bytes_per_sec",
+        )?;
 
-        let time_max = stats.len() as f64;
-        let net_max = stats
-            .iter()
-            .map(|s| (s.network.tx_bytes_per_sec + s.network.rx_bytes_per_sec) / 1e9)
-            .fold(0.0f64, |a, b| a.max(b))
-            * 1.1;
+        for (i, s) in stats.iter().enumerate() {
+            writeln!(
+                file,
+                "{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
+                i,
+                s.cpu.user,
+                s.cpu.system,
+                s.cpu.idle,
+                s.network.tx_packets_per_sec,
+                s.network.rx_packets_per_sec,
+                s.network.tx_bytes_per_sec,
+                s.network.rx_bytes_per_sec,
+            )?;
+        }
 
-        let mut chart = ChartBuilder::on(&root)
-            .caption(format!("Location: {}", location_name), ("sans-serif", 20))
-            .margin(10)
-            .x_label_area_size(40)
-            .y_label_area_size(50)
-            .right_y_label_area_size(50)
-            .build_cartesian_2d(0f64..time_max, 0f64..100f64)?
-            .set_secondary_coord(0f64..time_max, 0f64..net_max);
-
-        chart
-            .configure_mesh()
-            .x_desc("Time (s)")
-            .y_desc("CPU (%)")
-            .draw()?;
-
-        chart
-            .configure_secondary_axes()
-            .y_desc("Network (GB/s)")
-            .draw()?;
-
-        // CPU User
-        chart
-            .draw_series(LineSeries::new(
-                stats
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| (i as f64, s.cpu.user)),
-                &RED,
-            ))?
-            .label("CPU User")
-            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], RED));
-
-        // CPU System
-        chart
-            .draw_series(LineSeries::new(
-                stats
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| (i as f64, s.cpu.system)),
-                &BLUE,
-            ))?
-            .label("CPU System")
-            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], BLUE));
-
-        // CPU Idle
-        chart
-            .draw_series(LineSeries::new(
-                stats
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| (i as f64, s.cpu.idle)),
-                &GREEN,
-            ))?
-            .label("CPU Idle")
-            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], GREEN));
-
-        // CPU Non-Idle (User + System)
-        chart
-            .draw_series(LineSeries::new(
-                stats
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| (i as f64, s.cpu.user + s.cpu.system)),
-                BLACK.stroke_width(3),
-            ))?
-            .label("CPU Non-Idle")
-            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], BLACK.stroke_width(3)));
-
-        // Network GB/s (on secondary axis)
-        chart
-            .draw_secondary_series(LineSeries::new(
-                stats.iter().enumerate().map(|(i, s)| {
-                    (
-                        i as f64,
-                        (s.network.tx_bytes_per_sec + s.network.rx_bytes_per_sec) / 1e9,
-                    )
-                }),
-                MAGENTA.stroke_width(3),
-            ))?
-            .label("Network GB/s")
-            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], MAGENTA.stroke_width(3)));
-
-        chart
-            .configure_series_labels()
-            .background_style(WHITE.mix(0.8))
-            .border_style(BLACK)
-            .draw()?;
-
-        root.present()?;
-        println!("Generated graph: {}", filename.display());
+        println!("Generated CSV: {}", filename.display());
     }
+
+    Ok(())
+}
+
+/// Writes summary stats (throughput, latency) to a text file for each location
+fn write_summary_txt(
+    output_dir: &Path,
+    iteration: usize,
+    throughput: (f64, f64, f64),
+    latencies: (f64, f64, f64, u64),
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(output_dir)?;
+
+    let (throughput_lower, throughput_mean, throughput_upper) = throughput;
+    let (p50_latency, p99_latency, p999_latency, latency_samples) = latencies;
+
+    let filename = output_dir.join(format!("{}.txt", iteration));
+
+    let mut file = File::create(&filename)?;
+    writeln!(file, "=== Benchmark Summary ===")?;
+    writeln!(file, "Throughput (requests/s):")?;
+    writeln!(file, "  Lower: {:.2}", throughput_lower)?;
+    writeln!(file, "  Mean:  {:.2}", throughput_mean)?;
+    writeln!(file, "  Upper: {:.2}", throughput_upper)?;
+    writeln!(file)?;
+    writeln!(file, "Latency (ms):")?;
+    writeln!(file, "  p50:  {:.3}", p50_latency)?;
+    writeln!(file, "  p99:  {:.3}", p99_latency)?;
+    writeln!(file, "  p999: {:.3}", p999_latency)?;
+    writeln!(file, "  Samples: {}", latency_samples)?;
+    println!("Generated summary: {}", filename.display());
 
     Ok(())
 }
@@ -169,7 +116,7 @@ async fn run_benchmark(
     num_clients: usize,
     num_clients_per_node: usize,
     run_seconds: usize,
-) -> BenchResult {
+) -> (RunMetadata, HashMap<LocationId, String>, String) {
     let f = 1;
     let checkpoint_frequency = 1000;
     let i_am_leader_send_timeout = 5;
@@ -189,12 +136,16 @@ async fn run_benchmark(
     let client_aggregator = builder.process();
     let replicas = builder.cluster();
     let location_id_to_cluster = HashMap::from([
-        (proposers.id(), "proposer"),
-        (acceptors.id(), "acceptor"),
-        (clients.id(), "client"),
-        (replicas.id(), "replica"),
-        (client_aggregator.id(), "client_aggregator"),
+        (proposers.id(), "proposer".to_string()),
+        (acceptors.id(), "acceptor".to_string()),
+        (clients.id(), "client".to_string()),
+        (replicas.id(), "replica".to_string()),
+        (client_aggregator.id(), "client_aggregator".to_string()),
     ]);
+    let output_dir = format!(
+        "paxos_{}clients_{}virt_{}s",
+        num_clients, num_clients_per_node, run_seconds
+    );
 
     hydro_test::cluster::paxos_bench::paxos_bench(
         num_clients_per_node,
@@ -233,6 +184,15 @@ async fn run_benchmark(
     )
     .await;
 
+    (run_metadata, location_id_to_cluster, output_dir)
+}
+
+async fn output_metrics(
+    run_metadata: RunMetadata,
+    location_id_to_cluster: &HashMap<LocationId, String>,
+    output_dir: String,
+    iteration: usize,
+) {
     let (throughput_lower, throughput_mean, throughput_upper) = run_metadata.throughput;
     let (p50_latency, p99_latency, p999_latency, latency_samples) = run_metadata.latencies;
 
@@ -258,23 +218,22 @@ async fn run_benchmark(
             )
         });
 
-    // Generate graphs for sar stats
-    let output_dir = format!(
-        "benchmark_results/c{}_vc{}_thr{:.0}_p99{:.1}ms",
-        num_clients, num_clients_per_node, throughput_mean, p99_latency
-    );
-    if let Err(e) = generate_sar_graphs(
+    // Write CSV and summary files for sar stats
+    if let Err(e) = write_sar_csv(
         Path::new(&output_dir),
         &run_metadata.sar_stats,
-        location_id_to_cluster,
+        &location_id_to_cluster,
+        iteration,
     ) {
-        eprintln!("Failed to generate graphs: {}", e);
+        eprintln!("Failed to write CSV: {}", e);
     }
-
-    BenchResult {
-        virtual_clients: num_clients_per_node,
-        throughput_mean,
-        p99_latency,
+    if let Err(e) = write_summary_txt(
+        Path::new(&output_dir),
+        iteration,
+        run_metadata.throughput,
+        run_metadata.latencies,
+    ) {
+        eprintln!("Failed to write summary: {}", e);
     }
 }
 
@@ -301,10 +260,10 @@ async fn main() {
     // Binary search for optimal virtual clients
     let mut low = 1usize;
     let mut high = 200usize;
-    let mut results: Vec<BenchResult> = Vec::new();
+    let mut iteration = 0usize;
 
     // First run at low to establish baseline latency
-    let baseline = run_benchmark(
+    let (run_metadata, location_id_to_cluster, output_dir) = run_benchmark(
         &mut reusable_hosts,
         &mut deployment,
         NUM_CLIENTS,
@@ -312,22 +271,25 @@ async fn main() {
         RUN_SECONDS,
     )
     .await;
-    let baseline_p99 = baseline.p99_latency.max(0.001); // Avoid division by zero
-    results.push(baseline);
+    let baseline_p99 = run_metadata.latencies.1.max(0.001); // Avoid division by zero
+    output_metrics(run_metadata, &location_id_to_cluster, output_dir, iteration).await;
 
     // Binary search to find the point where p99 latency spikes
     while high - low > 10 {
         let mid = (low + high) / 2;
-        let result = run_benchmark(
+        iteration += 1;
+        let (run_metadata, location_id_to_cluster, output_dir) = run_benchmark(
             &mut reusable_hosts,
             &mut deployment,
             NUM_CLIENTS,
-            mid,
+            low,
             RUN_SECONDS,
         )
         .await;
+        let p99_latency = run_metadata.latencies.1;
+        output_metrics(run_metadata, &location_id_to_cluster, output_dir, iteration).await;
 
-        let latency_ratio = result.p99_latency / baseline_p99;
+        let latency_ratio = p99_latency / baseline_p99;
         println!(
             "virtual_clients={}, latency_ratio={:.2}x baseline",
             mid, latency_ratio
@@ -340,28 +302,9 @@ async fn main() {
             // Latency acceptable, search higher
             low = mid;
         }
-        results.push(result);
     }
-
-    // Final run at the converged value
-    let optimal = run_benchmark(
-        &mut reusable_hosts,
-        &mut deployment,
-        NUM_CLIENTS,
-        low,
-        RUN_SECONDS,
-    )
-    .await;
-    results.push(optimal);
 
     // Print summary
     println!("\n=== Benchmark Summary ===");
     println!("Optimal virtual clients: {}", low);
-    println!("\nAll results:");
-    for r in &results {
-        println!(
-            "  virtual_clients={:3}, throughput={:8.2} req/s, p99={:6.3} ms",
-            r.virtual_clients, r.throughput_mean, r.p99_latency
-        );
-    }
 }
