@@ -69,17 +69,31 @@ fn parse_cpu_line(line: &str) -> Option<CPUStats> {
     })
 }
 
-/// Parses a single network line from sar -n DEV output (eth0 only).
+/// Parses a single network line from sar -n DEV output (any non-loopback interface).
 /// Format: "HH:MM:SS AM/PM IFACE rxpck/s txpck/s rxkB/s txkB/s ..."
+/// Matches eth0, ens5, or any other interface name that isn't "lo".
 fn parse_network_line(line: &str) -> Option<NetworkStats> {
-    let eth0_regex =
-        Regex::new(r"eth0\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)").unwrap();
+    // Skip loopback interface
+    if line.contains("lo ") || line.contains("lo\t") {
+        return None;
+    }
 
-    eth0_regex.captures(line).and_then(|caps| {
-        let rx_pkt = caps[1].parse::<f64>().ok()?;
-        let tx_pkt = caps[2].parse::<f64>().ok()?;
-        let rx_kb = caps[3].parse::<f64>().ok()?;
-        let tx_kb = caps[4].parse::<f64>().ok()?;
+    // Match any interface: captures interface name followed by numeric stats
+    let iface_regex = Regex::new(
+        r"\s*\d+:\d+:\d+\s+(\S+)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)",
+    )
+    .unwrap();
+
+    iface_regex.captures(line).and_then(|caps| {
+        let iface = &caps[1];
+        // Skip loopback and header lines
+        if iface == "lo" || iface == "IFACE" {
+            return None;
+        }
+        let rx_pkt = caps[2].parse::<f64>().ok()?;
+        let tx_pkt = caps[3].parse::<f64>().ok()?;
+        let rx_kb = caps[4].parse::<f64>().ok()?;
+        let tx_kb = caps[5].parse::<f64>().ok()?;
         Some(NetworkStats {
             rx_packets_per_sec: rx_pkt,
             tx_packets_per_sec: tx_pkt,
@@ -98,11 +112,16 @@ pub fn parse_sar_output(lines: Vec<String>) -> Vec<SarStats> {
     for line in &lines {
         if let Some(cpu) = parse_cpu_line(line) {
             cpu_usages.push(cpu);
-        }
-        else if let Some(network) = parse_network_line(line) {
+        } else if let Some(network) = parse_network_line(line) {
             network_usages.push(network);
         }
     }
+
+    assert_eq!(
+        cpu_usages.len(),
+        network_usages.len(),
+        "Couldn't correctly parse sar output"
+    );
 
     // Combine
     let mut stats = vec![];
