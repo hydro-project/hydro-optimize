@@ -12,7 +12,7 @@ use crate::deploy_and_analyze::MetricLogs;
 
 #[derive(Default)]
 pub struct RunMetadata {
-    pub throughput: (f64, f64, f64), // mean - 2 std, mean, mean + 2 std
+    pub throughput: usize,
     pub latencies: (f64, f64, f64, u64), // p50, p99, p999, count
     pub send_overhead: HashMap<LocationId, f64>,
     pub recv_overhead: HashMap<LocationId, f64>,
@@ -136,21 +136,16 @@ pub fn parse_sar_output(lines: Vec<String>) -> Vec<SarStats> {
 }
 
 /// Parses throughput output from `print_parseable_bench_results`.
-/// Format: "HYDRO_OPTIMIZE_THR: {lower:.2} - {mean:.2} - {upper:.2} requests/s"
-/// Returns the last (lower, mean, upper) tuple found.
-pub fn parse_throughput(lines: Vec<String>) -> (f64, f64, f64) {
-    let regex =
-        Regex::new(r"(\d+\.?\d*)\s*-\s*(\d+\.?\d*)\s*-\s*(\d+\.?\d*)\s*requests/s").unwrap();
+/// Format: "HYDRO_OPTIMIZE_THR: {throughput} requests/s"
+/// Returns the last throughput value found.
+pub fn parse_throughput(lines: Vec<String>) -> usize {
+    let regex = Regex::new(r"(\d+\.?\d*)\s*requests/s").unwrap();
     lines
         .iter()
         .filter_map(|line| {
-            regex.captures(line).map(|cap| {
-                (
-                    cap[1].parse::<f64>().unwrap(),
-                    cap[2].parse::<f64>().unwrap(),
-                    cap[3].parse::<f64>().unwrap(),
-                )
-            })
+            regex
+                .captures(line)
+                .map(|cap| cap[1].parse::<f64>().unwrap() as usize)
         })
         .next_back()
         .unwrap()

@@ -53,7 +53,7 @@ fn write_sar_csv(
         let mut file = File::create(&filename)?;
         writeln!(
             file,
-            "time_s,cpu_user,cpu_system,cpu_idle,network_tx_bytes_per_sec,network_rx_bytes_per_sec",
+            "time_s,cpu_user,cpu_system,cpu_idle,network_tx_packets_per_sec,network_rx_packets_per_sec,network_tx_bytes_per_sec,network_rx_bytes_per_sec",
         )?;
 
         for (i, s) in stats.iter().enumerate() {
@@ -80,22 +80,18 @@ fn write_sar_csv(
 /// Writes summary stats (throughput, latency) to a text file for each location
 fn write_summary_txt(
     output_dir: &Path,
-    throughput: (f64, f64, f64),
+    throughput: usize,
     latencies: (f64, f64, f64, u64),
 ) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(output_dir)?;
 
-    let (throughput_lower, throughput_mean, throughput_upper) = throughput;
     let (p50_latency, p99_latency, p999_latency, latency_samples) = latencies;
 
     let filename = output_dir.join("summary.txt");
 
     let mut file = File::create(&filename)?;
     writeln!(file, "=== Benchmark Summary ===")?;
-    writeln!(file, "Throughput (requests/s):")?;
-    writeln!(file, "  Lower: {:.2}", throughput_lower)?;
-    writeln!(file, "  Mean:  {:.2}", throughput_mean)?;
-    writeln!(file, "  Upper: {:.2}", throughput_upper)?;
+    writeln!(file, "Throughput: {} requests/s", throughput)?;
     writeln!(file)?;
     writeln!(file, "Latency (ms):")?;
     writeln!(file, "  p50:  {:.3}", p50_latency)?;
@@ -163,6 +159,7 @@ async fn run_benchmark(
         &clients,
         &client_aggregator,
         &replicas,
+        print_result_frequency / 10,
         print_result_frequency,
         print_parseable_bench_results,
     );
@@ -190,13 +187,10 @@ async fn output_metrics(
     location_id_to_cluster: &HashMap<LocationId, String>,
     output_dir: String,
 ) {
-    let (throughput_lower, throughput_mean, throughput_upper) = run_metadata.throughput;
+    let throughput = run_metadata.throughput;
     let (p50_latency, p99_latency, p999_latency, latency_samples) = run_metadata.latencies;
 
-    println!(
-        "Throughput: {:.2} - {:.2} - {:.2} requests/s",
-        throughput_lower, throughput_mean, throughput_upper
-    );
+    println!("Throughput: {} requests/s", throughput);
     println!(
         "Latency: p50: {:.3} | p99 {:.3} | p999 {:.3} ms ({:} samples)",
         p50_latency, p99_latency, p999_latency, latency_samples
