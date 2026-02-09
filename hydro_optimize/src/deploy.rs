@@ -92,7 +92,7 @@ impl ReusableHosts {
     fn get_rust_flags(&self) -> String {
         match &self.host_type {
             InitializedHostType::Gcp { .. } | InitializedHostType::Aws { .. } => {
-                "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off -C link-args=--no-rosegment"
+                "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off"
             }
             InitializedHostType::Localhost => {
                 "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off"

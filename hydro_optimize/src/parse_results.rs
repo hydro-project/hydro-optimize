@@ -73,21 +73,14 @@ fn parse_cpu_line(line: &str) -> Option<CPUStats> {
 /// Format: "HH:MM:SS AM/PM IFACE rxpck/s txpck/s rxkB/s txkB/s ..."
 /// Matches eth0, ens5, or any other interface name that isn't "lo".
 fn parse_network_line(line: &str) -> Option<NetworkStats> {
-    // Skip loopback interface
-    if line.contains("lo ") || line.contains("lo\t") {
-        return None;
-    }
-
     // Match any interface: captures interface name followed by numeric stats
-    let iface_regex = Regex::new(
-        r"\s*\d+:\d+:\d+\s+(\S+)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)",
-    )
-    .unwrap();
+    let iface_regex =
+        Regex::new(r"(\S+)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)").unwrap();
 
     iface_regex.captures(line).and_then(|caps| {
         let iface = &caps[1];
         // Skip loopback and header lines
-        if iface == "lo" || iface == "IFACE" {
+        if iface == "lo" || iface == "docker0" || iface == "IFACE" {
             return None;
         }
         let rx_pkt = caps[2].parse::<f64>().ok()?;
