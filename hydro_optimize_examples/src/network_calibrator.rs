@@ -29,8 +29,8 @@ pub fn network_calibrator<'a>(
             // Server just echoes the payload
             payloads
                 .entries()
-                .broadcast(server, TCP.bincode(), nondet!(/** Test */))
-                .demux(clients, TCP.bincode())
+                .broadcast(server, TCP.fail_stop().bincode(), nondet!(/** Test */))
+                .demux(clients, TCP.fail_stop().bincode())
                 .values()
                 .into_keyed()
         },
@@ -38,10 +38,10 @@ pub fn network_calibrator<'a>(
     .values()
     .map(q!(|(_client_id, latency)| latency));
 
-    let bench_results = compute_throughput_latency(clients, latencies, nondet!(/** bench */));
+    let bench_results = compute_throughput_latency(clients, latencies, interval_millis / 10, nondet!(/** bench */));
     let aggregate_results =
-        aggregate_bench_results(bench_results, client_aggregator, clients, interval_millis);
-    print_parseable_bench_results(aggregate_results, interval_millis);
+        aggregate_bench_results(bench_results, client_aggregator, interval_millis);
+    print_parseable_bench_results(aggregate_results);
 }
 
 /// Generates an incrementing u32 for each virtual client ID, starting at 0

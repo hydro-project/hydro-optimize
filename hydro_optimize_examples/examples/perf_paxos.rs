@@ -75,6 +75,7 @@ async fn main() {
         &clients,
         &client_aggregator,
         &replicas,
+        print_result_frequency / 10,
         print_result_frequency,
         pretty_print_bench_results, // Note: Throughput/latency numbers won't be accessible to deploy_and_optimize
     );

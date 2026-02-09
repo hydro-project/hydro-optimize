@@ -12,8 +12,8 @@ use crate::deploy_and_analyze::MetricLogs;
 
 #[derive(Default)]
 pub struct RunMetadata {
-    pub throughput: usize,
-    pub latencies: (f64, f64, f64, u64), // p50, p99, p999, count
+    pub throughputs: Vec<usize>,
+    pub latencies: Vec<(f64, f64, f64, u64)>, // per-second: (p50, p99, p999, count)
     pub send_overhead: HashMap<LocationId, f64>,
     pub recv_overhead: HashMap<LocationId, f64>,
     pub unaccounted_perf: HashMap<LocationId, f64>, // % of perf samples not mapped to any operator
@@ -137,8 +137,8 @@ pub fn parse_sar_output(lines: Vec<String>) -> Vec<SarStats> {
 
 /// Parses throughput output from `print_parseable_bench_results`.
 /// Format: "HYDRO_OPTIMIZE_THR: {throughput} requests/s"
-/// Returns the last throughput value found.
-pub fn parse_throughput(lines: Vec<String>) -> usize {
+/// Returns all per-second throughput values found.
+pub fn parse_throughput(lines: Vec<String>) -> Vec<usize> {
     let regex = Regex::new(r"(\d+\.?\d*)\s*requests/s").unwrap();
     lines
         .iter()
@@ -147,14 +147,13 @@ pub fn parse_throughput(lines: Vec<String>) -> usize {
                 .captures(line)
                 .map(|cap| cap[1].parse::<f64>().unwrap() as usize)
         })
-        .next_back()
-        .unwrap()
+        .collect()
 }
 
 /// Parses latency output from `print_parseable_bench_results`.
 /// Format: "HYDRO_OPTIMIZE_LAT: p50: {p50:.3} | p99 {p99:.3} | p999 {p999:.3} ms ({num_samples} samples)"
-/// Returns the last (p50, p99, p999, num_samples) tuple found.
-pub fn parse_latency(lines: Vec<String>) -> (f64, f64, f64, u64) {
+/// Returns all per-second (p50, p99, p999, num_samples) tuples found.
+pub fn parse_latency(lines: Vec<String>) -> Vec<(f64, f64, f64, u64)> {
     let regex = Regex::new(r"p50:\s*(\d+\.?\d*)\s*\|\s*p99\s+(\d+\.?\d*)\s*\|\s*p999\s+(\d+\.?\d*)\s*ms\s*\((\d+)\s*samples\)").unwrap();
     lines
         .iter()
@@ -168,8 +167,7 @@ pub fn parse_latency(lines: Vec<String>) -> (f64, f64, f64, u64) {
                 )
             })
         })
-        .next_back()
-        .unwrap()
+        .collect()
 }
 
 /// Returns a map from (operator ID, is network receiver) to percentage of total samples, and the percentage of samples that are unaccounted
@@ -420,8 +418,12 @@ pub async fn analyze_cluster_results(
             continue;
         }
 
-        run_metadata.throughput = parse_throughput(throughputs);
-        run_metadata.latencies = parse_latency(drain_receiver(&mut metrics.latencies));
+        run_metadata
+            .throughputs
+            .extend(parse_throughput(throughputs));
+        run_metadata
+            .latencies
+            .extend(parse_latency(drain_receiver(&mut metrics.latencies)));
     }
 
     inject_count(ir, &op_to_count);

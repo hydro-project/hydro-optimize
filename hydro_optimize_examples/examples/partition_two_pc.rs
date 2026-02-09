@@ -60,6 +60,7 @@ async fn main() {
         num_participants,
         &clients,
         &client_aggregator,
+        print_result_frequency / 10,
         print_result_frequency,
         print_parseable_bench_results,
     );

@@ -11,7 +11,7 @@ use hydro_optimize::deploy::{HostType, ReusableHosts};
 use hydro_optimize::deploy_and_analyze::{
     Optimizations, ReusableClusters, ReusableProcesses, deploy_and_optimize,
 };
-use hydro_optimize::parse_results::{RunMetadata, SarStats};
+use hydro_optimize::parse_results::RunMetadata;
 use hydro_optimize_examples::print_parseable_bench_results;
 use hydro_test::cluster::paxos::{CorePaxos, PaxosConfig};
 
@@ -34,71 +34,67 @@ struct BenchmarkArgs {
     aws: bool,
 }
 
-/// Writes per-second CPU and network stats to CSV files for each location
-fn write_sar_csv(
+/// Writes per-second metrics CSV for each location, combining sar stats with
+/// the shared throughput and latency time series.
+fn write_metrics_csv(
     output_dir: &Path,
-    sar_stats: &HashMap<LocationId, Vec<SarStats>>,
+    run_metadata: &RunMetadata,
     location_id_to_cluster: &HashMap<LocationId, String>,
+    num_clients: usize,
+    num_clients_per_node: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(output_dir)?;
 
-    for (location, stats) in sar_stats {
+    for (location, stats) in &run_metadata.sar_stats {
         if stats.is_empty() {
             continue;
         }
 
         let location_name = location_id_to_cluster.get(location).unwrap();
-        let filename = output_dir.join(format!("{}.csv", location_name));
+        let filename = output_dir.join(format!(
+            "{}_{}c_{}vc.csv",
+            location_name, num_clients, num_clients_per_node
+        ));
+        let num_rows = stats
+            .len()
+            .max(run_metadata.throughputs.len())
+            .max(run_metadata.latencies.len());
 
         let mut file = File::create(&filename)?;
         writeln!(
             file,
-            "time_s,cpu_user,cpu_system,cpu_idle,network_tx_packets_per_sec,network_rx_packets_per_sec,network_tx_bytes_per_sec,network_rx_bytes_per_sec",
+            "time_s,cpu_user,cpu_system,cpu_idle,\
+             network_tx_packets_per_sec,network_rx_packets_per_sec,\
+             network_tx_bytes_per_sec,network_rx_bytes_per_sec,\
+             throughput_rps,latency_p50_ms,latency_p99_ms,latency_p999_ms,latency_samples",
         )?;
 
-        for (i, s) in stats.iter().enumerate() {
+        for i in 0..num_rows {
+            let sar = stats.get(i).copied().unwrap_or_default();
+            let thr = run_metadata.throughputs.get(i).copied().unwrap_or(0);
+            let (p50, p99, p999, count) =
+                run_metadata.latencies.get(i).copied().unwrap_or_default();
             writeln!(
                 file,
-                "{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
+                "{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{:.3},{:.3},{:.3},{}",
                 i,
-                s.cpu.user,
-                s.cpu.system,
-                s.cpu.idle,
-                s.network.tx_packets_per_sec,
-                s.network.rx_packets_per_sec,
-                s.network.tx_bytes_per_sec,
-                s.network.rx_bytes_per_sec,
+                sar.cpu.user,
+                sar.cpu.system,
+                sar.cpu.idle,
+                sar.network.tx_packets_per_sec,
+                sar.network.rx_packets_per_sec,
+                sar.network.tx_bytes_per_sec,
+                sar.network.rx_bytes_per_sec,
+                thr,
+                p50,
+                p99,
+                p999,
+                count,
             )?;
         }
 
         println!("Generated CSV: {}", filename.display());
     }
-
-    Ok(())
-}
-
-/// Writes summary stats (throughput, latency) to a text file for each location
-fn write_summary_txt(
-    output_dir: &Path,
-    throughput: usize,
-    latencies: (f64, f64, f64, u64),
-) -> Result<(), Box<dyn std::error::Error>> {
-    fs::create_dir_all(output_dir)?;
-
-    let (p50_latency, p99_latency, p999_latency, latency_samples) = latencies;
-
-    let filename = output_dir.join("summary.txt");
-
-    let mut file = File::create(&filename)?;
-    writeln!(file, "=== Benchmark Summary ===")?;
-    writeln!(file, "Throughput: {} requests/s", throughput)?;
-    writeln!(file)?;
-    writeln!(file, "Latency (ms):")?;
-    writeln!(file, "  p50:  {:.3}", p50_latency)?;
-    writeln!(file, "  p99:  {:.3}", p99_latency)?;
-    writeln!(file, "  p999: {:.3}", p999_latency)?;
-    writeln!(file, "  Samples: {}", latency_samples)?;
-    println!("Generated summary: {}", filename.display());
 
     Ok(())
 }
@@ -110,7 +106,7 @@ async fn run_benchmark(
     num_clients: usize,
     num_clients_per_node: usize,
     run_seconds: usize,
-) -> (RunMetadata, HashMap<LocationId, String>, String) {
+) -> (RunMetadata, HashMap<LocationId, String>) {
     let f = 1;
     let checkpoint_frequency = 1000;
     let i_am_leader_send_timeout = 5;
@@ -136,10 +132,6 @@ async fn run_benchmark(
         (replicas.id(), "replica".to_string()),
         (client_aggregator.id(), "client_aggregator".to_string()),
     ]);
-    let output_dir = format!(
-        "paxos_{}clients_{}virt_{}s",
-        num_clients, num_clients_per_node, run_seconds
-    );
 
     hydro_test::cluster::paxos_bench::paxos_bench(
         num_clients_per_node,
@@ -179,22 +171,25 @@ async fn run_benchmark(
     )
     .await;
 
-    (run_metadata, location_id_to_cluster, output_dir)
+    (run_metadata, location_id_to_cluster)
 }
 
 async fn output_metrics(
     run_metadata: RunMetadata,
     location_id_to_cluster: &HashMap<LocationId, String>,
-    output_dir: String,
+    output_dir: &Path,
+    num_clients: usize,
+    num_clients_per_node: usize,
 ) {
-    let throughput = run_metadata.throughput;
-    let (p50_latency, p99_latency, p999_latency, latency_samples) = run_metadata.latencies;
-
-    println!("Throughput: {} requests/s", throughput);
-    println!(
-        "Latency: p50: {:.3} | p99 {:.3} | p999 {:.3} ms ({:} samples)",
-        p50_latency, p99_latency, p999_latency, latency_samples
-    );
+    if let Some(&throughput) = run_metadata.throughputs.last() {
+        println!("Throughput: {} requests/s", throughput);
+    }
+    if let Some(&(p50, p99, p999, samples)) = run_metadata.latencies.last() {
+        println!(
+            "Latency: p50: {:.3} | p99 {:.3} | p999 {:.3} ms ({} samples)",
+            p50, p99, p999, samples
+        );
+    }
     run_metadata
         .sar_stats
         .iter()
@@ -204,25 +199,19 @@ async fn output_metrics(
                 location_id_to_cluster.get(location).unwrap(),
                 sar_stats
                     .last()
-                    .and_then(|stats| Some(stats.cpu.user + stats.cpu.system))
+                    .map(|stats| stats.cpu.user + stats.cpu.system)
                     .unwrap_or_default()
             )
         });
 
-    // Write CSV and summary files for sar stats
-    if let Err(e) = write_sar_csv(
-        Path::new(&output_dir),
-        &run_metadata.sar_stats,
+    if let Err(e) = write_metrics_csv(
+        output_dir,
+        &run_metadata,
         &location_id_to_cluster,
+        num_clients,
+        num_clients_per_node,
     ) {
         eprintln!("Failed to write CSV: {}", e);
-    }
-    if let Err(e) = write_summary_txt(
-        Path::new(&output_dir),
-        run_metadata.throughput,
-        run_metadata.latencies,
-    ) {
-        eprintln!("Failed to write summary: {}", e);
     }
 }
 
@@ -241,6 +230,14 @@ async fn main() {
 
     let mut reusable_hosts = ReusableHosts::new(host_type);
 
+    let output_dir = Path::new("benchmark_results").join(format!(
+        "paxos_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    ));
+
     // Fixed parameters
     const NUM_CLIENTS: usize = 3;
     const RUN_SECONDS: usize = 30;
@@ -251,7 +248,7 @@ async fn main() {
     let mut high = 200usize;
 
     // First run at low to establish baseline latency
-    let (run_metadata, location_id_to_cluster, output_dir) = run_benchmark(
+    let (run_metadata, location_id_to_cluster) = run_benchmark(
         &mut reusable_hosts,
         &mut deployment,
         NUM_CLIENTS,
@@ -259,13 +256,25 @@ async fn main() {
         RUN_SECONDS,
     )
     .await;
-    let baseline_p99 = run_metadata.latencies.1.max(0.001); // Avoid division by zero
-    output_metrics(run_metadata, &location_id_to_cluster, output_dir).await;
+    let baseline_p99 = run_metadata
+        .latencies
+        .last()
+        .map(|l| l.1)
+        .unwrap_or(0.001)
+        .max(0.001); // Avoid division by zero
+    output_metrics(
+        run_metadata,
+        &location_id_to_cluster,
+        &output_dir,
+        NUM_CLIENTS,
+        low,
+    )
+    .await;
 
     // Binary search to find the point where p99 latency spikes
     while high - low > 10 {
         let mid = (low + high) / 2;
-        let (run_metadata, location_id_to_cluster, output_dir) = run_benchmark(
+        let (run_metadata, location_id_to_cluster) = run_benchmark(
             &mut reusable_hosts,
             &mut deployment,
             NUM_CLIENTS,
@@ -273,8 +282,15 @@ async fn main() {
             RUN_SECONDS,
         )
         .await;
-        let p99_latency = run_metadata.latencies.1;
-        output_metrics(run_metadata, &location_id_to_cluster, output_dir).await;
+        let p99_latency = run_metadata.latencies.last().map(|l| l.1).unwrap_or(0.0);
+        output_metrics(
+            run_metadata,
+            &location_id_to_cluster,
+            &output_dir,
+            NUM_CLIENTS,
+            mid,
+        )
+        .await;
 
         let latency_ratio = p99_latency / baseline_p99;
         println!(
