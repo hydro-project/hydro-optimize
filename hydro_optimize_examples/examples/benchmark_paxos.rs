@@ -241,37 +241,13 @@ async fn main() {
     // Fixed parameters
     const NUM_CLIENTS: usize = 3;
     const RUN_SECONDS: usize = 30;
-    const LATENCY_SPIKE_THRESHOLD: f64 = 2.0; // p99 latency spike = 2x baseline
+    const LATENCY_SPIKE_THRESHOLD: f64 = 3.0; // p99 must be < 3x p50
 
     // Binary search for optimal virtual clients
     let mut low = 1usize;
     let mut high = 200usize;
 
-    // First run at low to establish baseline latency
-    let (run_metadata, location_id_to_cluster) = run_benchmark(
-        &mut reusable_hosts,
-        &mut deployment,
-        NUM_CLIENTS,
-        low,
-        RUN_SECONDS,
-    )
-    .await;
-    let baseline_p99 = run_metadata
-        .latencies
-        .last()
-        .map(|l| l.1)
-        .unwrap_or(0.001)
-        .max(0.001); // Avoid division by zero
-    output_metrics(
-        run_metadata,
-        &location_id_to_cluster,
-        &output_dir,
-        NUM_CLIENTS,
-        low,
-    )
-    .await;
-
-    // Binary search to find the point where p99 latency spikes
+    // Binary search to find the point where p99 latency spikes relative to p50
     while high - low > 10 {
         let mid = (low + high) / 2;
         let (run_metadata, location_id_to_cluster) = run_benchmark(
@@ -282,7 +258,12 @@ async fn main() {
             RUN_SECONDS,
         )
         .await;
-        let p99_latency = run_metadata.latencies.last().map(|l| l.1).unwrap_or(0.0);
+        let (p50, p99) = run_metadata
+            .latencies
+            .last()
+            .map(|l| (l.0, l.1))
+            .unwrap_or((0.001, 0.001));
+        let p50 = p50.max(0.001); // Avoid division by zero
         output_metrics(
             run_metadata,
             &location_id_to_cluster,
@@ -292,10 +273,10 @@ async fn main() {
         )
         .await;
 
-        let latency_ratio = p99_latency / baseline_p99;
+        let latency_ratio = p99 / p50;
         println!(
-            "virtual_clients={}, latency_ratio={:.2}x baseline",
-            mid, latency_ratio
+            "virtual_clients={}, p99/p50={:.2}x (threshold={:.1}x)",
+            mid, latency_ratio, LATENCY_SPIKE_THRESHOLD
         );
 
         if latency_ratio > LATENCY_SPIKE_THRESHOLD {
