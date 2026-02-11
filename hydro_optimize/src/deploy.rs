@@ -97,11 +97,17 @@ impl ReusableHosts {
             InitializedHostType::Localhost => {
                 "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off"
             }
-        }.to_string()
+        }
+        .to_string()
     }
 
-    pub fn get_no_perf_process_hosts(&mut self, deployment: &mut Deployment, display_name: String) -> TrybuildHost {
-        TrybuildHost::new(self.lazy_create_host(deployment, display_name.clone())).rustflags(self.get_rust_flags())
+    pub fn get_no_perf_process_hosts(
+        &mut self,
+        deployment: &mut Deployment,
+        display_name: String,
+    ) -> TrybuildHost {
+        TrybuildHost::new(self.lazy_create_host(deployment, display_name.clone()))
+            .rustflags(self.get_rust_flags())
     }
 
     pub fn get_process_hosts(

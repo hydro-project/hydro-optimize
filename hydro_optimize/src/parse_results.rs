@@ -370,11 +370,6 @@ pub async fn analyze_cluster_results(
                 .iter()
                 .reduce(|(max_usage_idx, max_usage_sar_stat), (idx, sar_stat)| {
                     if let Some(last_stat) = sar_stat.last() {
-                        println!(
-                            "Node {} Usage {}%",
-                            idx,
-                            last_stat.cpu.user + last_stat.cpu.system
-                        );
                         let max_last_stat = max_usage_sar_stat.last().unwrap().cpu;
                         if last_stat.cpu.user + last_stat.cpu.system
                             > max_last_stat.user + max_last_stat.system

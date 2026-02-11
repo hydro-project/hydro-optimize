@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use chrono::Local;
 use clap::{ArgAction, Parser};
 use hydro_deploy::Deployment;
 use hydro_lang::location::Location;
@@ -106,7 +107,7 @@ async fn run_benchmark(
     num_clients: usize,
     num_clients_per_node: usize,
     run_seconds: usize,
-) -> (RunMetadata, HashMap<LocationId, String>) {
+) -> (RunMetadata, HashMap<LocationId, String>, PathBuf) {
     let f = 1;
     let checkpoint_frequency = 1000;
     let i_am_leader_send_timeout = 5;
@@ -171,7 +172,12 @@ async fn run_benchmark(
     )
     .await;
 
-    (run_metadata, location_id_to_cluster)
+    let output_dir = Path::new("benchmark_results").join(format!(
+        "paxos_{}",
+        Local::now().format("%Y-%m-%d_%H-%M-%S")
+    ));
+
+    (run_metadata, location_id_to_cluster, output_dir)
 }
 
 async fn output_metrics(
@@ -180,14 +186,23 @@ async fn output_metrics(
     output_dir: &Path,
     num_clients: usize,
     num_clients_per_node: usize,
+    measurement_second: usize,
 ) {
-    if let Some(&throughput) = run_metadata.throughputs.last() {
-        println!("Throughput: {} requests/s", throughput);
-    }
-    if let Some(&(p50, p99, p999, samples)) = run_metadata.latencies.last() {
+    if let Some(&throughput) = run_metadata.throughputs.get(measurement_second) {
         println!(
-            "Latency: p50: {:.3} | p99 {:.3} | p999 {:.3} ms ({} samples)",
-            p50, p99, p999, samples
+            "Throughput @{}s: {} requests/s",
+            measurement_second + 1,
+            throughput
+        );
+    }
+    if let Some(&(p50, p99, p999, samples)) = run_metadata.latencies.get(measurement_second) {
+        println!(
+            "Latency @{}s: p50: {:.3} | p99 {:.3} | p999 {:.3} ms ({} samples)",
+            measurement_second + 1,
+            p50,
+            p99,
+            p999,
+            samples
         );
     }
     run_metadata
@@ -230,65 +245,92 @@ async fn main() {
 
     let mut reusable_hosts = ReusableHosts::new(host_type);
 
-    let output_dir = Path::new("benchmark_results").join(format!(
-        "paxos_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-    ));
+    const MEASUREMENT_SECOND: usize = 59;
+    const RUN_SECONDS: usize = 90;
+    const PHYSICAL_CLIENTS_MIN: usize = 1;
+    const PHYSICAL_CLIENTS_MAX: usize = 10;
+    const VIRTUAL_CLIENTS_MIN: usize = 1;
+    const VIRTUAL_CLIENTS_MAX: usize = 201;
+    const VIRTUAL_CLIENTS_STEP: usize = 50;
 
-    // Fixed parameters
-    const NUM_CLIENTS: usize = 3;
-    const RUN_SECONDS: usize = 30;
-    const LATENCY_SPIKE_THRESHOLD: f64 = 3.0; // p99 must be < 3x p50
+    let mut best_throughput: usize = 0;
+    let mut best_config: (usize, usize) = (0, 0);
+    let mut output_dir = None;
 
-    // Binary search for optimal virtual clients
-    let mut low = 1usize;
-    let mut high = 200usize;
+    'outer: for num_clients in (PHYSICAL_CLIENTS_MIN..=PHYSICAL_CLIENTS_MAX).step_by(1) {
+        let mut prev_throughput: Option<usize> = None;
+        let best_before_round = best_throughput;
 
-    // Binary search to find the point where p99 latency spikes relative to p50
-    while high - low > 10 {
-        let mid = (low + high) / 2;
-        let (run_metadata, location_id_to_cluster) = run_benchmark(
-            &mut reusable_hosts,
-            &mut deployment,
-            NUM_CLIENTS,
-            mid,
-            RUN_SECONDS,
-        )
-        .await;
-        let (p50, p99) = run_metadata
-            .latencies
-            .last()
-            .map(|l| (l.0, l.1))
-            .unwrap_or((0.001, 0.001));
-        let p50 = p50.max(0.001); // Avoid division by zero
-        output_metrics(
-            run_metadata,
-            &location_id_to_cluster,
-            &output_dir,
-            NUM_CLIENTS,
-            mid,
-        )
-        .await;
+        for num_virtual in (VIRTUAL_CLIENTS_MIN..=VIRTUAL_CLIENTS_MAX).step_by(VIRTUAL_CLIENTS_STEP)
+        {
+            let (run_metadata, location_id_to_cluster, new_output_dir) = run_benchmark(
+                &mut reusable_hosts,
+                &mut deployment,
+                num_clients,
+                num_virtual,
+                RUN_SECONDS,
+            )
+            .await;
 
-        let latency_ratio = p99 / p50;
-        println!(
-            "virtual_clients={}, p99/p50={:.2}x (threshold={:.1}x)",
-            mid, latency_ratio, LATENCY_SPIKE_THRESHOLD
-        );
+            let output_dir = output_dir.get_or_insert(new_output_dir);
 
-        if latency_ratio > LATENCY_SPIKE_THRESHOLD {
-            // Latency spiked, search lower
-            high = mid;
-        } else {
-            // Latency acceptable, search higher
-            low = mid;
+            let current_throughput = run_metadata.throughputs[MEASUREMENT_SECOND];
+            println!(
+                "physical_clients={}, virtual_clients={}, throughput@{}s={}",
+                num_clients,
+                num_virtual,
+                MEASUREMENT_SECOND + 1,
+                current_throughput
+            );
+
+            output_metrics(
+                run_metadata,
+                &location_id_to_cluster,
+                output_dir,
+                num_clients,
+                num_virtual,
+                MEASUREMENT_SECOND,
+            )
+            .await;
+
+            if current_throughput > best_throughput {
+                best_throughput = current_throughput;
+                best_config = (num_clients, num_virtual);
+            }
+
+            // Check saturation against the previous virtual-client run
+            if let Some(prev) = prev_throughput {
+                if current_throughput <= prev {
+                    println!(
+                        "Throughput saturated for {} physical clients \
+                         ({}→{} rps). Moving to next physical client count.",
+                        num_clients, prev, current_throughput
+                    );
+                    break; // break inner loop, increase physical clients
+                }
+            }
+
+            prev_throughput = Some(current_throughput);
+        }
+
+        // After increasing physical clients, check if we're still saturated
+        // compared to the best throughput *before* this round. If this round
+        // didn't improve on the prior best, more physical clients won't help.
+        if let Some(prev) = prev_throughput {
+            if prev <= best_before_round && num_clients > PHYSICAL_CLIENTS_MIN {
+                println!(
+                    "Throughput still saturated after increasing physical clients \
+                     (prior best={}, current_peak={}). Stopping search.",
+                    best_before_round, prev
+                );
+                break 'outer;
+            }
         }
     }
 
-    // Print summary
     println!("\n=== Benchmark Summary ===");
-    println!("Optimal virtual clients: low {} high {} ", low, high);
+    println!(
+        "Best throughput: {} rps with {} physical clients and {} virtual clients",
+        best_throughput, best_config.0, best_config.1
+    );
 }

@@ -18,6 +18,7 @@ stageleft.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+chrono = "0.4"
 ctor.workspace = true
 clap.workspace = true
 dfir_lang.workspace = true
