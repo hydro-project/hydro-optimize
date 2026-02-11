@@ -249,20 +249,29 @@ async fn main() {
     const RUN_SECONDS: usize = 90;
     const PHYSICAL_CLIENTS_MIN: usize = 1;
     const PHYSICAL_CLIENTS_MAX: usize = 10;
-    const VIRTUAL_CLIENTS_MIN: usize = 1;
-    const VIRTUAL_CLIENTS_MAX: usize = 201;
     const VIRTUAL_CLIENTS_STEP: usize = 50;
 
     let mut best_throughput: usize = 0;
     let mut best_config: (usize, usize) = (0, 0);
     let mut output_dir = None;
+    // Total virtual clients (physical × per-node) that saturated the previous
+    // physical-client round. Used to pick the starting per-node count for the
+    // next round so we don't re-explore the low end of the curve.
+    let mut saturated_total_virtual: Option<usize> = None;
 
     'outer: for num_clients in (PHYSICAL_CLIENTS_MIN..=PHYSICAL_CLIENTS_MAX).step_by(1) {
         let mut prev_throughput: Option<usize> = None;
         let best_before_round = best_throughput;
 
-        for num_virtual in (VIRTUAL_CLIENTS_MIN..=VIRTUAL_CLIENTS_MAX).step_by(VIRTUAL_CLIENTS_STEP)
-        {
+        // Start at the per-node count that yields roughly the same total
+        // virtual clients as the previous round's saturation point, rounded
+        // down to the nearest step (minimum 1).
+        let virtual_start = saturated_total_virtual
+            .map(|total| (total / num_clients).max(1))
+            .unwrap_or(1);
+
+        let mut num_virtual = virtual_start;
+        loop {
             let (run_metadata, location_id_to_cluster, new_output_dir) = run_benchmark(
                 &mut reusable_hosts,
                 &mut deployment,
@@ -306,11 +315,13 @@ async fn main() {
                          ({}→{} rps). Moving to next physical client count.",
                         num_clients, prev, current_throughput
                     );
+                    saturated_total_virtual = Some(num_clients * num_virtual);
                     break; // break inner loop, increase physical clients
                 }
             }
 
             prev_throughput = Some(current_throughput);
+            num_virtual += VIRTUAL_CLIENTS_STEP;
         }
 
         // After increasing physical clients, check if we're still saturated
