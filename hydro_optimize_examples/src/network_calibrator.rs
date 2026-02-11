@@ -38,7 +38,12 @@ pub fn network_calibrator<'a>(
     .values()
     .map(q!(|(_client_id, latency)| latency));
 
-    let bench_results = compute_throughput_latency(clients, latencies, interval_millis / 10, nondet!(/** bench */));
+    let bench_results = compute_throughput_latency(
+        clients,
+        latencies,
+        interval_millis / 10,
+        nondet!(/** bench */),
+    );
     let aggregate_results =
         aggregate_bench_results(bench_results, client_aggregator, interval_millis);
     print_parseable_bench_results(aggregate_results);

@@ -47,6 +47,8 @@ async fn main() {
     let num_clients = 3;
     let num_clients_per_node = 100;
     let print_result_frequency = 1000; // Millis
+    let run_seconds = 90;
+    let measurement_second = 60;
 
     let coordinator = builder.process();
     let participants = builder.cluster();
@@ -79,7 +81,8 @@ async fn main() {
             .with_partitioning()
             .excluding::<Client>()
             .excluding::<Aggregator>(),
-        None,
+        Some(run_seconds),
+        Some(measurement_second),
     )
     .await;
 }

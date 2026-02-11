@@ -193,6 +193,13 @@ impl ReusableClusters {
         ));
         self
     }
+
+    fn location_name_and_num(&self, location: &LocationId) -> Option<(String, usize)> {
+        self.named_clusters
+            .iter()
+            .find(|(key, _, _)| location.key() == *key)
+            .map(|(_, name, count)| (name.clone(), *count))
+    }
 }
 
 #[derive(Default)]
@@ -205,6 +212,13 @@ impl ReusableProcesses {
         self.named_processes
             .push((process.id().key(), std::any::type_name::<P>().to_string()));
         self
+    }
+
+    fn location_name(&self, location: &LocationId) -> Option<String> {
+        self.named_processes
+            .iter()
+            .find(|(key, _)| &location.key() == key)
+            .map(|(_, name)| name.clone())
     }
 }
 
@@ -249,6 +263,7 @@ impl Optimizations {
     }
 }
 
+/// `stability_second`: The second in which the protocol is expected to be stable, and its performance can be used as the basis for optimization.
 pub async fn deploy_and_optimize<'a>(
     reusable_hosts: &mut ReusableHosts,
     deployment: &mut Deployment,
@@ -257,9 +272,23 @@ pub async fn deploy_and_optimize<'a>(
     processes: ReusableProcesses,
     optimizations: Optimizations,
     num_seconds: Option<usize>,
+    stability_second: Option<usize>,
 ) -> RunMetadata {
-    if optimizations.iterations > 1 && num_seconds.is_none() {
-        panic!("Cannot specify multiple iterations without bounding run time");
+    assert!(
+        optimizations.iterations < 1 || num_seconds.is_some(),
+        "Cannot specify multiple iterations without bounding run time"
+    );
+    if let Some(num_seconds) = num_seconds {
+        assert!(
+            stability_second.is_some_and(|stability_time| stability_time < num_seconds),
+            "Invariant: stability_second < num_seconds"
+        );
+    }
+    if optimizations.decoupling || optimizations.partitioning {
+        assert!(
+            stability_second.is_some(),
+            "Must select stability_second with optimizations"
+        );
     }
 
     let counter_output_duration =
@@ -328,32 +357,39 @@ pub async fn deploy_and_optimize<'a>(
         remove_counter(&mut ir);
 
         // Create a mapping from each CycleSink to its corresponding CycleSource
-        // let cycle_source_to_sink_input = cycle_source_to_sink_input(&mut ir);
+        let cycle_source_to_sink_input = cycle_source_to_sink_input(&mut ir);
 
-        // if optimizations.decoupling {
-        //     let decision = decouple_analysis(
-        //         &mut ir,
-        //         &bottleneck,
-        //         send_overhead,
-        //         recv_overhead,
-        //         &cycle_source_to_sink_input,
-        //     );
+        if optimizations.decoupling {
+            let bottleneck = run_metadata.cpu_bottleneck(stability_second.unwrap());
+            // The bottleneck is either a process or cluster. Panic otherwise.
+            let (bottleneck_name, bottleneck_num_nodes) = processes
+                .location_name(&bottleneck)
+                .and_then(|name| Some((name, 1)))
+                .unwrap_or_else(|| clusters.location_name_and_num(&bottleneck).unwrap());
 
-        //     // Apply decoupling
-        //     let new_cluster = post_rewrite_builder.cluster::<()>();
-        //     let decouple_with_location = Decoupler {
-        //         decision,
-        //         orig_location: bottleneck,
-        //         decoupled_location: new_cluster.id().clone(),
-        //     };
-        //     decoupler::decouple(&mut ir, &decouple_with_location);
-        //     clusters.named_clusters.push((
-        //         new_cluster.id().key(),
-        //         format!("{}-decouple-{}", bottleneck_name, iteration),
-        //         bottleneck_num_nodes,
-        //     ));
-        //     // TODO: Save decoupling decision to file
-        // }
+            let decision = decouple_analysis(
+                &mut ir,
+                &bottleneck,
+                0.01, // TODO: Deprecate use of send/recv overheads, since they are inaccurate anyway
+                0.01,
+                &cycle_source_to_sink_input,
+            );
+
+            // Apply decoupling
+            let new_cluster = post_rewrite_builder.cluster::<()>();
+            let decouple_with_location = Decoupler {
+                decision,
+                orig_location: bottleneck,
+                decoupled_location: new_cluster.id().clone(),
+            };
+            decoupler::decouple(&mut ir, &decouple_with_location);
+            clusters.named_clusters.push((
+                new_cluster.id().key(),
+                format!("{}-decouple-{}", bottleneck_name, iteration),
+                bottleneck_num_nodes,
+            ));
+            // TODO: Save decoupling decision to file
+        }
 
         post_rewrite_builder.replace_ir(ir);
         builder = post_rewrite_builder.finalize();

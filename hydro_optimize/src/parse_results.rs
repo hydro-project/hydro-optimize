@@ -20,6 +20,48 @@ pub struct RunMetadata {
     pub sar_stats: HashMap<LocationId, Vec<SarStats>>,
 }
 
+impl RunMetadata {
+    /// Returns the location of the bottlenecked node by comparing CPU usages at `measurement_sec`.
+    /// Panics if no sar_stats exist for the given `measurement_sec`
+    pub fn cpu_bottleneck(&self, measurement_sec: usize) -> LocationId {
+        let (loc, _stats) = self
+            .sar_stats
+            .iter()
+            .reduce(|(max_loc, max_stats), (curr_loc, curr_stats)| {
+                let max_cpu = max_stats[measurement_sec].cpu;
+                let curr_cpu = curr_stats[measurement_sec].cpu;
+                if max_cpu.system + max_cpu.user < curr_cpu.system + curr_cpu.user {
+                    (curr_loc, curr_stats)
+                } else {
+                    (max_loc, max_stats)
+                }
+            })
+            .unwrap();
+        loc.clone()
+    }
+
+    /// Returns the location of the bottlenecked node by comparing network usage at `measurement_sec`.
+    /// Panics if no sar_stats exist for the given `measurement_sec`
+    pub fn network_bottlenck(&self, measurement_sec: usize) -> LocationId {
+        let (loc, _stats) = self
+            .sar_stats
+            .iter()
+            .reduce(|(max_loc, max_stats), (curr_loc, curr_stats)| {
+                let max_network = max_stats[measurement_sec].network;
+                let curr_network = curr_stats[measurement_sec].network;
+                if max_network.rx_bytes_per_sec + max_network.tx_bytes_per_sec
+                    < curr_network.rx_bytes_per_sec + curr_network.tx_bytes_per_sec
+                {
+                    (curr_loc, curr_stats)
+                } else {
+                    (max_loc, max_stats)
+                }
+            })
+            .unwrap();
+        loc.clone()
+    }
+}
+
 pub fn parse_cpu_usage(measurement: String) -> f64 {
     let regex = Regex::new(r"Total (\d+\.\d+)%").unwrap();
     regex

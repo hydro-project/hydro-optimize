@@ -84,6 +84,7 @@ async fn main() {
     let mut reusable_hosts = ReusableHosts::new(host_type);
     let num_times_to_optimize = 2;
     let run_seconds = 30;
+    let measurement_second = 29;
 
     deploy_and_optimize(
         &mut reusable_hosts,
@@ -101,6 +102,7 @@ async fn main() {
             .excluding::<Aggregator>()
             .with_iterations(num_times_to_optimize),
         Some(run_seconds),
+        Some(measurement_second),
     )
     .await;
 }

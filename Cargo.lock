@@ -2110,6 +2110,7 @@ dependencies = [
 name = "hydro_optimize_examples"
 version = "0.0.0"
 dependencies = [
+ "chrono",
  "clap",
  "ctor 0.2.9",
  "dfir_lang",

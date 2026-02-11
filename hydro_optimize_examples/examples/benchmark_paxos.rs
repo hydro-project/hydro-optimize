@@ -107,6 +107,7 @@ async fn run_benchmark(
     num_clients: usize,
     num_clients_per_node: usize,
     run_seconds: usize,
+    measurement_second: usize,
 ) -> (RunMetadata, HashMap<LocationId, String>, PathBuf) {
     let f = 1;
     let checkpoint_frequency = 1000;
@@ -169,6 +170,7 @@ async fn run_benchmark(
         ReusableProcesses::default().with_process(client_aggregator),
         Optimizations::default(),
         Some(run_seconds),
+        Some(measurement_second),
     )
     .await;
 
@@ -278,6 +280,7 @@ async fn main() {
                 num_clients,
                 num_virtual,
                 RUN_SECONDS,
+                MEASUREMENT_SECOND,
             )
             .await;
 
