@@ -28,7 +28,7 @@ pub fn simple_kv_bench<'a>(
         |input| {
             let k_tick = kv.tick();
             // Use atomic to prevent outputting to the client before values are inserted to the KV store
-            let k_payloads = input.send(kv, TCP.bincode()).atomic(&k_tick);
+            let k_payloads = input.send(kv, TCP.fail_stop().bincode()).atomic(&k_tick);
 
             let for_each_tick = kv.tick();
             // Insert each payload into the KV store
@@ -55,16 +55,23 @@ pub fn simple_kv_bench<'a>(
                 .for_each(q!(|_| {})); // Do nothing, just need to end on a HydroRoot
 
             // Send committed requests back to the original client
-            k_payloads.end_atomic().demux(clients, TCP.bincode())
+            k_payloads
+                .end_atomic()
+                .demux(clients, TCP.fail_stop().bincode())
         },
     )
     .values()
     .map(q!(|(_value, latency)| latency));
 
-    let bench_results = compute_throughput_latency(clients, latencies, nondet!(/** bench */));
+    let bench_results = compute_throughput_latency(
+        clients,
+        latencies,
+        interval_millis / 10,
+        nondet!(/** bench */),
+    );
     let aggregate_results =
-        aggregate_bench_results(bench_results, client_aggregator, clients, interval_millis);
-    print_parseable_bench_results(aggregate_results, interval_millis);
+        aggregate_bench_results(bench_results, client_aggregator, interval_millis);
+    print_parseable_bench_results(aggregate_results);
 }
 
 #[cfg(test)]

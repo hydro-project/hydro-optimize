@@ -5,3 +5,7 @@ scripts/*.png
 
 # I'll output the results of cargo run to these files
 *.results.txt
+.hydro
+out.txt
+out2.txt
+benchmark_results/

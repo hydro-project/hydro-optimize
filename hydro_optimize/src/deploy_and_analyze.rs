@@ -17,13 +17,13 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use crate::decouple_analysis::decouple_analysis;
 use crate::decoupler::{self, Decoupler};
 use crate::deploy::ReusableHosts;
-use crate::parse_results::{RunMetadata, analyze_cluster_results, analyze_send_recv_overheads};
+use crate::parse_results::{RunMetadata, analyze_cluster_results};
 use crate::repair::{cycle_source_to_sink_input, inject_id, remove_counter};
 
 pub(crate) const METRIC_INTERVAL_SECS: u64 = 1;
 const COUNTER_PREFIX: &str = "_optimize_counter";
 pub(crate) const CPU_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_CPU:";
-pub(crate) const NETWORK_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_NET:";
+pub(crate) const SAR_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_SAR:";
 pub(crate) const LATENCY_PREFIX: &str = "HYDRO_OPTIMIZE_LAT:";
 pub(crate) const THROUGHPUT_PREFIX: &str = "HYDRO_OPTIMIZE_THR:";
 
@@ -105,7 +105,7 @@ pub struct MetricLogs {
     pub throughputs: UnboundedReceiver<String>,
     pub latencies: UnboundedReceiver<String>,
     pub cpu: UnboundedReceiver<String>,
-    pub network: UnboundedReceiver<String>,
+    pub sar: UnboundedReceiver<String>,
     pub counters: UnboundedReceiver<String>,
 }
 
@@ -114,7 +114,7 @@ async fn track_process_metrics(process: &impl DeployCrateWrapper) -> MetricLogs 
         throughputs: process.stdout_filter(THROUGHPUT_PREFIX),
         latencies: process.stdout_filter(LATENCY_PREFIX),
         cpu: process.stdout_filter(CPU_USAGE_PREFIX),
-        network: process.stdout_filter(NETWORK_USAGE_PREFIX),
+        sar: process.stdout_filter(SAR_USAGE_PREFIX),
         counters: process.stdout_filter(COUNTER_PREFIX),
     }
 }
@@ -193,6 +193,13 @@ impl ReusableClusters {
         ));
         self
     }
+
+    fn location_name_and_num(&self, location: &LocationId) -> Option<(String, usize)> {
+        self.named_clusters
+            .iter()
+            .find(|(key, _, _)| location.key() == *key)
+            .map(|(_, name, count)| (name.clone(), *count))
+    }
 }
 
 #[derive(Default)]
@@ -205,6 +212,13 @@ impl ReusableProcesses {
         self.named_processes
             .push((process.id().key(), std::any::type_name::<P>().to_string()));
         self
+    }
+
+    fn location_name(&self, location: &LocationId) -> Option<String> {
+        self.named_processes
+            .iter()
+            .find(|(key, _)| &location.key() == key)
+            .map(|(_, name)| name.clone())
     }
 }
 
@@ -249,6 +263,8 @@ impl Optimizations {
     }
 }
 
+/// `stability_second`: The second in which the protocol is expected to be stable, and its performance can be used as the basis for optimization.
+#[allow(clippy::too_many_arguments)]
 pub async fn deploy_and_optimize<'a>(
     reusable_hosts: &mut ReusableHosts,
     deployment: &mut Deployment,
@@ -257,9 +273,23 @@ pub async fn deploy_and_optimize<'a>(
     processes: ReusableProcesses,
     optimizations: Optimizations,
     num_seconds: Option<usize>,
+    stability_second: Option<usize>,
 ) -> RunMetadata {
-    if optimizations.iterations > 1 && num_seconds.is_none() {
-        panic!("Cannot specify multiple iterations without bounding run time");
+    assert!(
+        optimizations.iterations < 1 || num_seconds.is_some(),
+        "Cannot specify multiple iterations without bounding run time"
+    );
+    if let Some(num_seconds) = num_seconds {
+        assert!(
+            stability_second.is_some_and(|stability_time| stability_time < num_seconds),
+            "Invariant: stability_second < num_seconds"
+        );
+    }
+    if optimizations.decoupling || optimizations.partitioning {
+        assert!(
+            stability_second.is_some(),
+            "Must select stability_second with optimizations"
+        );
     }
 
     let counter_output_duration =
@@ -286,15 +316,17 @@ pub async fn deploy_and_optimize<'a>(
         for (process_id, name) in processes.named_processes.iter() {
             deployable = deployable.with_process_erased(
                 *process_id,
-                reusable_hosts.get_process_hosts(deployment, name.clone()),
+                reusable_hosts.get_no_perf_process_hosts(deployment, name.clone()),
             );
         }
-        let network_sidecar = ScriptSidecar {
-            script: "sar -n DEV 1".to_string(),
-            prefix: NETWORK_USAGE_PREFIX.to_string(),
+
+        // Measure network (-n DEV) and CPU (-u) usage
+        let sar_sidecar = ScriptSidecar {
+            script: "sar -n DEV -u 1".to_string(),
+            prefix: SAR_USAGE_PREFIX.to_string(),
         };
         let nodes = deployable
-            .with_sidecar_all(&network_sidecar) // Measure network usage
+            .with_sidecar_all(&sar_sidecar) // Measure network usage
             .deploy(deployment);
         deployment.deploy().await.unwrap();
 
@@ -320,41 +352,27 @@ pub async fn deploy_and_optimize<'a>(
             .await
             .unwrap();
 
-        // Add metadata for this run, clearing the metadata from the previous run
-        run_metadata = RunMetadata::default();
-        let (bottleneck, bottleneck_name, bottleneck_num_nodes) = analyze_cluster_results(
-            &nodes,
-            &mut ir,
-            metrics,
-            &mut run_metadata,
-            &optimizations.exclude,
-        )
-        .await;
+        // Parse results to get metrics
+        run_metadata = analyze_cluster_results(&nodes, &mut ir, metrics).await;
         // Remove HydroNode::Counter (since we don't want to consider decoupling those)
         remove_counter(&mut ir);
 
         // Create a mapping from each CycleSink to its corresponding CycleSource
         let cycle_source_to_sink_input = cycle_source_to_sink_input(&mut ir);
-        analyze_send_recv_overheads(&mut ir, &mut run_metadata);
-        let send_overhead = run_metadata
-            .send_overhead
-            .get(&bottleneck)
-            .cloned()
-            .unwrap_or_default();
-        let recv_overhead = run_metadata
-            .recv_overhead
-            .get(&bottleneck)
-            .cloned()
-            .unwrap_or_default();
-
-        // TODO: Output overheads to file
 
         if optimizations.decoupling {
+            let bottleneck = run_metadata.cpu_bottleneck(stability_second.unwrap());
+            // The bottleneck is either a process or cluster. Panic otherwise.
+            let (bottleneck_name, bottleneck_num_nodes) = processes
+                .location_name(&bottleneck)
+                .map(|name| (name, 1))
+                .unwrap_or_else(|| clusters.location_name_and_num(&bottleneck).unwrap());
+
             let decision = decouple_analysis(
                 &mut ir,
                 &bottleneck,
-                send_overhead,
-                recv_overhead,
+                0.01, // TODO: Deprecate use of send/recv overheads, since they are inaccurate anyway
+                0.01,
                 &cycle_source_to_sink_input,
             );
 

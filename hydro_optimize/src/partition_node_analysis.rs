@@ -798,7 +798,7 @@ mod tests {
         let cluster2 = builder.cluster::<()>();
         cluster1
             .source_iter(q!([(1, 2)]))
-            .broadcast(&cluster2, TCP.bincode(), nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values()
             .map(q!(|(a, b)| (b, a + 2)))
             .assume_ordering(nondet!(/** test */))
@@ -817,7 +817,7 @@ mod tests {
         let cluster2 = builder.cluster::<()>();
         cluster1
             .source_iter(q!([(1, (2, (3, 4)))]))
-            .broadcast(&cluster2, TCP.bincode(), nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values()
             .map(q!(|(a, b)| (b.1, a, b.0 - a)))
             .map(q!(|(b1, _a, b0a)| (b0a, b1.0)))
@@ -837,7 +837,7 @@ mod tests {
         let cluster2 = builder.cluster::<()>();
         cluster1
             .source_iter(q!([(1, 2)]))
-            .broadcast(&cluster2, TCP.bincode(), nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values()
             .filter_map(q!(|(a, b)| { if a > 1 { Some((b, a + 2)) } else { None } }))
             .assume_ordering(nondet!(/** test */))
@@ -856,7 +856,7 @@ mod tests {
         let cluster2 = builder.cluster::<()>();
         cluster1
             .source_iter(q!([(1, 2)]))
-            .broadcast(&cluster2, TCP.bincode(), nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values()
             .filter_map(q!(|(a, b)| {
                 if a > 1 {
@@ -883,7 +883,7 @@ mod tests {
         let cluster2 = builder.cluster::<()>();
         let input = cluster1
             .source_iter(q!([(1, (2, 3))]))
-            .broadcast(&cluster2, TCP.bincode(), nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values();
         let stream1 = input.clone().map(q!(|(a, b)| (b, a + 2)));
         let stream2 = input.map(q!(|(a, b)| ((b.1, b.1), a + 3)));
@@ -908,7 +908,7 @@ mod tests {
         let cluster2 = builder.cluster::<()>();
         let input = cluster1
             .source_iter(q!([(1, (2, 3))]))
-            .broadcast(&cluster2, TCP.bincode(), nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values();
         let stream1 = input.clone().map(q!(|(a, b)| (b, a + 2)));
         let stream2 = input.map(q!(|(a, b)| ((b.1, b.1), a + 3)));
@@ -933,7 +933,7 @@ mod tests {
         let cluster2 = builder.cluster::<()>();
         let input = cluster1
             .source_iter(q!([(1, (2, 3))]))
-            .broadcast(&cluster2, TCP.bincode(), nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .ir_node_named("network")
             .values();
         let stream1 = input.clone().map(q!(|(a, b)| (b, a)));
@@ -959,7 +959,7 @@ mod tests {
         let cluster2 = builder.cluster::<()>();
         cluster1
             .source_iter(q!([(1, 2)]))
-            .broadcast(&cluster2, TCP.bincode(), nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values()
             .assume_ordering(nondet!(/** test */))
             .enumerate()
@@ -977,7 +977,7 @@ mod tests {
         let cluster2 = builder.cluster::<()>();
         cluster1
             .source_iter(q!([(1, 2)]))
-            .broadcast(&cluster2, TCP.bincode(), nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .ir_node_named("network")
             .values()
             .batch(&cluster2.tick(), nondet!(/** test */))
@@ -1004,7 +1004,7 @@ mod tests {
         let cluster2 = builder.cluster::<()>();
         cluster1
             .source_iter(q!([(1, 2)]))
-            .broadcast(&cluster2, TCP.bincode(), nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values()
             .batch(&cluster2.tick(), nondet!(/** test */))
             .reduce(q!(
@@ -1029,7 +1029,7 @@ mod tests {
         let cluster2 = builder.cluster::<()>();
         let input = cluster1
             .source_iter(q!([(1, 2)]))
-            .broadcast(&cluster2, TCP.bincode(), nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values();
         let cluster2_tick = cluster2.tick();
         let (complete_cycle, cycle) =
@@ -1060,7 +1060,7 @@ mod tests {
         let cluster2 = builder.cluster::<()>();
         let input = cluster1
             .source_iter(q!([(1, 2)]))
-            .broadcast(&cluster2, TCP.bincode(), nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .ir_node_named("network")
             .values();
         let cluster2_tick = cluster2.tick();
@@ -1095,7 +1095,7 @@ mod tests {
         let cluster2 = builder.cluster::<()>();
         let input = cluster1
             .source_iter(q!([(1, 2)]))
-            .broadcast(&cluster2, TCP.bincode(), nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values();
         let tick = cluster2.tick();
         let stream1 = input.map(q!(|(a, b)| (b, a + 2)));
@@ -1120,12 +1120,12 @@ mod tests {
         let cluster2 = builder.cluster::<()>();
         let input1 = cluster1
             .source_iter(q!([(1, 2)]))
-            .broadcast(&cluster2, TCP.bincode(), nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .ir_node_named("input1")
             .values();
         let input2 = cluster1
             .source_iter(q!([(3, 4)]))
-            .broadcast(&cluster2, TCP.bincode(), nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .ir_node_named("input2")
             .values();
         let tick = cluster2.tick();
@@ -1163,12 +1163,12 @@ mod tests {
         let cluster2 = builder.cluster::<()>();
         let input1 = cluster1
             .source_iter(q!([(1, 2)]))
-            .broadcast(&cluster2, TCP.bincode(), nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .ir_node_named("input1")
             .values();
         let input2 = cluster1
             .source_iter(q!([(3, 4)]))
-            .broadcast(&cluster2, TCP.bincode(), nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .ir_node_named("input2")
             .values();
         let tick = cluster2.tick();

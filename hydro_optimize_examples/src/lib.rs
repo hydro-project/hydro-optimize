@@ -7,8 +7,8 @@ pub mod simple_kv_bench;
 // pub mod lobsters;
 // pub mod web_submit;
 
-use hdrhistogram::Histogram;
-use hydro_std::bench_client::{AggregateBenchResult, rolling_average::RollingAverage};
+use hydro_lang::prelude::Process;
+use hydro_std::bench_client::BenchResult;
 use stageleft::q;
 use std::time::Duration;
 
@@ -18,43 +18,24 @@ pub(crate) const LATENCY_PREFIX: &str = "HYDRO_OPTIMIZE_LAT:";
 pub(crate) const THROUGHPUT_PREFIX: &str = "HYDRO_OPTIMIZE_THR:";
 
 pub fn print_parseable_bench_results<'a, Aggregator>(
-    aggregate_results: AggregateBenchResult<'a, Aggregator>,
-    interval_millis: u64,
+    aggregate_results: BenchResult<Process<'a, Aggregator>>,
 ) {
+    aggregate_results.throughput.for_each(q!(move |throughput| {
+        println!("{} {} requests/s", THROUGHPUT_PREFIX, throughput);
+    }));
     aggregate_results
-        .throughput
-        .filter_map(q!(move |(throughputs, num_client_machines): (
-            RollingAverage,
-            usize
-        )| {
-            if let Some((lower, upper)) = throughputs.confidence_interval_99() {
-                Some((
-                    lower * num_client_machines as f64,
-                    throughputs.sample_mean() * num_client_machines as f64,
-                    upper * num_client_machines as f64,
-                ))
-            } else {
-                None
-            }
-        }))
-        .for_each(q!(move |(lower, mean, upper)| {
-            println!(
-                "{} {:.2} - {:.2} - {:.2} requests/s",
-                THROUGHPUT_PREFIX, lower, mean, upper,
+        .latency_histogram
+        .for_each(q!(move |latencies| {
+            let (p50, p99, p999, num_samples) = (
+                Duration::from_nanos(latencies.borrow().value_at_quantile(0.5)).as_micros() as f64
+                    / 1000.0,
+                Duration::from_nanos(latencies.borrow().value_at_quantile(0.99)).as_micros() as f64
+                    / 1000.0,
+                Duration::from_nanos(latencies.borrow().value_at_quantile(0.999)).as_micros()
+                    as f64
+                    / 1000.0,
+                latencies.borrow().len(),
             );
-        }));
-    aggregate_results
-        .latency
-        .map(q!(move |latencies: Histogram<u64>| (
-            Duration::from_nanos(latencies.value_at_quantile(0.5)).as_micros() as f64
-                / interval_millis as f64,
-            Duration::from_nanos(latencies.value_at_quantile(0.99)).as_micros() as f64
-                / interval_millis as f64,
-            Duration::from_nanos(latencies.value_at_quantile(0.999)).as_micros() as f64
-                / interval_millis as f64,
-            latencies.len(),
-        )))
-        .for_each(q!(move |(p50, p99, p999, num_samples)| {
             println!(
                 "{} p50: {:.3} | p99 {:.3} | p999 {:.3} ms ({:} samples)",
                 LATENCY_PREFIX, p50, p99, p999, num_samples
