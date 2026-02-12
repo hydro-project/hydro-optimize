@@ -224,7 +224,7 @@ async fn output_metrics(
     if let Err(e) = write_metrics_csv(
         output_dir,
         &run_metadata,
-        &location_id_to_cluster,
+        location_id_to_cluster,
         num_clients,
         num_clients_per_node,
     ) {
@@ -311,16 +311,16 @@ async fn main() {
             }
 
             // Check saturation against the previous virtual-client run
-            if let Some(prev) = prev_throughput {
-                if current_throughput <= prev {
-                    println!(
-                        "Throughput saturated for {} physical clients \
-                         ({}→{} rps). Moving to next physical client count.",
-                        num_clients, prev, current_throughput
-                    );
-                    saturated_total_virtual = Some(num_clients * num_virtual);
-                    break; // break inner loop, increase physical clients
-                }
+            if let Some(prev) = prev_throughput
+                && current_throughput <= prev
+            {
+                println!(
+                    "Throughput saturated for {} physical clients \
+                     ({}→{} rps). Moving to next physical client count.",
+                    num_clients, prev, current_throughput
+                );
+                saturated_total_virtual = Some(num_clients * num_virtual);
+                break; // break inner loop, increase physical clients
             }
 
             prev_throughput = Some(current_throughput);
@@ -330,15 +330,16 @@ async fn main() {
         // After increasing physical clients, check if we're still saturated
         // compared to the best throughput *before* this round. If this round
         // didn't improve on the prior best, more physical clients won't help.
-        if let Some(prev) = prev_throughput {
-            if prev <= best_before_round && num_clients > PHYSICAL_CLIENTS_MIN {
-                println!(
-                    "Throughput still saturated after increasing physical clients \
-                     (prior best={}, current_peak={}). Stopping search.",
-                    best_before_round, prev
-                );
-                break 'outer;
-            }
+        if let Some(prev) = prev_throughput
+            && prev <= best_before_round
+            && num_clients > PHYSICAL_CLIENTS_MIN
+        {
+            println!(
+                "Throughput still saturated after increasing physical clients \
+                 (prior best={}, current_peak={}). Stopping search.",
+                best_before_round, prev
+            );
+            break 'outer;
         }
     }
 

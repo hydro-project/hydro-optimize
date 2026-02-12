@@ -17,7 +17,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use crate::decouple_analysis::decouple_analysis;
 use crate::decoupler::{self, Decoupler};
 use crate::deploy::ReusableHosts;
-use crate::parse_results::{RunMetadata, analyze_cluster_results, analyze_send_recv_overheads};
+use crate::parse_results::{RunMetadata, analyze_cluster_results};
 use crate::repair::{cycle_source_to_sink_input, inject_id, remove_counter};
 
 pub(crate) const METRIC_INTERVAL_SECS: u64 = 1;
@@ -264,6 +264,7 @@ impl Optimizations {
 }
 
 /// `stability_second`: The second in which the protocol is expected to be stable, and its performance can be used as the basis for optimization.
+#[allow(clippy::too_many_arguments)]
 pub async fn deploy_and_optimize<'a>(
     reusable_hosts: &mut ReusableHosts,
     deployment: &mut Deployment,
@@ -364,7 +365,7 @@ pub async fn deploy_and_optimize<'a>(
             // The bottleneck is either a process or cluster. Panic otherwise.
             let (bottleneck_name, bottleneck_num_nodes) = processes
                 .location_name(&bottleneck)
-                .and_then(|name| Some((name, 1)))
+                .map(|name| (name, 1))
                 .unwrap_or_else(|| clusters.location_name_and_num(&bottleneck).unwrap());
 
             let decision = decouple_analysis(
