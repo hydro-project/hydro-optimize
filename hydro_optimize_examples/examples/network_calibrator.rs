@@ -78,6 +78,7 @@ async fn main() {
                 .excluding::<Client>()
                 .excluding::<Aggregator>(),
             num_seconds_to_profile,
+            None,
         )
         .await;
     }

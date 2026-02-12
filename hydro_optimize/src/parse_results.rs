@@ -12,13 +12,54 @@ use crate::deploy_and_analyze::MetricLogs;
 
 #[derive(Default)]
 pub struct RunMetadata {
-    pub throughput: (f64, f64, f64), // mean - 2 std, mean, mean + 2 std
-    pub latencies: (f64, f64, f64, u64), // p50, p99, p999, count
+    pub throughputs: Vec<usize>,
+    pub latencies: Vec<(f64, f64, f64, u64)>, // per-second: (p50, p99, p999, count)
     pub send_overhead: HashMap<LocationId, f64>,
     pub recv_overhead: HashMap<LocationId, f64>,
     pub unaccounted_perf: HashMap<LocationId, f64>, // % of perf samples not mapped to any operator
-    pub total_usage: HashMap<LocationId, f64>,      // 100% CPU = 1.0
-    pub network_stats: HashMap<LocationId, NetworkStats>,
+    pub sar_stats: HashMap<LocationId, Vec<SarStats>>,
+}
+
+impl RunMetadata {
+    /// Returns the location of the bottlenecked node by comparing CPU usages at `measurement_sec`.
+    /// Panics if no sar_stats exist for the given `measurement_sec`
+    pub fn cpu_bottleneck(&self, measurement_sec: usize) -> LocationId {
+        let (loc, _stats) = self
+            .sar_stats
+            .iter()
+            .reduce(|(max_loc, max_stats), (curr_loc, curr_stats)| {
+                let max_cpu = max_stats[measurement_sec].cpu;
+                let curr_cpu = curr_stats[measurement_sec].cpu;
+                if max_cpu.system + max_cpu.user < curr_cpu.system + curr_cpu.user {
+                    (curr_loc, curr_stats)
+                } else {
+                    (max_loc, max_stats)
+                }
+            })
+            .unwrap();
+        loc.clone()
+    }
+
+    /// Returns the location of the bottlenecked node by comparing network usage at `measurement_sec`.
+    /// Panics if no sar_stats exist for the given `measurement_sec`
+    pub fn network_bottlenck(&self, measurement_sec: usize) -> LocationId {
+        let (loc, _stats) = self
+            .sar_stats
+            .iter()
+            .reduce(|(max_loc, max_stats), (curr_loc, curr_stats)| {
+                let max_network = max_stats[measurement_sec].network;
+                let curr_network = curr_stats[measurement_sec].network;
+                if max_network.rx_bytes_per_sec + max_network.tx_bytes_per_sec
+                    < curr_network.rx_bytes_per_sec + curr_network.tx_bytes_per_sec
+                {
+                    (curr_loc, curr_stats)
+                } else {
+                    (max_loc, max_stats)
+                }
+            })
+            .unwrap();
+        loc.clone()
+    }
 }
 
 pub fn parse_cpu_usage(measurement: String) -> f64 {
@@ -30,99 +71,124 @@ pub fn parse_cpu_usage(measurement: String) -> f64 {
         .unwrap_or(0f64)
 }
 
+/// Per-second CPU statistics from sar -u output
 #[derive(Debug, Default, Clone, Copy)]
-pub struct PercentileStats {
-    pub p50: f64,
-    pub p99: f64,
-    pub p999: f64,
+pub struct CPUStats {
+    pub user: f64,
+    pub system: f64,
+    pub idle: f64,
 }
 
-#[derive(Debug, Default, Clone)]
+/// Per-second network statistics from sar -n DEV output (eth0 only)
+#[derive(Debug, Default, Clone, Copy)]
 pub struct NetworkStats {
-    pub rx_packets_per_sec: PercentileStats,
-    pub tx_packets_per_sec: PercentileStats,
-    pub rx_bytes_per_sec: PercentileStats,
-    pub tx_bytes_per_sec: PercentileStats,
+    pub rx_packets_per_sec: f64,
+    pub tx_packets_per_sec: f64,
+    pub rx_bytes_per_sec: f64,
+    pub tx_bytes_per_sec: f64,
 }
 
-impl PercentileStats {
-    fn from_samples(samples: &mut [f64]) -> Self {
-        if samples.is_empty() {
-            return Self::default();
-        }
-        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let len = samples.len();
-        Self {
-            p50: samples[len * 50 / 100],
-            p99: samples[len * 99 / 100],
-            p999: samples[len.saturating_sub(1).min(len * 999 / 1000)],
-        }
-    }
+/// Combined per-second sar statistics
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SarStats {
+    pub cpu: CPUStats,
+    pub network: NetworkStats,
 }
 
-/// Parses `sar -n DEV` output lines and computes p50, p99, p999 for network metrics.
-/// Only considers eth0 interface data.
-pub fn parse_network_usage(lines: Vec<String>) -> NetworkStats {
-    let mut rx_pkt_samples = Vec::new();
-    let mut tx_pkt_samples = Vec::new();
-    let mut rx_kb_samples = Vec::new();
-    let mut tx_kb_samples = Vec::new();
+/// Parses a single CPU line from sar -u output.
+/// Format: "HH:MM:SS AM/PM CPU %user %nice %system %iowait %steal %idle"
+fn parse_cpu_line(line: &str) -> Option<CPUStats> {
+    let cpu_regex = Regex::new(
+        r"all\s+(\d+\.?\d*)\s+\d+\.?\d*\s+(\d+\.?\d*)\s+\d+\.?\d*\s+\d+\.?\d*\s+(\d+\.?\d*)",
+    )
+    .unwrap();
 
-    // sar output format: TIME IFACE rxpck/s txpck/s rxkB/s txkB/s ...
-    // We look for lines containing "eth0" with numeric data
-    let eth0_regex =
-        Regex::new(r"eth0\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)").unwrap();
+    cpu_regex.captures(line).and_then(|caps| {
+        let user = caps[1].parse::<f64>().ok()?;
+        let system = caps[2].parse::<f64>().ok()?;
+        let idle = caps[3].parse::<f64>().ok()?;
+        Some(CPUStats { user, system, idle })
+    })
+}
+
+/// Parses a single network line from sar -n DEV output (any non-loopback interface).
+/// Format: "HH:MM:SS AM/PM IFACE rxpck/s txpck/s rxkB/s txkB/s ..."
+/// Matches eth0, ens5, or any other interface name that isn't "lo".
+fn parse_network_line(line: &str) -> Option<NetworkStats> {
+    // Match any interface: captures interface name followed by numeric stats
+    let iface_regex =
+        Regex::new(r"(\S+)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)").unwrap();
+
+    iface_regex.captures(line).and_then(|caps| {
+        let iface = &caps[1];
+        // Skip loopback and header lines
+        if iface == "lo" || iface == "docker0" || iface == "IFACE" {
+            return None;
+        }
+        let rx_pkt = caps[2].parse::<f64>().ok()?;
+        let tx_pkt = caps[3].parse::<f64>().ok()?;
+        let rx_kb = caps[4].parse::<f64>().ok()?;
+        let tx_kb = caps[5].parse::<f64>().ok()?;
+        Some(NetworkStats {
+            rx_packets_per_sec: rx_pkt,
+            tx_packets_per_sec: tx_pkt,
+            rx_bytes_per_sec: rx_kb * 1024.0,
+            tx_bytes_per_sec: tx_kb * 1024.0,
+        })
+    })
+}
+
+/// Parses `sar -n DEV -u` output lines and returns per-second SarStats.
+/// Pairs CPU and network stats by matching timestamps.
+pub fn parse_sar_output(lines: Vec<String>) -> Vec<SarStats> {
+    let mut cpu_usages = vec![];
+    let mut network_usages = vec![];
 
     for line in &lines {
-        if let Some(caps) = eth0_regex.captures(line)
-            && let (Ok(rx_pkt), Ok(tx_pkt), Ok(rx_kb), Ok(tx_kb)) = (
-                caps[1].parse::<f64>(),
-                caps[2].parse::<f64>(),
-                caps[3].parse::<f64>(),
-                caps[4].parse::<f64>(),
-            )
-        {
-            rx_pkt_samples.push(rx_pkt);
-            tx_pkt_samples.push(tx_pkt);
-            // Convert kB/s to bytes/s
-            rx_kb_samples.push(rx_kb * 1024.0);
-            tx_kb_samples.push(tx_kb * 1024.0);
+        if let Some(cpu) = parse_cpu_line(line) {
+            cpu_usages.push(cpu);
+        } else if let Some(network) = parse_network_line(line) {
+            network_usages.push(network);
         }
     }
 
-    NetworkStats {
-        rx_packets_per_sec: PercentileStats::from_samples(&mut rx_pkt_samples),
-        tx_packets_per_sec: PercentileStats::from_samples(&mut tx_pkt_samples),
-        rx_bytes_per_sec: PercentileStats::from_samples(&mut rx_kb_samples),
-        tx_bytes_per_sec: PercentileStats::from_samples(&mut tx_kb_samples),
+    assert_eq!(
+        cpu_usages.len(),
+        network_usages.len(),
+        "Couldn't correctly parse sar output"
+    );
+
+    // Combine
+    let mut stats = vec![];
+    for i in 0..cpu_usages.len() {
+        stats.push(SarStats {
+            cpu: cpu_usages[i],
+            network: network_usages[i],
+        });
     }
+
+    stats
 }
 
 /// Parses throughput output from `print_parseable_bench_results`.
-/// Format: "HYDRO_OPTIMIZE_THR: {lower:.2} - {mean:.2} - {upper:.2} requests/s"
-/// Returns the last (lower, mean, upper) tuple found.
-pub fn parse_throughput(lines: Vec<String>) -> (f64, f64, f64) {
-    let regex =
-        Regex::new(r"(\d+\.?\d*)\s*-\s*(\d+\.?\d*)\s*-\s*(\d+\.?\d*)\s*requests/s").unwrap();
+/// Format: "HYDRO_OPTIMIZE_THR: {throughput} requests/s"
+/// Returns all per-second throughput values found.
+pub fn parse_throughput(lines: Vec<String>) -> Vec<usize> {
+    let regex = Regex::new(r"(\d+\.?\d*)\s*requests/s").unwrap();
     lines
         .iter()
         .filter_map(|line| {
-            regex.captures(line).map(|cap| {
-                (
-                    cap[1].parse::<f64>().unwrap(),
-                    cap[2].parse::<f64>().unwrap(),
-                    cap[3].parse::<f64>().unwrap(),
-                )
-            })
+            regex
+                .captures(line)
+                .map(|cap| cap[1].parse::<f64>().unwrap() as usize)
         })
-        .next_back()
-        .unwrap()
+        .collect()
 }
 
 /// Parses latency output from `print_parseable_bench_results`.
 /// Format: "HYDRO_OPTIMIZE_LAT: p50: {p50:.3} | p99 {p99:.3} | p999 {p999:.3} ms ({num_samples} samples)"
-/// Returns the last (p50, p99, p999, num_samples) tuple found.
-pub fn parse_latency(lines: Vec<String>) -> (f64, f64, f64, u64) {
+/// Returns all per-second (p50, p99, p999, num_samples) tuples found.
+pub fn parse_latency(lines: Vec<String>) -> Vec<(f64, f64, f64, u64)> {
     let regex = Regex::new(r"p50:\s*(\d+\.?\d*)\s*\|\s*p99\s+(\d+\.?\d*)\s*\|\s*p999\s+(\d+\.?\d*)\s*ms\s*\((\d+)\s*samples\)").unwrap();
     lines
         .iter()
@@ -136,8 +202,7 @@ pub fn parse_latency(lines: Vec<String>) -> (f64, f64, f64, u64) {
                 )
             })
         })
-        .next_back()
-        .unwrap()
+        .collect()
 }
 
 /// Returns a map from (operator ID, is network receiver) to percentage of total samples, and the percentage of samples that are unaccounted
@@ -314,90 +379,64 @@ fn drain_receiver(receiver: &mut UnboundedReceiver<String>) -> Vec<String> {
     lines
 }
 
-pub async fn analyze_process_results(
-    process: &impl DeployCrateWrapper,
-    ir: &mut [HydroRoot],
-    op_to_count: &mut HashMap<usize, usize>,
-    metrics: &mut MetricLogs,
-) -> (f64, NetworkStats) {
+pub async fn analyze_perf(process: &impl DeployCrateWrapper, ir: &mut [HydroRoot]) -> f64 {
     let underlying = process.underlying();
     let perf_results = underlying.tracing_results().unwrap();
 
-    // Inject perf usages into metadata
-    let unidentified_perf = inject_perf(ir, perf_results.folded_data.clone());
-
-    // Parse all metric streams
-    parse_counter_usage(drain_receiver(&mut metrics.counters), op_to_count);
-    let network_stats = parse_network_usage(drain_receiver(&mut metrics.network));
-    (unidentified_perf, network_stats)
+    // Inject perf usages into metadata, return unidentified perf
+    inject_perf(ir, perf_results.folded_data.clone())
 }
 
 pub async fn analyze_cluster_results(
     nodes: &DeployResult<'_, HydroDeploy>,
     ir: &mut [HydroRoot],
     mut cluster_metrics: HashMap<(LocationId, String, usize), MetricLogs>,
-    run_metadata: &mut RunMetadata,
-    exclude: &[String],
-) -> (LocationId, String, usize) {
-    let mut max_usage_cluster_id = None;
-    let mut max_usage_cluster_size = 0;
-    let mut max_usage_cluster_name = String::new();
-    let mut max_usage_overall = 0f64;
+) -> RunMetadata {
+    let mut run_metadata = RunMetadata::default();
     let mut op_to_count = HashMap::new();
 
     for (id, name, cluster) in nodes.get_all_clusters() {
         println!("Analyzing cluster {:?}: {}", id, name);
 
-        // Iterate through nodes' usages and keep the max usage one
-        let mut max_usage = None;
+        // Iterate through nodes' usages and only consider the max usage one
+        let mut sar_stats = HashMap::new();
         for (idx, _) in cluster.members().iter().enumerate() {
-            let usage = get_usage(
-                &mut cluster_metrics
-                    .get_mut(&(id.clone(), name.to_string(), idx))
-                    .unwrap()
-                    .cpu,
-            )
-            .await;
-            println!("Node {} usage: {}", idx, usage);
-            if let Some((prev_usage, _)) = max_usage {
-                if usage > prev_usage {
-                    max_usage = Some((usage, idx));
-                }
-            } else {
-                max_usage = Some((usage, idx));
-            }
-        }
-
-        if let Some((usage, idx)) = max_usage {
-            // Modify IR with perf & cardinality numbers
             let metrics = cluster_metrics
                 .get_mut(&(id.clone(), name.to_string(), idx))
                 .unwrap();
-            let (unidentified_perf, network_stats) = analyze_process_results(
-                cluster.members().get(idx).unwrap(),
-                ir,
-                &mut op_to_count,
-                metrics,
-            )
-            .await;
+            sar_stats.insert(idx, parse_sar_output(drain_receiver(&mut metrics.sar)));
+        }
 
-            run_metadata.total_usage.insert(id.clone(), usage);
-            run_metadata
-                .unaccounted_perf
-                .insert(id.clone(), unidentified_perf);
-            run_metadata
-                .network_stats
-                .insert(id.clone(), network_stats.clone());
-            println!("Network stats for {}: {:?}", idx, network_stats);
+        let max_usage_sar_stat =
+            sar_stats
+                .iter()
+                .reduce(|(max_usage_idx, max_usage_sar_stat), (idx, sar_stat)| {
+                    if let Some(last_stat) = sar_stat.last() {
+                        let max_last_stat = max_usage_sar_stat.last().unwrap().cpu;
+                        if last_stat.cpu.user + last_stat.cpu.system
+                            > max_last_stat.user + max_last_stat.system
+                        {
+                            return (idx, sar_stat);
+                        }
+                    }
+                    (max_usage_idx, max_usage_sar_stat)
+                });
 
-            // Update cluster with max usage
-            if max_usage_overall < usage && !exclude.contains(&name.to_string()) {
-                max_usage_cluster_id = Some(id);
-                max_usage_cluster_name = name.to_string();
-                max_usage_cluster_size = cluster.members().len();
-                max_usage_overall = usage;
-                println!("The bottleneck is {}", name);
-            }
+        if let Some((idx, max_sar_stat)) = max_usage_sar_stat {
+            let metrics = cluster_metrics
+                .get_mut(&(id.clone(), name.to_string(), *idx))
+                .unwrap();
+            // Parse perf
+            // let unidentified_perf = analyze_perf(cluster.members().get(*idx).unwrap(), ir).await;
+            // Parse counters for each op and add to op_to_count
+            parse_counter_usage(drain_receiver(&mut metrics.counters), &mut op_to_count);
+
+            // run_metadata
+            //     .unaccounted_perf
+            //     .insert(id.clone(), unidentified_perf);
+            run_metadata
+                .sar_stats
+                .insert(id.clone(), max_sar_stat.clone());
         }
     }
 
@@ -409,17 +448,16 @@ pub async fn analyze_cluster_results(
             continue;
         }
 
-        run_metadata.throughput = parse_throughput(throughputs);
-        run_metadata.latencies = parse_latency(drain_receiver(&mut metrics.latencies));
+        run_metadata
+            .throughputs
+            .extend(parse_throughput(throughputs));
+        run_metadata
+            .latencies
+            .extend(parse_latency(drain_receiver(&mut metrics.latencies)));
     }
 
     inject_count(ir, &op_to_count);
-
-    (
-        max_usage_cluster_id.unwrap(),
-        max_usage_cluster_name,
-        max_usage_cluster_size,
-    )
+    run_metadata
 }
 
 pub async fn get_usage(usage_out: &mut UnboundedReceiver<String>) -> f64 {

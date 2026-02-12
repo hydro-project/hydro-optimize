@@ -89,19 +89,32 @@ impl ReusableHosts {
             .clone()
     }
 
+    fn get_rust_flags(&self) -> String {
+        match &self.host_type {
+            InitializedHostType::Gcp { .. } | InitializedHostType::Aws { .. } => {
+                "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off"
+            }
+            InitializedHostType::Localhost => {
+                "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off"
+            }
+        }
+        .to_string()
+    }
+
+    pub fn get_no_perf_process_hosts(
+        &mut self,
+        deployment: &mut Deployment,
+        display_name: String,
+    ) -> TrybuildHost {
+        TrybuildHost::new(self.lazy_create_host(deployment, display_name.clone()))
+            .rustflags(self.get_rust_flags())
+    }
+
     pub fn get_process_hosts(
         &mut self,
         deployment: &mut Deployment,
         display_name: String,
     ) -> TrybuildHost {
-        let rustflags = match &self.host_type {
-            InitializedHostType::Gcp { .. } | InitializedHostType::Aws { .. } => {
-                "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off -C link-args=--no-rosegment"
-            }
-            InitializedHostType::Localhost => {
-                "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off"
-            }
-        };
         let setup_command = match &self.host_type {
             InitializedHostType::Gcp { .. } => DEBIAN_PERF_SETUP_COMMAND,
             InitializedHostType::Aws { .. } => AL2_PERF_SETUP_COMMAND,
@@ -113,7 +126,7 @@ impl ReusableHosts {
                 "HYDRO_RUNTIME_MEASURE_CPU_PREFIX",
                 super::deploy_and_analyze::CPU_USAGE_PREFIX,
             )
-            .rustflags(rustflags)
+            .rustflags(self.get_rust_flags())
             .tracing(
                 TracingOptions::builder()
                     .perf_raw_outfile(format!("{}.perf.data", display_name.clone()))
@@ -131,7 +144,7 @@ impl ReusableHosts {
         num_hosts: usize,
     ) -> Vec<TrybuildHost> {
         (0..num_hosts)
-            .map(|i| self.get_process_hosts(deployment, format!("{}{}", cluster_name, i)))
+            .map(|i| self.get_no_perf_process_hosts(deployment, format!("{}{}", cluster_name, i)))
             .collect()
     }
 }

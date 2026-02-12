@@ -75,6 +75,7 @@ async fn main() {
         &clients,
         &client_aggregator,
         &replicas,
+        print_result_frequency / 10,
         print_result_frequency,
         pretty_print_bench_results, // Note: Throughput/latency numbers won't be accessible to deploy_and_optimize
     );
@@ -83,6 +84,7 @@ async fn main() {
     let mut reusable_hosts = ReusableHosts::new(host_type);
     let num_times_to_optimize = 2;
     let run_seconds = 30;
+    let measurement_second = 29;
 
     deploy_and_optimize(
         &mut reusable_hosts,
@@ -100,6 +102,7 @@ async fn main() {
             .excluding::<Aggregator>()
             .with_iterations(num_times_to_optimize),
         Some(run_seconds),
+        Some(measurement_second),
     )
     .await;
 }
