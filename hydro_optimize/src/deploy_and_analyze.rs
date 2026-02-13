@@ -15,7 +15,7 @@ use hydro_lang::telemetry::Sidecar;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::decouple_analysis::decouple_analysis;
-use crate::decoupler::{self, Decoupler};
+use crate::decoupler;
 use crate::deploy::ReusableHosts;
 use crate::parse_results::{RunMetadata, analyze_cluster_results};
 use crate::repair::{cycle_source_to_sink_input, inject_id, remove_counter};
@@ -376,19 +376,16 @@ pub async fn deploy_and_optimize<'a>(
                 &cycle_source_to_sink_input,
             );
 
-            // Apply decoupling
-            let new_cluster = post_rewrite_builder.cluster::<()>();
-            let decouple_with_location = Decoupler {
-                decision,
-                orig_location: bottleneck,
-                decoupled_location: new_cluster.id().clone(),
-            };
-            decoupler::decouple(&mut ir, &decouple_with_location);
-            clusters.named_clusters.push((
-                new_cluster.id().key(),
-                format!("{}-decouple-{}", bottleneck_name, iteration),
-                bottleneck_num_nodes,
-            ));
+            // Apply decoupling — creates new clusters as needed
+            let new_clusters =
+                decoupler::decouple(&mut ir, decision, &bottleneck, &mut post_rewrite_builder);
+            for cluster in new_clusters {
+                clusters.named_clusters.push((
+                    cluster.id().key(),
+                    format!("{}-decouple-{}", bottleneck_name, iteration),
+                    bottleneck_num_nodes,
+                ));
+            }
             // TODO: Save decoupling decision to file
         }
 

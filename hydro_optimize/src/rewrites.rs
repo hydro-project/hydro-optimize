@@ -8,19 +8,22 @@ use hydro_lang::compile::ir::{
 };
 use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::location::dynamic::LocationId;
-use hydro_lang::location::{Cluster, Location, LocationKey};
+use hydro_lang::location::{Cluster, LocationKey};
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 use syn::parse_quote;
 use syn::visit_mut::{self, VisitMut};
 
-use crate::decoupler::{self, Decoupler};
+use crate::decoupler::{self, DecoupleDecision};
 use crate::partitioner::Partitioner;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum Rewrite {
-    Decouple(Decoupler),
+    Decouple {
+        decision: DecoupleDecision,
+        orig_location: LocationId,
+    },
     Partition(Partitioner),
 }
 
@@ -36,32 +39,35 @@ pub type Rewrites = Vec<RewriteMetadata>;
 /// Replays the rewrites in order.
 /// Returns Vec(Cluster, number of nodes) for each created cluster and a new FlowBuilder
 pub fn replay<'a>(
-    rewrites: &mut Rewrites,
+    rewrites: Rewrites,
     builder: &mut FlowBuilder<'a>,
     ir: &[HydroRoot],
 ) -> Vec<(Cluster<'a, ()>, usize)> {
-    let mut new_clusters = vec![];
+    let mut all_new_clusters = vec![];
 
     let mut ir = deep_clone(ir);
 
     // Apply decoupling/partitioning in order
-    for rewrite_metadata in rewrites.iter_mut() {
-        let new_cluster = builder.cluster::<()>();
-        match &mut rewrite_metadata.rewrite {
-            Rewrite::Decouple(decoupler) => {
-                decoupler.decoupled_location = new_cluster.id().clone();
-                decoupler::decouple(&mut ir, decoupler);
+    for rewrite_metadata in rewrites {
+        match rewrite_metadata.rewrite {
+            Rewrite::Decouple {
+                decision,
+                orig_location,
+            } => {
+                let new_clusters = decoupler::decouple(&mut ir, decision, &orig_location, builder);
+                for cluster in new_clusters {
+                    all_new_clusters.push((cluster, rewrite_metadata.num_nodes));
+                }
             }
             Rewrite::Partition(_partitioner) => {
                 panic!("Partitioning is not yet replayable");
             }
         }
-        new_clusters.push((new_cluster, rewrite_metadata.num_nodes));
     }
 
     builder.replace_ir(ir);
 
-    new_clusters
+    all_new_clusters
 }
 
 /// Replace CLUSTER_SELF_ID with the ID of the original node the partition is assigned to

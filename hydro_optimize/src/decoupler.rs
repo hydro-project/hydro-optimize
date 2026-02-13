@@ -1,37 +1,30 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use hydro_lang::compile::builder::FlowBuilder;
 use hydro_lang::compile::ir::{
     DebugInstantiate, HydroIrMetadata, HydroIrOpMetadata, HydroNode, HydroRoot, TeeNode,
     transform_bottom_up, traverse_dfir,
 };
 use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::location::dynamic::LocationId;
+use hydro_lang::location::{Cluster, Location};
 use proc_macro2::Span;
-use serde::{Deserialize, Serialize};
 use stageleft::quote_type;
 use syn::visit_mut::VisitMut;
 
 use crate::repair::{cycle_source_to_sink_input, inject_location};
 use crate::rewrites::{
     ClusterSelfIdReplace, collection_kind_to_debug_type, deserialize_bincode_with_type,
-    prepend_member_id_to_collection_kind, serialize_bincode_with_type, tee_to_inner_id,
+    op_id_to_inputs, prepend_member_id_to_collection_kind, serialize_bincode_with_type,
+    tee_to_inner_id,
 };
 
-#[derive(Clone, Serialize, Deserialize, Default)]
-pub struct DecoupleDecision {
-    pub output_to_decoupled_machine_after: Vec<usize>, /* The output of the operator at this index should be sent to the decoupled machine */
-    pub output_to_original_machine_after: Vec<usize>, /* The output of the operator at this index should be sent to the original machine */
-    pub place_on_decoupled_machine: Vec<usize>, /* This operator should be placed on the decoupled machine. Only for sources */
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Decoupler {
-    pub decision: DecoupleDecision,
-    pub orig_location: LocationId,
-    pub decoupled_location: LocationId,
-}
+/// Each index represents a location. Index 0 is always the original location.
+/// Higher indices are new locations created by the decoupler.
+/// Each HashSet contains the op_ids assigned to that location.
+pub type DecoupleDecision = Vec<HashSet<usize>>;
 
 fn add_network(node: &mut HydroNode, new_location: &LocationId) {
     let metadata = node.metadata().clone();
@@ -147,32 +140,81 @@ fn add_tee(
     *node = teed_node;
 }
 
+/// Determine the location index for an op. Returns 0 (original) if not in the decision.
+/// Find which location index an op is assigned to. Returns 0 (original) if not found.
+fn op_location(decision: &DecoupleDecision, op_id: usize) -> usize {
+    decision
+        .iter()
+        .position(|ops| ops.contains(&op_id))
+        .unwrap_or(0)
+}
+
+/// Derive the network insertion and source placement actions from the decision
+/// by comparing each op's location to its inputs' locations.
+struct NetworkDecisions {
+    /// op_id -> target LocationId: insert network sending output of this op to target
+    output_to: HashMap<usize, LocationId>,
+    /// op_ids whose source/network nodes should be relocated
+    place_on: HashMap<usize, LocationId>,
+}
+
+fn calc_network_decisions(
+    decision: &DecoupleDecision,
+    op_id_to_inputs: &HashMap<usize, Vec<usize>>,
+    locations: &[LocationId],
+) -> NetworkDecisions {
+    let mut output_to = HashMap::new();
+    let mut place_on = HashMap::new();
+
+    for (loc_idx, ops) in decision.iter().enumerate() {
+        for op_id in ops {
+            if let Some(inputs) = op_id_to_inputs.get(op_id) {
+                if let Some(first_input) = inputs.first() {
+                    let input_loc_idx = op_location(decision, *first_input);
+                    if input_loc_idx != loc_idx {
+                        // The input is on a different location than this op,
+                        // so we need to insert a network after the input sending to this op's location
+                        output_to.insert(*op_id, locations[loc_idx].clone());
+                    }
+                } else {
+                    // No inputs (source node) — if assigned to non-original location, place it there
+                    if loc_idx != 0 {
+                        place_on.insert(*op_id, locations[loc_idx].clone());
+                    }
+                }
+            } else {
+                // Not in op_id_to_inputs — treat as source
+                if loc_idx != 0 {
+                    place_on.insert(*op_id, locations[loc_idx].clone());
+                }
+            }
+        }
+    }
+
+    NetworkDecisions {
+        output_to,
+        place_on,
+    }
+}
+
 fn decouple_node(
     node: &mut HydroNode,
-    decoupler: &Decoupler,
+    network_decisions: &NetworkDecisions,
     next_stmt_id: &mut usize,
     new_inners: &mut HashMap<(usize, LocationId), Rc<RefCell<HydroNode>>>,
     tee_to_inner_id_before_rewrites: &HashMap<usize, usize>,
 ) {
     // Replace location of sources, if necessary
-    if decoupler
-        .decision
-        .place_on_decoupled_machine
-        .contains(next_stmt_id)
-    {
+    if let Some(target_location) = network_decisions.place_on.get(next_stmt_id) {
         match node {
             HydroNode::Source { metadata, .. }
             | HydroNode::SingletonSource { metadata, .. }
             | HydroNode::Network { metadata, .. } => {
                 println!(
                     "Changing source/network destination from {:?} to location {:?}, id: {}",
-                    metadata.location_id,
-                    decoupler.decoupled_location.clone(),
-                    next_stmt_id
+                    metadata.location_id, target_location, next_stmt_id
                 );
-                metadata
-                    .location_id
-                    .swap_root(decoupler.decoupled_location.clone());
+                metadata.location_id.swap_root(target_location.clone());
             }
             _ => {
                 std::panic!(
@@ -184,20 +226,8 @@ fn decouple_node(
         return;
     }
 
-    // Otherwise, replace where the outputs go
-    let new_location = if decoupler
-        .decision
-        .output_to_decoupled_machine_after
-        .contains(next_stmt_id)
-    {
-        &decoupler.decoupled_location
-    } else if decoupler
-        .decision
-        .output_to_original_machine_after
-        .contains(next_stmt_id)
-    {
-        &decoupler.orig_location
-    } else {
+    // Otherwise, check if we need to insert a network
+    let Some(target_location) = network_decisions.output_to.get(next_stmt_id) else {
         return;
     };
 
@@ -211,11 +241,11 @@ fn decouple_node(
         HydroNode::Tee { .. } => {
             println!(
                 "Creating a TEE to location {:?}, id: {}",
-                new_location, next_stmt_id
+                target_location, next_stmt_id
             );
             add_tee(
                 node,
-                new_location,
+                target_location,
                 new_inners,
                 tee_to_inner_id_before_rewrites,
             );
@@ -223,11 +253,11 @@ fn decouple_node(
         _ => {
             println!(
                 "Creating network to location {:?} after node {}, id: {}",
-                new_location,
+                target_location,
                 node.print_root(),
                 next_stmt_id
             );
-            add_network(node, new_location);
+            add_network(node, target_location);
         }
     }
 }
@@ -258,7 +288,35 @@ fn fix_cluster_self_id_node(node: &mut HydroNode, mut locations: ClusterSelfIdRe
     }
 }
 
-pub fn decouple(ir: &mut [HydroRoot], decoupler: &Decoupler) {
+/// Apply the decoupling decision to the IR.
+/// Creates new cluster locations as needed via the FlowBuilder and returns them.
+pub fn decouple<'a>(
+    ir: &mut [HydroRoot],
+    mut decision: DecoupleDecision,
+    orig_location: &LocationId,
+    builder: &mut FlowBuilder<'a>,
+) -> Vec<Cluster<'a, ()>> {
+    // Preprocess: remove empty location sets and check if there's anything to decouple
+    decision.retain(|ops| !ops.is_empty());
+    let num_locations = decision.len();
+    if num_locations <= 1 {
+        return vec![];
+    }
+
+    // Create clusters for each new location index (1..last)
+    let mut new_clusters = Vec::new();
+    let mut locations: Vec<LocationId> = vec![orig_location.clone()];
+    for _ in 1..num_locations {
+        let cluster = builder.cluster::<()>();
+        locations.push(cluster.id().clone());
+        new_clusters.push(cluster);
+    }
+
+    // Derive actions from the decision by comparing op locations to input locations
+    let cycle_map = cycle_source_to_sink_input(ir);
+    let all_op_id_to_inputs = op_id_to_inputs(ir, Some(&orig_location.key()), &cycle_map);
+    let actions = calc_network_decisions(&decision, &all_op_id_to_inputs, &locations);
+
     let tee_to_inner_id_before_rewrites = tee_to_inner_id(ir);
     let mut new_inners = HashMap::new();
     traverse_dfir::<HydroDeploy>(
@@ -267,7 +325,7 @@ pub fn decouple(ir: &mut [HydroRoot], decoupler: &Decoupler) {
         |node, next_stmt_id| {
             decouple_node(
                 node,
-                decoupler,
+                &actions,
                 next_stmt_id,
                 &mut new_inners,
                 &tee_to_inner_id_before_rewrites,
@@ -276,21 +334,26 @@ pub fn decouple(ir: &mut [HydroRoot], decoupler: &Decoupler) {
     );
 
     // Fix locations since we changed some
-    let cycle_source_to_sink_input = cycle_source_to_sink_input(ir);
-    inject_location(ir, &cycle_source_to_sink_input);
-    // Fix CLUSTER_SELF_ID for the decoupled node
-    let locations = ClusterSelfIdReplace::Decouple {
-        orig_cluster_id: decoupler.orig_location.key(),
-        decoupled_cluster_id: decoupler.decoupled_location.key(),
-    };
-    transform_bottom_up(
-        ir,
-        &mut |leaf| {
-            fix_cluster_self_id_root(leaf, locations);
-        },
-        &mut |node| {
-            fix_cluster_self_id_node(node, locations);
-        },
-        true,
-    );
+    let cycle_source_to_sink_input_post = cycle_source_to_sink_input(ir);
+    inject_location(ir, &cycle_source_to_sink_input_post);
+
+    // Fix CLUSTER_SELF_ID for each new location
+    for cluster in &new_clusters {
+        let locations = ClusterSelfIdReplace::Decouple {
+            orig_cluster_id: orig_location.key(),
+            decoupled_cluster_id: cluster.id().key(),
+        };
+        transform_bottom_up(
+            ir,
+            &mut |leaf| {
+                fix_cluster_self_id_root(leaf, locations);
+            },
+            &mut |node| {
+                fix_cluster_self_id_node(node, locations);
+            },
+            true,
+        );
+    }
+
+    new_clusters
 }

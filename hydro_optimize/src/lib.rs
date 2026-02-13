@@ -4,6 +4,7 @@ hydro_lang::setup!();
 pub mod debug;
 pub mod decouple_analysis;
 pub mod decoupler;
+pub mod greedy_decouple_analysis;
 pub mod deploy;
 pub mod deploy_and_analyze;
 pub mod parse_results;
