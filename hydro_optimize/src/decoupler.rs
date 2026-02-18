@@ -49,7 +49,7 @@ fn add_network(node: &mut HydroNode, send_location: &LocationId, recv_location: 
         Span::call_site(),
     );
     let f: syn::Expr = syn::parse_quote!(|b| (
-        ::hydro_lang::location::MemberId::<()>::from_tagless(#ident.clone()),
+        hydro_lang::location::MemberId::<()>::from_tagless(#ident.clone()),
         b
     ));
 

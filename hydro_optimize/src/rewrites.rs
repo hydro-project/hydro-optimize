@@ -263,7 +263,7 @@ pub fn serialize_bincode_with_type(is_demux: bool, t_type: &syn::Type) -> syn::E
 
     if is_demux {
         parse_quote! {
-            ::#root::runtime_support::stageleft::runtime_support::fn1_type_hint::<(#root::location::MemberId<_>, #t_type), _>(
+            #root::runtime_support::stageleft::runtime_support::fn1_type_hint::<(#root::location::MemberId<_>, #t_type), _>(
                 |(id, data)| {
                     (id.into_tagless(), #root::runtime_support::bincode::serialize(&data).unwrap().into())
                 }
@@ -271,7 +271,7 @@ pub fn serialize_bincode_with_type(is_demux: bool, t_type: &syn::Type) -> syn::E
         }
     } else {
         parse_quote! {
-            ::#root::runtime_support::stageleft::runtime_support::fn1_type_hint::<#t_type, _>(
+            #root::runtime_support::stageleft::runtime_support::fn1_type_hint::<#t_type, _>(
                 |data| {
                     #root::runtime_support::bincode::serialize(&data).unwrap().into()
                 }
