@@ -1,6 +1,8 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::{
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 use hydro_lang::compile::builder::FlowBuilder;
 use hydro_lang::compile::ir::{
@@ -14,26 +16,37 @@ use proc_macro2::Span;
 use stageleft::quote_type;
 use syn::visit_mut::VisitMut;
 
-use crate::repair::{cycle_source_to_sink_input, inject_location};
+use crate::repair::{cycle_source_to_sink_input, inject_id, inject_location};
 use crate::rewrites::{
     ClusterSelfIdReplace, collection_kind_to_debug_type, deserialize_bincode_with_type,
-    op_id_to_inputs, prepend_member_id_to_collection_kind, serialize_bincode_with_type,
-    tee_to_inner_id,
+    prepend_member_id_to_collection_kind, serialize_bincode_with_type, tee_to_inner_id,
 };
 
-/// Each index represents a location. Index 0 is always the original location.
-/// Higher indices are new locations created by the decoupler.
-/// Each HashSet contains the op_ids assigned to that location.
-pub type DecoupleDecision = Vec<HashSet<usize>>;
+/// Mapping from op id to location index, starting from 0.
+///
+/// Note: The location index is where the output of the node goes, not necessarily where the node is executed.
+/// Limitations: Sources can't be decoupled from their children.
+pub type DecoupleDecision = HashMap<usize, usize>;
 
-fn add_network(node: &mut HydroNode, new_location: &LocationId) {
+/// Adds networking after `node`.
+/// - `send_location`: the source of the network.
+/// - `recv_location`: the destination of the network
+///
+/// Replaces the node with:
+/// 1. Map (to add destination member id)
+/// 2. Network
+/// 3. Map (to remove member id)
+fn add_network(node: &mut HydroNode, send_location: &LocationId, recv_location: &LocationId) {
     let metadata = node.metadata().clone();
-    let parent_id = metadata.location_id.root().key();
+    // If the decoupled node is a cluster, then we must ensure that after a decoupling,
+    // each node sends to its own respective decoupled member.
+    // Doesn't matter which location we use; it will be replaced with `ClusterSelfIdReplace`.
+    let member_id = send_location.key();
     let node_content = std::mem::replace(node, HydroNode::Placeholder);
 
-    // Map from b to (MemberId, b), where MemberId is the id of the decoupled (or original) node we're sending to
+    // Map from b to (MemberId, b)
     let ident = syn::Ident::new(
-        &format!("__hydro_lang_cluster_self_id_{}", parent_id),
+        &format!("__hydro_lang_cluster_self_id_{}", member_id),
         Span::call_site(),
     );
     let f: syn::Expr = syn::parse_quote!(|b| (
@@ -49,7 +62,7 @@ fn add_network(node: &mut HydroNode, new_location: &LocationId) {
         f: f.into(),
         input: Box::new(node_content),
         metadata: HydroIrMetadata {
-            location_id: metadata.location_id.root().clone(), // Remove any ticks
+            location_id: send_location.clone(),
             collection_kind: new_collection_kind.clone(),
             cardinality: None,
             tag: None,
@@ -75,7 +88,7 @@ fn add_network(node: &mut HydroNode, new_location: &LocationId) {
         .map(|e| e.into()),
         input: Box::new(mapped_node),
         metadata: HydroIrMetadata {
-            location_id: new_location.clone(),
+            location_id: recv_location.clone(),
             collection_kind: new_collection_kind,
             cardinality: None,
             tag: None,
@@ -88,13 +101,13 @@ fn add_network(node: &mut HydroNode, new_location: &LocationId) {
         },
     };
 
-    // Map again to remove the member Id (mimicking send_anonymous)
+    // Map again to remove the member Id
     let f: syn::Expr = syn::parse_quote!(|(_, b)| b);
     let mapped_node = HydroNode::Map {
         f: f.into(),
         input: Box::new(network_node),
         metadata: HydroIrMetadata {
-            location_id: new_location.clone(),
+            location_id: recv_location.clone(),
             collection_kind: original_collection_kind,
             cardinality: None,
             tag: None,
@@ -109,25 +122,33 @@ fn add_network(node: &mut HydroNode, new_location: &LocationId) {
     *node = mapped_node;
 }
 
+/// Adds networking between `node` and its inner, assuming `node` is a Tee.
+/// If its inner already has networking to the new location, doesn't add
+/// networking again; instead, reuses the existing network and tees after it.
+///
+/// - `node`: Must be a Tee
 fn add_tee(
     node: &mut HydroNode,
     new_location: &LocationId,
+    inner_id: usize,
+    inner_location: &LocationId,
     new_inners: &mut HashMap<(usize, LocationId), Rc<RefCell<HydroNode>>>,
-    tee_to_inner_id_before_rewrites: &HashMap<usize, usize>,
 ) {
-    let metadata = node.metadata().clone();
-    let inner_id = tee_to_inner_id_before_rewrites
-        .get(&metadata.op.id.unwrap())
-        .unwrap();
+    assert!(
+        matches!(node, HydroNode::Tee { .. }),
+        "add_tee called on non-tee node: {}",
+        node.print_root()
+    );
 
+    let metadata = node.metadata().clone();
     let new_inner = new_inners
-        .entry((*inner_id, new_location.clone()))
+        .entry((inner_id, new_location.clone()))
         .or_insert_with(|| {
             println!(
                 "Adding network before Tee to location {:?} after id: {}",
                 new_location, inner_id
             );
-            add_network(node, new_location);
+            add_network(node, inner_location, new_location);
             let node_content = std::mem::replace(node, HydroNode::Placeholder);
             Rc::new(RefCell::new(node_content))
         })
@@ -140,126 +161,119 @@ fn add_tee(
     *node = teed_node;
 }
 
-/// Determine the location index for an op. Returns 0 (original) if not in the decision.
-/// Find which location index an op is assigned to. Returns 0 (original) if not found.
-fn op_location(decision: &DecoupleDecision, op_id: usize) -> usize {
-    decision
-        .iter()
-        .position(|ops| ops.contains(&op_id))
-        .unwrap_or(0)
-}
-
-/// Derive the network insertion and source placement actions from the decision
-/// by comparing each op's location to its inputs' locations.
-struct NetworkDecisions {
-    /// op_id -> target LocationId: insert network sending output of this op to target
-    output_to: HashMap<usize, LocationId>,
-    /// op_ids whose source/network nodes should be relocated
-    place_on: HashMap<usize, LocationId>,
-}
-
-fn calc_network_decisions(
-    decision: &DecoupleDecision,
-    op_id_to_inputs: &HashMap<usize, Vec<usize>>,
-    locations: &[LocationId],
-) -> NetworkDecisions {
-    let mut output_to = HashMap::new();
-    let mut place_on = HashMap::new();
-
-    for (loc_idx, ops) in decision.iter().enumerate() {
-        for op_id in ops {
-            if let Some(inputs) = op_id_to_inputs.get(op_id) {
-                if let Some(first_input) = inputs.first() {
-                    let input_loc_idx = op_location(decision, *first_input);
-                    if input_loc_idx != loc_idx {
-                        // The input is on a different location than this op,
-                        // so we need to insert a network after the input sending to this op's location
-                        output_to.insert(*op_id, locations[loc_idx].clone());
-                    }
-                } else {
-                    // No inputs (source node) — if assigned to non-original location, place it there
-                    if loc_idx != 0 {
-                        place_on.insert(*op_id, locations[loc_idx].clone());
-                    }
-                }
-            } else {
-                // Not in op_id_to_inputs — treat as source
-                if loc_idx != 0 {
-                    place_on.insert(*op_id, locations[loc_idx].clone());
-                }
-            }
-        }
-    }
-
-    NetworkDecisions {
-        output_to,
-        place_on,
-    }
-}
-
+/// Places nodes based on location specified in `decision` and adds networking:
+/// 1. If the node is a source, change its location.
+/// 2. Otherwise, if the node's location differs from its input's location, then add a
+///    network after the node.
+/// 2.1. If the node is a Tee, the input is the inner, and the network is inserted AFTER the
+///   inner. The effect is the same as placing the network after the Tee. The network is only
+///   created once per inner, if multiple Tees are sent to the same destination.
+///
+/// Note: The location of a node is where its OUTPUT goes; it is NOT where the node is executed.
 fn decouple_node(
     node: &mut HydroNode,
-    network_decisions: &NetworkDecisions,
-    next_stmt_id: &mut usize,
+    op_id: &mut usize,
+    decision: &DecoupleDecision,
+    location_map: &HashMap<usize, LocationId>,
     new_inners: &mut HashMap<(usize, LocationId), Rc<RefCell<HydroNode>>>,
     tee_to_inner_id_before_rewrites: &HashMap<usize, usize>,
+    cycle_source_to_sink_input: &HashMap<usize, usize>,
 ) {
-    // Replace location of sources, if necessary
-    if let Some(target_location) = network_decisions.place_on.get(next_stmt_id) {
-        match node {
-            HydroNode::Source { metadata, .. }
-            | HydroNode::SingletonSource { metadata, .. }
-            | HydroNode::Network { metadata, .. } => {
-                println!(
-                    "Changing source/network destination from {:?} to location {:?}, id: {}",
-                    metadata.location_id, target_location, next_stmt_id
-                );
-                metadata.location_id.swap_root(target_location.clone());
-            }
-            _ => {
-                std::panic!(
-                    "Decoupler placing non-source/network node on decoupled machine: {}",
-                    node.print_root()
-                );
-            }
-        }
-        return;
-    }
-
-    // Otherwise, check if we need to insert a network
-    let Some(target_location) = network_decisions.output_to.get(next_stmt_id) else {
+    // Ignore unaffected nodes
+    let Some(output_location_idx) = decision.get(op_id) else {
         return;
     };
+    let output_location = location_map.get(output_location_idx).unwrap();
 
-    match node {
-        HydroNode::Placeholder | HydroNode::Network { .. } => {
-            std::panic!(
-                "Decoupler modifying placeholder node or incorrectly handling network node: {}",
-                next_stmt_id
+    // If this node is not a special case, then get the location_idx of one of its inputs
+    let input_location_idx = match node {
+        HydroNode::Placeholder
+        | HydroNode::Cast { .. }
+        | HydroNode::ObserveNonDet { .. }
+        | HydroNode::BeginAtomic { .. }
+        | HydroNode::EndAtomic { .. }
+        | HydroNode::Batch { .. }
+        | HydroNode::YieldConcat { .. }
+        | HydroNode::Counter { .. }
+        | HydroNode::ExternalInput { .. } => {
+            std::panic!("Decoupler placing unexpected node: {}.", op_id);
+        }
+        // Replace location of sources
+        HydroNode::Source { metadata, .. }
+        | HydroNode::SingletonSource { metadata, .. }
+        | HydroNode::Network { metadata, .. } => {
+            println!(
+                "Placing source/network on location {:?}, id: {}",
+                output_location, op_id
             );
+            metadata.location_id.swap_root(output_location.clone());
+            return;
         }
         HydroNode::Tee { .. } => {
+            // If this Tee is assigned a location, its inner must have one assigned as
+            // well
+            let inner_id = tee_to_inner_id_before_rewrites.get(&op_id).unwrap();
+            let inner_location_idx = decision.get(inner_id).unwrap();
+
+            if inner_location_idx == output_location_idx {
+                // No need to add a network if the inner is going to the same location
+                return;
+            }
+
+            let inner_location = location_map.get(inner_location_idx).unwrap();
             println!(
                 "Creating a TEE to location {:?}, id: {}",
-                target_location, next_stmt_id
+                inner_location, op_id
             );
-            add_tee(
-                node,
-                target_location,
-                new_inners,
-                tee_to_inner_id_before_rewrites,
-            );
+            add_tee(node, output_location, *inner_id, inner_location, new_inners);
+            return;
+        }
+        HydroNode::CycleSource { .. } => {
+            // CycleSource doesn't have inputs; check the CycleSink's input.
+            let sink_input = cycle_source_to_sink_input.get(op_id).unwrap();
+            decision.get(sink_input).unwrap()
         }
         _ => {
-            println!(
-                "Creating network to location {:?} after node {}, id: {}",
-                target_location,
-                node.print_root(),
-                next_stmt_id
+            let input_metadata = node.input_metadata();
+            assert!(
+                input_metadata.len() > 0,
+                "Node with no inputs assigned location: {}, {}",
+                op_id,
+                node.print_root()
             );
-            add_network(node, target_location);
+            // Verify that all inputs have the same output location
+            let input_locations_idx = input_metadata
+                .iter()
+                .map(|meta| {
+                    let input_op_id = meta.op.id.unwrap();
+                    decision.get(&input_op_id).expect(&format!(
+                        "Input op id {} of node id {} not found in decision",
+                        input_op_id, op_id
+                    ))
+                })
+                .collect::<HashSet<_>>();
+            assert!(
+                input_locations_idx.len() == 1,
+                "Node with multiple input locations: {}, {}, input location indices: {:?}",
+                op_id,
+                node.print_root(),
+                input_locations_idx
+            );
+            input_locations_idx.into_iter().next().unwrap()
         }
+    };
+
+    if input_location_idx == output_location_idx {
+        // No need to add a network if the input is coming from the same location
+        return;
     }
+
+    println!(
+        "Creating network to location {:?} after id: {}",
+        output_location, op_id
+    );
+    let input_location = location_map.get(input_location_idx).unwrap();
+    add_network(node, input_location, output_location);
 }
 
 fn fix_cluster_self_id_root(root: &mut HydroRoot, mut locations: ClusterSelfIdReplace) {
@@ -292,50 +306,56 @@ fn fix_cluster_self_id_node(node: &mut HydroNode, mut locations: ClusterSelfIdRe
 /// Creates new cluster locations as needed via the FlowBuilder and returns them.
 pub fn decouple<'a>(
     ir: &mut [HydroRoot],
-    mut decision: DecoupleDecision,
+    decision: DecoupleDecision,
     orig_location: &LocationId,
     builder: &mut FlowBuilder<'a>,
 ) -> Vec<Cluster<'a, ()>> {
-    // Preprocess: remove empty location sets and check if there's anything to decouple
-    decision.retain(|ops| !ops.is_empty());
-    let num_locations = decision.len();
-    if num_locations <= 1 {
+    // Preprocess: count the number of unique locations.
+    // If there is only 1, no decoupling is necessary.
+    let unique_locations = decision.values().collect::<HashSet<_>>();
+    if unique_locations.len() <= 1 {
         return vec![];
     }
 
     // Create clusters for each new location index (1..last)
     let mut new_clusters = Vec::new();
-    let mut locations: Vec<LocationId> = vec![orig_location.clone()];
-    for _ in 1..num_locations {
-        let cluster = builder.cluster::<()>();
-        locations.push(cluster.id().clone());
-        new_clusters.push(cluster);
+    let mut locations_map = HashMap::new();
+    for location_idx in unique_locations {
+        // Special case for id 0. This is the original location
+        if *location_idx == 0 {
+            locations_map.insert(0, orig_location.clone());
+        } else {
+            // Otherwise create a new cluster for this location index
+            let cluster = builder.cluster::<()>();
+            locations_map.insert(*location_idx, cluster.id().clone());
+            new_clusters.push(cluster);
+        }
     }
 
-    // Derive actions from the decision by comparing op locations to input locations
-    let cycle_map = cycle_source_to_sink_input(ir);
-    let all_op_id_to_inputs = op_id_to_inputs(ir, Some(&orig_location.key()), &cycle_map);
-    let actions = calc_network_decisions(&decision, &all_op_id_to_inputs, &locations);
-
+    let cycles = cycle_source_to_sink_input(ir);
     let tee_to_inner_id_before_rewrites = tee_to_inner_id(ir);
     let mut new_inners = HashMap::new();
     traverse_dfir::<HydroDeploy>(
         ir,
         |_, _| {},
-        |node, next_stmt_id| {
+        |node, op_id| {
             decouple_node(
                 node,
-                &actions,
-                next_stmt_id,
+                op_id,
+                &decision,
+                &locations_map,
                 &mut new_inners,
                 &tee_to_inner_id_before_rewrites,
+                &cycles,
             );
         },
     );
 
     // Fix locations since we changed some
-    let cycle_source_to_sink_input_post = cycle_source_to_sink_input(ir);
-    inject_location(ir, &cycle_source_to_sink_input_post);
+    inject_id(ir);
+    // print_id(ir);
+    let cycles = cycle_source_to_sink_input(ir);
+    inject_location(ir, &cycles);
 
     // Fix CLUSTER_SELF_ID for each new location
     for cluster in &new_clusters {

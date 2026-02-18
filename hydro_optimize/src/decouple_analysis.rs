@@ -432,14 +432,14 @@ pub(crate) fn decouple_analysis(
     let ModelMetadata { op_id_to_var, .. } = &mut *model_metadata.borrow_mut();
 
     // Build decision: index 0 = original, index 1 = decoupled
-    let mut decision: DecoupleDecision = vec![HashSet::new(), HashSet::new()];
+    let mut decision = DecoupleDecision::default();
     let mut orig_machine = vec![];
     let mut decoupled_machine = vec![];
 
     for (op_id, _inputs) in op_id_to_inputs {
         if let Some(op_var) = op_id_to_var.get(&op_id) {
             let loc_idx = solution.value(*op_var).round() as usize;
-            decision[loc_idx].insert(op_id);
+            decision.insert(op_id, loc_idx);
 
             if loc_idx == 0 {
                 orig_machine.push(op_id);

@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use hydro_lang::compile::builder::FlowBuilder;
+use hydro_lang::compile::built::BuiltFlow;
 use hydro_lang::compile::ir::{
     BoundKind, CollectionKind, DebugType, HydroIrMetadata, HydroNode, HydroRoot,
     KeyedSingletonBoundKind, StreamOrder, StreamRetry, deep_clone, traverse_dfir,
@@ -40,12 +41,12 @@ pub type Rewrites = Vec<RewriteMetadata>;
 /// Returns Vec(Cluster, number of nodes) for each created cluster and a new FlowBuilder
 pub fn replay<'a>(
     rewrites: Rewrites,
-    builder: &mut FlowBuilder<'a>,
-    ir: &[HydroRoot],
-) -> Vec<(Cluster<'a, ()>, usize)> {
+    built: BuiltFlow<'a>,
+) -> (Vec<(Cluster<'a, ()>, usize)>, FlowBuilder<'a>) {
     let mut all_new_clusters = vec![];
 
-    let mut ir = deep_clone(ir);
+    let mut ir = deep_clone(built.ir());
+    let mut builder = FlowBuilder::from_built(&built);
 
     // Apply decoupling/partitioning in order
     for rewrite_metadata in rewrites {
@@ -54,7 +55,8 @@ pub fn replay<'a>(
                 decision,
                 orig_location,
             } => {
-                let new_clusters = decoupler::decouple(&mut ir, decision, &orig_location, builder);
+                let new_clusters =
+                    decoupler::decouple(&mut ir, decision, &orig_location, &mut builder);
                 for cluster in new_clusters {
                     all_new_clusters.push((cluster, rewrite_metadata.num_nodes));
                 }
@@ -67,7 +69,7 @@ pub fn replay<'a>(
 
     builder.replace_ir(ir);
 
-    all_new_clusters
+    (all_new_clusters, builder)
 }
 
 /// Replace CLUSTER_SELF_ID with the ID of the original node the partition is assigned to

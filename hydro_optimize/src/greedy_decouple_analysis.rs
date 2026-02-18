@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::HashMap};
+use std::collections::HashMap;
 
 use hydro_lang::{
     compile::ir::{HydroNode, HydroRoot, traverse_dfir},
@@ -8,90 +8,75 @@ use hydro_lang::{
 
 use crate::decoupler::DecoupleDecision;
 
-/// `tick_loc`: Mapping from tick ID to location for all ops with that tikc
-/// `next_loc`: Next available location ID. Increment once used.
-fn assign_location(
-    location_id: &LocationId,
+fn assign_location_node(
+    node: &mut HydroNode,
     op_id: &mut usize,
-    decisions: &RefCell<DecoupleDecision>,
-    tick_loc: &RefCell<HashMap<usize, usize>>,
+    next_loc: &mut usize,
+    decisions: &mut DecoupleDecision,
+    tick_loc: &mut HashMap<usize, usize>,
     node_to_decouple: &LocationId,
 ) {
+    match node {
+        // Ignore non-operational nodes
+        HydroNode::Placeholder
+        | HydroNode::Cast { .. }
+        | HydroNode::ObserveNonDet { .. }
+        | HydroNode::BeginAtomic { .. }
+        | HydroNode::EndAtomic { .. }
+        | HydroNode::Batch { .. }
+        | HydroNode::YieldConcat { .. }
+        | HydroNode::ExternalInput { .. }
+        | HydroNode::Counter { .. } => return,
+        _ => {}
+    }
+
+    let location_id = &node.metadata().location_id;
+
     // Ignore nodes that we aren't decoupling
     if location_id.root() != node_to_decouple.root() {
         return;
     }
-    let mut decisions = decisions.borrow_mut();
-    let mut tick_loc = tick_loc.borrow_mut();
 
     // Add a new location unless it's part of a tick that already has an assigned location
     let location = match location_id {
-        LocationId::Tick(tick_id, _) => {
-            *tick_loc.entry(*tick_id).or_insert_with(|| decisions.len())
+        LocationId::Tick(tick_id, _) => *tick_loc.entry(*tick_id).or_insert_with(|| {
+            let loc = *next_loc;
+            *next_loc += 1;
+            loc
+        }),
+        _ => {
+            let loc = *next_loc;
+            *next_loc += 1;
+            loc
         }
-        _ => decisions.len(),
     };
 
-    if location >= decisions.len() {
-        decisions.push(Default::default());
-    }
-
-    decisions.get_mut(location).unwrap().insert(*op_id);
-}
-
-fn assign_location_node(
-    node: &mut HydroNode,
-    op_id: &mut usize,
-    decisions: &RefCell<DecoupleDecision>,
-    tick_loc: &RefCell<HashMap<usize, usize>>,
-    node_to_decouple: &LocationId,
-) {
-    // Ignore networks
-    if let HydroNode::Network { .. } = node {
-        return;
-    }
-    assign_location(
-        &node.metadata().location_id,
-        op_id,
-        decisions,
-        tick_loc,
-        node_to_decouple,
-    );
-}
-
-fn assign_location_root(
-    root: &mut HydroRoot,
-    op_id: &mut usize,
-    decisions: &RefCell<DecoupleDecision>,
-    tick_loc: &RefCell<HashMap<usize, usize>>,
-    node_to_decouple: &LocationId,
-) {
-    assign_location(
-        &root.input_metadata().location_id,
-        op_id,
-        decisions,
-        tick_loc,
-        node_to_decouple,
-    );
+    decisions.insert(*op_id, location);
 }
 
 /// Decouples as much as possible; only leaving ticked regions un-decoupled.
-pub(crate) fn greedy_decouple_analysis(
+pub fn greedy_decouple_analysis(
     ir: &mut [HydroRoot],
     node_to_decouple: &LocationId,
 ) -> DecoupleDecision {
-    let decisions = RefCell::new(DecoupleDecision::default());
-    let tick_loc = RefCell::new(HashMap::default());
+    let mut decisions = DecoupleDecision::default();
+    let mut tick_loc = HashMap::default();
+    let mut next_loc = 0;
 
     traverse_dfir::<HydroDeploy>(
         ir,
-        |root, op_id| {
-            assign_location_root(root, op_id, &decisions, &tick_loc, node_to_decouple);
-        },
+        |_, _| {},
         |node, op_id| {
-            assign_location_node(node, op_id, &decisions, &tick_loc, node_to_decouple);
+            assign_location_node(
+                node,
+                op_id,
+                &mut next_loc,
+                &mut decisions,
+                &mut tick_loc,
+                node_to_decouple,
+            );
         },
     );
 
-    decisions.into_inner()
+    decisions
 }

@@ -194,6 +194,10 @@ impl ReusableClusters {
         self
     }
 
+    pub fn from(named_clusters: Vec<(LocationKey, String, usize)>) -> Self {
+        Self { named_clusters }
+    }
+
     fn location_name_and_num(&self, location: &LocationId) -> Option<(String, usize)> {
         self.named_clusters
             .iter()
