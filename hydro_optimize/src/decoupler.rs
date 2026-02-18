@@ -18,8 +18,7 @@ use syn::visit_mut::VisitMut;
 
 use crate::repair::{cycle_source_to_sink_input, inject_id, inject_location};
 use crate::rewrites::{
-    ClusterSelfIdReplace, collection_kind_to_debug_type, deserialize_bincode_with_type,
-    prepend_member_id_to_collection_kind, serialize_bincode_with_type, tee_to_inner_id,
+    ClusterSelfIdReplace, collection_kind_to_debug_type, deserialize_bincode_with_type, op_id_to_inputs, prepend_member_id_to_collection_kind, serialize_bincode_with_type, tee_to_inner_id
 };
 
 /// Mapping from op id to location index, starting from 0.
@@ -165,11 +164,12 @@ fn add_tee(
 /// 1. If the node is a source, change its location.
 /// 2. Otherwise, if the node's location differs from its input's location, then add a
 ///    network after the node.
-/// 2.1. If the node is a Tee, the input is the inner, and the network is inserted AFTER the
-///   inner. The effect is the same as placing the network after the Tee. The network is only
-///   created once per inner, if multiple Tees are sent to the same destination.
+///    2.1. If the node is a Tee, the input is the inner, and the network is inserted AFTER the
+///    inner. The effect is the same as placing the network after the Tee. The network is only
+///    created once per inner, if multiple Tees are sent to the same destination.
 ///
 /// Note: The location of a node is where its OUTPUT goes; it is NOT where the node is executed.
+#[allow(clippy::too_many_arguments)]
 fn decouple_node(
     node: &mut HydroNode,
     op_id: &mut usize,
@@ -177,6 +177,7 @@ fn decouple_node(
     location_map: &HashMap<usize, LocationId>,
     new_inners: &mut HashMap<(usize, LocationId), Rc<RefCell<HydroNode>>>,
     tee_to_inner_id_before_rewrites: &HashMap<usize, usize>,
+    op_id_to_inputs_before_rewrites: &HashMap<usize, Vec<usize>>,
     cycle_source_to_sink_input: &HashMap<usize, usize>,
 ) {
     // Ignore unaffected nodes
@@ -188,15 +189,8 @@ fn decouple_node(
     // If this node is not a special case, then get the location_idx of one of its inputs
     let input_location_idx = match node {
         HydroNode::Placeholder
-        | HydroNode::Cast { .. }
-        | HydroNode::ObserveNonDet { .. }
-        | HydroNode::BeginAtomic { .. }
-        | HydroNode::EndAtomic { .. }
-        | HydroNode::Batch { .. }
-        | HydroNode::YieldConcat { .. }
-        | HydroNode::Counter { .. }
-        | HydroNode::ExternalInput { .. } => {
-            std::panic!("Decoupler placing unexpected node: {}.", op_id);
+        | HydroNode::Counter { .. } => {
+            std::panic!("Decoupling placeholder/counter: {}.", op_id);
         }
         // Replace location of sources
         HydroNode::Source { metadata, .. }
@@ -212,7 +206,7 @@ fn decouple_node(
         HydroNode::Tee { .. } => {
             // If this Tee is assigned a location, its inner must have one assigned as
             // well
-            let inner_id = tee_to_inner_id_before_rewrites.get(&op_id).unwrap();
+            let inner_id = tee_to_inner_id_before_rewrites.get(op_id).unwrap();
             let inner_location_idx = decision.get(inner_id).unwrap();
 
             if inner_location_idx == output_location_idx {
@@ -234,22 +228,29 @@ fn decouple_node(
             decision.get(sink_input).unwrap()
         }
         _ => {
-            let input_metadata = node.input_metadata();
+            let input_ids = op_id_to_inputs_before_rewrites.get(op_id).unwrap_or_else(|| {
+                panic!(
+                    "Input op ids of node id {} not found: {}",
+                    op_id,
+                    node.print_root()
+                )
+            });
             assert!(
-                input_metadata.len() > 0,
+                !input_ids.is_empty(),
                 "Node with no inputs assigned location: {}, {}",
                 op_id,
                 node.print_root()
             );
             // Verify that all inputs have the same output location
-            let input_locations_idx = input_metadata
+            let input_locations_idx = input_ids 
                 .iter()
-                .map(|meta| {
-                    let input_op_id = meta.op.id.unwrap();
-                    decision.get(&input_op_id).expect(&format!(
-                        "Input op id {} of node id {} not found in decision",
-                        input_op_id, op_id
-                    ))
+                .map(|input_id| {
+                    decision.get(input_id).unwrap_or_else(|| {
+                        panic!(
+                            "Input id {} of node id {} not found in decision",
+                            input_id, op_id
+                        )
+                    })
                 })
                 .collect::<HashSet<_>>();
             assert!(
@@ -334,6 +335,7 @@ pub fn decouple<'a>(
 
     let cycles = cycle_source_to_sink_input(ir);
     let tee_to_inner_id_before_rewrites = tee_to_inner_id(ir);
+    let op_id_to_input_before_rewrites = op_id_to_inputs(ir, None, &cycles);
     let mut new_inners = HashMap::new();
     traverse_dfir::<HydroDeploy>(
         ir,
@@ -346,6 +348,7 @@ pub fn decouple<'a>(
                 &locations_map,
                 &mut new_inners,
                 &tee_to_inner_id_before_rewrites,
+                &op_id_to_input_before_rewrites,
                 &cycles,
             );
         },

@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::decoupler::DecoupleDecision;
 use crate::rewrites::op_id_to_inputs;

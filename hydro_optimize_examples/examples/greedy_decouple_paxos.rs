@@ -105,8 +105,7 @@ async fn main() {
         num_nodes: f + 1,
         rewrite: decouple,
     };
-    let (new_proposer_nodes, new_builder) =
-        replay(vec![rewrite_metadata], built);
+    let (new_proposer_nodes, new_builder) = replay(vec![rewrite_metadata], built);
     let new_proposers_with_names = new_proposer_nodes
         .iter()
         .enumerate()
