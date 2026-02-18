@@ -236,8 +236,8 @@ pub struct Optimizations {
 impl Default for Optimizations {
     fn default() -> Self {
         Self {
-            decoupling: true,
-            partitioning: true,
+            decoupling: false,
+            partitioning: false,
             exclude: vec![],
             iterations: 1,
         }
