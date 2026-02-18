@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 
 use hydro_lang::{
-    compile::ir::{HydroNode, HydroRoot, traverse_dfir},
+    compile::{
+        builder::ClockId,
+        ir::{HydroNode, HydroRoot, traverse_dfir},
+    },
     deploy::HydroDeploy,
     location::dynamic::LocationId,
 };
@@ -22,7 +25,7 @@ fn assign_location_node(
     op_id: &mut usize,
     next_loc: &mut usize,
     decisions: &mut DecoupleDecision,
-    op_to_tick: &mut HashMap<usize, usize>,
+    op_to_tick: &mut HashMap<usize, ClockId>,
     node_to_decouple: &LocationId,
 ) {
     let location_id = &node.metadata().location_id;

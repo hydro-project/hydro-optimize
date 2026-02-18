@@ -18,7 +18,9 @@ use syn::visit_mut::VisitMut;
 
 use crate::repair::{cycle_source_to_sink_input, inject_id, inject_location};
 use crate::rewrites::{
-    ClusterSelfIdReplace, collection_kind_to_debug_type, deserialize_bincode_with_type, op_id_to_inputs, prepend_member_id_to_collection_kind, serialize_bincode_with_type, tee_to_inner_id
+    ClusterSelfIdReplace, collection_kind_to_debug_type, deserialize_bincode_with_type,
+    op_id_to_inputs, prepend_member_id_to_collection_kind, serialize_bincode_with_type,
+    tee_to_inner_id,
 };
 
 /// Mapping from op id to location index, starting from 0.
@@ -188,8 +190,7 @@ fn decouple_node(
 
     // If this node is not a special case, then get the location_idx of one of its inputs
     let input_location_idx = match node {
-        HydroNode::Placeholder
-        | HydroNode::Counter { .. } => {
+        HydroNode::Placeholder | HydroNode::Counter { .. } => {
             std::panic!("Decoupling placeholder/counter: {}.", op_id);
         }
         // Replace location of sources
@@ -228,13 +229,15 @@ fn decouple_node(
             decision.get(sink_input).unwrap()
         }
         _ => {
-            let input_ids = op_id_to_inputs_before_rewrites.get(op_id).unwrap_or_else(|| {
-                panic!(
-                    "Input op ids of node id {} not found: {}",
-                    op_id,
-                    node.print_root()
-                )
-            });
+            let input_ids = op_id_to_inputs_before_rewrites
+                .get(op_id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Input op ids of node id {} not found: {}",
+                        op_id,
+                        node.print_root()
+                    )
+                });
             assert!(
                 !input_ids.is_empty(),
                 "Node with no inputs assigned location: {}, {}",
@@ -242,7 +245,7 @@ fn decouple_node(
                 node.print_root()
             );
             // Verify that all inputs have the same output location
-            let input_locations_idx = input_ids 
+            let input_locations_idx = input_ids
                 .iter()
                 .map(|input_id| {
                     decision.get(input_id).unwrap_or_else(|| {

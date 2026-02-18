@@ -8,6 +8,7 @@ use good_lp::{
     Constraint, Expression, ProblemVariables, Solution, SolverModel, Variable, constraint, highs,
     variable, variables,
 };
+use hydro_lang::compile::builder::ClockId;
 use hydro_lang::compile::ir::{
     HydroIrMetadata, HydroIrOpMetadata, HydroNode, HydroRoot, traverse_dfir,
 };
@@ -42,7 +43,7 @@ struct ModelMetadata {
     orig_node_cpu_usage: Expression,
     decoupled_node_cpu_usage: Expression,
     op_id_to_var: HashMap<usize, Variable>,
-    prev_op_input_with_tick: HashMap<usize, usize>, // tick_id: last op_id with that tick_id
+    prev_op_input_with_tick: HashMap<ClockId, usize>, // tick_id: last op_id with that tick_id
     tee_inner_to_decoupled_vars: HashMap<usize, (Variable, Variable)>, /* inner_id: (orig_to_decoupled, decoupled_to_orig) */
     network_ids: HashMap<usize, NetworkType>,
 }

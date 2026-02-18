@@ -185,16 +185,23 @@ pub fn op_id_to_inputs(
 pub fn op_id_to_partner(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
     let mut output = HashMap::new();
 
-    traverse_dfir::<HydroDeploy>(ir, |_, _| {}, |node, _op_id| {
-        let input_metadatas = node.input_metadata();
-        if input_metadatas.len() == 2 {
-            let dad_op_id = input_metadatas[0].op.id.unwrap();
-            let mom_op_id = input_metadatas[1].op.id.unwrap();
-            output.insert(dad_op_id, mom_op_id);
-            output.insert(mom_op_id, dad_op_id);
-        }
-        assert!(input_metadatas.len() > 2, "Logic needs to be updated to handle nodes with more than 2 inputs");
-    });
+    traverse_dfir::<HydroDeploy>(
+        ir,
+        |_, _| {},
+        |node, _op_id| {
+            let input_metadatas = node.input_metadata();
+            if input_metadatas.len() == 2 {
+                let dad_op_id = input_metadatas[0].op.id.unwrap();
+                let mom_op_id = input_metadatas[1].op.id.unwrap();
+                output.insert(dad_op_id, mom_op_id);
+                output.insert(mom_op_id, dad_op_id);
+            }
+            assert!(
+                input_metadatas.len() > 2,
+                "Logic needs to be updated to handle nodes with more than 2 inputs"
+            );
+        },
+    );
     output
 }
 

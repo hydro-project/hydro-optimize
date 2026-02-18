@@ -1,12 +1,12 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use hydro_lang::compile::builder::CycleId;
 use hydro_lang::compile::ir::{
     HydroIrOpMetadata, HydroNode, HydroRoot, transform_bottom_up, traverse_dfir,
 };
 use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::location::dynamic::LocationId;
-use syn::Ident;
 
 fn inject_id_metadata(
     metadata: &mut HydroIrOpMetadata,
@@ -36,23 +36,26 @@ pub fn inject_id(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
     new_id_to_old_id.take()
 }
 
-fn link_cycles_root(root: &mut HydroRoot, sink_inputs: &mut HashMap<Ident, usize>) {
-    if let HydroRoot::CycleSink { ident, input, .. } = root {
-        sink_inputs.insert(ident.clone(), input.op_metadata().id.unwrap());
+fn link_cycles_root(root: &mut HydroRoot, sink_inputs: &mut HashMap<CycleId, usize>) {
+    if let HydroRoot::CycleSink {
+        cycle_id, input, ..
+    } = root
+    {
+        sink_inputs.insert(*cycle_id, input.op_metadata().id.unwrap());
         println!(
             "Cycle sink {:?} has input {:?}",
-            ident.clone(),
+            cycle_id.clone(),
             input.op_metadata().id.unwrap()
         );
     }
 }
 
-fn link_cycles_node(node: &mut HydroNode, sources: &mut HashMap<Ident, usize>) {
+fn link_cycles_node(node: &mut HydroNode, sources: &mut HashMap<CycleId, usize>) {
     if let HydroNode::CycleSource {
-        ident, metadata, ..
+        cycle_id, metadata, ..
     } = node
     {
-        sources.insert(ident.clone(), metadata.op.id.unwrap());
+        sources.insert(*cycle_id, metadata.op.id.unwrap());
     }
 }
 
