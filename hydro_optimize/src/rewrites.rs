@@ -11,7 +11,7 @@ use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::location::{Cluster, LocationKey};
 use proc_macro2::{Span, TokenStream};
-use quote::quote;
+use quote::{ToTokens, quote};
 use serde::{Deserialize, Serialize};
 use syn::parse_quote;
 use syn::visit_mut::{self, VisitMut};
@@ -219,6 +219,41 @@ pub fn tee_to_inner_id(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
     );
 
     mapping
+}
+
+/// Check if the type is serializable. Currently a janky implementation that just looks for common unserializable types.
+/// Add to the list as new errors emerge.
+fn type_is_serializable(t: &DebugType) -> bool {
+    let type_name = t.to_token_stream().to_string();
+    let unserializable_types = [
+        "Rc",
+        "RefCell",
+        "Instant",
+        "Duration",
+        "SystemTime",
+        "HashMap",
+    ];
+    !unserializable_types
+        .iter()
+        .any(|unser| type_name.contains(unser))
+}
+
+pub fn is_serializable(output_type: &CollectionKind) -> bool {
+    match output_type {
+        CollectionKind::Stream { element_type, .. }
+        | CollectionKind::Singleton { element_type, .. }
+        | CollectionKind::Optional { element_type, .. } => type_is_serializable(element_type),
+        CollectionKind::KeyedStream {
+            key_type,
+            value_type,
+            ..
+        }
+        | CollectionKind::KeyedSingleton {
+            key_type,
+            value_type,
+            ..
+        } => type_is_serializable(key_type) && type_is_serializable(value_type),
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]

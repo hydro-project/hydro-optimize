@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 
+use ena::unify::{InPlace, UnificationTable, UnifyKey};
 use hydro_lang::{
     compile::{
         builder::ClockId,
@@ -9,23 +11,40 @@ use hydro_lang::{
     location::dynamic::LocationId,
 };
 
+use crate::rewrites::is_serializable;
 use crate::{
     decoupler::DecoupleDecision, repair::cycle_source_to_sink_input, rewrites::op_id_to_inputs,
 };
 
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+struct UnitKey(u32);
+
+impl UnifyKey for UnitKey {
+    type Value = ();
+    fn index(&self) -> u32 {
+        self.0
+    }
+    fn from_index(u: u32) -> Self {
+        UnitKey(u)
+    }
+    fn tag() -> &'static str {
+        "UnitKey"
+    }
+}
+
+type UnionFind = UnificationTable<InPlace<UnitKey>>;
+
 /// For each `node` executing on `node_to_decouple` (its input's location is `node_to_decouple`), assign it a new location.
-/// Also populate `op_to_tick`.
+/// Also populate `op_to_key`, `key_to_loc`, `tick_to_ops` and `unserializable_ops`.
 ///
 /// Concretely, if the node's parent's location is `node_to_decouple`, then the node must be executing on `node_to_decouple`.
-/// Respect the following invariant: If the node is part of a tick, then all nodes in the tick must be assigned to the same location.
-/// - `next_loc`: the next int that represents an unused location.
-/// - `op_to_tick`: map from op_id to tick, if it is in one
 fn assign_location_node(
     node: &mut HydroNode,
     op_id: &mut usize,
-    next_loc: &mut usize,
-    decisions: &mut DecoupleDecision,
-    op_to_tick: &mut HashMap<usize, ClockId>,
+    op_to_key: &mut HashMap<usize, UnitKey>,
+    key_to_loc: &mut UnionFind,
+    tick_to_ops: &mut HashMap<ClockId, HashSet<usize>>,
+    unserializable_ops: &mut HashSet<usize>,
     node_to_decouple: &LocationId,
 ) {
     let location_id = &node.metadata().location_id;
@@ -36,13 +55,15 @@ fn assign_location_node(
     }
 
     if let LocationId::Tick(tick_id, _) = location_id {
-        op_to_tick.insert(*op_id, *tick_id);
+        tick_to_ops.entry(*tick_id).or_default().insert(*op_id);
     }
 
-    let new_loc = *next_loc;
-    *next_loc += 1;
+    if !is_serializable(&node.metadata().collection_kind) {
+        unserializable_ops.insert(*op_id);
+    }
 
-    decisions.insert(*op_id, new_loc);
+    let key = key_to_loc.new_key(());
+    op_to_key.insert(*op_id, key);
 }
 
 /// Decouples as much as possible; only leaving ticked regions un-decoupled.
@@ -50,9 +71,10 @@ pub fn greedy_decouple_analysis(
     ir: &mut [HydroRoot],
     node_to_decouple: &LocationId,
 ) -> DecoupleDecision {
-    let mut decisions = DecoupleDecision::default();
-    let mut op_to_tick = HashMap::new();
-    let mut next_loc = 0;
+    let mut op_to_key = HashMap::new();
+    let mut key_to_loc = UnificationTable::<InPlace<UnitKey>>::default();
+    let mut tick_to_ops = HashMap::new();
+    let mut unserializable_ops = HashSet::new();
 
     traverse_dfir::<HydroDeploy>(
         ir,
@@ -61,9 +83,10 @@ pub fn greedy_decouple_analysis(
             assign_location_node(
                 node,
                 op_id,
-                &mut next_loc,
-                &mut decisions,
-                &mut op_to_tick,
+                &mut op_to_key,
+                &mut key_to_loc,
+                &mut tick_to_ops,
+                &mut unserializable_ops,
                 node_to_decouple,
             );
         },
@@ -72,36 +95,61 @@ pub fn greedy_decouple_analysis(
     // Constrain tick
     let cycles = cycle_source_to_sink_input(ir);
     let op_id_to_input = op_id_to_inputs(ir, Some(&node_to_decouple.key()), &cycles);
-    let mut tick_loc = HashMap::new();
-    for (op_id, tick_id) in op_to_tick {
-        if let Some(inputs) = op_id_to_input.get(&op_id) {
-            if inputs.is_empty() {
-                continue;
-            }
-
-            // For all ops of the same tick, their inputs all output to the same location
-            let location = tick_loc
-                .entry(tick_id)
-                .or_insert_with(|| *decisions.get(&inputs[0]).unwrap());
-            for input in inputs {
-                decisions.insert(*input, *location);
+    let mut tick_to_op_inputs = HashMap::new();
+    for (tick_id, ops) in tick_to_ops {
+        for op_id in ops {
+            if let Some(inputs) = op_id_to_input.get(&op_id) {
+                tick_to_op_inputs
+                    .entry(tick_id)
+                    .or_insert_with(HashSet::new)
+                    .extend(inputs);
             }
         }
     }
+    for (_tick_id, op_inputs) in tick_to_op_inputs {
+        // Pairwise union
+        let op_inputs_vec: Vec<usize> = op_inputs.into_iter().collect();
+        for i in 0..op_inputs_vec.len() - 1 {
+            let input1_key = op_to_key
+                .get(&op_inputs_vec[i])
+                .expect("Input should have a key");
+            let input2_key = op_to_key
+                .get(&op_inputs_vec[i + 1])
+                .expect("Input should have a key");
+            key_to_loc.union(*input1_key, *input2_key);
+        }
+    }
 
-    // Constrain inputs to the same op
-    for (_op_id, inputs) in op_id_to_input {
+    // Constrain inputs
+    for (_op_id, inputs) in op_id_to_input.iter() {
         assert!(
             inputs.len() <= 2,
             "Did not expect op with more than 2 inputs"
         );
-        if inputs.is_empty() || inputs.len() != 2 {
+        if inputs.len() != 2 {
             continue;
         }
 
-        let location = decisions.get(&inputs[0]).unwrap();
-        decisions.insert(inputs[1], *location);
+        let input1_key = op_to_key.get(&inputs[0]).expect("Input should have a key");
+        let input2_key = op_to_key.get(&inputs[1]).expect("Input should have a key");
+        key_to_loc.union(*input1_key, *input2_key);
     }
 
-    decisions
+    // Constrain based on serializability. If it's not serializable, then it has to be on the same location as its inputs
+    for op_id in unserializable_ops {
+        let op_key = op_to_key.get(&op_id).expect("Op should have a key");
+        let inputs = op_id_to_input
+            .get(&op_id)
+            .expect("Op's parent is not in the same location, must be network. But Network must output a serializable type?");
+        for input in inputs {
+            let input_key = op_to_key.get(input).expect("Input should have a key");
+            key_to_loc.union(*op_key, *input_key);
+        }
+    }
+
+    let mut decision = DecoupleDecision::default();
+    for (op_id, key) in op_to_key {
+        decision.insert(op_id, key_to_loc.find(key).0 as usize);
+    }
+    decision
 }

@@ -10,6 +10,7 @@ edition = "2024"
 all-features = true
 
 [dependencies]
+ena = "0.14.4"
 good_lp = { version = "1.14.0", features = ["highs"], default-features = false }
 hydro_deploy.workspace = true
 hydro_lang = { workspace = true, features = ["deploy"] }
