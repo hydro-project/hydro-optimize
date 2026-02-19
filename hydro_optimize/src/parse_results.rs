@@ -152,22 +152,18 @@ pub fn parse_sar_output(lines: Vec<String>) -> Vec<SarStats> {
         }
     }
 
-    assert_eq!(
+    assert!(
+        cpu_usages.len().abs_diff(network_usages.len()) <= 1,
+        "sar output mismatch: {} cpu vs {} network entries",
         cpu_usages.len(),
         network_usages.len(),
-        "Couldn't correctly parse sar output"
     );
 
-    // Combine
-    let mut stats = vec![];
-    for i in 0..cpu_usages.len() {
-        stats.push(SarStats {
-            cpu: cpu_usages[i],
-            network: network_usages[i],
-        });
-    }
-
-    stats
+    cpu_usages
+        .into_iter()
+        .zip(network_usages)
+        .map(|(cpu, network)| SarStats { cpu, network })
+        .collect()
 }
 
 /// Parses throughput output from `print_parseable_bench_results`.
