@@ -42,10 +42,6 @@ fn link_cycles_root(root: &mut HydroRoot, sink_inputs: &mut HashMap<CycleId, usi
     } = root
     {
         sink_inputs.insert(*cycle_id, input.op_metadata().id.unwrap());
-        println!(
-            cycle_id.clone(),
-            input.op_metadata().id.unwrap()
-        );
     }
 }
 
