@@ -16,7 +16,6 @@ use proc_macro2::Span;
 use stageleft::quote_type;
 use syn::visit_mut::VisitMut;
 
-use crate::debug::print_id;
 use crate::repair::{cycle_source_to_sink_input, inject_id, inject_location};
 use crate::rewrites::{
     ClusterSelfIdReplace, collection_kind_to_debug_type, deserialize_bincode_with_type,
@@ -51,15 +50,10 @@ fn add_network(node: &mut HydroNode, send_location: &LocationId, recv_location: 
         &format!("__hydro_lang_cluster_self_id_{}", member_id),
         Span::call_site(),
     );
-    let recv_location_str = format!("{:?}", recv_location);
-    let node_id = metadata.op.id.unwrap_or(0);
-    let f: syn::Expr = syn::parse_quote!(|b| {
-        // ::std::println!("{} Node sending to location {:?}", #node_id, #recv_location_str); 
-    (
+    let f: syn::Expr = syn::parse_quote!(|b| (
         hydro_lang::location::MemberId::<()>::from_tagless(#ident.clone()),
         b
-    )
-    });
+    ));
 
     // Calculate the new CollectionKind
     let original_collection_kind = metadata.collection_kind.clone();
@@ -342,9 +336,6 @@ pub fn decouple<'a>(
         }
     }
 
-    println!("Before decoupling");
-    print_id(ir);
-
     let cycles = cycle_source_to_sink_input(ir);
     let tee_to_inner_id_before_rewrites = tee_to_inner_id(ir);
     let op_id_to_input_before_rewrites = op_id_to_inputs(ir, None, &cycles);
@@ -388,9 +379,6 @@ pub fn decouple<'a>(
             true,
         );
     }
-
-    println!("After decoupling");
-    print_id(ir);
 
     new_clusters
 }
