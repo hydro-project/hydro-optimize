@@ -238,22 +238,28 @@ fn type_is_serializable(t: &DebugType) -> bool {
         .any(|unser| type_name.contains(unser))
 }
 
-pub fn is_serializable(output_type: &CollectionKind) -> bool {
-    match output_type {
-        CollectionKind::Stream { element_type, .. }
-        | CollectionKind::Singleton { element_type, .. }
-        | CollectionKind::Optional { element_type, .. } => type_is_serializable(element_type),
-        CollectionKind::KeyedStream {
-            key_type,
-            value_type,
-            ..
+/// Returns whether a node can be decoupled.
+///
+/// False if:
+/// 1. The node relies on replay (Optional, Singleton, KeyedSingleton without BoundedValue)
+/// 2. The output type is not serializable
+pub fn can_decouple(output_type: &CollectionKind) -> bool {
+    !output_type.is_bounded()
+        && match output_type {
+            CollectionKind::Stream { element_type, .. } => type_is_serializable(element_type),
+            CollectionKind::KeyedSingleton {
+                bound: KeyedSingletonBoundKind::BoundedValue,
+                ..
+            } => true,
+            CollectionKind::Optional { .. }
+            | CollectionKind::Singleton { .. }
+            | CollectionKind::KeyedSingleton { .. } => false,
+            CollectionKind::KeyedStream {
+                key_type,
+                value_type,
+                ..
+            } => type_is_serializable(key_type) && type_is_serializable(value_type),
         }
-        | CollectionKind::KeyedSingleton {
-            key_type,
-            value_type,
-            ..
-        } => type_is_serializable(key_type) && type_is_serializable(value_type),
-    }
 }
 
 #[derive(Clone, PartialEq, Eq)]

@@ -167,12 +167,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.101"
+version = "1.0.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f0e0fee31ef5ed1ba1316088939cea399010ed7731dba877ed44aeb407a75ea"
-dependencies = [
- "backtrace",
-]
+checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "append-only-vec"
@@ -686,9 +683,9 @@ dependencies = [
 
 [[package]]
 name = "bumpalo"
-version = "3.20.1"
+version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c6f81257d10a0f602a294ae4182251151ff97dbb504ef9afcdda4a64b24d9b4"
+checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
 
 [[package]]
 name = "by_address"
@@ -860,9 +857,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.5.59"
+version = "4.5.60"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5caf74d17c3aec5495110c34cc3f78644bfa89af6c8993ed4de2790e49b6499"
+checksum = "2797f34da339ce31042b27d23607e051786132987f595b02ba4f6a6dffb7030a"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -870,9 +867,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.5.59"
+version = "4.5.60"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "370daa45065b80218950227371916a1633217ae42b2715b2287b606dcd618e24"
+checksum = "24a241312cea5059b13574bb9b3861cabf758b879c15190b37b6d6fd63ab6876"
 dependencies = [
  "anstream",
  "anstyle",
@@ -1016,7 +1013,7 @@ dependencies = [
 [[package]]
 name = "copy_span"
 version = "0.1.0"
-source = "git+https://github.com/hydro-project/hydro.git#bf569f43dcc71e11a8a520709374ca2271775556"
+source = "git+https://github.com/hydro-project/hydro.git#676ca45da47281aca0d0a19155601b6edc81acec"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1236,7 +1233,7 @@ dependencies = [
 [[package]]
 name = "dfir_lang"
 version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git#bf569f43dcc71e11a8a520709374ca2271775556"
+source = "git+https://github.com/hydro-project/hydro.git#676ca45da47281aca0d0a19155601b6edc81acec"
 dependencies = [
  "auto_impl",
  "documented",
@@ -1254,7 +1251,7 @@ dependencies = [
 [[package]]
 name = "dfir_rs"
 version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git#bf569f43dcc71e11a8a520709374ca2271775556"
+source = "git+https://github.com/hydro-project/hydro.git#676ca45da47281aca0d0a19155601b6edc81acec"
 dependencies = [
  "bincode",
  "bytes",
@@ -1803,9 +1800,9 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "good_lp"
-version = "1.14.2"
+version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "776aa1ba88ac058e78408c17f4dbff826a51ae08ed6642f71ca0edd7fe9383f3"
+checksum = "8c071f15f0c38eb6445a8100660c5806f4c597b611f24442de1b31b87d41da5c"
 dependencies = [
  "fnv",
  "highs",
@@ -1974,7 +1971,7 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 [[package]]
 name = "hydro_build_utils"
 version = "0.0.1"
-source = "git+https://github.com/hydro-project/hydro.git#bf569f43dcc71e11a8a520709374ca2271775556"
+source = "git+https://github.com/hydro-project/hydro.git#676ca45da47281aca0d0a19155601b6edc81acec"
 dependencies = [
  "insta",
  "rustc_version",
@@ -1983,7 +1980,7 @@ dependencies = [
 [[package]]
 name = "hydro_deploy"
 version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git#bf569f43dcc71e11a8a520709374ca2271775556"
+source = "git+https://github.com/hydro-project/hydro.git#676ca45da47281aca0d0a19155601b6edc81acec"
 dependencies = [
  "anyhow",
  "append-only-vec",
@@ -2019,7 +2016,7 @@ dependencies = [
 [[package]]
 name = "hydro_deploy_integration"
 version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git#bf569f43dcc71e11a8a520709374ca2271775556"
+source = "git+https://github.com/hydro-project/hydro.git#676ca45da47281aca0d0a19155601b6edc81acec"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -2037,7 +2034,7 @@ dependencies = [
 [[package]]
 name = "hydro_lang"
 version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git#bf569f43dcc71e11a8a520709374ca2271775556"
+source = "git+https://github.com/hydro-project/hydro.git#676ca45da47281aca0d0a19155601b6edc81acec"
 dependencies = [
  "auto_impl",
  "backtrace",
@@ -2142,7 +2139,7 @@ dependencies = [
 [[package]]
 name = "hydro_std"
 version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git#bf569f43dcc71e11a8a520709374ca2271775556"
+source = "git+https://github.com/hydro-project/hydro.git#676ca45da47281aca0d0a19155601b6edc81acec"
 dependencies = [
  "hdrhistogram",
  "hydro_lang",
@@ -2154,7 +2151,7 @@ dependencies = [
 [[package]]
 name = "hydro_test"
 version = "0.0.0"
-source = "git+https://github.com/hydro-project/hydro.git#bf569f43dcc71e11a8a520709374ca2271775556"
+source = "git+https://github.com/hydro-project/hydro.git#676ca45da47281aca0d0a19155601b6edc81acec"
 dependencies = [
  "bytes",
  "colored",
@@ -2369,7 +2366,7 @@ dependencies = [
 [[package]]
 name = "include_mdtests"
 version = "0.0.0"
-source = "git+https://github.com/hydro-project/hydro.git#bf569f43dcc71e11a8a520709374ca2271775556"
+source = "git+https://github.com/hydro-project/hydro.git#676ca45da47281aca0d0a19155601b6edc81acec"
 dependencies = [
  "glob",
  "proc-macro2",
@@ -2565,9 +2562,9 @@ checksum = "8eaf4bc02d17cbdd7ff4c7438cafcdf7fb9a4613313ad11b4f8fefe7d3fa0130"
 
 [[package]]
 name = "js-sys"
-version = "0.3.85"
+version = "0.3.86"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c942ebf8e95485ca0d52d97da7c5a2c387d0e7f0ba4c35e93bfcaee045955b3"
+checksum = "d36139f1c97c42c0c86a411910b04e48d4939a0376e6e0f989420cbdee0120e5"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
@@ -2576,7 +2573,7 @@ dependencies = [
 [[package]]
 name = "lattices"
 version = "0.6.2"
-source = "git+https://github.com/hydro-project/hydro.git#bf569f43dcc71e11a8a520709374ca2271775556"
+source = "git+https://github.com/hydro-project/hydro.git#676ca45da47281aca0d0a19155601b6edc81acec"
 dependencies = [
  "cc-traits",
  "fst",
@@ -2592,7 +2589,7 @@ dependencies = [
 [[package]]
 name = "lattices_macro"
 version = "0.5.11"
-source = "git+https://github.com/hydro-project/hydro.git#bf569f43dcc71e11a8a520709374ca2271775556"
+source = "git+https://github.com/hydro-project/hydro.git#676ca45da47281aca0d0a19155601b6edc81acec"
 dependencies = [
  "hydro_build_utils",
  "proc-macro-crate 3.4.0",
@@ -4328,7 +4325,7 @@ checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 [[package]]
 name = "sinktools"
 version = "0.0.1"
-source = "git+https://github.com/hydro-project/hydro.git#bf569f43dcc71e11a8a520709374ca2271775556"
+source = "git+https://github.com/hydro-project/hydro.git#676ca45da47281aca0d0a19155601b6edc81acec"
 dependencies = [
  "futures-util",
  "pin-project-lite",
@@ -4554,9 +4551,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "2.0.116"
+version = "2.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3df424c70518695237746f84cede799c9c58fcb37450d7b23716568cc8bc69cb"
+checksum = "e665b8803e7b1d2a727f4023456bbbbe74da67099c585258af0ad9c5013b9b99"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5141,7 +5138,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 [[package]]
 name = "variadics"
 version = "0.0.10"
-source = "git+https://github.com/hydro-project/hydro.git#bf569f43dcc71e11a8a520709374ca2271775556"
+source = "git+https://github.com/hydro-project/hydro.git#676ca45da47281aca0d0a19155601b6edc81acec"
 dependencies = [
  "hashbrown 0.14.5",
  "hydro_build_utils",
@@ -5151,7 +5148,7 @@ dependencies = [
 [[package]]
 name = "variadics_macro"
 version = "0.6.2"
-source = "git+https://github.com/hydro-project/hydro.git#bf569f43dcc71e11a8a520709374ca2271775556"
+source = "git+https://github.com/hydro-project/hydro.git#676ca45da47281aca0d0a19155601b6edc81acec"
 dependencies = [
  "proc-macro-crate 3.4.0",
  "proc-macro2",
@@ -5211,9 +5208,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen"
-version = "0.2.108"
+version = "0.2.109"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64024a30ec1e37399cf85a7ffefebdb72205ca1c972291c51512360d90bd8566"
+checksum = "9ff9c7baef35ac3c0e17d8bfc9ad75eb62f85a2f02bccc906699dadb0aa9c622"
 dependencies = [
  "cfg-if",
  "once_cell",
@@ -5224,9 +5221,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-futures"
-version = "0.4.58"
+version = "0.4.59"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70a6e77fd0ae8029c9ea0063f87c46fde723e7d887703d74ad2616d792e51e6f"
+checksum = "d24699cd39db9966cf6e2ef10d2f72779c961ad905911f395ea201c3ec9f545d"
 dependencies = [
  "cfg-if",
  "futures-util",
@@ -5238,9 +5235,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro"
-version = "0.2.108"
+version = "0.2.109"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "008b239d9c740232e71bd39e8ef6429d27097518b6b30bdf9086833bd5b6d608"
+checksum = "39455e84ad887a0bbc93c116d72403f1bb0a39e37dd6f235a43e2128a0c7f1fd"
 dependencies = [
  "quote",
  "wasm-bindgen-macro-support",
@@ -5248,9 +5245,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro-support"
-version = "0.2.108"
+version = "0.2.109"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5256bae2d58f54820e6490f9839c49780dff84c65aeab9e772f15d5f0e913a55"
+checksum = "dff4761f60b0b51fd13fec8764167b7bbcc34498ce3e52805fe1db6f2d56b6d6"
 dependencies = [
  "bumpalo",
  "proc-macro2",
@@ -5261,9 +5258,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-shared"
-version = "0.2.108"
+version = "0.2.109"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f01b580c9ac74c8d8f0c0e4afb04eeef2acf145458e52c03845ee9cd23e3d12"
+checksum = "bc6a171c53d98021a93a474c4a4579d76ba97f9517d871bc12e27640f218b6dd"
 dependencies = [
  "unicode-ident",
 ]
@@ -5317,9 +5314,9 @@ dependencies = [
 
 [[package]]
 name = "web-sys"
-version = "0.3.85"
+version = "0.3.86"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "312e32e551d92129218ea9a2452120f4aabc03529ef03e4d0d82fb2780608598"
+checksum = "668fa5d00434e890a452ab060d24e3904d1be93f7bb01b70e5603baa2b8ab23b"
 dependencies = [
  "js-sys",
  "wasm-bindgen",

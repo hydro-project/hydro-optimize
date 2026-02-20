@@ -11,7 +11,7 @@ use hydro_lang::{
     location::dynamic::LocationId,
 };
 
-use crate::rewrites::is_serializable;
+use crate::rewrites::can_decouple;
 use crate::{
     decoupler::DecoupleDecision, repair::cycle_source_to_sink_input, rewrites::op_id_to_inputs,
 };
@@ -35,7 +35,7 @@ impl UnifyKey for UnitKey {
 type UnionFind = UnificationTable<InPlace<UnitKey>>;
 
 /// For each `node` executing on `node_to_decouple` (its input's location is `node_to_decouple`), assign it a new location.
-/// Also populate `op_to_key`, `key_to_loc`, `tick_to_ops` and `unserializable_ops`.
+/// Also populate `op_to_key`, `key_to_loc`, `tick_to_ops` and `do_not_decouple`.
 ///
 /// Concretely, if the node's parent's location is `node_to_decouple`, then the node must be executing on `node_to_decouple`.
 fn assign_location_node(
@@ -44,7 +44,7 @@ fn assign_location_node(
     op_to_key: &mut HashMap<usize, UnitKey>,
     key_to_loc: &mut UnionFind,
     tick_to_ops: &mut HashMap<ClockId, HashSet<usize>>,
-    unserializable_ops: &mut HashSet<usize>,
+    do_not_decouple: &mut HashSet<usize>,
     node_to_decouple: &LocationId,
 ) {
     let location_id = &node.metadata().location_id;
@@ -54,12 +54,21 @@ fn assign_location_node(
         return;
     }
 
-    if let LocationId::Tick(tick_id, _) = location_id {
-        tick_to_ops.entry(*tick_id).or_default().insert(*op_id);
+    let tick_id = match location_id {
+        LocationId::Tick(tick_id, _) => Some(*tick_id),
+        LocationId::Atomic(tick) => match tick.as_ref() {
+            LocationId::Tick(tick_id, _) => Some(*tick_id),
+            _ => panic!("Expected tick location for atomic node"),
+        },
+        _ => None,
+    };
+
+    if let Some(tick_id) = tick_id {
+        tick_to_ops.entry(tick_id).or_default().insert(*op_id);
     }
 
-    if !is_serializable(&node.metadata().collection_kind) {
-        unserializable_ops.insert(*op_id);
+    if !can_decouple(&node.metadata().collection_kind) {
+        do_not_decouple.insert(*op_id);
     }
 
     let key = key_to_loc.new_key(());
@@ -74,7 +83,7 @@ pub fn greedy_decouple_analysis(
     let mut op_to_key = HashMap::new();
     let mut key_to_loc = UnificationTable::<InPlace<UnitKey>>::default();
     let mut tick_to_ops = HashMap::new();
-    let mut unserializable_ops = HashSet::new();
+    let mut do_not_decouple = HashSet::new();
 
     traverse_dfir::<HydroDeploy>(
         ir,
@@ -86,7 +95,7 @@ pub fn greedy_decouple_analysis(
                 &mut op_to_key,
                 &mut key_to_loc,
                 &mut tick_to_ops,
-                &mut unserializable_ops,
+                &mut do_not_decouple,
                 node_to_decouple,
             );
         },
@@ -135,12 +144,12 @@ pub fn greedy_decouple_analysis(
         key_to_loc.union(*input1_key, *input2_key);
     }
 
-    // Constrain based on serializability. If it's not serializable, then it has to be on the same location as its inputs
-    for op_id in unserializable_ops {
+    // Do not decouple constraints
+    for op_id in do_not_decouple {
         let op_key = op_to_key.get(&op_id).expect("Op should have a key");
         let inputs = op_id_to_input
             .get(&op_id)
-            .expect("Op's parent is not in the same location, must be network. But Network must output a serializable type?");
+            .expect("Op's parent is not in the same location, must be network. But Network must be serializable and unbounded?");
         for input in inputs {
             let input_key = op_to_key.get(input).expect("Input should have a key");
             key_to_loc.union(*op_key, *input_key);
