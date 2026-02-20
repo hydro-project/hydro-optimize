@@ -252,6 +252,7 @@ async fn main() {
     const PHYSICAL_CLIENTS_MIN: usize = 1;
     const PHYSICAL_CLIENTS_MAX: usize = 10;
     const VIRTUAL_CLIENTS_STEP: usize = 50;
+    const LATENCY_THRESHOLD: f64 = 10.0;
 
     let mut best_throughput: usize = 0;
     let mut best_config: (usize, usize) = (0, 0);
@@ -263,6 +264,7 @@ async fn main() {
 
     'outer: for num_clients in (PHYSICAL_CLIENTS_MIN..=PHYSICAL_CLIENTS_MAX).step_by(1) {
         let mut prev_throughput: Option<usize> = None;
+        let mut best_latency: Option<f64> = None;
         let best_before_round = best_throughput;
 
         // Start at the per-node count that yields roughly the same total
@@ -287,6 +289,7 @@ async fn main() {
             let output_dir = output_dir.get_or_insert(new_output_dir);
 
             let current_throughput = run_metadata.throughputs[MEASUREMENT_SECOND];
+            let current_latency = run_metadata.latencies[MEASUREMENT_SECOND].1; // p99
             println!(
                 "physical_clients={}, virtual_clients={}, throughput@{}s={}",
                 num_clients,
@@ -310,17 +313,22 @@ async fn main() {
                 best_config = (num_clients, num_virtual);
             }
 
-            // Check saturation against the previous virtual-client run
-            if let Some(prev) = prev_throughput
-                && current_throughput <= prev
-            {
-                println!(
-                    "Throughput saturated for {} physical clients \
-                     ({}→{} rps). Moving to next physical client count.",
-                    num_clients, prev, current_throughput
-                );
-                saturated_total_virtual = Some(num_clients * num_virtual);
-                break; // break inner loop, increase physical clients
+            // Throughput stalled
+            if prev_throughput.is_some_and(|prev| current_throughput <= prev) {
+                let best = best_latency.expect("Previous config must've recorded a best_latency");
+                // Check saturation against the best latency for this physical config,
+                if current_latency > best * LATENCY_THRESHOLD {
+                    println!(
+                        "Throughput saturated for {} physical clients \
+                     (latency {:.2}→{:.2} ms). Moving to next physical client count.",
+                        num_clients, best, current_latency
+                    );
+                    saturated_total_virtual = Some(num_clients * num_virtual);
+                    break; // break inner loop, increase physical clients
+                }
+            } else {
+                // Keep incrementing best latency until throughput stalls
+                best_latency = Some(current_latency);
             }
 
             prev_throughput = Some(current_throughput);

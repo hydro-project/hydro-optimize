@@ -78,7 +78,7 @@ impl ReusableHosts {
                 InitializedHostType::Aws { network } => deployment
                     .AwsEc2Host()
                     .region(AWS_REGION)
-                    .instance_type("t3.micro")
+                    .instance_type("m5.2xlarge")
                     .ami(AWS_INSTANCE_AMI)
                     .network(network.clone())
                     // Better performance than MUSL, perf reporting fewer unidentified stacks, but requires launching from Linux
