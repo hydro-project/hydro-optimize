@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use hydro_lang::compile::ir::{HydroNode, HydroRoot, traverse_dfir};
-use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::location::dynamic::LocationId;
 use syn::visit::Visit;
 
@@ -32,16 +31,14 @@ fn all_inputs_parents(
 fn all_inputs(ir: &mut [HydroRoot], location: &LocationId) -> Vec<usize> {
     let mut inputs = vec![];
 
-    traverse_dfir::<HydroDeploy>(
-        ir,
-        |_, _| {},
-        |node, next_stmt_id| match get_network_type(node, &location.root().key()) {
-            Some(NetworkType::Recv) | Some(NetworkType::SendRecv) => {
-                inputs.push(*next_stmt_id);
-            }
-            _ => {}
-        },
-    );
+    traverse_dfir(ir,
+    |_, _| {},
+    |node, next_stmt_id| match get_network_type(node, &location.root().key()) {
+        Some(NetworkType::Recv) | Some(NetworkType::SendRecv) => {
+            inputs.push(*next_stmt_id);
+        }
+        _ => {}
+    },);
 
     inputs
 }
@@ -374,13 +371,11 @@ fn input_dependency_analysis(
     loop {
         println!("Input dependency analysis iteration {}", num_iters);
 
-        traverse_dfir::<HydroDeploy>(
-            ir,
-            |_, _| {}, // Don't need to analyze leaves since they don't output anyway
-            |node, next_stmt_id| {
-                input_dependency_analysis_node(node, next_stmt_id, &mut metadata);
-            },
-        );
+        traverse_dfir(ir,
+        |_, _| {}, // Don't need to analyze leaves since they don't output anyway
+        |node, next_stmt_id| {
+            input_dependency_analysis_node(node, next_stmt_id, &mut metadata);
+        },);
 
         // Check if we've hit fixpoint
         let mut hasher = DefaultHasher::new();
@@ -612,18 +607,16 @@ pub fn partitioning_analysis(
 
     println!("\nBegin partitioning constraint analysis");
 
-    traverse_dfir::<HydroDeploy>(
-        ir,
-        |_, _| {},
-        |node, next_op_id| {
-            partitioning_constraint_analysis_node(
-                node,
-                next_op_id,
-                &dependency_metadata,
-                &mut possible_partitionings,
-            );
-        },
-    );
+    traverse_dfir(ir,
+    |_, _| {},
+    |node, next_op_id| {
+        partitioning_constraint_analysis_node(
+            node,
+            next_op_id,
+            &dependency_metadata,
+            &mut possible_partitionings,
+        );
+    },);
 
     for (op_id, partitioning_options) in &possible_partitionings {
         println!(

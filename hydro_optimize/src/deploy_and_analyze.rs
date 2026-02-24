@@ -95,13 +95,11 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
 }
 
 fn insert_counter(ir: &mut [HydroRoot], duration: &syn::Expr) {
-    traverse_dfir::<HydroDeploy>(
-        ir,
-        |_, _| {},
-        |node, next_stmt_id| {
-            insert_counter_node(node, next_stmt_id, duration.clone());
-        },
-    );
+    traverse_dfir(ir,
+    |_, _| {},
+    |node, next_stmt_id| {
+        insert_counter_node(node, next_stmt_id, duration.clone());
+    },);
 }
 
 pub struct MetricLogs {

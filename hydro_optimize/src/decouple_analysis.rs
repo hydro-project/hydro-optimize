@@ -12,7 +12,6 @@ use hydro_lang::compile::builder::ClockId;
 use hydro_lang::compile::ir::{
     HydroIrMetadata, HydroIrOpMetadata, HydroNode, HydroRoot, traverse_dfir,
 };
-use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::location::dynamic::LocationId;
 
 use super::rewrites::{NetworkType, get_network_type};
@@ -418,7 +417,7 @@ pub(crate) fn decouple_analysis(
         cycle_source_to_sink_input,
     );
 
-    traverse_dfir::<HydroDeploy>(
+    traverse_dfir(
         ir,
         |root, _| {
             decouple_analysis_root(root, &op_id_to_inputs, &model_metadata);

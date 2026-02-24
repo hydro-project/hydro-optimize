@@ -1,7 +1,5 @@
 use hydro_lang::{
-    location::Location,
-    nondet::nondet,
-    prelude::{Cluster, Process, TCP},
+    live_collections::stream::{ExactlyOnce, TotalOrder}, location::Location, nondet::nondet, prelude::{Cluster, Process, TCP}
 };
 use hydro_std::bench_client::{aggregate_bench_results, bench_client, compute_throughput_latency};
 
@@ -46,10 +44,10 @@ pub fn simple_kv_bench<'a>(
                 )
                 .entries()
                 .all_ticks()
-                .assume_ordering(
+                .assume_ordering::<TotalOrder>(
                     nondet!(/** for_each does nothing, just need to end on a HydroRoot */),
                 )
-                .assume_retries(
+                .assume_retries::<ExactlyOnce>(
                     nondet!(/** for_each does nothing, just need to end on a HydroRoot */),
                 )
                 .for_each(q!(|_| {})); // Do nothing, just need to end on a HydroRoot

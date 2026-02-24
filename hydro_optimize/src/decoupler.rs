@@ -9,7 +9,6 @@ use hydro_lang::compile::ir::{
     DebugInstantiate, HydroIrMetadata, HydroIrOpMetadata, HydroNode, HydroRoot, TeeNode,
     transform_bottom_up, traverse_dfir,
 };
-use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::location::{Cluster, Location};
 use proc_macro2::Span;
@@ -340,7 +339,7 @@ pub fn decouple<'a>(
     let tee_to_inner_id_before_rewrites = tee_to_inner_id(ir);
     let op_id_to_input_before_rewrites = op_id_to_inputs(ir, None, &cycles);
     let mut new_inners = HashMap::new();
-    traverse_dfir::<HydroDeploy>(
+    traverse_dfir(
         ir,
         |_, _| {},
         |node, op_id| {

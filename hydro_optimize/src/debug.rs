@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use hydro_lang::compile::ir::{HydroNode, HydroRoot, traverse_dfir};
-use hydro_lang::deploy::HydroDeploy;
 
 use crate::rewrites::tee_to_inner_id;
 
@@ -45,7 +44,7 @@ fn print_id_node(
 
 pub fn print_id(ir: &mut [HydroRoot]) {
     let tee_to_inner = tee_to_inner_id(ir);
-    traverse_dfir::<HydroDeploy>(ir, print_id_root, |node, op_id| {
+    traverse_dfir(ir, print_id_root, |node, op_id| {
         print_id_node(node, op_id, &tee_to_inner)
     });
 }
@@ -63,7 +62,7 @@ fn name_to_id_node(
 // Create a mapping from named IR nodes (from `ir_node_named`) to their IDs
 pub fn name_to_id_map(ir: &mut [HydroRoot]) -> HashMap<String, usize> {
     let mut mapping = HashMap::new();
-    traverse_dfir::<HydroDeploy>(
+    traverse_dfir(
         ir,
         |_, _| {},
         |node, next_stmt_id| name_to_id_node(node, next_stmt_id, &mut mapping),

@@ -5,7 +5,6 @@ use hydro_lang::compile::builder::CycleId;
 use hydro_lang::compile::ir::{
     HydroIrOpMetadata, HydroNode, HydroRoot, transform_bottom_up, traverse_dfir,
 };
-use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::location::dynamic::LocationId;
 
 fn inject_id_metadata(
@@ -23,15 +22,13 @@ fn inject_id_metadata(
 pub fn inject_id(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
     let new_id_to_old_id = RefCell::new(HashMap::new());
 
-    traverse_dfir::<HydroDeploy>(
-        ir,
-        |leaf, id| {
-            inject_id_metadata(leaf.op_metadata_mut(), *id, &new_id_to_old_id);
-        },
-        |node, id| {
-            inject_id_metadata(node.op_metadata_mut(), *id, &new_id_to_old_id);
-        },
-    );
+    traverse_dfir(ir,
+    |leaf, id| {
+        inject_id_metadata(leaf.op_metadata_mut(), *id, &new_id_to_old_id);
+    },
+    |node, id| {
+        inject_id_metadata(node.op_metadata_mut(), *id, &new_id_to_old_id);
+    },);
 
     new_id_to_old_id.take()
 }
@@ -173,5 +170,5 @@ fn remove_counter_node(node: &mut HydroNode, _next_stmt_id: &mut usize) {
 }
 
 pub fn remove_counter(ir: &mut [HydroRoot]) {
-    traverse_dfir::<HydroDeploy>(ir, |_, _| {}, remove_counter_node);
+    traverse_dfir(ir, |_, _| {}, remove_counter_node);
 }
