@@ -1,8 +1,8 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::decoupler::DecoupleDecision;
-use crate::rewrites::op_id_to_inputs;
+use crate::rewrites::{can_decouple, op_id_to_inputs};
 use good_lp::solvers::highs::HighsSolution;
 use good_lp::{
     Constraint, Expression, ProblemVariables, Solution, SolverModel, Variable, constraint, highs,
@@ -43,6 +43,7 @@ struct ModelMetadata {
     orig_node_cpu_usage: Expression,
     decoupled_node_cpu_usage: Expression,
     op_id_to_var: HashMap<usize, Variable>,
+	do_not_decouple: HashSet<usize>,
     prev_op_input_with_tick: HashMap<ClockId, usize>, // tick_id: last op_id with that tick_id
     tee_inner_to_decoupled_vars: HashMap<usize, (Variable, Variable)>, /* inner_id: (orig_to_decoupled, decoupled_to_orig) */
     network_ids: HashMap<usize, NetworkType>,
@@ -345,6 +346,13 @@ fn decouple_analysis_node(
         model_metadata,
     );
     add_tick_constraint(node.metadata(), op_id_to_inputs, model_metadata);
+
+    if !can_decouple(&node.metadata().collection_kind) {
+        model_metadata
+            .borrow_mut()
+            .do_not_decouple
+            .insert(*op_id);
+    }
 }
 
 fn solve(model_metadata: &RefCell<ModelMetadata>) -> HighsSolution {
@@ -399,6 +407,7 @@ pub(crate) fn decouple_analysis(
         orig_node_cpu_usage: Expression::default(),
         decoupled_node_cpu_usage: Expression::default(),
         op_id_to_var: HashMap::new(),
+        do_not_decouple: HashSet::new(),
         prev_op_input_with_tick: HashMap::new(),
         tee_inner_to_decoupled_vars: HashMap::new(),
         network_ids: HashMap::new(),
@@ -418,15 +427,23 @@ pub(crate) fn decouple_analysis(
             decouple_analysis_node(node, next_op_id, &op_id_to_inputs, &model_metadata);
         },
     );
-    for inputs in op_id_to_inputs.values() {
+
+    for (op_id, inputs) in op_id_to_inputs.iter() {
         let ModelMetadata {
             op_id_to_var,
             variables,
             constraints,
+            do_not_decouple,
             ..
         } = &mut *model_metadata.borrow_mut();
+
         // Add input constraints. All inputs of an op must output to the same machine (be assigned the same var)
-        add_equality_constr(inputs, op_id_to_var, variables, constraints);
+        let mut same_loc_ops = inputs.clone();
+    		// If this op cannot be decoupled, then make sure it ahs the same location as its input
+    		if do_not_decouple.contains(op_id) {
+    		    same_loc_ops.push(*op_id);
+    		}
+        add_equality_constr(&same_loc_ops, op_id_to_var, variables, constraints);
     }
 
     let solution = solve(&model_metadata);

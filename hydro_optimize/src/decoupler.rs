@@ -359,7 +359,6 @@ pub fn decouple<'a>(
 
     // Fix locations since we changed some
     inject_id(ir);
-    // print_id(ir);
     let cycles = cycle_source_to_sink_input(ir);
     inject_location(ir, &cycles);
 
