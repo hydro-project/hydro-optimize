@@ -1,18 +1,20 @@
+use std::collections::HashMap;
+use std::path::Path;
+
+use chrono::Local;
 use clap::{ArgAction, Parser};
-use hydro_deploy::Deployment;
 use hydro_lang::compile::ir::deep_clone;
 use hydro_lang::location::Location;
+use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::viz::config::GraphConfig;
-use hydro_optimize::deploy::{HostType, ReusableHosts};
 use hydro_optimize::deploy_and_analyze::{
-    Optimizations, ReusableClusters, ReusableProcesses, deploy_and_optimize,
+    BenchmarkArgs, BenchmarkConfig, Optimizations, ReusableClusters, ReusableProcesses, benchmark_protocol
 };
 use hydro_optimize::greedy_decouple_analysis::greedy_decouple_analysis;
 use hydro_optimize::repair::inject_id;
 use hydro_optimize::rewrites::{Rewrite, RewriteMetadata, replay};
-use hydro_std::bench_client::pretty_print_bench_results;
+use hydro_optimize_examples::print_parseable_bench_results;
 use hydro_test::cluster::paxos::{CorePaxos, PaxosConfig};
-use hydro_test::cluster::paxos_bench::{Aggregator, Client};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, group(
@@ -33,29 +35,22 @@ struct Args {
     aws: bool,
 }
 
-#[tokio::main]
-async fn main() {
-    let args = Args::parse();
 
-    let mut deployment = Deployment::new();
-    let host_type: HostType = if let Some(project) = args.gcp {
-        HostType::Gcp { project }
-    } else if args.aws {
-        HostType::Aws
-    } else {
-        HostType::Localhost
-    };
+/// Runs a single Paxos benchmark with the given parameters
+fn run_benchmark<'a>(num_clients: usize, num_clients_per_node: usize) -> BenchmarkConfig<'a> {
+    let f = 1;
+    let checkpoint_frequency = 1000;
+    let i_am_leader_send_timeout = 5;
+    let i_am_leader_check_timeout = 10;
+    let i_am_leader_check_timeout_delay_multiplier = 15;
+    let print_result_frequency = 1000;
+
+    println!(
+        "Running Greedy Decouple Paxos with {} clients and {} virtual clients per node",
+        num_clients, num_clients_per_node,
+    );
 
     let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
-    let f = 1;
-    let num_clients = 3;
-    let num_clients_per_node = 100; // Change based on experiment between 1, 50, 100.
-    let checkpoint_frequency = 1000; // Num log entries
-    let i_am_leader_send_timeout = 5; // Sec
-    let i_am_leader_check_timeout = 10; // Sec
-    let i_am_leader_check_timeout_delay_multiplier = 15;
-    let print_result_frequency = 1000; // Millis
-
     let proposers = builder.cluster();
     let acceptors = builder.cluster();
     let clients = builder.cluster();
@@ -82,13 +77,8 @@ async fn main() {
         &replicas,
         print_result_frequency / 10,
         print_result_frequency,
-        pretty_print_bench_results, // Note: Throughput/latency numbers won't be accessible to deploy_and_optimize
+        print_parseable_bench_results,
     );
-
-    // Deploy
-    let mut reusable_hosts = ReusableHosts::new(host_type);
-    let run_seconds = 90;
-    let measurement_second = 59;
 
     // Decouple first
     let built = builder.optimize_with(|ir| {
@@ -106,27 +96,61 @@ async fn main() {
         rewrite: decouple,
     };
     let (new_proposer_nodes, new_builder) = replay(vec![rewrite_metadata], built);
-    let new_proposers_with_names = new_proposer_nodes
+    let new_proposer_ids_with_name_num = new_proposer_nodes
         .iter()
         .enumerate()
-        .map(|(i, (cluster, num))| (cluster.id().key(), format!("decouple-{}", i), *num))
-        .collect();
+        .map(|(i, (cluster, num))| (cluster.id(), format!("decouple-{}", i), *num))
+        .collect::<Vec<_>>();
 
-    deploy_and_optimize(
-        &mut reusable_hosts,
-        &mut deployment,
-        new_builder.finalize(),
-        ReusableClusters::from(new_proposers_with_names)
-            .with_cluster(proposers, f + 1)
-            .with_cluster(acceptors, 2 * f + 1)
-            .with_cluster(clients, num_clients)
-            .with_cluster(replicas, f + 1),
-        ReusableProcesses::default().with_process(client_aggregator),
-        Optimizations::default()
-            .excluding::<Client>()
-            .excluding::<Aggregator>(),
-        Some(run_seconds),
-        Some(measurement_second),
+    let new_proposer_ids_with_names = new_proposer_ids_with_name_num 
+        .iter()
+        .map(|(id, name, _)| (id.clone(), name.clone()))
+        .collect::<HashMap<LocationId, String>>();
+    let mut location_id_to_cluster = HashMap::from([
+        (proposers.id(), "proposer".to_string()),
+        (acceptors.id(), "acceptor".to_string()),
+        (clients.id(), "client".to_string()),
+        (replicas.id(), "replica".to_string()),
+        (client_aggregator.id(), "client_aggregator".to_string()),
+    ]);
+    location_id_to_cluster.extend(new_proposer_ids_with_names);
+    
+    let new_proposer_keys_with_name_num = new_proposer_ids_with_name_num 
+        .into_iter()
+        .map(|(id, name, num)| (id.key(), name, num))
+        .collect();
+    let clusters = ReusableClusters::from(new_proposer_keys_with_name_num)
+        .with_cluster(proposers, f + 1)
+        .with_cluster(acceptors, 2 * f + 1)
+        .with_cluster(clients, num_clients)
+        .with_cluster(replicas, f + 1);
+    let processes = ReusableProcesses::default().with_process(client_aggregator);
+    let optimizations = Optimizations::default();
+
+    let output_dir = Path::new("benchmark_results").join(format!(
+        "greedy_decouple_paxos_{}",
+        Local::now().format("%Y-%m-%d_%H-%M-%S")
+    ));
+
+    BenchmarkConfig {
+        builder: new_builder,
+        clusters,
+        processes,
+        optimizations,
+        location_id_to_cluster,
+        output_dir,
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let args = Args::parse();
+    benchmark_protocol(
+        BenchmarkArgs {
+            gcp: args.gcp,
+            aws: args.aws,
+        },
+        run_benchmark,
     )
     .await;
 }

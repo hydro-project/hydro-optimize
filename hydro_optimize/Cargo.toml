@@ -32,8 +32,6 @@ quote = "1.0.35"
 ctor.workspace = true
 hydro_build_utils.workspace = true
 hydro_lang = { workspace = true, features = ["viz"] }
-hydro_test.workspace = true
-clap.workspace = true
 include_mdtests.workspace = true
 
 [build-dependencies]
