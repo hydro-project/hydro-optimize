@@ -251,31 +251,24 @@ async fn main() {
     const RUN_SECONDS: usize = 90;
     const PHYSICAL_CLIENTS_MIN: usize = 1;
     const PHYSICAL_CLIENTS_MAX: usize = 10;
-    const VIRTUAL_CLIENTS_STEP: usize = 50;
-    const LATENCY_THRESHOLD: f64 = 10.0;
+    const VIRTUAL_CLIENTS_STEP: usize = 100;
+    const STALL_PATIENCE: usize = 3;
 
     let mut best_throughput: usize = 0;
     let mut best_config: (usize, usize) = (0, 0);
     let mut output_dir = None;
-    // Total virtual clients (physical × per-node) that saturated the previous
-    // physical-client round. Used to pick the starting per-node count for the
-    // next round so we don't re-explore the low end of the curve.
-    let mut saturated_total_virtual: Option<usize> = None;
 
-    'outer: for num_clients in (PHYSICAL_CLIENTS_MIN..=PHYSICAL_CLIENTS_MAX).step_by(1) {
-        let mut prev_throughput: Option<usize> = None;
-        let mut best_latency: Option<f64> = None;
-        let best_before_round = best_throughput;
+    for num_clients in (PHYSICAL_CLIENTS_MIN..=PHYSICAL_CLIENTS_MAX).step_by(1) {
+        let mut round_best_throughput = 0;
+        let mut round_best_virtual = 0;
+        let mut stall_count = 0;
 
         // Start at the per-node count that yields roughly the same total
-        // virtual clients as the previous round's saturation point, rounded
-        // down to the nearest step (minimum 1).
-        let virtual_start = saturated_total_virtual
-            .map(|total| (total / num_clients).max(1))
-            .unwrap_or(1);
+        // virtual clients as the previous round's best throughput config,
+        // rounded down to the nearest step (minimum 1).
+        let mut num_virtual = std::cmp::max(1, best_config.0 * best_config.1 / num_clients);
 
-        let mut num_virtual = virtual_start;
-        loop {
+        while stall_count <= STALL_PATIENCE {
             let (run_metadata, location_id_to_cluster, new_output_dir) = run_benchmark(
                 &mut reusable_hosts,
                 &mut deployment,
@@ -289,7 +282,6 @@ async fn main() {
             let output_dir = output_dir.get_or_insert(new_output_dir);
 
             let current_throughput = run_metadata.throughputs[MEASUREMENT_SECOND];
-            let current_latency = run_metadata.latencies[MEASUREMENT_SECOND].1; // p99
             println!(
                 "physical_clients={}, virtual_clients={}, throughput@{}s={}",
                 num_clients,
@@ -308,46 +300,41 @@ async fn main() {
             )
             .await;
 
-            if current_throughput > best_throughput {
-                best_throughput = current_throughput;
-                best_config = (num_clients, num_virtual);
-            }
-
-            // Throughput stalled
-            if prev_throughput.is_some_and(|prev| current_throughput <= prev) {
-                let best = best_latency.expect("Previous config must've recorded a best_latency");
-                // Check saturation against the best latency for this physical config,
-                if current_latency > best * LATENCY_THRESHOLD {
-                    println!(
-                        "Throughput saturated for {} physical clients \
-                     (latency {:.2}→{:.2} ms). Moving to next physical client count.",
-                        num_clients, best, current_latency
-                    );
-                    saturated_total_virtual = Some(num_clients * num_virtual);
-                    break; // break inner loop, increase physical clients
-                }
+            if current_throughput > round_best_throughput {
+                round_best_throughput = current_throughput;
+                round_best_virtual = num_virtual;
+                stall_count = 0;
             } else {
-                // Keep incrementing best latency until throughput stalls
-                best_latency = Some(current_latency);
+                stall_count += 1;
             }
 
-            prev_throughput = Some(current_throughput);
             num_virtual += VIRTUAL_CLIENTS_STEP;
+
+            // TODO: Debugging
+            stall_count += STALL_PATIENCE + 1;
         }
 
-        // After increasing physical clients, check if we're still saturated
-        // compared to the best throughput *before* this round. If this round
-        // didn't improve on the prior best, more physical clients won't help.
-        if let Some(prev) = prev_throughput
-            && prev <= best_before_round
-            && num_clients > PHYSICAL_CLIENTS_MIN
-        {
+        println!(
+            "Throughput stalled for {} configs at {} physical clients \
+                     (best={} at {}vc). Moving to next physical client count.",
+            STALL_PATIENCE, num_clients, round_best_throughput, round_best_virtual
+        );
+
+        if round_best_throughput > best_throughput {
+            best_throughput = round_best_throughput;
+            best_config = (num_clients, round_best_virtual);
+        } else {
             println!(
                 "Throughput still saturated after increasing physical clients \
                  (prior best={}, current_peak={}). Stopping search.",
-                best_before_round, prev
+                best_throughput, round_best_throughput
             );
-            break 'outer;
+            break;
+        }
+
+        // TODO: Debugging
+        if num_clients > 1 {
+            break;
         }
     }
 

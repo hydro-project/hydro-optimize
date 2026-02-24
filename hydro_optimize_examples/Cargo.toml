@@ -26,7 +26,6 @@ hydro_build_utils.workspace = true
 hydro_deploy.workspace = true
 hydro_lang = { workspace = true, features = ["deploy", "viz", "sim"] }
 hydro_optimize = { path = "../hydro_optimize" }
-plotters = { version = "0.3", default-features = false, features = ["svg_backend", "line_series"] }
 regex.workspace = true
 
 [build-dependencies]
