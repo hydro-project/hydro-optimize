@@ -2,12 +2,12 @@
 """
 Benchmark Saturation Graph
 
-Reads all proposer CSVs from a benchmark_results folder and plots:
-  1. Throughput (x) vs p99 Latency (y)
-  2. CPU usage * multiplier
-  3. Network bandwidth (GB/s)
+Reads all cluster CSVs from a benchmark_results folder and plots:
+  1. Throughput (x) vs p50 Latency (y)
+  2. Per-cluster CPU usage
+  3. Per-cluster Network bandwidth (GB/s)
 
-All values are taken at a specific measurement time (--time).
+Values are averaged over a time range (--time start,end).
 """
 
 import argparse
@@ -16,71 +16,89 @@ import glob
 import os
 import re
 import sys
+from collections import defaultdict
 import matplotlib.pyplot as plt
 
 
-def parse_clients(filename):
-    """Extract (physical, virtual) from proposer_<N>c_<N>vc.csv."""
-    m = re.search(r"_(\d+)c_(\d+)vc\.csv$", filename)
+def parse_csv_name(filename):
+    """Extract (cluster, physical, virtual) from cluster_<N>c_<N>vc.csv."""
+    m = re.match(r"(.+?)_(\d+)c_(\d+)vc\.csv$", filename)
     if not m:
-        return None, None
-    return int(m.group(1)), int(m.group(2))
+        return None, None, None
+    return m.group(1), int(m.group(2)), int(m.group(3))
 
 
-def read_point(filepath, time_s, cpu_multiplier):
-    phys, virt = parse_clients(os.path.basename(filepath))
-    if phys is None:
-        return None
+def read_point(filepath, time_start, time_end):
+    rows = []
     with open(filepath, "r") as f:
         for row in csv.DictReader(f):
-            if int(row["time_s"]) == time_s:
-                throughput = float(row["throughput_rps"])
-                latency = float(row["latency_p50_ms"])
-                cpu = (float(row["cpu_user"]) + float(row["cpu_system"])) * cpu_multiplier
-                net_gb = (float(row["network_tx_bytes_per_sec"]) + float(row["network_rx_bytes_per_sec"])) / 1e9
-                return throughput, latency, cpu, net_gb, phys, virt
-    return None
+            t = int(row["time_s"])
+            if time_start <= t <= time_end:
+                rows.append(row)
+    if not rows:
+        return None
+    n = len(rows)
+    return {
+        "throughput": sum(float(r["throughput_rps"]) for r in rows) / n,
+        "latency": sum(float(r["latency_p50_ms"]) for r in rows) / n,
+        "cpu": sum(float(r["cpu_user"]) + float(r["cpu_system"]) for r in rows) / n,
+        "net_gb": sum(float(r["network_tx_bytes_per_sec"]) + float(r["network_rx_bytes_per_sec"]) for r in rows) / n / 1e9,
+    }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Plot benchmark saturation curves from proposer CSVs")
+    parser = argparse.ArgumentParser(description="Plot benchmark saturation curves")
     parser.add_argument("folder", help="Path to a benchmark_results subfolder")
-    parser.add_argument("-t", "--time", type=int, required=True, help="Measurement time_s to extract")
-    parser.add_argument("-m", "--cpu-multiplier", type=float, default=1.0, help="CPU usage multiplier (default: 1.0)")
+    parser.add_argument("-t", "--time", type=str, required=True, help="Time range as start,end (e.g. 30,60)")
+    parser.add_argument("-m", "--cpu-multiplier", type=float, default=1.0, help="CPU usage multiplier (e.g. 8.0 to scale 8-core percentages to single-core)")
     parser.add_argument("-o", "--output", default=None, help="Output image path")
     args = parser.parse_args()
 
-    csvs = sorted(glob.glob(os.path.join(args.folder, "proposer_*.csv")))
-    if not csvs:
-        print(f"Error: no proposer CSVs found in {args.folder}", file=sys.stderr)
+    time_start, time_end = (int(x) for x in args.time.split(","))
+
+    all_csvs = sorted(glob.glob(os.path.join(args.folder, "*_*c_*vc.csv")))
+    if not all_csvs:
+        print(f"Error: no CSVs found in {args.folder}", file=sys.stderr)
         sys.exit(1)
 
-    points = []
-    for path in csvs:
-        pt = read_point(path, args.time, args.cpu_multiplier)
+    # Group CSVs by cluster name
+    # cluster_data[cluster][(phys, virt)] = {throughput, latency, cpu, net_gb}
+    cluster_data = defaultdict(dict)
+    for path in all_csvs:
+        cluster, phys, virt = parse_csv_name(os.path.basename(path))
+        if cluster is None:
+            continue
+        pt = read_point(path, time_start, time_end)
         if pt:
-            points.append(pt)
+            cluster_data[cluster][(phys, virt)] = pt
 
-    if not points:
-        print(f"Error: no data at time_s={args.time}", file=sys.stderr)
+    if not cluster_data:
+        print(f"Error: no data for time range {time_start}-{time_end}", file=sys.stderr)
         sys.exit(1)
 
-    points.sort(key=lambda p: (p[4], p[5]))  # sort by (phys, virt)
-    throughput, latency, cpu, net, phys, virt = zip(*points)
-    total_clients = [p * v for p, v in zip(phys, virt)]
+    # Pick first cluster for throughput/latency (same across all)
+    ref_cluster = next(iter(cluster_data))
+    configs = sorted(cluster_data[ref_cluster].keys())  # sorted by (phys, virt)
+    throughput = [cluster_data[ref_cluster][c]["throughput"] for c in configs]
+    latency = [cluster_data[ref_cluster][c]["latency"] for c in configs]
+    total_clients = [p * v for p, v in configs]
+    phys_list = [c[0] for c in configs]
 
-    # Assign a color per unique physical client count
-    unique_phys = sorted(set(phys))
-    cmap = plt.cm.get_cmap("tab10", len(unique_phys))
-    phys_color = {p: cmap(i) for i, p in enumerate(unique_phys)}
-    colors = [phys_color[p] for p in phys]
+    unique_phys = sorted(set(phys_list))
+    phys_cmap = plt.cm.get_cmap("tab10", len(unique_phys))
+    phys_color = {p: phys_cmap(i) for i, p in enumerate(unique_phys)}
+
+    # Consistent colors for clusters
+    clusters = sorted(cluster_data.keys())
+    cluster_cmap = plt.cm.get_cmap("Set2", len(clusters))
+    cluster_color = {c: cluster_cmap(i) for i, c in enumerate(clusters)}
 
     fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
 
-    # Latency plot: colored by physical clients, labeled with total clients
+    # Latency plot
     ax_lat = axes[0]
     for p in unique_phys:
-        idx = [i for i, x in enumerate(phys) if x == p]
+        idx = [i for i, x in enumerate(phys_list) if x == p]
         ax_lat.plot(
             [throughput[i] for i in idx], [latency[i] for i in idx],
             "o-", color=phys_color[p], linewidth=1.5, markersize=5,
@@ -89,25 +107,29 @@ def main():
     for i, tc in enumerate(total_clients):
         ax_lat.annotate(str(tc), (throughput[i], latency[i]),
                         textcoords="offset points", xytext=(4, 4), fontsize=7,
-                        color=colors[i])
+                        color=phys_color[phys_list[i]])
     ax_lat.set_ylabel("p50 Latency (ms)", fontsize=11)
     ax_lat.grid(True, alpha=0.3)
     ax_lat.legend(fontsize=9)
 
-    # CPU and network plots
-    for ax, data, label, color in [
-        (axes[1], cpu, f"CPU (%) ×{args.cpu_multiplier}", "tab:red"),
-        (axes[2], net, "Network (GB/s)", "tab:blue"),
+    # CPU and network plots per cluster
+    for ax, metric, label in [
+        (axes[1], "cpu", f"CPU (%) ×{args.cpu_multiplier}"),
+        (axes[2], "net_gb", "Network (GB/s)"),
     ]:
-        for p in unique_phys:
-            idx = [i for i, x in enumerate(phys) if x == p]
-            ax.plot([throughput[i] for i in idx], [data[i] for i in idx],
-                    "o-", color=color, linewidth=1.5, markersize=5)
+        for cluster in clusters:
+            data = cluster_data[cluster]
+            cfgs = sorted(data.keys())
+            thr = [cluster_data[ref_cluster][c]["throughput"] for c in cfgs if c in cluster_data[ref_cluster]]
+            vals = [data[c][metric] * (args.cpu_multiplier if metric == "cpu" else 1) for c in cfgs if c in cluster_data[ref_cluster]]
+            ax.plot(thr, vals, "o-", color=cluster_color[cluster],
+                    linewidth=1.5, markersize=5, label=cluster)
         ax.set_ylabel(label, fontsize=11)
         ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=9)
 
     axes[-1].set_xlabel("Throughput (rps)", fontsize=12)
-    fig.suptitle(f"{os.path.basename(args.folder)} @ t={args.time}s", fontsize=14, fontweight="bold")
+    fig.suptitle(f"{os.path.basename(args.folder)} @ t={time_start}-{time_end}s (avg)", fontsize=14, fontweight="bold")
     plt.tight_layout(rect=[0, 0, 1, 0.97])
 
     output = args.output or os.path.join(args.folder, "saturation.png")
