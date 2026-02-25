@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 
 def parse_csv_name(filename):
     """Extract (cluster, physical, virtual) from cluster_<N>c_<N>vc.csv."""
-    m = re.match(r"(.+?)_(\d+)c_(\d+)vc\.csv$", filename)
+    m = re.match(r"(.+?)_(\d+)c_(\d+)vc_r(\d+)\.csv$", filename)
     if not m:
         return None, None, None
     return m.group(1), int(m.group(2)), int(m.group(3))
@@ -56,7 +56,7 @@ def main():
 
     time_start, time_end = (int(x) for x in args.time.split(","))
 
-    all_csvs = sorted(glob.glob(os.path.join(args.folder, "*_*c_*vc.csv")))
+    all_csvs = sorted(glob.glob(os.path.join(args.folder, "*_*c_*vc_r*.csv")))
     if not all_csvs:
         print(f"Error: no CSVs found in {args.folder}", file=sys.stderr)
         sys.exit(1)
