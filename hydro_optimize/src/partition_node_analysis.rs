@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use hydro_lang::compile::ir::{HydroNode, HydroRoot, traverse_dfir};
-use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::location::dynamic::LocationId;
 use syn::visit::Visit;
 
@@ -32,7 +31,7 @@ fn all_inputs_parents(
 fn all_inputs(ir: &mut [HydroRoot], location: &LocationId) -> Vec<usize> {
     let mut inputs = vec![];
 
-    traverse_dfir::<HydroDeploy>(
+    traverse_dfir(
         ir,
         |_, _| {},
         |node, next_stmt_id| match get_network_type(node, &location.root().key()) {
@@ -374,7 +373,7 @@ fn input_dependency_analysis(
     loop {
         println!("Input dependency analysis iteration {}", num_iters);
 
-        traverse_dfir::<HydroDeploy>(
+        traverse_dfir(
             ir,
             |_, _| {}, // Don't need to analyze leaves since they don't output anyway
             |node, next_stmt_id| {
@@ -612,7 +611,7 @@ pub fn partitioning_analysis(
 
     println!("\nBegin partitioning constraint analysis");
 
-    traverse_dfir::<HydroDeploy>(
+    traverse_dfir(
         ir,
         |_, _| {},
         |node, next_op_id| {
@@ -764,7 +763,7 @@ mod tests {
 
     use hydro_lang::compile::ir::deep_clone;
     use hydro_lang::deploy::HydroDeploy;
-    use hydro_lang::live_collections::stream::NoOrder;
+    use hydro_lang::live_collections::stream::{ExactlyOnce, NoOrder, TotalOrder};
     use hydro_lang::location::dynamic::LocationId;
     use hydro_lang::prelude::*;
     use stageleft::q;
@@ -801,8 +800,8 @@ mod tests {
             .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values()
             .map(q!(|(a, b)| (b, a + 2)))
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|(b, a2)| {
                 println!("b: {}, a+2: {}", b, a2);
             }));
@@ -821,8 +820,8 @@ mod tests {
             .values()
             .map(q!(|(a, b)| (b.1, a, b.0 - a)))
             .map(q!(|(b1, _a, b0a)| (b0a, b1.0)))
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|(b0a, b10)| {
                 println!("b.0 - a: {}, b.1.0: {}", b0a, b10);
             }));
@@ -840,8 +839,8 @@ mod tests {
             .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values()
             .filter_map(q!(|(a, b)| { if a > 1 { Some((b, a + 2)) } else { None } }))
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|(b, a2)| {
                 println!("b: {}, a+2: {}", b, a2);
             }));
@@ -867,8 +866,8 @@ mod tests {
                     None
                 }
             }))
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|(none, a2)| {
                 println!("None: {:?}, a+2: {}", none, a2);
             }));
@@ -892,8 +891,8 @@ mod tests {
             .batch(&tick, nondet!(/** test */))
             .chain(stream1.batch(&tick, nondet!(/** test */)))
             .all_ticks()
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|((x, b1), y)| {
                 println!("x: {}, b.1: {}, y: {}", x, b1, y);
             }));
@@ -917,8 +916,8 @@ mod tests {
             .batch(&tick, nondet!(/** test */))
             .cross_product(stream1.batch(&tick, nondet!(/** test */)))
             .all_ticks()
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|(((b1, b1_again), a3), (b, a2))| {
                 println!("((({}, {}), {}), ({:?}, {}))", b1, b1_again, a3, b, a2);
             }));
@@ -943,8 +942,8 @@ mod tests {
             .batch(&tick, nondet!(/** test */))
             .join(stream1.batch(&tick, nondet!(/** test */)))
             .all_ticks()
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|((b1, b1_again), (a3, a))| {
                 println!("(({}, {}), {}, {})", b1, b1_again, a3, a);
             }));
@@ -961,7 +960,7 @@ mod tests {
             .source_iter(q!([(1, 2)]))
             .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values()
-            .assume_ordering(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
             .enumerate()
             .for_each(q!(|(i, (a, b))| {
                 println!("i: {}, a: {}, b: {}", i, a, b);
@@ -988,8 +987,8 @@ mod tests {
             ))
             .entries()
             .all_ticks()
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|(a, b_sum)| {
                 println!("a: {}, b_sum: {}", a, b_sum);
             }));
@@ -1044,8 +1043,8 @@ mod tests {
 
         cycle
             .all_ticks()
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|(a, b)| {
                 println!("a: {}, b: {}", a, b);
             }));
@@ -1079,8 +1078,8 @@ mod tests {
         complete_cycle2.complete_next_tick(cycle2_out.clone());
         cycle2_out
             .all_ticks()
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|(b, _)| {
                 println!("b: {}", b);
             }));
@@ -1104,8 +1103,8 @@ mod tests {
             .batch(&tick, nondet!(/** test */))
             .chain(stream1.batch(&tick, nondet!(/** test */)))
             .all_ticks()
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|_| {
                 println!("No dependencies");
             }));
@@ -1139,16 +1138,16 @@ mod tests {
             .clone()
             .chain(stream1.clone())
             .all_ticks()
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|_| {
                 println!("Dependent on both input1.b and input2.b");
             }));
         stream2
             .join(stream1)
             .all_ticks()
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|(_, (a1, a2))| {
                 println!("a*2 from input 1: {}, -a from input 2: {}", a1, a2);
             }));
@@ -1176,8 +1175,8 @@ mod tests {
             .batch(&tick, nondet!(/** test */))
             .filter_not_in(input2.batch(&tick, nondet!(/** test */)))
             .all_ticks()
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|(a, b)| {
                 println!("a: {}, b: {}", a, b);
             }));

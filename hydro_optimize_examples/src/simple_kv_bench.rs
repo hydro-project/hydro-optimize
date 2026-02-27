@@ -1,10 +1,10 @@
 use hydro_lang::{
+    live_collections::stream::{ExactlyOnce, TotalOrder},
     location::Location,
     nondet::nondet,
-    prelude::{Cluster, Process, TCP},
+    prelude::{Bounded, Cluster, Process, Singleton, TCP},
 };
 use hydro_std::bench_client::{aggregate_bench_results, bench_client, compute_throughput_latency};
-
 use hydro_test::cluster::paxos_bench::inc_i32_workload_generator;
 use stageleft::q;
 
@@ -15,9 +15,9 @@ pub struct Client;
 pub struct Aggregator;
 
 pub fn simple_kv_bench<'a>(
-    num_clients_per_node: usize,
     kv: &Process<'a, Kv>,
     clients: &Cluster<'a, Client>,
+    num_clients_per_node: Singleton<usize, Cluster<'a, Client>, Bounded>,
     client_aggregator: &Process<'a, Aggregator>,
     interval_millis: u64,
 ) {
@@ -46,10 +46,10 @@ pub fn simple_kv_bench<'a>(
                 )
                 .entries()
                 .all_ticks()
-                .assume_ordering(
+                .assume_ordering::<TotalOrder>(
                     nondet!(/** for_each does nothing, just need to end on a HydroRoot */),
                 )
-                .assume_retries(
+                .assume_retries::<ExactlyOnce>(
                     nondet!(/** for_each does nothing, just need to end on a HydroRoot */),
                 )
                 .for_each(q!(|_| {})); // Do nothing, just need to end on a HydroRoot
@@ -88,6 +88,10 @@ mod tests {
     use crate::THROUGHPUT_PREFIX;
     #[cfg(stageleft_runtime)]
     use crate::simple_kv_bench::simple_kv_bench;
+    #[cfg(stageleft_runtime)]
+    use hydro_lang::location::Location;
+    #[cfg(stageleft_runtime)]
+    use stageleft::q;
 
     #[tokio::test]
     async fn simple_kv_some_throughput() {
@@ -97,7 +101,13 @@ mod tests {
         let client_aggregator = builder.process();
         let interval_millis = 1000;
 
-        simple_kv_bench(1, &kv, &clients, &client_aggregator, interval_millis);
+        simple_kv_bench(
+            &kv,
+            &clients,
+            clients.singleton(q!(1usize)),
+            &client_aggregator,
+            interval_millis,
+        );
         let mut deployment = Deployment::new();
 
         let nodes = builder

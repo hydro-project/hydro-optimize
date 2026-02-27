@@ -2,25 +2,28 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use hydro_lang::compile::builder::FlowBuilder;
+use hydro_lang::compile::built::BuiltFlow;
 use hydro_lang::compile::ir::{
     BoundKind, CollectionKind, DebugType, HydroIrMetadata, HydroNode, HydroRoot,
     KeyedSingletonBoundKind, StreamOrder, StreamRetry, deep_clone, traverse_dfir,
 };
-use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::location::dynamic::LocationId;
-use hydro_lang::location::{Cluster, Location, LocationKey};
+use hydro_lang::location::{Cluster, LocationKey};
 use proc_macro2::{Span, TokenStream};
-use quote::quote;
+use quote::{ToTokens, quote};
 use serde::{Deserialize, Serialize};
 use syn::parse_quote;
 use syn::visit_mut::{self, VisitMut};
 
-use crate::decoupler::{self, Decoupler};
+use crate::decoupler::{self, DecoupleDecision};
 use crate::partitioner::Partitioner;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum Rewrite {
-    Decouple(Decoupler),
+    Decouple {
+        decision: DecoupleDecision,
+        orig_location: LocationId,
+    },
     Partition(Partitioner),
 }
 
@@ -36,32 +39,36 @@ pub type Rewrites = Vec<RewriteMetadata>;
 /// Replays the rewrites in order.
 /// Returns Vec(Cluster, number of nodes) for each created cluster and a new FlowBuilder
 pub fn replay<'a>(
-    rewrites: &mut Rewrites,
-    builder: &mut FlowBuilder<'a>,
-    ir: &[HydroRoot],
-) -> Vec<(Cluster<'a, ()>, usize)> {
-    let mut new_clusters = vec![];
+    rewrites: Rewrites,
+    built: BuiltFlow<'a>,
+) -> (Vec<(Cluster<'a, ()>, usize)>, FlowBuilder<'a>) {
+    let mut all_new_clusters = vec![];
 
-    let mut ir = deep_clone(ir);
+    let mut ir = deep_clone(built.ir());
+    let mut builder = FlowBuilder::from_built(&built);
 
     // Apply decoupling/partitioning in order
-    for rewrite_metadata in rewrites.iter_mut() {
-        let new_cluster = builder.cluster::<()>();
-        match &mut rewrite_metadata.rewrite {
-            Rewrite::Decouple(decoupler) => {
-                decoupler.decoupled_location = new_cluster.id().clone();
-                decoupler::decouple(&mut ir, decoupler);
+    for rewrite_metadata in rewrites {
+        match rewrite_metadata.rewrite {
+            Rewrite::Decouple {
+                decision,
+                orig_location,
+            } => {
+                let new_clusters =
+                    decoupler::decouple(&mut ir, decision, &orig_location, &mut builder);
+                for cluster in new_clusters {
+                    all_new_clusters.push((cluster, rewrite_metadata.num_nodes));
+                }
             }
             Rewrite::Partition(_partitioner) => {
                 panic!("Partitioning is not yet replayable");
             }
         }
-        new_clusters.push((new_cluster, rewrite_metadata.num_nodes));
     }
 
     builder.replace_ir(ir);
 
-    new_clusters
+    (all_new_clusters, builder)
 }
 
 /// Replace CLUSTER_SELF_ID with the ID of the original node the partition is assigned to
@@ -149,7 +156,7 @@ pub fn op_id_to_inputs(
 ) -> HashMap<usize, Vec<usize>> {
     let mapping = RefCell::new(HashMap::new());
 
-    traverse_dfir::<HydroDeploy>(
+    traverse_dfir(
         ir,
         |leaf, op_id| {
             let relevant_input_ids = relevant_inputs(vec![leaf.input_metadata()], location);
@@ -173,10 +180,34 @@ pub fn op_id_to_inputs(
     mapping.take()
 }
 
+/// Creates a mapping from op_id to the other (if any) op_id that outputs to the same node.
+pub fn op_id_to_partner(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
+    let mut output = HashMap::new();
+
+    traverse_dfir(
+        ir,
+        |_, _| {},
+        |node, _op_id| {
+            let input_metadatas = node.input_metadata();
+            if input_metadatas.len() == 2 {
+                let dad_op_id = input_metadatas[0].op.id.unwrap();
+                let mom_op_id = input_metadatas[1].op.id.unwrap();
+                output.insert(dad_op_id, mom_op_id);
+                output.insert(mom_op_id, dad_op_id);
+            }
+            assert!(
+                input_metadatas.len() > 2,
+                "Logic needs to be updated to handle nodes with more than 2 inputs"
+            );
+        },
+    );
+    output
+}
+
 pub fn tee_to_inner_id(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
     let mut mapping = HashMap::new();
 
-    traverse_dfir::<HydroDeploy>(
+    traverse_dfir(
         ir,
         |_, _| {},
         |node, op_id| {
@@ -187,6 +218,47 @@ pub fn tee_to_inner_id(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
     );
 
     mapping
+}
+
+/// Check if the type is serializable. Currently a janky implementation that just looks for common unserializable types.
+/// Add to the list as new errors emerge.
+fn type_is_serializable(t: &DebugType) -> bool {
+    let type_name = t.to_token_stream().to_string();
+    let unserializable_types = [
+        "Rc",
+        "RefCell",
+        "Instant",
+        "Duration",
+        "SystemTime",
+        "HashMap",
+    ];
+    !unserializable_types
+        .iter()
+        .any(|unser| type_name.contains(unser))
+}
+
+/// Returns whether a node can be decoupled.
+///
+/// False if:
+/// 1. The node relies on replay (Optional, Singleton, KeyedSingleton without BoundedValue)
+/// 2. The output type is not serializable
+pub fn can_decouple(output_type: &CollectionKind) -> bool {
+    !output_type.is_bounded()
+        && match output_type {
+            CollectionKind::Stream { element_type, .. } => type_is_serializable(element_type),
+            CollectionKind::KeyedSingleton {
+                bound: KeyedSingletonBoundKind::BoundedValue,
+                ..
+            } => true,
+            CollectionKind::Optional { .. }
+            | CollectionKind::Singleton { .. }
+            | CollectionKind::KeyedSingleton { .. } => false,
+            CollectionKind::KeyedStream {
+                key_type,
+                value_type,
+                ..
+            } => type_is_serializable(key_type) && type_is_serializable(value_type),
+        }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -238,7 +310,7 @@ pub fn serialize_bincode_with_type(is_demux: bool, t_type: &syn::Type) -> syn::E
 
     if is_demux {
         parse_quote! {
-            ::#root::runtime_support::stageleft::runtime_support::fn1_type_hint::<(#root::location::MemberId<_>, #t_type), _>(
+            #root::runtime_support::stageleft::runtime_support::fn1_type_hint::<(#root::location::MemberId<_>, #t_type), _>(
                 |(id, data)| {
                     (id.into_tagless(), #root::runtime_support::bincode::serialize(&data).unwrap().into())
                 }
@@ -246,7 +318,7 @@ pub fn serialize_bincode_with_type(is_demux: bool, t_type: &syn::Type) -> syn::E
         }
     } else {
         parse_quote! {
-            ::#root::runtime_support::stageleft::runtime_support::fn1_type_hint::<#t_type, _>(
+            #root::runtime_support::stageleft::runtime_support::fn1_type_hint::<#t_type, _>(
                 |data| {
                     #root::runtime_support::bincode::serialize(&data).unwrap().into()
                 }

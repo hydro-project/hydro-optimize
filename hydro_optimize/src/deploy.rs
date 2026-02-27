@@ -30,6 +30,7 @@ enum InitializedHostType {
 pub struct ReusableHosts {
     hosts: HashMap<String, Arc<dyn Host>>, // Key = display_name
     host_type: InitializedHostType,
+    env: HashMap<String, String>,
 }
 
 // Note: Aws AMIs vary by region. If you are changing the region, please also change the AMI.
@@ -52,7 +53,14 @@ impl ReusableHosts {
         Self {
             hosts: HashMap::new(),
             host_type: initialized,
+            env: HashMap::new(),
         }
+    }
+
+    /// Add an environment variable that will be set for all hosts.
+    /// If a value with the same key already exists, it will be overwritten.
+    pub fn insert_env(&mut self, key: String, value: String) {
+        self.env.insert(key, value);
     }
 
     // NOTE: Creating hosts with the same display_name in the same deployment will result in undefined behavior.
@@ -78,7 +86,7 @@ impl ReusableHosts {
                 InitializedHostType::Aws { network } => deployment
                     .AwsEc2Host()
                     .region(AWS_REGION)
-                    .instance_type("t3.micro")
+                    .instance_type("m5.2xlarge")
                     .ami(AWS_INSTANCE_AMI)
                     .network(network.clone())
                     // Better performance than MUSL, perf reporting fewer unidentified stacks, but requires launching from Linux
@@ -101,13 +109,20 @@ impl ReusableHosts {
         .to_string()
     }
 
+    fn host_with_env(&self, host: TrybuildHost) -> TrybuildHost {
+        self.env.iter().fold(host, |host, (key, value)| {
+            host.env(key.clone(), value.clone())
+        })
+    }
+
     pub fn get_no_perf_process_hosts(
         &mut self,
         deployment: &mut Deployment,
         display_name: String,
     ) -> TrybuildHost {
-        TrybuildHost::new(self.lazy_create_host(deployment, display_name.clone()))
-            .rustflags(self.get_rust_flags())
+        let host = TrybuildHost::new(self.lazy_create_host(deployment, display_name.clone()))
+            .rustflags(self.get_rust_flags());
+        self.host_with_env(host)
     }
 
     pub fn get_process_hosts(
@@ -120,7 +135,7 @@ impl ReusableHosts {
             InitializedHostType::Aws { .. } => AL2_PERF_SETUP_COMMAND,
             InitializedHostType::Localhost => "", // Isn't run on localhost anyway
         };
-        TrybuildHost::new(self.lazy_create_host(deployment, display_name.clone()))
+        let host = TrybuildHost::new(self.lazy_create_host(deployment, display_name.clone()))
             .additional_hydro_features(vec!["runtime_measure".to_string()])
             .build_env(
                 "HYDRO_RUNTIME_MEASURE_CPU_PREFIX",
@@ -134,7 +149,8 @@ impl ReusableHosts {
                     .frequency(128)
                     .setup_command(setup_command)
                     .build(),
-            )
+            );
+        self.host_with_env(host)
     }
 
     pub fn get_cluster_hosts(

@@ -6,6 +6,7 @@ pub mod decouple_analysis;
 pub mod decoupler;
 pub mod deploy;
 pub mod deploy_and_analyze;
+pub mod greedy_decouple_analysis;
 pub mod parse_results;
 pub mod partition_node_analysis;
 pub mod partition_syn_analysis;

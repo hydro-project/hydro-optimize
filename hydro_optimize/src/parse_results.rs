@@ -152,22 +152,18 @@ pub fn parse_sar_output(lines: Vec<String>) -> Vec<SarStats> {
         }
     }
 
-    assert_eq!(
+    assert!(
+        cpu_usages.len().abs_diff(network_usages.len()) <= 1,
+        "sar output mismatch: {} cpu vs {} network entries",
         cpu_usages.len(),
         network_usages.len(),
-        "Couldn't correctly parse sar output"
     );
 
-    // Combine
-    let mut stats = vec![];
-    for i in 0..cpu_usages.len() {
-        stats.push(SarStats {
-            cpu: cpu_usages[i],
-            network: network_usages[i],
-        });
-    }
-
-    stats
+    cpu_usages
+        .into_iter()
+        .zip(network_usages)
+        .map(|(cpu, network)| SarStats { cpu, network })
+        .collect()
 }
 
 /// Parses throughput output from `print_parseable_bench_results`.
@@ -273,7 +269,7 @@ fn inject_perf_node(
 
 pub fn inject_perf(ir: &mut [HydroRoot], folded_data: Vec<u8>) -> f64 {
     let (id_to_usage, unidentified_usage) = parse_perf(String::from_utf8(folded_data).unwrap());
-    traverse_dfir::<HydroDeploy>(
+    traverse_dfir(
         ir,
         |root, next_stmt_id| {
             inject_perf_root(root, &id_to_usage, next_stmt_id);
@@ -360,7 +356,7 @@ fn inject_count_node(
 }
 
 pub fn inject_count(ir: &mut [HydroRoot], op_to_count: &HashMap<usize, usize>) {
-    traverse_dfir::<HydroDeploy>(
+    traverse_dfir(
         ir,
         |_, _| {},
         |node, next_stmt_id| {
@@ -467,7 +463,7 @@ pub async fn get_usage(usage_out: &mut UnboundedReceiver<String>) -> f64 {
 
 // Track the max of each so we decouple conservatively
 pub fn analyze_send_recv_overheads(ir: &mut [HydroRoot], run_metadata: &mut RunMetadata) {
-    traverse_dfir::<HydroDeploy>(
+    traverse_dfir(
         ir,
         |_, _| {},
         |node, _| {

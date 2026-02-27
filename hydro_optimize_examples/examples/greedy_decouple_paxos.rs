@@ -3,12 +3,18 @@ use std::path::Path;
 
 use chrono::Local;
 use clap::{ArgAction, Parser};
+use hydro_lang::compile::ir::deep_clone;
 use hydro_lang::location::Location;
+use hydro_lang::location::dynamic::LocationId;
+use hydro_lang::viz::config::GraphConfig;
 use hydro_optimize::deploy_and_analyze::NUM_CLIENTS_PER_NODE_ENV;
 use hydro_optimize::deploy_and_analyze::{
     BenchmarkArgs, BenchmarkConfig, Optimizations, ReusableClusters, ReusableProcesses,
     benchmark_protocol,
 };
+use hydro_optimize::greedy_decouple_analysis::greedy_decouple_analysis;
+use hydro_optimize::repair::inject_id;
+use hydro_optimize::rewrites::{Rewrite, RewriteMetadata, replay};
 use hydro_optimize_examples::print_parseable_bench_results;
 use hydro_test::cluster::paxos::{CorePaxos, PaxosConfig};
 use stageleft::q;
@@ -20,6 +26,9 @@ use stageleft::q;
         .multiple(false)
 ))]
 struct Args {
+    #[command(flatten)]
+    graph: GraphConfig,
+
     /// Use Gcp for deployment (provide project name)
     #[arg(long)]
     gcp: Option<String>,
@@ -44,13 +53,6 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
     let clients = builder.cluster();
     let client_aggregator = builder.process();
     let replicas = builder.cluster();
-    let location_id_to_cluster = HashMap::from([
-        (proposers.id(), "proposer".to_string()),
-        (acceptors.id(), "acceptor".to_string()),
-        (clients.id(), "client".to_string()),
-        (replicas.id(), "replica".to_string()),
-        (client_aggregator.id(), "client_aggregator".to_string()),
-    ]);
 
     hydro_test::cluster::paxos_bench::paxos_bench(
         checkpoint_frequency,
@@ -78,7 +80,46 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
         print_parseable_bench_results,
     );
 
-    let clusters = ReusableClusters::default()
+    // Decouple first
+    let built = builder.optimize_with(|ir| {
+        inject_id(ir);
+    });
+    let mut ir = deep_clone(built.ir());
+    let decision = greedy_decouple_analysis(&mut ir, &proposers.id());
+    let decouple = Rewrite::Decouple {
+        decision,
+        orig_location: proposers.id(),
+    };
+    let rewrite_metadata = RewriteMetadata {
+        node: proposers.id(),
+        num_nodes: f + 1,
+        rewrite: decouple,
+    };
+    let (new_proposer_nodes, new_builder) = replay(vec![rewrite_metadata], built);
+    let new_proposer_ids_with_name_num = new_proposer_nodes
+        .iter()
+        .enumerate()
+        .map(|(i, (cluster, num))| (cluster.id(), format!("decouple-{}", i), *num))
+        .collect::<Vec<_>>();
+
+    let new_proposer_ids_with_names = new_proposer_ids_with_name_num
+        .iter()
+        .map(|(id, name, _)| (id.clone(), name.clone()))
+        .collect::<HashMap<LocationId, String>>();
+    let mut location_id_to_cluster = HashMap::from([
+        (proposers.id(), "proposer".to_string()),
+        (acceptors.id(), "acceptor".to_string()),
+        (clients.id(), "client".to_string()),
+        (replicas.id(), "replica".to_string()),
+        (client_aggregator.id(), "client_aggregator".to_string()),
+    ]);
+    location_id_to_cluster.extend(new_proposer_ids_with_names);
+
+    let new_proposer_keys_with_name_num = new_proposer_ids_with_name_num
+        .into_iter()
+        .map(|(id, name, num)| (id.key(), name, num))
+        .collect();
+    let clusters = ReusableClusters::from(new_proposer_keys_with_name_num)
         .with_cluster(proposers, f + 1)
         .with_cluster(acceptors, 2 * f + 1)
         .with_cluster(clients, num_clients)
@@ -87,13 +128,13 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
     let optimizations = Optimizations::default();
 
     let output_dir = Path::new("benchmark_results").join(format!(
-        "paxos_{}",
+        "greedy_decouple_paxos_{}",
         Local::now().format("%Y-%m-%d_%H-%M-%S")
     ));
 
     BenchmarkConfig {
-        name: "Paxos".to_string(),
-        builder,
+        name: "Greedy Decouple Paxos".to_string(),
+        builder: new_builder,
         clusters,
         processes,
         optimizations,
