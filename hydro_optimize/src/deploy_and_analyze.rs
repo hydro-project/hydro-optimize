@@ -30,6 +30,8 @@ pub(crate) const SAR_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_SAR:";
 pub(crate) const LATENCY_PREFIX: &str = "HYDRO_OPTIMIZE_LAT:";
 pub(crate) const THROUGHPUT_PREFIX: &str = "HYDRO_OPTIMIZE_THR:";
 
+pub const NUM_CLIENTS_PER_NODE_ENV: &str = "NUM_CLIENTS_PER_NODE";
+
 // Note: Ensure edits to the match arms are consistent with inject_count_node
 fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration: syn::Expr) {
     match node {
@@ -180,7 +182,7 @@ impl Sidecar for ScriptSidecar {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ReusableClusters {
     named_clusters: Vec<(LocationKey, String, usize)>,
 }
@@ -207,7 +209,7 @@ impl ReusableClusters {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ReusableProcesses {
     named_processes: Vec<(LocationKey, String)>,
 }
@@ -241,6 +243,17 @@ impl Default for Optimizations {
             partitioning: false,
             exclude: vec![],
             iterations: 1,
+        }
+    }
+}
+
+impl Clone for Optimizations {
+    fn clone(&self) -> Self {
+        Self {
+            decoupling: self.decoupling,
+            partitioning: self.partitioning,
+            exclude: self.exclude.clone(),
+            iterations: self.iterations,
         }
     }
 }
@@ -532,10 +545,7 @@ pub struct BenchmarkConfig<'a> {
 
 pub async fn benchmark_protocol<'a>(
     args: BenchmarkArgs,
-    run_benchmark: fn(
-        usize, // num_clients
-        usize, // num_clients_per_node
-    ) -> BenchmarkConfig<'a>,
+    run_benchmark: fn(usize) -> BenchmarkConfig<'a>,
 ) {
     let mut deployment = Deployment::new();
     let host_type: HostType = if let Some(project) = args.gcp {
@@ -560,6 +570,16 @@ pub async fn benchmark_protocol<'a>(
     let mut output_dir = None;
 
     for num_clients in (PHYSICAL_CLIENTS_MIN..=PHYSICAL_CLIENTS_MAX).step_by(1) {
+        let BenchmarkConfig {
+            builder,
+            clusters,
+            processes,
+            optimizations,
+            location_id_to_cluster,
+            output_dir: config_output_dir,
+        } = run_benchmark(num_clients);
+        let built = builder.finalize();
+
         let mut round_best_throughput = 0;
         let mut round_best_virtual = 0;
         let mut stall_count = 0;
@@ -570,21 +590,23 @@ pub async fn benchmark_protocol<'a>(
         let mut num_virtual = std::cmp::max(1, best_config.0 * best_config.1 / num_clients);
 
         while stall_count <= STALL_PATIENCE {
-            let benchmark_config = run_benchmark(num_clients, num_virtual);
+            let iteration_built = FlowBuilder::from_built(&built).finalize();
+            // Set the number of virtual clients
+            reusable_hosts.insert_env(NUM_CLIENTS_PER_NODE_ENV.to_string(), num_virtual.to_string());
 
             let run_metadata = deploy_and_optimize(
                 &mut reusable_hosts,
                 &mut deployment,
-                benchmark_config.builder.finalize(),
-                benchmark_config.clusters,
-                benchmark_config.processes,
-                benchmark_config.optimizations,
+                iteration_built,
+                clusters.clone(),
+                processes.clone(),
+                optimizations.clone(),
                 Some(RUN_SECONDS),
                 Some(MEASUREMENT_SECOND),
             )
             .await;
 
-            let output_dir = output_dir.get_or_insert(benchmark_config.output_dir);
+            let output_dir = output_dir.get_or_insert(config_output_dir.clone());
 
             let current_throughput = run_metadata.throughputs[MEASUREMENT_SECOND];
             println!(
@@ -597,14 +619,13 @@ pub async fn benchmark_protocol<'a>(
 
             output_metrics(
                 run_metadata,
-                &benchmark_config.location_id_to_cluster,
+                &location_id_to_cluster,
                 output_dir,
                 num_clients,
                 num_virtual,
                 MEASUREMENT_SECOND,
             )
             .await;
-
 
             if current_throughput > round_best_throughput {
                 round_best_throughput = current_throughput;

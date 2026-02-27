@@ -1,5 +1,8 @@
+use std::collections::HashMap;
+
 use clap::{ArgAction, Parser};
 use hydro_deploy::Deployment;
+use hydro_lang::location::Location;
 use hydro_lang::viz::config::GraphConfig;
 use hydro_optimize::deploy::{HostType, ReusableHosts};
 use hydro_optimize::deploy_and_analyze::{
@@ -8,6 +11,7 @@ use hydro_optimize::deploy_and_analyze::{
 use hydro_std::bench_client::pretty_print_bench_results;
 use hydro_test::cluster::paxos::{CorePaxos, PaxosConfig};
 use hydro_test::cluster::paxos_bench::{Aggregator, Client};
+use stageleft::q;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, group(
@@ -58,7 +62,6 @@ async fn main() {
     let replicas = builder.cluster();
 
     hydro_test::cluster::paxos_bench::paxos_bench(
-        num_clients_per_node,
         checkpoint_frequency,
         f,
         f + 1,
@@ -73,6 +76,10 @@ async fn main() {
             },
         },
         &clients,
+        clients.singleton(q!(std::env::var("NUM_CLIENTS_PER_NODE")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap())),
         &client_aggregator,
         &replicas,
         print_result_frequency / 10,

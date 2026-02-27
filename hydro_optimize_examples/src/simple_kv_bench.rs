@@ -1,5 +1,5 @@
 use hydro_lang::{
-    live_collections::stream::{ExactlyOnce, TotalOrder}, location::Location, nondet::nondet, prelude::{Cluster, Process, TCP}
+    live_collections::stream::{ExactlyOnce, TotalOrder}, location::Location, nondet::nondet, prelude::{Bounded, Cluster, Process, Singleton, TCP}
 };
 use hydro_std::bench_client::{aggregate_bench_results, bench_client, compute_throughput_latency};
 
@@ -13,9 +13,9 @@ pub struct Client;
 pub struct Aggregator;
 
 pub fn simple_kv_bench<'a>(
-    num_clients_per_node: usize,
     kv: &Process<'a, Kv>,
     clients: &Cluster<'a, Client>,
+    num_clients_per_node: Singleton<usize, Cluster<'a, Client>, Bounded>,
     client_aggregator: &Process<'a, Aggregator>,
     interval_millis: u64,
 ) {
@@ -95,7 +95,7 @@ mod tests {
         let client_aggregator = builder.process();
         let interval_millis = 1000;
 
-        simple_kv_bench(1, &kv, &clients, &client_aggregator, interval_millis);
+        simple_kv_bench(&kv, &clients, clients.singleton(q!(1usize)), &client_aggregator, interval_millis);
         let mut deployment = Deployment::new();
 
         let nodes = builder

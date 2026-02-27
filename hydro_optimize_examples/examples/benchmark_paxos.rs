@@ -10,6 +10,7 @@ use hydro_optimize::deploy_and_analyze::{
 };
 use hydro_optimize_examples::print_parseable_bench_results;
 use hydro_test::cluster::paxos::{CorePaxos, PaxosConfig};
+use stageleft::q;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, group(
@@ -28,7 +29,7 @@ struct Args {
 }
 
 /// Runs a single Paxos benchmark with the given parameters
-fn run_benchmark<'a>(num_clients: usize, num_clients_per_node: usize) -> BenchmarkConfig<'a> {
+fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
     let f = 1;
     let checkpoint_frequency = 1000;
     let i_am_leader_send_timeout = 5;
@@ -37,8 +38,8 @@ fn run_benchmark<'a>(num_clients: usize, num_clients_per_node: usize) -> Benchma
     let print_result_frequency = 1000;
 
     println!(
-        "Running Paxos with {} clients and {} virtual clients per node",
-        num_clients, num_clients_per_node,
+        "Running Paxos with {} clients",
+        num_clients,
     );
 
     let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
@@ -56,7 +57,6 @@ fn run_benchmark<'a>(num_clients: usize, num_clients_per_node: usize) -> Benchma
     ]);
 
     hydro_test::cluster::paxos_bench::paxos_bench(
-        num_clients_per_node,
         checkpoint_frequency,
         f,
         f + 1,
@@ -71,6 +71,10 @@ fn run_benchmark<'a>(num_clients: usize, num_clients_per_node: usize) -> Benchma
             },
         },
         &clients,
+        clients.singleton(q!(std::env::var(NUM_CLIENTS_PER_NODE_ENV.to_string())
+            .unwrap()
+            .parse::<usize>()
+            .unwrap())),
         &client_aggregator,
         &replicas,
         print_result_frequency / 10,
