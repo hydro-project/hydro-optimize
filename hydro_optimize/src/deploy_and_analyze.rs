@@ -97,11 +97,13 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
 }
 
 fn insert_counter(ir: &mut [HydroRoot], duration: &syn::Expr) {
-    traverse_dfir(ir,
-    |_, _| {},
-    |node, next_stmt_id| {
-        insert_counter_node(node, next_stmt_id, duration.clone());
-    },);
+    traverse_dfir(
+        ir,
+        |_, _| {},
+        |node, next_stmt_id| {
+            insert_counter_node(node, next_stmt_id, duration.clone());
+        },
+    );
 }
 
 pub struct MetricLogs {
@@ -229,6 +231,7 @@ impl ReusableProcesses {
     }
 }
 
+#[derive(Clone)]
 pub struct Optimizations {
     decoupling: bool,
     partitioning: bool,
@@ -243,17 +246,6 @@ impl Default for Optimizations {
             partitioning: false,
             exclude: vec![],
             iterations: 1,
-        }
-    }
-}
-
-impl Clone for Optimizations {
-    fn clone(&self) -> Self {
-        Self {
-            decoupling: self.decoupling,
-            partitioning: self.partitioning,
-            exclude: self.exclude.clone(),
-            iterations: self.iterations,
         }
     }
 }
@@ -422,6 +414,7 @@ fn write_metrics_csv(
     location_id_to_cluster: &HashMap<LocationId, String>,
     num_clients: usize,
     num_clients_per_node: usize,
+    run: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(output_dir)?;
 
@@ -432,8 +425,8 @@ fn write_metrics_csv(
 
         let location_name = location_id_to_cluster.get(location).unwrap();
         let filename = output_dir.join(format!(
-            "{}_{}c_{}vc.csv",
-            location_name, num_clients, num_clients_per_node
+            "{}_{}c_{}vc_r{}.csv",
+            location_name, num_clients, num_clients_per_node, run
         ));
         let num_rows = stats
             .len()
@@ -486,6 +479,7 @@ async fn output_metrics(
     num_clients: usize,
     num_clients_per_node: usize,
     measurement_second: usize,
+    run: usize,
 ) {
     if let Some(&throughput) = run_metadata.throughputs.get(measurement_second) {
         println!(
@@ -524,6 +518,7 @@ async fn output_metrics(
         location_id_to_cluster,
         num_clients,
         num_clients_per_node,
+        run,
     ) {
         eprintln!("Failed to write CSV: {}", e);
     }
@@ -545,8 +540,13 @@ pub struct BenchmarkConfig<'a> {
 
 pub async fn benchmark_protocol<'a>(
     args: BenchmarkArgs,
-    run_benchmark: fn(usize) -> BenchmarkConfig<'a>,
+    num_runs: usize,
+    run_benchmark: fn(
+        usize, // num_clients
+    ) -> BenchmarkConfig<'a>,
 ) {
+    assert!(num_runs > 0, "Must run at least one iteration of the benchmark");
+
     let mut deployment = Deployment::new();
     let host_type: HostType = if let Some(project) = args.gcp {
         HostType::Gcp { project }
@@ -558,6 +558,7 @@ pub async fn benchmark_protocol<'a>(
 
     let mut reusable_hosts = ReusableHosts::new(host_type);
 
+    const START_MEASUREMENT_SECOND: usize = 30;
     const MEASUREMENT_SECOND: usize = 59;
     const RUN_SECONDS: usize = 90;
     const PHYSICAL_CLIENTS_MIN: usize = 1;
@@ -588,44 +589,63 @@ pub async fn benchmark_protocol<'a>(
         // virtual clients as the previous round's best throughput config,
         // rounded down to the nearest step (minimum 1).
         let mut num_virtual = std::cmp::max(1, best_config.0 * best_config.1 / num_clients);
-
-        while stall_count <= STALL_PATIENCE {
-            let iteration_built = FlowBuilder::from_built(&built).finalize();
-            // Set the number of virtual clients
+        while stall_count < STALL_PATIENCE {
+            let benchmark_config = run_benchmark(num_clients);
+            // Set up FlowBuilder for cloning
+            let built = benchmark_config.builder.finalize();
+            let ir = built.ir();
+            let output_dir = output_dir.get_or_insert(benchmark_config.output_dir);
+            // Set num virtual clients
             reusable_hosts.insert_env(NUM_CLIENTS_PER_NODE_ENV.to_string(), num_virtual.to_string());
 
-            let run_metadata = deploy_and_optimize(
-                &mut reusable_hosts,
-                &mut deployment,
-                iteration_built,
-                clusters.clone(),
-                processes.clone(),
-                optimizations.clone(),
-                Some(RUN_SECONDS),
-                Some(MEASUREMENT_SECOND),
-            )
-            .await;
+            let mut throughput_sum = 0;
+            for run in 0..num_runs {
+                let mut builder = FlowBuilder::from_built(&built);
+                builder.replace_ir(deep_clone(ir));
+                let run_metadata = deploy_and_optimize(
+                    &mut reusable_hosts,
+                    &mut deployment,
+                    builder.finalize(),
+                    benchmark_config.clusters.clone(),
+                    benchmark_config.processes.clone(),
+                    benchmark_config.optimizations.clone(),
+                    Some(RUN_SECONDS),
+                    Some(MEASUREMENT_SECOND),
+                )
+                .await;
 
-            let output_dir = output_dir.get_or_insert(config_output_dir.clone());
+                let run_throughput = run_metadata.throughputs
+                    [START_MEASUREMENT_SECOND..=MEASUREMENT_SECOND]
+                    .iter()
+                    .sum::<usize>()
+                    / (MEASUREMENT_SECOND - START_MEASUREMENT_SECOND + 1);
+                println!(
+                    "physical_clients={}, virtual_clients={}, run={}, throughput@{}s={}",
+                    num_clients,
+                    num_virtual,
+                    run,
+                    MEASUREMENT_SECOND + 1,
+                    run_throughput
+                );
+                throughput_sum += run_throughput;
 
-            let current_throughput = run_metadata.throughputs[MEASUREMENT_SECOND];
+                output_metrics(
+                    run_metadata,
+                    &benchmark_config.location_id_to_cluster,
+                    output_dir,
+                    num_clients,
+                    num_virtual,
+                    MEASUREMENT_SECOND,
+                    run,
+                )
+                .await;
+            }
+
+            let current_throughput = throughput_sum / num_runs;
             println!(
-                "physical_clients={}, virtual_clients={}, throughput@{}s={}",
-                num_clients,
-                num_virtual,
-                MEASUREMENT_SECOND + 1,
-                current_throughput
+                "physical_clients={}, virtual_clients={}, avg_throughput={}",
+                num_clients, num_virtual, current_throughput
             );
-
-            output_metrics(
-                run_metadata,
-                &location_id_to_cluster,
-                output_dir,
-                num_clients,
-                num_virtual,
-                MEASUREMENT_SECOND,
-            )
-            .await;
 
             if current_throughput > round_best_throughput {
                 round_best_throughput = current_throughput;

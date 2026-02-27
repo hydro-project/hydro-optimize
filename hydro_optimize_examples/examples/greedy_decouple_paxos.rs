@@ -149,11 +149,13 @@ fn run_benchmark<'a>(num_clients: usize, num_virtual_clients_env: String) -> Ben
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+    let num_runs = 3;
     benchmark_protocol(
         BenchmarkArgs {
             gcp: args.gcp,
             aws: args.aws,
         },
+        num_runs,
         run_benchmark,
     )
     .await;
