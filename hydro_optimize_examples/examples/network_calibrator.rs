@@ -4,12 +4,15 @@ use std::path::Path;
 use chrono::Local;
 use clap::{ArgAction, Parser};
 use hydro_lang::location::Location;
-use hydro_lang::{viz::config::GraphConfig};
+use hydro_lang::viz::config::GraphConfig;
+use hydro_optimize::deploy_and_analyze::NUM_CLIENTS_PER_NODE_ENV;
 use hydro_optimize::deploy_and_analyze::{
     BenchmarkArgs, BenchmarkConfig, Optimizations, ReusableClusters, ReusableProcesses,
     benchmark_protocol,
 };
 use hydro_optimize_examples::network_calibrator::network_calibrator;
+
+use stageleft::q;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, group(
@@ -30,14 +33,9 @@ struct Args {
     aws: bool,
 }
 
-fn run_benchmark<'a>(num_clients: usize, num_clients_per_node: usize) -> BenchmarkConfig<'a> {
+fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
     let message_size = 8;
     let print_result_frequency = 1000;
-
-    println!(
-        "Running network calibrator with {} clients and {} virtual clients per node",
-        num_clients, num_clients_per_node,
-    );
 
     let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
     let server = builder.cluster();
@@ -50,10 +48,13 @@ fn run_benchmark<'a>(num_clients: usize, num_clients_per_node: usize) -> Benchma
     ]);
 
     network_calibrator(
-        num_clients_per_node,
         message_size,
         &server,
         &clients,
+        clients.singleton(q!(std::env::var(NUM_CLIENTS_PER_NODE_ENV)
+            .unwrap()
+            .parse::<usize>()
+            .unwrap())),
         &client_aggregator,
         print_result_frequency,
     );
@@ -70,6 +71,7 @@ fn run_benchmark<'a>(num_clients: usize, num_clients_per_node: usize) -> Benchma
     ));
 
     BenchmarkConfig {
+        name: "Network Calibrator".to_string(),
         builder,
         clusters,
         processes,

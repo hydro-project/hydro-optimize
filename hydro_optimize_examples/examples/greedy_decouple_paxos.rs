@@ -7,8 +7,10 @@ use hydro_lang::compile::ir::deep_clone;
 use hydro_lang::location::Location;
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::viz::config::GraphConfig;
+use hydro_optimize::deploy_and_analyze::NUM_CLIENTS_PER_NODE_ENV;
 use hydro_optimize::deploy_and_analyze::{
-    BenchmarkArgs, BenchmarkConfig, Optimizations, ReusableClusters, ReusableProcesses, benchmark_protocol
+    BenchmarkArgs, BenchmarkConfig, Optimizations, ReusableClusters, ReusableProcesses,
+    benchmark_protocol,
 };
 use hydro_optimize::greedy_decouple_analysis::greedy_decouple_analysis;
 use hydro_optimize::repair::inject_id;
@@ -36,20 +38,14 @@ struct Args {
     aws: bool,
 }
 
-
 /// Runs a single Paxos benchmark with the given parameters
-fn run_benchmark<'a>(num_clients: usize, num_virtual_clients_env: String) -> BenchmarkConfig<'a> {
+fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
     let f = 1;
     let checkpoint_frequency = 1000;
     let i_am_leader_send_timeout = 5;
     let i_am_leader_check_timeout = 10;
     let i_am_leader_check_timeout_delay_multiplier = 15;
     let print_result_frequency = 1000;
-
-    println!(
-        "Running Greedy Decouple Paxos with {} clients",
-        num_clients,
-    );
 
     let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
     let proposers = builder.cluster();
@@ -73,7 +69,7 @@ fn run_benchmark<'a>(num_clients: usize, num_virtual_clients_env: String) -> Ben
             },
         },
         &clients,
-        clients.singleton(q!(std::env::var(NUM_CLIENTS_PER_NODE_ENV.to_string())
+        clients.singleton(q!(std::env::var(NUM_CLIENTS_PER_NODE_ENV)
             .unwrap()
             .parse::<usize>()
             .unwrap())),
@@ -106,7 +102,7 @@ fn run_benchmark<'a>(num_clients: usize, num_virtual_clients_env: String) -> Ben
         .map(|(i, (cluster, num))| (cluster.id(), format!("decouple-{}", i), *num))
         .collect::<Vec<_>>();
 
-    let new_proposer_ids_with_names = new_proposer_ids_with_name_num 
+    let new_proposer_ids_with_names = new_proposer_ids_with_name_num
         .iter()
         .map(|(id, name, _)| (id.clone(), name.clone()))
         .collect::<HashMap<LocationId, String>>();
@@ -118,8 +114,8 @@ fn run_benchmark<'a>(num_clients: usize, num_virtual_clients_env: String) -> Ben
         (client_aggregator.id(), "client_aggregator".to_string()),
     ]);
     location_id_to_cluster.extend(new_proposer_ids_with_names);
-    
-    let new_proposer_keys_with_name_num = new_proposer_ids_with_name_num 
+
+    let new_proposer_keys_with_name_num = new_proposer_ids_with_name_num
         .into_iter()
         .map(|(id, name, num)| (id.key(), name, num))
         .collect();
@@ -137,6 +133,7 @@ fn run_benchmark<'a>(num_clients: usize, num_virtual_clients_env: String) -> Ben
     ));
 
     BenchmarkConfig {
+        name: "Greedy Decouple Paxos".to_string(),
         builder: new_builder,
         clusters,
         processes,

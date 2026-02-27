@@ -310,21 +310,25 @@ fn partition_node(node: &mut HydroNode, partitioner: &Partitioner, next_stmt_id:
 
 /// Limitations: Can only partition sends to clusters (not processes). Can only partition sends to 1 cluster at a time. Assumes that the partitioned attribute can be casted to usize.
 pub fn partition(ir: &mut [HydroRoot], partitioner: &Partitioner) {
-    traverse_dfir(ir,
-    |_, _| {},
-    |node, next_stmt_id| {
-        partition_node(node, partitioner, next_stmt_id);
-    },);
+    traverse_dfir(
+        ir,
+        |_, _| {},
+        |node, next_stmt_id| {
+            partition_node(node, partitioner, next_stmt_id);
+        },
+    );
 
     if partitioner.new_cluster_id.is_some() {
         // DANGER: Do not depend on the ID here, since nodes would've been injected
         // Fix network only after all IDs have been replaced, since get_network_type relies on it
-        traverse_dfir(ir,
-        |_, _| {},
-        |node, next_stmt_id| {
-            replace_network_serialization(node, partitioner, *next_stmt_id);
-            remove_sender_id_from_receiver(node, partitioner, *next_stmt_id);
-        },);
+        traverse_dfir(
+            ir,
+            |_, _| {},
+            |node, next_stmt_id| {
+                replace_network_serialization(node, partitioner, *next_stmt_id);
+                remove_sender_id_from_receiver(node, partitioner, *next_stmt_id);
+            },
+        );
     }
 
     // Fix IDs since we injected nodes

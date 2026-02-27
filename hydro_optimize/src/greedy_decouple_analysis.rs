@@ -84,19 +84,21 @@ pub fn greedy_decouple_analysis(
     let mut tick_to_ops = HashMap::new();
     let mut do_not_decouple = HashSet::new();
 
-    traverse_dfir(ir,
-    |_, _| {},
-    |node, op_id| {
-        assign_location_node(
-            node,
-            op_id,
-            &mut op_to_key,
-            &mut key_to_loc,
-            &mut tick_to_ops,
-            &mut do_not_decouple,
-            node_to_decouple,
-        );
-    },);
+    traverse_dfir(
+        ir,
+        |_, _| {},
+        |node, op_id| {
+            assign_location_node(
+                node,
+                op_id,
+                &mut op_to_key,
+                &mut key_to_loc,
+                &mut tick_to_ops,
+                &mut do_not_decouple,
+                node_to_decouple,
+            );
+        },
+    );
 
     // Constrain tick
     let cycles = cycle_source_to_sink_input(ir);

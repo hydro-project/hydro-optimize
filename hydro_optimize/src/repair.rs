@@ -22,13 +22,15 @@ fn inject_id_metadata(
 pub fn inject_id(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
     let new_id_to_old_id = RefCell::new(HashMap::new());
 
-    traverse_dfir(ir,
-    |leaf, id| {
-        inject_id_metadata(leaf.op_metadata_mut(), *id, &new_id_to_old_id);
-    },
-    |node, id| {
-        inject_id_metadata(node.op_metadata_mut(), *id, &new_id_to_old_id);
-    },);
+    traverse_dfir(
+        ir,
+        |leaf, id| {
+            inject_id_metadata(leaf.op_metadata_mut(), *id, &new_id_to_old_id);
+        },
+        |node, id| {
+            inject_id_metadata(node.op_metadata_mut(), *id, &new_id_to_old_id);
+        },
+    );
 
     new_id_to_old_id.take()
 }

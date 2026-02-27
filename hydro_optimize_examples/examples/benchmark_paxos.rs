@@ -4,6 +4,7 @@ use std::path::Path;
 use chrono::Local;
 use clap::{ArgAction, Parser};
 use hydro_lang::location::Location;
+use hydro_optimize::deploy_and_analyze::NUM_CLIENTS_PER_NODE_ENV;
 use hydro_optimize::deploy_and_analyze::{
     BenchmarkArgs, BenchmarkConfig, Optimizations, ReusableClusters, ReusableProcesses,
     benchmark_protocol,
@@ -37,11 +38,6 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
     let i_am_leader_check_timeout_delay_multiplier = 15;
     let print_result_frequency = 1000;
 
-    println!(
-        "Running Paxos with {} clients",
-        num_clients,
-    );
-
     let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
     let proposers = builder.cluster();
     let acceptors = builder.cluster();
@@ -71,7 +67,7 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
             },
         },
         &clients,
-        clients.singleton(q!(std::env::var(NUM_CLIENTS_PER_NODE_ENV.to_string())
+        clients.singleton(q!(std::env::var(NUM_CLIENTS_PER_NODE_ENV)
             .unwrap()
             .parse::<usize>()
             .unwrap())),
@@ -96,6 +92,7 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
     ));
 
     BenchmarkConfig {
+        name: "Paxos".to_string(),
         builder,
         clusters,
         processes,

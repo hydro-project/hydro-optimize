@@ -1,8 +1,10 @@
 use hydro_lang::{
-    live_collections::stream::{ExactlyOnce, TotalOrder}, location::Location, nondet::nondet, prelude::{Bounded, Cluster, Process, Singleton, TCP}
+    live_collections::stream::{ExactlyOnce, TotalOrder},
+    location::Location,
+    nondet::nondet,
+    prelude::{Bounded, Cluster, Process, Singleton, TCP},
 };
 use hydro_std::bench_client::{aggregate_bench_results, bench_client, compute_throughput_latency};
-
 use hydro_test::cluster::paxos_bench::inc_i32_workload_generator;
 use stageleft::q;
 
@@ -86,6 +88,10 @@ mod tests {
     use crate::THROUGHPUT_PREFIX;
     #[cfg(stageleft_runtime)]
     use crate::simple_kv_bench::simple_kv_bench;
+    #[cfg(stageleft_runtime)]
+    use hydro_lang::location::Location;
+    #[cfg(stageleft_runtime)]
+    use stageleft::q;
 
     #[tokio::test]
     async fn simple_kv_some_throughput() {
@@ -95,7 +101,13 @@ mod tests {
         let client_aggregator = builder.process();
         let interval_millis = 1000;
 
-        simple_kv_bench(&kv, &clients, clients.singleton(q!(1usize)), &client_aggregator, interval_millis);
+        simple_kv_bench(
+            &kv,
+            &clients,
+            clients.singleton(q!(1usize)),
+            &client_aggregator,
+            interval_millis,
+        );
         let mut deployment = Deployment::new();
 
         let nodes = builder

@@ -1,5 +1,6 @@
 use clap::{ArgAction, Parser};
 use hydro_deploy::Deployment;
+use hydro_lang::location::Location;
 use hydro_lang::viz::config::GraphConfig;
 use hydro_optimize::deploy::{HostType, ReusableHosts};
 use hydro_optimize::deploy_and_analyze::{
@@ -7,6 +8,8 @@ use hydro_optimize::deploy_and_analyze::{
 };
 use hydro_optimize_examples::print_parseable_bench_results;
 use hydro_test::cluster::two_pc_bench::{Aggregator, Client};
+
+use stageleft::q;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, group(
@@ -45,7 +48,7 @@ async fn main() {
     let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
     let num_participants = 3;
     let num_clients = 3;
-    let num_clients_per_node = 100;
+    let num_clients_per_node: usize = 100;
     let print_result_frequency = 1000; // Millis
     let run_seconds = 90;
     let measurement_second = 60;
@@ -56,11 +59,11 @@ async fn main() {
     let client_aggregator = builder.process();
 
     hydro_test::cluster::two_pc_bench::two_pc_bench(
-        num_clients_per_node,
         &coordinator,
         &participants,
         num_participants,
         &clients,
+        clients.singleton(q!(num_clients_per_node)),
         &client_aggregator,
         print_result_frequency / 10,
         print_result_frequency,

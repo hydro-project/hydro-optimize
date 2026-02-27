@@ -1,5 +1,8 @@
 use hydro_lang::{
-    live_collections::{sliced::sliced, stream::{NoOrder, TotalOrder}},
+    live_collections::{
+        sliced::sliced,
+        stream::{NoOrder, TotalOrder},
+    },
     location::Location,
     nondet::nondet,
     prelude::{KeyedStream, Process, Stream, Unbounded},

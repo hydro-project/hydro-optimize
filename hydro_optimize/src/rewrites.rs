@@ -156,24 +156,26 @@ pub fn op_id_to_inputs(
 ) -> HashMap<usize, Vec<usize>> {
     let mapping = RefCell::new(HashMap::new());
 
-    traverse_dfir(ir,
-    |leaf, op_id| {
-        let relevant_input_ids = relevant_inputs(vec![leaf.input_metadata()], location);
-        mapping.borrow_mut().insert(*op_id, relevant_input_ids);
-    },
-    |node, op_id| {
-        let input_ids = match node {
-            HydroNode::CycleSource { .. } => {
-                // For CycleSource, its input is its CycleSink's input. Note: assumes the CycleSink is on the same cluster
-                vec![*cycle_source_to_sink_input.get(op_id).unwrap()]
-            }
-            HydroNode::Tee { inner, .. } => {
-                vec![inner.0.borrow().op_metadata().id.unwrap()]
-            }
-            _ => relevant_inputs(node.input_metadata(), location),
-        };
-        mapping.borrow_mut().insert(*op_id, input_ids);
-    },);
+    traverse_dfir(
+        ir,
+        |leaf, op_id| {
+            let relevant_input_ids = relevant_inputs(vec![leaf.input_metadata()], location);
+            mapping.borrow_mut().insert(*op_id, relevant_input_ids);
+        },
+        |node, op_id| {
+            let input_ids = match node {
+                HydroNode::CycleSource { .. } => {
+                    // For CycleSource, its input is its CycleSink's input. Note: assumes the CycleSink is on the same cluster
+                    vec![*cycle_source_to_sink_input.get(op_id).unwrap()]
+                }
+                HydroNode::Tee { inner, .. } => {
+                    vec![inner.0.borrow().op_metadata().id.unwrap()]
+                }
+                _ => relevant_inputs(node.input_metadata(), location),
+            };
+            mapping.borrow_mut().insert(*op_id, input_ids);
+        },
+    );
 
     mapping.take()
 }
@@ -182,34 +184,38 @@ pub fn op_id_to_inputs(
 pub fn op_id_to_partner(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
     let mut output = HashMap::new();
 
-    traverse_dfir(ir,
-    |_, _| {},
-    |node, _op_id| {
-        let input_metadatas = node.input_metadata();
-        if input_metadatas.len() == 2 {
-            let dad_op_id = input_metadatas[0].op.id.unwrap();
-            let mom_op_id = input_metadatas[1].op.id.unwrap();
-            output.insert(dad_op_id, mom_op_id);
-            output.insert(mom_op_id, dad_op_id);
-        }
-        assert!(
-            input_metadatas.len() > 2,
-            "Logic needs to be updated to handle nodes with more than 2 inputs"
-        );
-    },);
+    traverse_dfir(
+        ir,
+        |_, _| {},
+        |node, _op_id| {
+            let input_metadatas = node.input_metadata();
+            if input_metadatas.len() == 2 {
+                let dad_op_id = input_metadatas[0].op.id.unwrap();
+                let mom_op_id = input_metadatas[1].op.id.unwrap();
+                output.insert(dad_op_id, mom_op_id);
+                output.insert(mom_op_id, dad_op_id);
+            }
+            assert!(
+                input_metadatas.len() > 2,
+                "Logic needs to be updated to handle nodes with more than 2 inputs"
+            );
+        },
+    );
     output
 }
 
 pub fn tee_to_inner_id(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
     let mut mapping = HashMap::new();
 
-    traverse_dfir(ir,
-    |_, _| {},
-    |node, op_id| {
-        if let HydroNode::Tee { inner, .. } = node {
-            mapping.insert(*op_id, inner.0.borrow().op_metadata().id.unwrap());
-        }
-    },);
+    traverse_dfir(
+        ir,
+        |_, _| {},
+        |node, op_id| {
+            if let HydroNode::Tee { inner, .. } = node {
+                mapping.insert(*op_id, inner.0.borrow().op_metadata().id.unwrap());
+            }
+        },
+    );
 
     mapping
 }

@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use clap::{ArgAction, Parser};
 use hydro_deploy::Deployment;
 use hydro_lang::location::Location;
@@ -48,7 +46,7 @@ async fn main() {
     let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
     let f = 1;
     let num_clients = 3;
-    let num_clients_per_node = 100; // Change based on experiment between 1, 50, 100.
+    let num_clients_per_node: usize = 100; // Change based on experiment between 1, 50, 100.
     let checkpoint_frequency = 1000; // Num log entries
     let i_am_leader_send_timeout = 5; // Sec
     let i_am_leader_check_timeout = 10; // Sec
@@ -76,10 +74,7 @@ async fn main() {
             },
         },
         &clients,
-        clients.singleton(q!(std::env::var("NUM_CLIENTS_PER_NODE")
-            .unwrap()
-            .parse::<usize>()
-            .unwrap())),
+        clients.singleton(q!(num_clients_per_node)),
         &client_aggregator,
         &replicas,
         print_result_frequency / 10,

@@ -11,6 +11,7 @@ use hydro_lang::compile::ir::{
 };
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::location::{Cluster, Location};
+use hydro_lang::networking::{NetworkingInfo, TcpFault};
 use proc_macro2::Span;
 use stageleft::quote_type;
 use syn::visit_mut::VisitMut;
@@ -79,6 +80,9 @@ fn add_network(node: &mut HydroNode, send_location: &LocationId, recv_location: 
     let output_debug_type = collection_kind_to_debug_type(&original_collection_kind);
     let network_node = HydroNode::Network {
         name: None,
+        networking_info: NetworkingInfo::Tcp {
+            fault: TcpFault::FailStop,
+        },
         serialize_fn: Some(serialize_bincode_with_type(true, &output_debug_type)).map(|e| e.into()),
         instantiate_fn: DebugInstantiate::Building,
         deserialize_fn: Some(deserialize_bincode_with_type(

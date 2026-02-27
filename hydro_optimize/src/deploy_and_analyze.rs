@@ -530,6 +530,7 @@ pub struct BenchmarkArgs {
 }
 
 pub struct BenchmarkConfig<'a> {
+    pub name: String,
     pub builder: FlowBuilder<'a>,
     pub clusters: ReusableClusters,
     pub processes: ReusableProcesses,
@@ -545,7 +546,10 @@ pub async fn benchmark_protocol<'a>(
         usize, // num_clients
     ) -> BenchmarkConfig<'a>,
 ) {
-    assert!(num_runs > 0, "Must run at least one iteration of the benchmark");
+    assert!(
+        num_runs > 0,
+        "Must run at least one iteration of the benchmark"
+    );
 
     let mut deployment = Deployment::new();
     let host_type: HostType = if let Some(project) = args.gcp {
@@ -571,35 +575,34 @@ pub async fn benchmark_protocol<'a>(
     let mut output_dir = None;
 
     for num_clients in (PHYSICAL_CLIENTS_MIN..=PHYSICAL_CLIENTS_MAX).step_by(1) {
-        let BenchmarkConfig {
-            builder,
-            clusters,
-            processes,
-            optimizations,
-            location_id_to_cluster,
-            output_dir: config_output_dir,
-        } = run_benchmark(num_clients);
-        let built = builder.finalize();
-
         let mut round_best_throughput = 0;
         let mut round_best_virtual = 0;
         let mut stall_count = 0;
+
+        let benchmark_config = run_benchmark(num_clients);
+        // Set up FlowBuilder for cloning
+        let built = benchmark_config.builder.finalize();
+        let ir = built.ir();
+        let output_dir = output_dir.get_or_insert(benchmark_config.output_dir);
 
         // Start at the per-node count that yields roughly the same total
         // virtual clients as the previous round's best throughput config,
         // rounded down to the nearest step (minimum 1).
         let mut num_virtual = std::cmp::max(1, best_config.0 * best_config.1 / num_clients);
         while stall_count < STALL_PATIENCE {
-            let benchmark_config = run_benchmark(num_clients);
-            // Set up FlowBuilder for cloning
-            let built = benchmark_config.builder.finalize();
-            let ir = built.ir();
-            let output_dir = output_dir.get_or_insert(benchmark_config.output_dir);
             // Set num virtual clients
-            reusable_hosts.insert_env(NUM_CLIENTS_PER_NODE_ENV.to_string(), num_virtual.to_string());
+            reusable_hosts.insert_env(
+                NUM_CLIENTS_PER_NODE_ENV.to_string(),
+                num_virtual.to_string(),
+            );
 
             let mut throughput_sum = 0;
             for run in 0..num_runs {
+                println!(
+                    "Running {} with {} clients and {} virtual clients (run {})",
+                    benchmark_config.name, num_clients, num_virtual, run
+                );
+
                 let mut builder = FlowBuilder::from_built(&built);
                 builder.replace_ir(deep_clone(ir));
                 let run_metadata = deploy_and_optimize(

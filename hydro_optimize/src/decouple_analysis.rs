@@ -42,7 +42,7 @@ struct ModelMetadata {
     orig_node_cpu_usage: Expression,
     decoupled_node_cpu_usage: Expression,
     op_id_to_var: HashMap<usize, Variable>,
-	do_not_decouple: HashSet<usize>,
+    do_not_decouple: HashSet<usize>,
     prev_op_input_with_tick: HashMap<ClockId, usize>, // tick_id: last op_id with that tick_id
     tee_inner_to_decoupled_vars: HashMap<usize, (Variable, Variable)>, /* inner_id: (orig_to_decoupled, decoupled_to_orig) */
     network_ids: HashMap<usize, NetworkType>,
@@ -347,10 +347,7 @@ fn decouple_analysis_node(
     add_tick_constraint(node.metadata(), op_id_to_inputs, model_metadata);
 
     if !can_decouple(&node.metadata().collection_kind) {
-        model_metadata
-            .borrow_mut()
-            .do_not_decouple
-            .insert(*op_id);
+        model_metadata.borrow_mut().do_not_decouple.insert(*op_id);
     }
 }
 
@@ -438,10 +435,10 @@ pub(crate) fn decouple_analysis(
 
         // Add input constraints. All inputs of an op must output to the same machine (be assigned the same var)
         let mut same_loc_ops = inputs.clone();
-    		// If this op cannot be decoupled, then make sure it ahs the same location as its input
-    		if do_not_decouple.contains(op_id) {
-    		    same_loc_ops.push(*op_id);
-    		}
+        // If this op cannot be decoupled, then make sure it ahs the same location as its input
+        if do_not_decouple.contains(op_id) {
+            same_loc_ops.push(*op_id);
+        }
         add_equality_constr(&same_loc_ops, op_id_to_var, variables, constraints);
     }
 

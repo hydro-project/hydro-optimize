@@ -269,13 +269,15 @@ fn inject_perf_node(
 
 pub fn inject_perf(ir: &mut [HydroRoot], folded_data: Vec<u8>) -> f64 {
     let (id_to_usage, unidentified_usage) = parse_perf(String::from_utf8(folded_data).unwrap());
-    traverse_dfir(ir,
-    |root, next_stmt_id| {
-        inject_perf_root(root, &id_to_usage, next_stmt_id);
-    },
-    |node, next_stmt_id| {
-        inject_perf_node(node, &id_to_usage, next_stmt_id);
-    },);
+    traverse_dfir(
+        ir,
+        |root, next_stmt_id| {
+            inject_perf_root(root, &id_to_usage, next_stmt_id);
+        },
+        |node, next_stmt_id| {
+            inject_perf_node(node, &id_to_usage, next_stmt_id);
+        },
+    );
     unidentified_usage
 }
 
@@ -354,11 +356,13 @@ fn inject_count_node(
 }
 
 pub fn inject_count(ir: &mut [HydroRoot], op_to_count: &HashMap<usize, usize>) {
-    traverse_dfir(ir,
-    |_, _| {},
-    |node, next_stmt_id| {
-        inject_count_node(node, next_stmt_id, op_to_count);
-    },);
+    traverse_dfir(
+        ir,
+        |_, _| {},
+        |node, next_stmt_id| {
+            inject_count_node(node, next_stmt_id, op_to_count);
+        },
+    );
 }
 
 /// Drains all currently available messages from a receiver into a Vec.
@@ -459,50 +463,52 @@ pub async fn get_usage(usage_out: &mut UnboundedReceiver<String>) -> f64 {
 
 // Track the max of each so we decouple conservatively
 pub fn analyze_send_recv_overheads(ir: &mut [HydroRoot], run_metadata: &mut RunMetadata) {
-    traverse_dfir(ir,
-    |_, _| {},
-    |node, _| {
-        if let HydroNode::Network {
-            input, metadata, ..
-        } = node
-        {
-            let sender = input.metadata().location_id.root();
-            let receiver = metadata.location_id.root();
-    
-            // Use cardinality from the network's input, not the network itself.
-            // Reason: Cardinality is measured at ONE recipient, but the sender may be sending to MANY machines.
-            if let Some(cpu_usage) = metadata.op.cpu_usage
-                && let Some(cardinality) = input.metadata().cardinality
+    traverse_dfir(
+        ir,
+        |_, _| {},
+        |node, _| {
+            if let HydroNode::Network {
+                input, metadata, ..
+            } = node
             {
-                let overhead = cpu_usage / cardinality as f64;
-                run_metadata
-                    .send_overhead
-                    .entry(sender.clone())
-                    .and_modify(|max_send_overhead| {
-                        if overhead > *max_send_overhead {
-                            *max_send_overhead = overhead;
-                        }
-                    })
-                    .or_insert(overhead);
+                let sender = input.metadata().location_id.root();
+                let receiver = metadata.location_id.root();
+
+                // Use cardinality from the network's input, not the network itself.
+                // Reason: Cardinality is measured at ONE recipient, but the sender may be sending to MANY machines.
+                if let Some(cpu_usage) = metadata.op.cpu_usage
+                    && let Some(cardinality) = input.metadata().cardinality
+                {
+                    let overhead = cpu_usage / cardinality as f64;
+                    run_metadata
+                        .send_overhead
+                        .entry(sender.clone())
+                        .and_modify(|max_send_overhead| {
+                            if overhead > *max_send_overhead {
+                                *max_send_overhead = overhead;
+                            }
+                        })
+                        .or_insert(overhead);
+                }
+
+                if let Some(cardinality) = metadata.cardinality
+                    && let Some(cpu_usage) = metadata.op.network_recv_cpu_usage
+                {
+                    let overhead = cpu_usage / cardinality as f64;
+
+                    run_metadata
+                        .recv_overhead
+                        .entry(receiver.clone())
+                        .and_modify(|max_recv_overhead| {
+                            if overhead > *max_recv_overhead {
+                                *max_recv_overhead = overhead;
+                            }
+                        })
+                        .or_insert(overhead);
+                }
             }
-    
-            if let Some(cardinality) = metadata.cardinality
-                && let Some(cpu_usage) = metadata.op.network_recv_cpu_usage
-            {
-                let overhead = cpu_usage / cardinality as f64;
-    
-                run_metadata
-                    .recv_overhead
-                    .entry(receiver.clone())
-                    .and_modify(|max_recv_overhead| {
-                        if overhead > *max_recv_overhead {
-                            *max_recv_overhead = overhead;
-                        }
-                    })
-                    .or_insert(overhead);
-            }
-        }
-    },);
+        },
+    );
 
     // Print
     for (location, overhead) in &run_metadata.send_overhead {

@@ -817,13 +817,15 @@ mod tests {
 
     fn partition_analysis(ir: &mut [HydroRoot]) -> BTreeMap<usize, StructOrTuple> {
         let partitioning_metadata = RefCell::new(BTreeMap::new());
-        traverse_dfir(ir,
-        |leaf, next_stmt_id| {
-            partition_analysis_root(leaf, next_stmt_id, &partitioning_metadata);
-        },
-        |node, next_stmt_id| {
-            partition_analysis_node(node, next_stmt_id, &partitioning_metadata);
-        },);
+        traverse_dfir(
+            ir,
+            |leaf, next_stmt_id| {
+                partition_analysis_root(leaf, next_stmt_id, &partitioning_metadata);
+            },
+            |node, next_stmt_id| {
+                partition_analysis_node(node, next_stmt_id, &partitioning_metadata);
+            },
+        );
 
         partitioning_metadata.into_inner()
     }
