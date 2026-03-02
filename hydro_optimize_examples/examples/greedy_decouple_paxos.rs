@@ -43,7 +43,8 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
     let f = 1;
     let checkpoint_frequency = 1000;
     let i_am_leader_send_timeout = 5;
-    let i_am_leader_check_timeout = 10;
+    // NOTE: Prevent timeout and reelection. Proposer 0 will still attempt immediate election.
+    let i_am_leader_check_timeout = 100;
     let i_am_leader_check_timeout_delay_multiplier = 15;
     let print_result_frequency = 1000;
 
