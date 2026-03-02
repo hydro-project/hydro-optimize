@@ -569,6 +569,10 @@ pub async fn benchmark_protocol<'a>(
     const PHYSICAL_CLIENTS_MAX: usize = 10;
     const VIRTUAL_CLIENTS_STEP: usize = 100;
     const STALL_PATIENCE: usize = 3;
+    const NUM_RUNS_NO_THROUGHPUT: usize = 3;
+
+    const INIT_WARMUP_VIRTUAL_CLIENTS: usize = 1000;
+    const INIT_WARMUP_SECONDS: usize = 600;
 
     let mut best_throughput: usize = 0;
     let mut best_config: (usize, usize) = (0, 0);
@@ -585,6 +589,35 @@ pub async fn benchmark_protocol<'a>(
         let ir = built.ir();
         let output_dir = output_dir.get_or_insert(benchmark_config.output_dir);
 
+        if num_clients == PHYSICAL_CLIENTS_MIN {
+            println!(
+                "Warming up {} with {} clients and {} virtual clients for {} seconds",
+                benchmark_config.name,
+                num_clients,
+                INIT_WARMUP_VIRTUAL_CLIENTS,
+                INIT_WARMUP_SECONDS
+            );
+            // Set num virtual clients
+            reusable_hosts.insert_env(
+                NUM_CLIENTS_PER_NODE_ENV.to_string(),
+                INIT_WARMUP_VIRTUAL_CLIENTS.to_string(),
+            );
+
+            let mut builder = FlowBuilder::from_built(&built);
+            builder.replace_ir(deep_clone(ir));
+            let _ = deploy_and_optimize(
+                &mut reusable_hosts,
+                &mut deployment,
+                builder.finalize(),
+                benchmark_config.clusters.clone(),
+                benchmark_config.processes.clone(),
+                benchmark_config.optimizations.clone(),
+                Some(INIT_WARMUP_SECONDS),
+                Some(MEASUREMENT_SECOND),
+            )
+            .await;
+        }
+
         // Start at the per-node count that yields roughly the same total
         // virtual clients as the previous round's best throughput config,
         // rounded down to the nearest step (minimum 1).
@@ -597,7 +630,10 @@ pub async fn benchmark_protocol<'a>(
             );
 
             let mut throughput_sum = 0;
-            for run in 0..num_runs {
+            let mut successful_runs = 0;
+            let mut zero_throughput_count = 0;
+            let mut run = 0;
+            while successful_runs < num_runs {
                 println!(
                     "Running {} with {} clients and {} virtual clients (run {})",
                     benchmark_config.name, num_clients, num_virtual, run
@@ -630,7 +666,6 @@ pub async fn benchmark_protocol<'a>(
                     MEASUREMENT_SECOND + 1,
                     run_throughput
                 );
-                throughput_sum += run_throughput;
 
                 output_metrics(
                     run_metadata,
@@ -642,6 +677,25 @@ pub async fn benchmark_protocol<'a>(
                     run,
                 )
                 .await;
+
+                if run_throughput == 0 {
+                    zero_throughput_count += 1;
+                    println!(
+                        "Zero throughput detected ({}/{})",
+                        zero_throughput_count, NUM_RUNS_NO_THROUGHPUT
+                    );
+                    if zero_throughput_count > NUM_RUNS_NO_THROUGHPUT {
+                        println!(
+                            "Exceeded {} zero-throughput runs for this config. Terminating benchmark.",
+                            NUM_RUNS_NO_THROUGHPUT
+                        );
+                        return;
+                    }
+                } else {
+                    throughput_sum += run_throughput;
+                    successful_runs += 1;
+                }
+                run += 1;
             }
 
             let current_throughput = throughput_sum / num_runs;

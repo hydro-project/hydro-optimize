@@ -21,11 +21,11 @@ import matplotlib.pyplot as plt
 
 
 def parse_csv_name(filename):
-    """Extract (cluster, physical, virtual) from cluster_<N>c_<N>vc.csv."""
+    """Extract (cluster, physical, virtual, run) from cluster_<N>c_<N>vc_r<N>.csv."""
     m = re.match(r"(.+?)_(\d+)c_(\d+)vc_r(\d+)\.csv$", filename)
     if not m:
-        return None, None, None
-    return m.group(1), int(m.group(2)), int(m.group(3))
+        return None, None, None, None
+    return m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4))
 
 
 def read_point(filepath, time_start, time_end):
@@ -61,20 +61,34 @@ def main():
         print(f"Error: no CSVs found in {args.folder}", file=sys.stderr)
         sys.exit(1)
 
-    # Group CSVs by cluster name
-    # cluster_data[cluster][(phys, virt)] = {throughput, latency, cpu, net_gb}
-    cluster_data = defaultdict(dict)
+    # Group CSVs by cluster name, collecting all runs
+    # cluster_runs[cluster][(phys, virt)] = [pt, pt, ...]
+    cluster_runs = defaultdict(lambda: defaultdict(list))
     for path in all_csvs:
-        cluster, phys, virt = parse_csv_name(os.path.basename(path))
+        cluster, phys, virt, run = parse_csv_name(os.path.basename(path))
         if cluster is None:
             continue
         pt = read_point(path, time_start, time_end)
         if pt:
-            cluster_data[cluster][(phys, virt)] = pt
+            cluster_runs[cluster][(phys, virt)].append(pt)
 
-    if not cluster_data:
+    if not cluster_runs:
         print(f"Error: no data for time range {time_start}-{time_end}", file=sys.stderr)
         sys.exit(1)
+
+    # Aggregate runs into avg/min/max per config
+    METRICS = ["throughput", "latency", "cpu", "net_gb"]
+    # cluster_data[cluster][(phys, virt)] = {metric_avg, metric_lo, metric_hi}
+    cluster_data = defaultdict(dict)
+    for cluster, configs_runs in cluster_runs.items():
+        for cfg, pts in configs_runs.items():
+            agg = {}
+            for m in METRICS:
+                vals = [p[m] for p in pts]
+                agg[m] = sum(vals) / len(vals)
+                agg[f"{m}_lo"] = min(vals)
+                agg[f"{m}_hi"] = max(vals)
+            cluster_data[cluster][cfg] = agg
 
     # Pick first cluster for throughput/latency (same across all)
     ref_cluster = next(iter(cluster_data))
@@ -99,11 +113,13 @@ def main():
     ax_lat = axes[0]
     for p in unique_phys:
         idx = [i for i, x in enumerate(phys_list) if x == p]
-        ax_lat.plot(
-            [throughput[i] for i in idx], [latency[i] for i in idx],
-            "o-", color=phys_color[p], linewidth=1.5, markersize=5,
-            label=f"{p} physical",
-        )
+        thr_p = [throughput[i] for i in idx]
+        lat_p = [latency[i] for i in idx]
+        ax_lat.plot(thr_p, lat_p, "o-", color=phys_color[p], linewidth=1.5, markersize=5,
+                    label=f"{p} physical")
+        lat_lo = [cluster_data[ref_cluster][configs[i]]["latency_lo"] for i in idx]
+        lat_hi = [cluster_data[ref_cluster][configs[i]]["latency_hi"] for i in idx]
+        ax_lat.fill_between(thr_p, lat_lo, lat_hi, color=phys_color[p], alpha=0.15)
     for i, tc in enumerate(total_clients):
         ax_lat.annotate(str(tc), (throughput[i], latency[i]),
                         textcoords="offset points", xytext=(4, 4), fontsize=7,
@@ -117,13 +133,17 @@ def main():
         (axes[1], "cpu", f"CPU (%) ×{args.cpu_multiplier}"),
         (axes[2], "net_gb", "Network (GB/s)"),
     ]:
+        mul = args.cpu_multiplier if metric == "cpu" else 1
         for cluster in clusters:
             data = cluster_data[cluster]
-            cfgs = sorted(data.keys())
-            thr = [cluster_data[ref_cluster][c]["throughput"] for c in cfgs if c in cluster_data[ref_cluster]]
-            vals = [data[c][metric] * (args.cpu_multiplier if metric == "cpu" else 1) for c in cfgs if c in cluster_data[ref_cluster]]
+            cfgs = sorted(c for c in data if c in cluster_data[ref_cluster])
+            thr = [cluster_data[ref_cluster][c]["throughput"] for c in cfgs]
+            vals = [data[c][metric] * mul for c in cfgs]
+            lo = [data[c][f"{metric}_lo"] * mul for c in cfgs]
+            hi = [data[c][f"{metric}_hi"] * mul for c in cfgs]
             ax.plot(thr, vals, "o-", color=cluster_color[cluster],
                     linewidth=1.5, markersize=5, label=cluster)
+            ax.fill_between(thr, lo, hi, color=cluster_color[cluster], alpha=0.15)
         ax.set_ylabel(label, fontsize=11)
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=9)
