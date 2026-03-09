@@ -6,7 +6,7 @@ use std::{
 
 use hydro_lang::compile::builder::FlowBuilder;
 use hydro_lang::compile::ir::{
-    DebugInstantiate, HydroIrMetadata, HydroIrOpMetadata, HydroNode, HydroRoot, TeeNode,
+    DebugInstantiate, HydroIrMetadata, HydroIrOpMetadata, HydroNode, HydroRoot,  SharedNode,
     transform_bottom_up, traverse_dfir,
 };
 use hydro_lang::location::dynamic::LocationId;
@@ -159,7 +159,7 @@ fn add_tee(
         .clone();
 
     let teed_node = HydroNode::Tee {
-        inner: TeeNode(new_inner),
+        inner: SharedNode(new_inner),
         metadata,
     };
     *node = teed_node;

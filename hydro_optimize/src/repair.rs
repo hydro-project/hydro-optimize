@@ -103,7 +103,7 @@ fn inject_location_node(
                 id_to_location.insert(op_id, metadata.location_id.clone());
                 return false;
             }
-            HydroNode::Tee { inner, .. } => {
+            HydroNode::Tee { inner, .. } | HydroNode::Partition { inner, .. } => {
                 vec![inner.0.borrow().op_metadata().id.unwrap()]
             }
             HydroNode::CycleSource { .. } => {

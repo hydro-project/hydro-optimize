@@ -61,6 +61,7 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
         | HydroNode::Network { metadata, .. }
         | HydroNode::ExternalInput { metadata, .. }
         | HydroNode::SingletonSource { metadata, .. }
+        | HydroNode::Partition { metadata, .. }
          => {
             let metadata = metadata.clone();
             let node_content = std::mem::replace(node, HydroNode::Placeholder);

@@ -168,7 +168,7 @@ pub fn op_id_to_inputs(
                     // For CycleSource, its input is its CycleSink's input. Note: assumes the CycleSink is on the same cluster
                     vec![*cycle_source_to_sink_input.get(op_id).unwrap()]
                 }
-                HydroNode::Tee { inner, .. } => {
+                HydroNode::Tee { inner, .. } | HydroNode::Partition { inner, .. } => {
                     vec![inner.0.borrow().op_metadata().id.unwrap()]
                 }
                 _ => relevant_inputs(node.input_metadata(), location),
@@ -211,7 +211,7 @@ pub fn tee_to_inner_id(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
         ir,
         |_, _| {},
         |node, op_id| {
-            if let HydroNode::Tee { inner, .. } = node {
+            if let HydroNode::Tee { inner, .. } | HydroNode::Partition { inner, .. } = node {
                 mapping.insert(*op_id, inner.0.borrow().op_metadata().id.unwrap());
             }
         },

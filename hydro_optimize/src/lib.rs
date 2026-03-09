@@ -1,4 +1,5 @@
 #[cfg(stageleft_runtime)]
+#[cfg(test)]
 hydro_lang::setup!();
 
 pub mod debug;
