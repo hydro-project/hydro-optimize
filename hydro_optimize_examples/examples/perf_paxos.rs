@@ -83,7 +83,7 @@ async fn main() {
     );
 
     // Deploy
-    let mut reusable_hosts = ReusableHosts::new(host_type);
+    let mut reusable_hosts = ReusableHosts::new(&host_type);
     let num_times_to_optimize = 2;
     let run_seconds = 30;
     let measurement_second = 29;

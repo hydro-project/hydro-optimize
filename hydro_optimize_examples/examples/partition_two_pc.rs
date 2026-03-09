@@ -43,7 +43,7 @@ async fn main() {
         HostType::Localhost
     };
 
-    let mut reusable_hosts = ReusableHosts::new(host_type);
+    let mut reusable_hosts = ReusableHosts::new(&host_type);
 
     let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
     let num_participants = 3;

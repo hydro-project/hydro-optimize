@@ -561,7 +561,7 @@ pub async fn benchmark_protocol<'a>(
         HostType::Localhost
     };
 
-    let mut reusable_hosts = ReusableHosts::new(host_type);
+    let mut reusable_hosts = ReusableHosts::new(&host_type);
 
     const START_MEASUREMENT_SECOND: usize = 30;
     const MEASUREMENT_SECOND: usize = 59;
@@ -590,7 +590,7 @@ pub async fn benchmark_protocol<'a>(
         let ir = built.ir();
         let output_dir = output_dir.get_or_insert(benchmark_config.output_dir);
 
-        if num_clients == PHYSICAL_CLIENTS_MIN {
+        if num_clients == PHYSICAL_CLIENTS_MIN && host_type != HostType::Localhost {
             println!(
                 "Warming up {} with {} clients and {} virtual clients for {} seconds",
                 benchmark_config.name,
