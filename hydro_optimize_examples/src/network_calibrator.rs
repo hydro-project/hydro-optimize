@@ -1,7 +1,7 @@
 use hydro_lang::{
     live_collections::stream::NoOrder,
     nondet::nondet,
-    prelude::{Cluster, KeyedStream, Process, TCP, Unbounded},
+    prelude::{Bounded, Cluster, KeyedStream, Process, Singleton, TCP, Unbounded},
 };
 use hydro_std::bench_client::{aggregate_bench_results, bench_client, compute_throughput_latency};
 
@@ -14,10 +14,10 @@ pub struct Server;
 pub struct Aggregator;
 
 pub fn network_calibrator<'a>(
-    num_clients_per_node: usize,
     message_size: usize,
     server: &Cluster<'a, Server>,
     clients: &Cluster<'a, Client>,
+    num_clients_per_node: Singleton<usize, Cluster<'a, Client>, Bounded>,
     client_aggregator: &Process<'a, Aggregator>,
     interval_millis: u64,
 ) {

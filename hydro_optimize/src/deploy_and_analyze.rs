@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use hydro_deploy::Deployment;
@@ -15,9 +18,9 @@ use hydro_lang::telemetry::Sidecar;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::decouple_analysis::decouple_analysis;
-use crate::decoupler::{self, Decoupler};
-use crate::deploy::ReusableHosts;
-use crate::parse_results::{RunMetadata, analyze_cluster_results};
+use crate::decoupler;
+use crate::deploy::{HostType, ReusableHosts};
+use crate::parse_results::{CPUStat, RunMetadata, SarStats, analyze_cluster_results};
 use crate::repair::{cycle_source_to_sink_input, inject_id, remove_counter};
 
 pub(crate) const METRIC_INTERVAL_SECS: u64 = 1;
@@ -26,6 +29,8 @@ pub(crate) const CPU_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_CPU:";
 pub(crate) const SAR_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_SAR:";
 pub(crate) const LATENCY_PREFIX: &str = "HYDRO_OPTIMIZE_LAT:";
 pub(crate) const THROUGHPUT_PREFIX: &str = "HYDRO_OPTIMIZE_THR:";
+
+pub const NUM_CLIENTS_PER_NODE_ENV: &str = "NUM_CLIENTS_PER_NODE";
 
 // Note: Ensure edits to the match arms are consistent with inject_count_node
 fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration: syn::Expr) {
@@ -56,6 +61,7 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
         | HydroNode::Network { metadata, .. }
         | HydroNode::ExternalInput { metadata, .. }
         | HydroNode::SingletonSource { metadata, .. }
+        | HydroNode::Partition { metadata, .. }
          => {
             let metadata = metadata.clone();
             let node_content = std::mem::replace(node, HydroNode::Placeholder);
@@ -92,7 +98,7 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
 }
 
 fn insert_counter(ir: &mut [HydroRoot], duration: &syn::Expr) {
-    traverse_dfir::<HydroDeploy>(
+    traverse_dfir(
         ir,
         |_, _| {},
         |node, next_stmt_id| {
@@ -179,7 +185,7 @@ impl Sidecar for ScriptSidecar {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ReusableClusters {
     named_clusters: Vec<(LocationKey, String, usize)>,
 }
@@ -194,6 +200,10 @@ impl ReusableClusters {
         self
     }
 
+    pub fn from(named_clusters: Vec<(LocationKey, String, usize)>) -> Self {
+        Self { named_clusters }
+    }
+
     fn location_name_and_num(&self, location: &LocationId) -> Option<(String, usize)> {
         self.named_clusters
             .iter()
@@ -202,7 +212,7 @@ impl ReusableClusters {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ReusableProcesses {
     named_processes: Vec<(LocationKey, String)>,
 }
@@ -222,6 +232,7 @@ impl ReusableProcesses {
     }
 }
 
+#[derive(Clone)]
 pub struct Optimizations {
     decoupling: bool,
     partitioning: bool,
@@ -232,8 +243,8 @@ pub struct Optimizations {
 impl Default for Optimizations {
     fn default() -> Self {
         Self {
-            decoupling: true,
-            partitioning: true,
+            decoupling: false,
+            partitioning: false,
             exclude: vec![],
             iterations: 1,
         }
@@ -274,6 +285,7 @@ pub async fn deploy_and_optimize<'a>(
     optimizations: Optimizations,
     num_seconds: Option<usize>,
     stability_second: Option<usize>,
+    analyze: bool,
 ) -> RunMetadata {
     assert!(
         optimizations.iterations < 1 || num_seconds.is_some(),
@@ -287,8 +299,8 @@ pub async fn deploy_and_optimize<'a>(
     }
     if optimizations.decoupling || optimizations.partitioning {
         assert!(
-            stability_second.is_some(),
-            "Must select stability_second with optimizations"
+            stability_second.is_some() && analyze,
+            "Must select stability_second and enable analysis with optimizations"
         );
     }
 
@@ -320,9 +332,9 @@ pub async fn deploy_and_optimize<'a>(
             );
         }
 
-        // Measure network (-n DEV) and CPU (-u) usage
+        // Measure network (-n DEV) and CPU (-u) usage. -P ALL measures all CPUs on the machine
         let sar_sidecar = ScriptSidecar {
-            script: "sar -n DEV -u 1".to_string(),
+            script: "sar -n DEV -u -P ALL 1".to_string(),
             prefix: SAR_USAGE_PREFIX.to_string(),
         };
         let nodes = deployable
@@ -352,44 +364,44 @@ pub async fn deploy_and_optimize<'a>(
             .await
             .unwrap();
 
-        // Parse results to get metrics
-        run_metadata = analyze_cluster_results(&nodes, &mut ir, metrics).await;
-        // Remove HydroNode::Counter (since we don't want to consider decoupling those)
-        remove_counter(&mut ir);
+        if analyze {
+            // Parse results to get metrics
+            run_metadata =
+                analyze_cluster_results(&nodes, &mut ir, metrics, stability_second).await;
+            // Remove HydroNode::Counter (since we don't want to consider decoupling those)
+            remove_counter(&mut ir);
 
-        // Create a mapping from each CycleSink to its corresponding CycleSource
-        let cycle_source_to_sink_input = cycle_source_to_sink_input(&mut ir);
+            // Create a mapping from each CycleSink to its corresponding CycleSource
+            let cycle_source_to_sink_input = cycle_source_to_sink_input(&mut ir);
 
-        if optimizations.decoupling {
-            let bottleneck = run_metadata.cpu_bottleneck(stability_second.unwrap());
-            // The bottleneck is either a process or cluster. Panic otherwise.
-            let (bottleneck_name, bottleneck_num_nodes) = processes
-                .location_name(&bottleneck)
-                .map(|name| (name, 1))
-                .unwrap_or_else(|| clusters.location_name_and_num(&bottleneck).unwrap());
+            if optimizations.decoupling {
+                let bottleneck = run_metadata.cpu_bottleneck(stability_second.unwrap());
+                // The bottleneck is either a process or cluster. Panic otherwise.
+                let (bottleneck_name, bottleneck_num_nodes) = processes
+                    .location_name(&bottleneck)
+                    .map(|name| (name, 1))
+                    .unwrap_or_else(|| clusters.location_name_and_num(&bottleneck).unwrap());
 
-            let decision = decouple_analysis(
-                &mut ir,
-                &bottleneck,
-                0.01, // TODO: Deprecate use of send/recv overheads, since they are inaccurate anyway
-                0.01,
-                &cycle_source_to_sink_input,
-            );
+                let decision = decouple_analysis(
+                    &mut ir,
+                    &bottleneck,
+                    0.01, // TODO: Deprecate use of send/recv overheads, since they are inaccurate anyway
+                    0.01,
+                    &cycle_source_to_sink_input,
+                );
 
-            // Apply decoupling
-            let new_cluster = post_rewrite_builder.cluster::<()>();
-            let decouple_with_location = Decoupler {
-                decision,
-                orig_location: bottleneck,
-                decoupled_location: new_cluster.id().clone(),
-            };
-            decoupler::decouple(&mut ir, &decouple_with_location);
-            clusters.named_clusters.push((
-                new_cluster.id().key(),
-                format!("{}-decouple-{}", bottleneck_name, iteration),
-                bottleneck_num_nodes,
-            ));
-            // TODO: Save decoupling decision to file
+                // Apply decoupling — creates new clusters as needed
+                let new_clusters =
+                    decoupler::decouple(&mut ir, decision, &bottleneck, &mut post_rewrite_builder);
+                for cluster in new_clusters {
+                    clusters.named_clusters.push((
+                        cluster.id().key(),
+                        format!("{}-decouple-{}", bottleneck_name, iteration),
+                        bottleneck_num_nodes,
+                    ));
+                }
+                // TODO: Save decoupling decision to file
+            }
         }
 
         post_rewrite_builder.replace_ir(ir);
@@ -397,4 +409,362 @@ pub async fn deploy_and_optimize<'a>(
     }
 
     run_metadata
+}
+
+/// Writes per-second metrics CSV for each location, combining sar stats with
+/// the shared throughput and latency time series.
+fn write_metrics_csv(
+    output_dir: &Path,
+    run_metadata: &RunMetadata,
+    location_id_to_cluster: &HashMap<LocationId, String>,
+    num_clients: usize,
+    num_clients_per_node: usize,
+    run: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(output_dir)?;
+
+    for (location, stats) in &run_metadata.sar_stats {
+        if stats.is_empty() {
+            continue;
+        }
+
+        let location_name = location_id_to_cluster.get(location).unwrap();
+        let filename = output_dir.join(format!(
+            "{}_{}c_{}vc_r{}.csv",
+            location_name, num_clients, num_clients_per_node, run
+        ));
+        let num_rows = stats
+            .len()
+            .max(run_metadata.throughputs.len())
+            .max(run_metadata.latencies.len());
+
+        let num_cores = stats
+            .iter()
+            .map(|s| s.cpu.core_stats.len())
+            .max()
+            .unwrap_or(0);
+
+        let mut file = File::create(&filename)?;
+        // Header
+        write!(file, "time_s,cpu_user,cpu_system,cpu_idle")?;
+        for c in 0..num_cores {
+            write!(file, ",core{}_user,core{}_system,core{}_idle", c, c, c)?;
+        }
+        writeln!(
+            file,
+            ",network_tx_packets_per_sec,network_rx_packets_per_sec,\
+             network_tx_bytes_per_sec,network_rx_bytes_per_sec,\
+             throughput_rps,latency_p50_ms,latency_p99_ms,latency_p999_ms,latency_samples",
+        )?;
+
+        let default_sar = SarStats::default();
+        for i in 0..num_rows {
+            let sar = stats.get(i).unwrap_or(&default_sar);
+            let thr = run_metadata.throughputs.get(i).copied().unwrap_or(0);
+            let (p50, p99, p999, count) =
+                run_metadata.latencies.get(i).copied().unwrap_or_default();
+            write!(
+                file,
+                "{},{:.2},{:.2},{:.2}",
+                i, sar.cpu.all_stats.user, sar.cpu.all_stats.system, sar.cpu.all_stats.idle,
+            )?;
+            let default_core = CPUStat::default();
+            for c in 0..num_cores {
+                let core = sar.cpu.core_stats.get(c).unwrap_or(&default_core);
+                write!(
+                    file,
+                    ",{:.2},{:.2},{:.2}",
+                    core.user, core.system, core.idle
+                )?;
+            }
+            writeln!(
+                file,
+                ",{:.2},{:.2},{:.2},{:.2},{},{:.3},{:.3},{:.3},{}",
+                sar.network.tx_packets_per_sec,
+                sar.network.rx_packets_per_sec,
+                sar.network.tx_bytes_per_sec,
+                sar.network.rx_bytes_per_sec,
+                thr,
+                p50,
+                p99,
+                p999,
+                count,
+            )?;
+        }
+
+        println!("Generated CSV: {}", filename.display());
+    }
+
+    Ok(())
+}
+
+async fn output_metrics(
+    run_metadata: RunMetadata,
+    location_id_to_cluster: &HashMap<LocationId, String>,
+    output_dir: &Path,
+    num_clients: usize,
+    num_clients_per_node: usize,
+    measurement_second: usize,
+    run: usize,
+) {
+    if let Some(&throughput) = run_metadata.throughputs.get(measurement_second) {
+        println!(
+            "Throughput @{}s: {} requests/s",
+            measurement_second + 1,
+            throughput
+        );
+    }
+    if let Some(&(p50, p99, p999, samples)) = run_metadata.latencies.get(measurement_second) {
+        println!(
+            "Latency @{}s: p50: {:.3} | p99 {:.3} | p999 {:.3} ms ({} samples)",
+            measurement_second + 1,
+            p50,
+            p99,
+            p999,
+            samples
+        );
+    }
+    run_metadata
+        .sar_stats
+        .iter()
+        .for_each(|(location, sar_stats)| {
+            println!(
+                "{} CPU: {:.2}%",
+                location_id_to_cluster.get(location).unwrap(),
+                sar_stats
+                    .last()
+                    .map(|stats| stats.cpu.all_stats.user + stats.cpu.all_stats.system)
+                    .unwrap_or_default()
+            )
+        });
+
+    if let Err(e) = write_metrics_csv(
+        output_dir,
+        &run_metadata,
+        location_id_to_cluster,
+        num_clients,
+        num_clients_per_node,
+        run,
+    ) {
+        eprintln!("Failed to write CSV: {}", e);
+    }
+}
+
+pub struct BenchmarkArgs {
+    pub gcp: Option<String>,
+    pub aws: bool,
+}
+
+pub struct BenchmarkConfig<'a> {
+    pub name: String,
+    pub builder: FlowBuilder<'a>,
+    pub clusters: ReusableClusters,
+    pub processes: ReusableProcesses,
+    pub optimizations: Optimizations,
+    pub location_id_to_cluster: HashMap<LocationId, String>,
+    pub output_dir: PathBuf,
+}
+
+pub async fn benchmark_protocol<'a>(
+    args: BenchmarkArgs,
+    num_runs: usize,
+    run_benchmark: fn(
+        usize, // num_clients
+    ) -> BenchmarkConfig<'a>,
+) {
+    assert!(
+        num_runs > 0,
+        "Must run at least one iteration of the benchmark"
+    );
+
+    let mut deployment = Deployment::new();
+    let host_type: HostType = if let Some(project) = args.gcp {
+        HostType::Gcp { project }
+    } else if args.aws {
+        HostType::Aws
+    } else {
+        HostType::Localhost
+    };
+
+    let mut reusable_hosts = ReusableHosts::new(&host_type);
+
+    const START_MEASUREMENT_SECOND: usize = 30;
+    const MEASUREMENT_SECOND: usize = 59;
+    const RUN_SECONDS: usize = 90;
+    const PHYSICAL_CLIENTS_MIN: usize = 1;
+    const PHYSICAL_CLIENTS_MAX: usize = 10;
+    const VIRTUAL_CLIENTS_STEP: usize = 100;
+    const STALL_PATIENCE: usize = 3;
+    const NUM_RUNS_NO_THROUGHPUT: usize = 3;
+
+    const INIT_WARMUP_VIRTUAL_CLIENTS: usize = 1000;
+    const INIT_WARMUP_SECONDS: usize = 600;
+
+    let mut best_throughput: usize = 0;
+    let mut best_config: (usize, usize) = (0, 0);
+    let mut output_dir = None;
+
+    for num_clients in (PHYSICAL_CLIENTS_MIN..=PHYSICAL_CLIENTS_MAX).step_by(1) {
+        let mut round_best_throughput = 0;
+        let mut round_best_virtual = 0;
+        let mut stall_count = 0;
+
+        let benchmark_config = run_benchmark(num_clients);
+        // Set up FlowBuilder for cloning
+        let built = benchmark_config.builder.finalize();
+        let ir = built.ir();
+        let output_dir = output_dir.get_or_insert(benchmark_config.output_dir);
+
+        if num_clients == PHYSICAL_CLIENTS_MIN && host_type != HostType::Localhost {
+            println!(
+                "Warming up {} with {} clients and {} virtual clients for {} seconds",
+                benchmark_config.name,
+                num_clients,
+                INIT_WARMUP_VIRTUAL_CLIENTS,
+                INIT_WARMUP_SECONDS
+            );
+            // Set num virtual clients
+            reusable_hosts.insert_env(
+                NUM_CLIENTS_PER_NODE_ENV.to_string(),
+                INIT_WARMUP_VIRTUAL_CLIENTS.to_string(),
+            );
+
+            let mut builder = FlowBuilder::from_built(&built);
+            builder.replace_ir(deep_clone(ir));
+            let _ = deploy_and_optimize(
+                &mut reusable_hosts,
+                &mut deployment,
+                builder.finalize(),
+                benchmark_config.clusters.clone(),
+                benchmark_config.processes.clone(),
+                benchmark_config.optimizations.clone(),
+                Some(INIT_WARMUP_SECONDS),
+                Some(MEASUREMENT_SECOND),
+                false,
+            )
+            .await;
+        }
+
+        // Start at the per-node count that yields roughly the same total
+        // virtual clients as the previous round's best throughput config,
+        // rounded down to the nearest step (minimum 1).
+        let mut num_virtual = std::cmp::max(1, best_config.0 * best_config.1 / num_clients);
+        while stall_count < STALL_PATIENCE {
+            // Set num virtual clients
+            reusable_hosts.insert_env(
+                NUM_CLIENTS_PER_NODE_ENV.to_string(),
+                num_virtual.to_string(),
+            );
+
+            let mut throughput_sum = 0;
+            let mut successful_runs = 0;
+            let mut zero_throughput_count = 0;
+            let mut run = 0;
+            while successful_runs < num_runs {
+                println!(
+                    "Running {} with {} clients and {} virtual clients (run {})",
+                    benchmark_config.name, num_clients, num_virtual, run
+                );
+
+                let mut builder = FlowBuilder::from_built(&built);
+                builder.replace_ir(deep_clone(ir));
+                let run_metadata = deploy_and_optimize(
+                    &mut reusable_hosts,
+                    &mut deployment,
+                    builder.finalize(),
+                    benchmark_config.clusters.clone(),
+                    benchmark_config.processes.clone(),
+                    benchmark_config.optimizations.clone(),
+                    Some(RUN_SECONDS),
+                    Some(MEASUREMENT_SECOND),
+                    true,
+                )
+                .await;
+
+                let run_throughput = run_metadata.throughputs
+                    [START_MEASUREMENT_SECOND..=MEASUREMENT_SECOND]
+                    .iter()
+                    .sum::<usize>()
+                    / (MEASUREMENT_SECOND - START_MEASUREMENT_SECOND + 1);
+                println!(
+                    "physical_clients={}, virtual_clients={}, run={}, throughput@{}s={}",
+                    num_clients,
+                    num_virtual,
+                    run,
+                    MEASUREMENT_SECOND + 1,
+                    run_throughput
+                );
+
+                output_metrics(
+                    run_metadata,
+                    &benchmark_config.location_id_to_cluster,
+                    output_dir,
+                    num_clients,
+                    num_virtual,
+                    MEASUREMENT_SECOND,
+                    run,
+                )
+                .await;
+
+                if run_throughput == 0 {
+                    zero_throughput_count += 1;
+                    println!(
+                        "Zero throughput detected ({}/{})",
+                        zero_throughput_count, NUM_RUNS_NO_THROUGHPUT
+                    );
+                    if zero_throughput_count > NUM_RUNS_NO_THROUGHPUT {
+                        println!(
+                            "Exceeded {} zero-throughput runs for this config. Terminating benchmark.",
+                            NUM_RUNS_NO_THROUGHPUT
+                        );
+                        return;
+                    }
+                } else {
+                    throughput_sum += run_throughput;
+                    successful_runs += 1;
+                }
+                run += 1;
+            }
+
+            let current_throughput = throughput_sum / num_runs;
+            println!(
+                "physical_clients={}, virtual_clients={}, avg_throughput={}",
+                num_clients, num_virtual, current_throughput
+            );
+
+            if current_throughput > round_best_throughput {
+                round_best_throughput = current_throughput;
+                round_best_virtual = num_virtual;
+                stall_count = 0;
+            } else {
+                stall_count += 1;
+            }
+
+            num_virtual += VIRTUAL_CLIENTS_STEP / num_clients;
+        }
+
+        println!(
+            "Throughput stalled for {} configs at {} physical clients \
+                     (best={} at {}vc). Moving to next physical client count.",
+            STALL_PATIENCE, num_clients, round_best_throughput, round_best_virtual
+        );
+
+        if round_best_throughput > best_throughput {
+            best_throughput = round_best_throughput;
+            best_config = (num_clients, round_best_virtual);
+        } else {
+            println!(
+                "Throughput still saturated after increasing physical clients \
+                 (prior best={}, current_peak={}). Stopping search.",
+                best_throughput, round_best_throughput
+            );
+            break;
+        }
+    }
+
+    println!("\n=== Benchmark Summary ===");
+    println!(
+        "Best throughput: {} rps with {} physical clients and {} virtual clients",
+        best_throughput, best_config.0, best_config.1
+    );
 }
