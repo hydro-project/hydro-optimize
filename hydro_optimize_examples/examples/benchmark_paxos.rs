@@ -105,7 +105,7 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    let num_runs = 3;
+    let num_runs = 1;
     benchmark_protocol(
         BenchmarkArgs {
             gcp: args.gcp,

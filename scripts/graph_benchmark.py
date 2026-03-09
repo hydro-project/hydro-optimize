@@ -107,7 +107,7 @@ def main():
     cluster_cmap = plt.cm.get_cmap("Set2", len(clusters))
     cluster_color = {c: cluster_cmap(i) for i, c in enumerate(clusters)}
 
-    fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+    fig, axes = plt.subplots(2 + len(clusters), 1, figsize=(10, 4 + 3 * len(clusters)), sharex=True)
 
     # Latency plot
     ax_lat = axes[0]
@@ -128,25 +128,43 @@ def main():
     ax_lat.grid(True, alpha=0.3)
     ax_lat.legend(fontsize=9)
 
-    # CPU and network plots per cluster
-    for ax, metric, label in [
-        (axes[1], "cpu", f"CPU (%) ×{args.cpu_multiplier}"),
-        (axes[2], "net_gb", "Network (GB/s)"),
-    ]:
-        mul = args.cpu_multiplier if metric == "cpu" else 1
-        for cluster in clusters:
-            data = cluster_data[cluster]
-            cfgs = sorted(c for c in data if c in cluster_data[ref_cluster])
-            thr = [cluster_data[ref_cluster][c]["throughput"] for c in cfgs]
-            vals = [data[c][metric] * mul for c in cfgs]
-            lo = [data[c][f"{metric}_lo"] * mul for c in cfgs]
-            hi = [data[c][f"{metric}_hi"] * mul for c in cfgs]
-            ax.plot(thr, vals, "o-", color=cluster_color[cluster],
-                    linewidth=1.5, markersize=5, label=cluster)
-            ax.fill_between(thr, lo, hi, color=cluster_color[cluster], alpha=0.15)
-        ax.set_ylabel(label, fontsize=11)
+    # Per-cluster CPU plots
+    mul = args.cpu_multiplier
+    for ci, cluster in enumerate(clusters):
+        ax = axes[1 + ci]
+        data = cluster_data[cluster]
+        cfgs = sorted(c for c in data if c in cluster_data[ref_cluster])
+        for p in unique_phys:
+            p_cfgs = [c for c in cfgs if c[0] == p]
+            if not p_cfgs:
+                continue
+            thr = [cluster_data[ref_cluster][c]["throughput"] for c in p_cfgs]
+            vals = [data[c]["cpu"] * mul for c in p_cfgs]
+            lo = [data[c]["cpu_lo"] * mul for c in p_cfgs]
+            hi = [data[c]["cpu_hi"] * mul for c in p_cfgs]
+            ax.plot(thr, vals, "o-", color=phys_color[p],
+                    linewidth=1.5, markersize=5, label=f"{p} physical")
+            ax.fill_between(thr, lo, hi, color=phys_color[p], alpha=0.15)
+        ax.set_ylabel(f"CPU (%) ×{mul}", fontsize=11)
+        ax.set_title(cluster, fontsize=11)
         ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=9)
+        ax.legend(fontsize=9, loc="lower right")
+
+    # Network plot (all clusters combined)
+    ax_net = axes[-1]
+    for cluster in clusters:
+        data = cluster_data[cluster]
+        cfgs = sorted(c for c in data if c in cluster_data[ref_cluster])
+        thr = [cluster_data[ref_cluster][c]["throughput"] for c in cfgs]
+        vals = [data[c]["net_gb"] for c in cfgs]
+        lo = [data[c]["net_gb_lo"] for c in cfgs]
+        hi = [data[c]["net_gb_hi"] for c in cfgs]
+        ax_net.plot(thr, vals, "o-", color=cluster_color[cluster],
+                    linewidth=1.5, markersize=5, label=cluster)
+        ax_net.fill_between(thr, lo, hi, color=cluster_color[cluster], alpha=0.15)
+    ax_net.set_ylabel("Network (GB/s)", fontsize=11)
+    ax_net.grid(True, alpha=0.3)
+    ax_net.legend(fontsize=9)
 
     axes[-1].set_xlabel("Throughput (rps)", fontsize=12)
     fig.suptitle(f"{os.path.basename(args.folder)} @ t={time_start}-{time_end}s (avg)", fontsize=14, fontweight="bold")

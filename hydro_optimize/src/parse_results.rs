@@ -28,8 +28,8 @@ impl RunMetadata {
             .sar_stats
             .iter()
             .reduce(|(max_loc, max_stats), (curr_loc, curr_stats)| {
-                let max_cpu = max_stats[measurement_sec].cpu;
-                let curr_cpu = curr_stats[measurement_sec].cpu;
+                let max_cpu = &max_stats[measurement_sec].cpu.all_stats;
+                let curr_cpu = &curr_stats[measurement_sec].cpu.all_stats;
                 if max_cpu.system + max_cpu.user < curr_cpu.system + curr_cpu.user {
                     (curr_loc, curr_stats)
                 } else {
@@ -73,10 +73,15 @@ pub fn parse_cpu_usage(measurement: String) -> f64 {
 
 /// Per-second CPU statistics from sar -u output
 #[derive(Debug, Default, Clone, Copy)]
-pub struct CPUStats {
+pub struct CPUStat {
     pub user: f64,
     pub system: f64,
     pub idle: f64,
+}
+#[derive(Debug, Default, Clone)]
+pub struct CPUStats {
+    pub core_stats: Vec<CPUStat>, // One for each core
+    pub all_stats: CPUStat,
 }
 
 /// Per-second network statistics from sar -n DEV output (eth0 only)
@@ -89,25 +94,26 @@ pub struct NetworkStats {
 }
 
 /// Combined per-second sar statistics
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct SarStats {
     pub cpu: CPUStats,
     pub network: NetworkStats,
 }
 
-/// Parses a single CPU line from sar -u output.
-/// Format: "HH:MM:SS AM/PM CPU %user %nice %system %iowait %steal %idle"
-fn parse_cpu_line(line: &str) -> Option<CPUStats> {
+/// Parses a single CPU line from sar -u -P ALL output.
+/// Returns (is_all, CPUStat) where is_all=true for the "all" aggregate line.
+fn parse_cpu_line(line: &str) -> Option<(bool, CPUStat)> {
     let cpu_regex = Regex::new(
-        r"all\s+(\d+\.?\d*)\s+\d+\.?\d*\s+(\d+\.?\d*)\s+\d+\.?\d*\s+\d+\.?\d*\s+(\d+\.?\d*)",
+        r"\s(all|\d+)\s+(\d+\.?\d*)\s+\d+\.?\d*\s+(\d+\.?\d*)\s+\d+\.?\d*\s+\d+\.?\d*\s+(\d+\.?\d*)$",
     )
     .unwrap();
 
     cpu_regex.captures(line).and_then(|caps| {
-        let user = caps[1].parse::<f64>().ok()?;
-        let system = caps[2].parse::<f64>().ok()?;
-        let idle = caps[3].parse::<f64>().ok()?;
-        Some(CPUStats { user, system, idle })
+        let is_all = &caps[1] == "all";
+        let user = caps[2].parse::<f64>().ok()?;
+        let system = caps[3].parse::<f64>().ok()?;
+        let idle = caps[4].parse::<f64>().ok()?;
+        Some((is_all, CPUStat { user, system, idle }))
     })
 }
 
@@ -138,15 +144,23 @@ fn parse_network_line(line: &str) -> Option<NetworkStats> {
     })
 }
 
-/// Parses `sar -n DEV -u` output lines and returns per-second SarStats.
-/// Pairs CPU and network stats by matching timestamps.
+/// Parses `sar -n DEV -u -P ALL` output lines and returns per-second SarStats.
+/// Groups per-core CPU stats with the aggregate "all" line.
 pub fn parse_sar_output(lines: Vec<String>) -> Vec<SarStats> {
-    let mut cpu_usages = vec![];
+    let mut cpu_usages: Vec<CPUStats> = vec![];
     let mut network_usages = vec![];
 
     for line in &lines {
-        if let Some(cpu) = parse_cpu_line(line) {
-            cpu_usages.push(cpu);
+        if let Some((is_all, stat)) = parse_cpu_line(line) {
+            // Assumes that "all" line comes before per-core lines
+            if is_all {
+                cpu_usages.push(CPUStats {
+                    all_stats: stat,
+                    core_stats: vec![],
+                });
+            } else if let Some(last) = cpu_usages.last_mut() {
+                last.core_stats.push(stat);
+            }
         } else if let Some(network) = parse_network_line(line) {
             network_usages.push(network);
         }
@@ -282,14 +296,16 @@ pub fn inject_perf(ir: &mut [HydroRoot], folded_data: Vec<u8>) -> f64 {
 }
 
 /// Returns (op_id, count)
-pub fn parse_counter_usage(lines: Vec<String>, op_to_count: &mut HashMap<usize, usize>) {
+pub fn parse_counter_usage(lines: Vec<String>) -> HashMap<usize, usize> {
     let regex = Regex::new(r"\((\d+)\): (\d+)").unwrap();
+    let mut op_to_count = HashMap::new();
     for measurement in lines {
         let matches = regex.captures_iter(&measurement).last().unwrap();
         let op_id = matches[1].parse::<usize>().unwrap();
         let count = matches[2].parse::<usize>().unwrap();
         op_to_count.insert(op_id, count);
     }
+    op_to_count
 }
 
 // Note: Ensure edits to the match arms are consistent with insert_counter_node
@@ -367,10 +383,13 @@ pub fn inject_count(ir: &mut [HydroRoot], op_to_count: &HashMap<usize, usize>) {
 }
 
 /// Drains all currently available messages from a receiver into a Vec.
-/// Uses try_recv() to avoid blocking if the channel is empty but not closed.
-fn drain_receiver(receiver: &mut UnboundedReceiver<String>) -> Vec<String> {
+async fn drain_receiver(receiver: &mut UnboundedReceiver<String>) -> Vec<String> {
     let mut lines = Vec::new();
-    while let Ok(line) = receiver.try_recv() {
+    if receiver.is_empty() {
+        // If the receiver is empty but not closed, calling recv() will block.
+        return lines;
+    }
+    while let Some(line) = receiver.recv().await {
         lines.push(line);
     }
     lines
@@ -388,45 +407,61 @@ pub async fn analyze_cluster_results(
     nodes: &DeployResult<'_, HydroDeploy>,
     ir: &mut [HydroRoot],
     mut cluster_metrics: HashMap<(LocationId, String, usize), MetricLogs>,
+    measurement_second: Option<usize>,
 ) -> RunMetadata {
     let mut run_metadata = RunMetadata::default();
     let mut op_to_count = HashMap::new();
 
-    for (id, name, cluster) in nodes.get_all_clusters() {
-        println!("Analyzing cluster {:?}: {}", id, name);
+    // Drain all receivers and parse in parallel across all nodes
+    let mut set = tokio::task::JoinSet::new();
+    for (key, mut metrics) in cluster_metrics.drain() {
+        set.spawn(async move {
+            println!("Analyzing cluster {:?}: {}", key.0, key.1);
+            let (sar_stats, op_to_count, throughputs, latencies) = tokio::join!(
+                async { parse_sar_output(drain_receiver(&mut metrics.sar).await) },
+                async { parse_counter_usage(drain_receiver(&mut metrics.counters).await) },
+                async { parse_throughput(drain_receiver(&mut metrics.throughputs).await) },
+                async { parse_latency(drain_receiver(&mut metrics.latencies).await) },
+            );
+            println!("Parsed stats from cluster {:?}: {}", key.0, key.1);
+            (key.clone(), sar_stats, op_to_count, throughputs, latencies)
+        });
+    }
 
-        // Iterate through nodes' usages and only consider the max usage one
-        let mut sar_stats = HashMap::new();
-        for (idx, _) in cluster.members().iter().enumerate() {
-            let metrics = cluster_metrics
-                .get_mut(&(id.clone(), name.to_string(), idx))
-                .unwrap();
-            sar_stats.insert(idx, parse_sar_output(drain_receiver(&mut metrics.sar)));
-        }
+    let mut drained: HashMap<(LocationId, String), Vec<_>> = HashMap::new();
+    while let Some(result) = set.join_next().await {
+        let ((id, name, _idx), sar_stats, op_to_count, throughputs, latencies) = result.unwrap();
+        drained.entry((id, name)).or_default().push((
+            sar_stats,
+            op_to_count,
+            throughputs,
+            latencies,
+        ));
+    }
 
-        let max_usage_sar_stat =
-            sar_stats
-                .iter()
-                .reduce(|(max_usage_idx, max_usage_sar_stat), (idx, sar_stat)| {
-                    if let Some(last_stat) = sar_stat.last() {
-                        let max_last_stat = max_usage_sar_stat.last().unwrap().cpu;
-                        if last_stat.cpu.user + last_stat.cpu.system
-                            > max_last_stat.user + max_last_stat.system
-                        {
-                            return (idx, sar_stat);
-                        }
-                    }
-                    (max_usage_idx, max_usage_sar_stat)
-                });
+    for (id, name, _cluster) in nodes.get_all_clusters() {
+        let cluster_data = drained.get(&(id.clone(), name.to_string())).unwrap();
 
-        if let Some((idx, max_sar_stat)) = max_usage_sar_stat {
-            let metrics = cluster_metrics
-                .get_mut(&(id.clone(), name.to_string(), *idx))
-                .unwrap();
+        // Find the node with max CPU usage
+        let max_usage = cluster_data.iter().reduce(|max_data, data| {
+            let stat = measurement_second
+                .and_then(|s| data.0.get(s))
+                .or_else(|| data.0.last());
+            let max_stat = measurement_second
+                .and_then(|s| max_data.0.get(s))
+                .or_else(|| max_data.0.last());
+            match (stat, max_stat) {
+                (Some(s), Some(ms)) if s.cpu.all_stats.user + s.cpu.all_stats.system > ms.cpu.all_stats.user + ms.cpu.all_stats.system => {
+                    data
+                }
+                _ => max_data,
+            }
+        });
+
+        if let Some((max_sar_stat, counters, _, _)) = max_usage {
             // Parse perf
             // let unidentified_perf = analyze_perf(cluster.members().get(*idx).unwrap(), ir).await;
-            // Parse counters for each op and add to op_to_count
-            parse_counter_usage(drain_receiver(&mut metrics.counters), &mut op_to_count);
+            op_to_count.extend(counters.clone());
 
             // run_metadata
             //     .unaccounted_perf
@@ -438,19 +473,15 @@ pub async fn analyze_cluster_results(
     }
 
     // Collect throughput/latency from all processes (aggregator outputs these)
-    for metrics in cluster_metrics.values_mut() {
-        // Filter metrics until we find the Aggregator
-        let throughputs = drain_receiver(&mut metrics.throughputs);
-        if throughputs.is_empty() {
-            continue;
+    for node_data in drained.into_values().flatten() {
+        let (_, _, throughputs, latencies) = node_data;
+        let has_throughput = !throughputs.is_empty();
+        run_metadata.throughputs.extend(throughputs);
+        run_metadata.latencies.extend(latencies);
+        if has_throughput {
+            // Found aggregator, we're done
+            break;
         }
-
-        run_metadata
-            .throughputs
-            .extend(parse_throughput(throughputs));
-        run_metadata
-            .latencies
-            .extend(parse_latency(drain_receiver(&mut metrics.latencies)));
     }
 
     inject_count(ir, &op_to_count);

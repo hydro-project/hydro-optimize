@@ -105,6 +105,7 @@ async fn main() {
             .with_iterations(num_times_to_optimize),
         Some(run_seconds),
         Some(measurement_second),
+        true,
     )
     .await;
 }

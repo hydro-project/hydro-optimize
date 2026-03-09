@@ -20,7 +20,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use crate::decouple_analysis::decouple_analysis;
 use crate::decoupler;
 use crate::deploy::{HostType, ReusableHosts};
-use crate::parse_results::{RunMetadata, analyze_cluster_results};
+use crate::parse_results::{CPUStat, RunMetadata, SarStats, analyze_cluster_results};
 use crate::repair::{cycle_source_to_sink_input, inject_id, remove_counter};
 
 pub(crate) const METRIC_INTERVAL_SECS: u64 = 1;
@@ -285,6 +285,7 @@ pub async fn deploy_and_optimize<'a>(
     optimizations: Optimizations,
     num_seconds: Option<usize>,
     stability_second: Option<usize>,
+    analyze: bool,
 ) -> RunMetadata {
     assert!(
         optimizations.iterations < 1 || num_seconds.is_some(),
@@ -298,8 +299,8 @@ pub async fn deploy_and_optimize<'a>(
     }
     if optimizations.decoupling || optimizations.partitioning {
         assert!(
-            stability_second.is_some(),
-            "Must select stability_second with optimizations"
+            stability_second.is_some() && analyze,
+            "Must select stability_second and enable analysis with optimizations"
         );
     }
 
@@ -331,9 +332,9 @@ pub async fn deploy_and_optimize<'a>(
             );
         }
 
-        // Measure network (-n DEV) and CPU (-u) usage
+        // Measure network (-n DEV) and CPU (-u) usage. -P ALL measures all CPUs on the machine
         let sar_sidecar = ScriptSidecar {
-            script: "sar -n DEV -u 1".to_string(),
+            script: "sar -n DEV -u -P ALL 1".to_string(),
             prefix: SAR_USAGE_PREFIX.to_string(),
         };
         let nodes = deployable
@@ -363,41 +364,44 @@ pub async fn deploy_and_optimize<'a>(
             .await
             .unwrap();
 
-        // Parse results to get metrics
-        run_metadata = analyze_cluster_results(&nodes, &mut ir, metrics).await;
-        // Remove HydroNode::Counter (since we don't want to consider decoupling those)
-        remove_counter(&mut ir);
+        if analyze {
+            // Parse results to get metrics
+            run_metadata =
+                analyze_cluster_results(&nodes, &mut ir, metrics, stability_second).await;
+            // Remove HydroNode::Counter (since we don't want to consider decoupling those)
+            remove_counter(&mut ir);
 
-        // Create a mapping from each CycleSink to its corresponding CycleSource
-        let cycle_source_to_sink_input = cycle_source_to_sink_input(&mut ir);
+            // Create a mapping from each CycleSink to its corresponding CycleSource
+            let cycle_source_to_sink_input = cycle_source_to_sink_input(&mut ir);
 
-        if optimizations.decoupling {
-            let bottleneck = run_metadata.cpu_bottleneck(stability_second.unwrap());
-            // The bottleneck is either a process or cluster. Panic otherwise.
-            let (bottleneck_name, bottleneck_num_nodes) = processes
-                .location_name(&bottleneck)
-                .map(|name| (name, 1))
-                .unwrap_or_else(|| clusters.location_name_and_num(&bottleneck).unwrap());
+            if optimizations.decoupling {
+                let bottleneck = run_metadata.cpu_bottleneck(stability_second.unwrap());
+                // The bottleneck is either a process or cluster. Panic otherwise.
+                let (bottleneck_name, bottleneck_num_nodes) = processes
+                    .location_name(&bottleneck)
+                    .map(|name| (name, 1))
+                    .unwrap_or_else(|| clusters.location_name_and_num(&bottleneck).unwrap());
 
-            let decision = decouple_analysis(
-                &mut ir,
-                &bottleneck,
-                0.01, // TODO: Deprecate use of send/recv overheads, since they are inaccurate anyway
-                0.01,
-                &cycle_source_to_sink_input,
-            );
+                let decision = decouple_analysis(
+                    &mut ir,
+                    &bottleneck,
+                    0.01, // TODO: Deprecate use of send/recv overheads, since they are inaccurate anyway
+                    0.01,
+                    &cycle_source_to_sink_input,
+                );
 
-            // Apply decoupling — creates new clusters as needed
-            let new_clusters =
-                decoupler::decouple(&mut ir, decision, &bottleneck, &mut post_rewrite_builder);
-            for cluster in new_clusters {
-                clusters.named_clusters.push((
-                    cluster.id().key(),
-                    format!("{}-decouple-{}", bottleneck_name, iteration),
-                    bottleneck_num_nodes,
-                ));
+                // Apply decoupling — creates new clusters as needed
+                let new_clusters =
+                    decoupler::decouple(&mut ir, decision, &bottleneck, &mut post_rewrite_builder);
+                for cluster in new_clusters {
+                    clusters.named_clusters.push((
+                        cluster.id().key(),
+                        format!("{}-decouple-{}", bottleneck_name, iteration),
+                        bottleneck_num_nodes,
+                    ));
+                }
+                // TODO: Save decoupling decision to file
             }
-            // TODO: Save decoupling decision to file
         }
 
         post_rewrite_builder.replace_ir(ir);
@@ -434,27 +438,48 @@ fn write_metrics_csv(
             .max(run_metadata.throughputs.len())
             .max(run_metadata.latencies.len());
 
+        let num_cores = stats
+            .iter()
+            .map(|s| s.cpu.core_stats.len())
+            .max()
+            .unwrap_or(0);
+
         let mut file = File::create(&filename)?;
+        // Header
+        write!(file, "time_s,cpu_user,cpu_system,cpu_idle")?;
+        for c in 0..num_cores {
+            write!(file, ",core{}_user,core{}_system,core{}_idle", c, c, c)?;
+        }
         writeln!(
             file,
-            "time_s,cpu_user,cpu_system,cpu_idle,\
-             network_tx_packets_per_sec,network_rx_packets_per_sec,\
+            ",network_tx_packets_per_sec,network_rx_packets_per_sec,\
              network_tx_bytes_per_sec,network_rx_bytes_per_sec,\
              throughput_rps,latency_p50_ms,latency_p99_ms,latency_p999_ms,latency_samples",
         )?;
 
+        let default_sar = SarStats::default();
         for i in 0..num_rows {
-            let sar = stats.get(i).copied().unwrap_or_default();
+            let sar = stats.get(i).unwrap_or(&default_sar);
             let thr = run_metadata.throughputs.get(i).copied().unwrap_or(0);
             let (p50, p99, p999, count) =
                 run_metadata.latencies.get(i).copied().unwrap_or_default();
+            write!(
+                file,
+                "{},{:.2},{:.2},{:.2}",
+                i, sar.cpu.all_stats.user, sar.cpu.all_stats.system, sar.cpu.all_stats.idle,
+            )?;
+            let default_core = CPUStat::default();
+            for c in 0..num_cores {
+                let core = sar.cpu.core_stats.get(c).unwrap_or(&default_core);
+                write!(
+                    file,
+                    ",{:.2},{:.2},{:.2}",
+                    core.user, core.system, core.idle
+                )?;
+            }
             writeln!(
                 file,
-                "{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{:.3},{:.3},{:.3},{}",
-                i,
-                sar.cpu.user,
-                sar.cpu.system,
-                sar.cpu.idle,
+                ",{:.2},{:.2},{:.2},{:.2},{},{:.3},{:.3},{:.3},{}",
                 sar.network.tx_packets_per_sec,
                 sar.network.rx_packets_per_sec,
                 sar.network.tx_bytes_per_sec,
@@ -508,7 +533,7 @@ async fn output_metrics(
                 location_id_to_cluster.get(location).unwrap(),
                 sar_stats
                     .last()
-                    .map(|stats| stats.cpu.user + stats.cpu.system)
+                    .map(|stats| stats.cpu.all_stats.user + stats.cpu.all_stats.system)
                     .unwrap_or_default()
             )
         });
@@ -615,6 +640,7 @@ pub async fn benchmark_protocol<'a>(
                 benchmark_config.optimizations.clone(),
                 Some(INIT_WARMUP_SECONDS),
                 Some(MEASUREMENT_SECOND),
+                false,
             )
             .await;
         }
@@ -651,6 +677,7 @@ pub async fn benchmark_protocol<'a>(
                     benchmark_config.optimizations.clone(),
                     Some(RUN_SECONDS),
                     Some(MEASUREMENT_SECOND),
+                    true,
                 )
                 .await;
 
@@ -713,7 +740,7 @@ pub async fn benchmark_protocol<'a>(
                 stall_count += 1;
             }
 
-            num_virtual += VIRTUAL_CLIENTS_STEP;
+            num_virtual += VIRTUAL_CLIENTS_STEP / num_clients;
         }
 
         println!(
