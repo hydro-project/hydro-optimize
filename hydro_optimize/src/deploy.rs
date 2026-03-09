@@ -9,6 +9,7 @@ use hydro_deploy::{AwsNetwork, Deployment, Host, HostTargetType, LinuxCompileTyp
 use hydro_lang::deploy::TrybuildHost;
 
 /// What the user provides when creating ReusableHosts
+#[derive(PartialEq, Eq, Clone)]
 pub enum HostType {
     Gcp { project: String },
     Aws,
@@ -38,11 +39,11 @@ const AWS_REGION: &str = "us-west-2";
 const AWS_INSTANCE_AMI: &str = "ami-055a9df0c8c9f681c"; // Amazon Linux 2
 
 impl ReusableHosts {
-    pub fn new(host_type: HostType) -> Self {
+    pub fn new(host_type: &HostType) -> Self {
         let initialized = match host_type {
             HostType::Gcp { project } => InitializedHostType::Gcp {
                 network: GcpNetwork::new(project.clone(), None),
-                project,
+                project: project.clone(),
             },
             HostType::Aws => InitializedHostType::Aws {
                 network: AwsNetwork::new(AWS_REGION, None),

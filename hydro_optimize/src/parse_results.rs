@@ -339,7 +339,8 @@ fn inject_count_node(
         | HydroNode::ReduceKeyedWatermark { metadata, .. }
         | HydroNode::Network { metadata, .. }
         | HydroNode::ExternalInput { metadata, .. }
-        | HydroNode::SingletonSource { metadata, .. } => {
+        | HydroNode::SingletonSource { metadata, .. }
+        | HydroNode::Partition { metadata, .. } => {
             if let Some(count) = op_to_count.get(next_stmt_id) {
                 metadata.cardinality = Some(*count);
             }
@@ -348,7 +349,7 @@ fn inject_count_node(
                 metadata.cardinality = Some(1);
             }
         }
-        HydroNode::Tee { inner ,metadata, .. } => {
+        HydroNode::Tee { inner, metadata, .. } => {
             metadata.cardinality = inner.0.borrow().metadata().cardinality;
         }
         | HydroNode::Map { input, metadata, .. } // Equal to parent cardinality

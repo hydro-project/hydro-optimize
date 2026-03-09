@@ -179,7 +179,8 @@ fn input_dependency_analysis_node(
         | HydroNode::BeginAtomic { .. }
         | HydroNode::EndAtomic { .. }
         | HydroNode::Batch { .. }
-        | HydroNode::YieldConcat { .. } => {
+        | HydroNode::YieldConcat { .. }
+        | HydroNode::Partition { .. } => {
             // For each input the first (and potentially only) parent depends on, take its dependency
             for input_id in input_taint_entry.iter() {
                 if let Some(parent_dependencies_on_input) = parent_input_dependencies.get(input_id) &&
@@ -572,7 +573,8 @@ fn partitioning_constraint_analysis_node(
             | HydroNode::BeginAtomic { .. }
             | HydroNode::EndAtomic { .. }
             | HydroNode::Batch { .. }
-            | HydroNode::YieldConcat { .. } => {
+            | HydroNode::YieldConcat { .. }
+            | HydroNode::Partition { .. } => {
                 // Doesn't impede partitioning, return
                 return;
             }
@@ -1179,6 +1181,30 @@ mod tests {
             .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|(a, b)| {
                 println!("a: {}, b: {}", a, b);
+            }));
+
+        test_input_partitionable(builder, cluster2.id(), true);
+    }
+
+    #[test]
+    fn test_partition_partitionable() {
+        let mut builder = FlowBuilder::new();
+        let cluster1 = builder.cluster::<()>();
+        let cluster2 = builder.cluster::<()>();
+        let (evens, odds) = cluster1
+            .source_iter(q!([(1, 2)]))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
+            .values()
+            .partition(q!(|(a, _b)| a % 2 == 0));
+        evens.assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
+            .for_each(q!(|(b, a2)| {
+                println!("b: {}, a+2: {}", b, a2);
+            }));
+        odds.assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
+            .for_each(q!(|(b, a2)| {
+                println!("b: {}, a+2: {}", b, a2);
             }));
 
         test_input_partitionable(builder, cluster2.id(), true);
