@@ -127,7 +127,7 @@ mod tests {
         deployment.start().await.unwrap();
 
         let re =
-            Regex::new(r"(\d+\.?\d*)\s*-\s*(\d+\.?\d*)\s*-\s*(\d+\.?\d*)\s*requests/s").unwrap();
+            Regex::new(r"(\d+) requests/s").unwrap();
         let mut found = 0;
         let mut client_out = client_out;
         while let Some(line) = client_out.recv().await {
