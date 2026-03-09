@@ -86,6 +86,7 @@ async fn main() {
             .excluding::<Aggregator>(),
         Some(run_seconds),
         Some(measurement_second),
+        true,
     )
     .await;
 }
