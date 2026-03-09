@@ -1,5 +1,8 @@
 use hydro_lang::{
-    live_collections::{sliced::sliced, stream::NoOrder},
+    live_collections::{
+        sliced::sliced,
+        stream::{NoOrder, TotalOrder},
+    },
     location::Location,
     nondet::nondet,
     prelude::{KeyedStream, Process, Stream, Unbounded},
@@ -46,7 +49,7 @@ where
         // TODO: Replace with KeyedSingleton when support is added
         // (lock_id, (client_id, virtual_client_id))
         let mut acquired_locks = use::state_null::<Stream<(u32, Client), _, _, NoOrder>>();
-        let keyed_acquired_locks = acquired_locks.into_keyed().assume_ordering(nondet!(/** Actually KeyedSingleton */)).first();
+        let keyed_acquired_locks = acquired_locks.into_keyed().assume_ordering::<TotalOrder>(nondet!(/** Actually KeyedSingleton */)).first();
 
         // Always process releases first. Find out which locks still can't be acquired
         let curr_acquired_locks = keyed_acquired_locks
@@ -54,7 +57,7 @@ where
             .filter_key_not_in(mapped_releases); // Only correct if non-lock holders don't release locks they don't own
 
         // For each lock, pick a random acquire as the winner
-        let winning_acquires = mapped_acquires.clone().assume_ordering(nondet!(/** Randomly pick one acquire to be the winner */)).first();
+        let winning_acquires = mapped_acquires.clone().assume_ordering::<TotalOrder>(nondet!(/** Randomly pick one acquire to be the winner */)).first();
 
         // Acquires win for all non-acquired locks, even ones that don't exist yet
         let newly_acquired_locks = winning_acquires.filter_key_not_in(curr_acquired_locks.clone().keys());

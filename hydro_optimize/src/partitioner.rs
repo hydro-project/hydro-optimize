@@ -2,7 +2,6 @@ use core::panic;
 use std::collections::HashMap;
 
 use hydro_lang::compile::ir::{HydroNode, HydroRoot, traverse_dfir};
-use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::location::LocationKey;
 use hydro_lang::location::dynamic::LocationId;
 use serde::{Deserialize, Serialize};
@@ -143,7 +142,7 @@ fn replace_sender_dest(node: &mut HydroNode, partitioner: &Partitioner, next_stm
                     let partition_val = ::std::hash::Hasher::finish(&s) as u32;
 
                     (
-                        ::hydro_lang::location::MemberId::<()>::from_raw_id((partition_val % #num_partitions as u32) as u32),
+                        hydro_lang::location::MemberId::<()>::from_raw_id((partition_val % #num_partitions as u32) as u32),
                         struct_or_tuple
                     )
                 }
@@ -151,14 +150,14 @@ fn replace_sender_dest(node: &mut HydroNode, partitioner: &Partitioner, next_stm
         } else {
             // Already a cluster
             syn::parse_quote!(
-                |(orig_dest, struct_or_tuple): (::hydro_lang::location::MemberId<_>, _)| {
+                |(orig_dest, struct_or_tuple): (hydro_lang::location::MemberId<_>, _)| {
                     // Hash the field we'll partition on
                     let mut s = ::std::hash::DefaultHasher::new();
                     ::std::hash::Hash::hash(&#struct_or_tuple_with_fields, &mut s);
                     let partition_val = ::std::hash::Hasher::finish(&s) as u32;
 
                     (
-                        ::hydro_lang::location::MemberId::<()>::from_raw_id((orig_dest.raw_id * #num_partitions as u32) + (partition_val % #num_partitions as u32) as u32),
+                        hydro_lang::location::MemberId::<()>::from_raw_id((orig_dest.raw_id * #num_partitions as u32) + (partition_val % #num_partitions as u32) as u32),
                         struct_or_tuple
                     )
                 }
@@ -195,7 +194,7 @@ fn replace_receiver_src_id(node: &mut HydroNode, partitioner: &Partitioner, op_i
         let metadata = metadata.clone();
         let node_content = std::mem::replace(node, HydroNode::Placeholder);
         let f: syn::Expr = syn::parse_quote!(|(sender_id, b)| (
-            ::hydro_lang::location::MemberId::<_>::from_raw_id(sender_id.raw_id / #num_partitions as u32),
+            hydro_lang::location::MemberId::<_>::from_raw_id(sender_id.raw_id / #num_partitions as u32),
             b
         ));
 
@@ -311,7 +310,7 @@ fn partition_node(node: &mut HydroNode, partitioner: &Partitioner, next_stmt_id:
 
 /// Limitations: Can only partition sends to clusters (not processes). Can only partition sends to 1 cluster at a time. Assumes that the partitioned attribute can be casted to usize.
 pub fn partition(ir: &mut [HydroRoot], partitioner: &Partitioner) {
-    traverse_dfir::<HydroDeploy>(
+    traverse_dfir(
         ir,
         |_, _| {},
         |node, next_stmt_id| {
@@ -322,7 +321,7 @@ pub fn partition(ir: &mut [HydroRoot], partitioner: &Partitioner) {
     if partitioner.new_cluster_id.is_some() {
         // DANGER: Do not depend on the ID here, since nodes would've been injected
         // Fix network only after all IDs have been replaced, since get_network_type relies on it
-        traverse_dfir::<HydroDeploy>(
+        traverse_dfir(
             ir,
             |_, _| {},
             |node, next_stmt_id| {

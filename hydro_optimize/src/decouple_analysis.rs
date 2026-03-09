@@ -1,17 +1,17 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::decoupler::DecoupleDecision;
-use crate::rewrites::op_id_to_inputs;
+use crate::rewrites::{can_decouple, op_id_to_inputs};
 use good_lp::solvers::highs::HighsSolution;
 use good_lp::{
     Constraint, Expression, ProblemVariables, Solution, SolverModel, Variable, constraint, highs,
     variable, variables,
 };
+use hydro_lang::compile::builder::ClockId;
 use hydro_lang::compile::ir::{
     HydroIrMetadata, HydroIrOpMetadata, HydroNode, HydroRoot, traverse_dfir,
 };
-use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::location::dynamic::LocationId;
 
 use super::rewrites::{NetworkType, get_network_type};
@@ -42,7 +42,8 @@ struct ModelMetadata {
     orig_node_cpu_usage: Expression,
     decoupled_node_cpu_usage: Expression,
     op_id_to_var: HashMap<usize, Variable>,
-    prev_op_input_with_tick: HashMap<usize, usize>, // tick_id: last op_id with that tick_id
+    do_not_decouple: HashSet<usize>,
+    prev_op_input_with_tick: HashMap<ClockId, usize>, // tick_id: last op_id with that tick_id
     tee_inner_to_decoupled_vars: HashMap<usize, (Variable, Variable)>, /* inner_id: (orig_to_decoupled, decoupled_to_orig) */
     network_ids: HashMap<usize, NetworkType>,
 }
@@ -344,6 +345,10 @@ fn decouple_analysis_node(
         model_metadata,
     );
     add_tick_constraint(node.metadata(), op_id_to_inputs, model_metadata);
+
+    if !can_decouple(&node.metadata().collection_kind) {
+        model_metadata.borrow_mut().do_not_decouple.insert(*op_id);
+    }
 }
 
 fn solve(model_metadata: &RefCell<ModelMetadata>) -> HighsSolution {
@@ -398,6 +403,7 @@ pub(crate) fn decouple_analysis(
         orig_node_cpu_usage: Expression::default(),
         decoupled_node_cpu_usage: Expression::default(),
         op_id_to_var: HashMap::new(),
+        do_not_decouple: HashSet::new(),
         prev_op_input_with_tick: HashMap::new(),
         tee_inner_to_decoupled_vars: HashMap::new(),
         network_ids: HashMap::new(),
@@ -408,7 +414,7 @@ pub(crate) fn decouple_analysis(
         cycle_source_to_sink_input,
     );
 
-    traverse_dfir::<HydroDeploy>(
+    traverse_dfir(
         ir,
         |root, _| {
             decouple_analysis_root(root, &op_id_to_inputs, &model_metadata);
@@ -417,71 +423,42 @@ pub(crate) fn decouple_analysis(
             decouple_analysis_node(node, next_op_id, &op_id_to_inputs, &model_metadata);
         },
     );
-    for inputs in op_id_to_inputs.values() {
+
+    for (op_id, inputs) in op_id_to_inputs.iter() {
         let ModelMetadata {
             op_id_to_var,
             variables,
             constraints,
+            do_not_decouple,
             ..
         } = &mut *model_metadata.borrow_mut();
+
         // Add input constraints. All inputs of an op must output to the same machine (be assigned the same var)
-        add_equality_constr(inputs, op_id_to_var, variables, constraints);
+        let mut same_loc_ops = inputs.clone();
+        // If this op cannot be decoupled, then make sure it ahs the same location as its input
+        if do_not_decouple.contains(op_id) {
+            same_loc_ops.push(*op_id);
+        }
+        add_equality_constr(&same_loc_ops, op_id_to_var, variables, constraints);
     }
 
     let solution = solve(&model_metadata);
-    let ModelMetadata {
-        op_id_to_var,
-        network_ids,
-        ..
-    } = &mut *model_metadata.borrow_mut();
+    let ModelMetadata { op_id_to_var, .. } = &mut *model_metadata.borrow_mut();
 
+    // Build decision: index 0 = original, index 1 = decoupled
+    let mut decision = DecoupleDecision::default();
     let mut orig_machine = vec![];
     let mut decoupled_machine = vec![];
-    let mut decision = DecoupleDecision::default();
 
-    for (op_id, inputs) in op_id_to_inputs {
+    for (op_id, _inputs) in op_id_to_inputs {
         if let Some(op_var) = op_id_to_var.get(&op_id) {
-            let op_value = solution.value(*op_var).round();
-            let mut input_value = None;
-            if let Some(input) = inputs.first()
-                && let Some(input_var) = op_id_to_var.get(input)
-            {
-                input_value = Some(solution.value(*input_var).round());
-            };
+            let loc_idx = solution.value(*op_var).round() as usize;
+            decision.insert(op_id, loc_idx);
 
-            // Don't insert network if this is Source or already a Network
-            let network_type = network_ids.get(&op_id);
-
-            #[expect(clippy::collapsible_else_if, reason = "code symmetry")]
-            if network_type.is_none()
-                && let Some(input_unwrapped) = input_value
-            {
-                // Figure out if we should insert Network nodes
-                match (input_unwrapped, op_value) {
-                    (0.0, 1.0) => {
-                        decision.output_to_decoupled_machine_after.push(op_id);
-                    }
-                    (1.0, 0.0) => {
-                        decision.output_to_original_machine_after.push(op_id);
-                    }
-                    _ => {}
-                }
-
-                if input_unwrapped == 0.0 {
-                    orig_machine.push(op_id);
-                } else {
-                    decoupled_machine.push(op_id);
-                }
+            if loc_idx == 0 {
+                orig_machine.push(op_id);
             } else {
-                if op_value == 0.0 {
-                    orig_machine.push(op_id);
-                } else {
-                    decoupled_machine.push(op_id);
-                    // Don't modify the destination if we're sending to someone else
-                    if !network_type.is_some_and(|t| *t == NetworkType::Send) {
-                        decision.place_on_decoupled_machine.push(op_id);
-                    }
-                }
+                decoupled_machine.push(op_id);
             }
         }
     }
@@ -490,21 +467,6 @@ pub(crate) fn decouple_analysis(
     decoupled_machine.sort();
     println!("Original: {:?}", orig_machine);
     println!("Decoupling: {:?}", decoupled_machine);
-    decision.output_to_decoupled_machine_after.sort();
-    decision.output_to_original_machine_after.sort();
-    decision.place_on_decoupled_machine.sort();
-    println!(
-        "Original outputting to decoupled after: {:?}",
-        decision.output_to_decoupled_machine_after
-    );
-    println!(
-        "Decoupled outputting to original after: {:?}",
-        decision.output_to_original_machine_after
-    );
-    println!(
-        "Placing on decoupled: {:?}",
-        decision.place_on_decoupled_machine
-    );
 
     decision
 }
