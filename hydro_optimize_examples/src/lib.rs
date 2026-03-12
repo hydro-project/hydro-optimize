@@ -1,14 +1,19 @@
 #[cfg(stageleft_runtime)]
 hydro_lang::setup!();
 
-pub mod lock_server;
 pub mod chain_replication;
+pub mod lock_server;
 pub mod network_calibrator;
 pub mod simple_kv_bench;
 // pub mod lobsters;
 // pub mod web_submit;
 
-use hydro_lang::prelude::Process;
+use hydro_lang::{
+    live_collections::{
+        boundedness::Boundedness,
+        stream::{ExactlyOnce, Ordering, Retries, TotalOrder},
+    }, location::Location, nondet::nondet, prelude::{Process, Stream}
+};
 use hydro_std::bench_client::BenchResult;
 use stageleft::q;
 use std::time::Duration;
@@ -42,4 +47,12 @@ pub fn print_parseable_bench_results<'a, Aggregator>(
                 LATENCY_PREFIX, p50, p99, p999, num_samples
             );
         }));
+}
+
+// TODO: Remove once Hydro supports dangling HydroNodes
+pub fn black_hole<'a, T, L: Location<'a>>(stream: Stream<T, L, impl Boundedness, impl Ordering, impl Retries>) {
+    stream
+        .assume_ordering::<TotalOrder>(nondet!(/** doing nothing */))
+        .assume_retries::<ExactlyOnce>(nondet!(/** doing nothing */))
+        .for_each(q!(|_| {}));
 }
