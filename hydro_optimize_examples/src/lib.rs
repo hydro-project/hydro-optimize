@@ -2,6 +2,7 @@
 hydro_lang::setup!();
 
 pub mod lock_server;
+pub mod chain_replication;
 pub mod network_calibrator;
 pub mod simple_kv_bench;
 // pub mod lobsters;
