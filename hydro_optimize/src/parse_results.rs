@@ -407,6 +407,7 @@ pub async fn analyze_cluster_results(
     nodes: &DeployResult<'_, HydroDeploy>,
     ir: &mut [HydroRoot],
     mut cluster_metrics: HashMap<(LocationId, String, usize), MetricLogs>,
+    client_id: &LocationId,
     measurement_second: Option<usize>,
 ) -> RunMetadata {
     let mut run_metadata = RunMetadata::default();
@@ -414,17 +415,21 @@ pub async fn analyze_cluster_results(
 
     // Drain all receivers and parse in parallel across all nodes
     let mut set = tokio::task::JoinSet::new();
-    for (key, mut metrics) in cluster_metrics.drain() {
+    for ((location, name, idx), mut metrics) in cluster_metrics.drain() {
+        if location == *client_id && idx > 0 {
+            // Only analyze the client with index 0, since all clients should have similar perf. Saves time
+            continue;
+        }
         set.spawn(async move {
-            println!("Analyzing cluster {:?}: {}", key.0, key.1);
+            println!("Analyzing cluster {:?}: {}", name, idx);
             let (sar_stats, op_to_count, throughputs, latencies) = tokio::join!(
                 async { parse_sar_output(drain_receiver(&mut metrics.sar).await) },
                 async { parse_counter_usage(drain_receiver(&mut metrics.counters).await) },
                 async { parse_throughput(drain_receiver(&mut metrics.throughputs).await) },
                 async { parse_latency(drain_receiver(&mut metrics.latencies).await) },
             );
-            println!("Parsed stats from cluster {:?}: {}", key.0, key.1);
-            (key.clone(), sar_stats, op_to_count, throughputs, latencies)
+            println!("Parsed stats from cluster {:?}: {}", name, idx);
+            ((location, name, idx), sar_stats, op_to_count, throughputs, latencies)
         });
     }
 

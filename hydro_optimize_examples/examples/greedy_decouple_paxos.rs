@@ -1,13 +1,10 @@
 use std::collections::HashMap;
-use std::path::Path;
 
-use chrono::Local;
 use clap::{ArgAction, Parser};
 use hydro_lang::compile::ir::deep_clone;
 use hydro_lang::location::Location;
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::viz::config::GraphConfig;
-use hydro_optimize::deploy_and_analyze::NUM_CLIENTS_PER_NODE_ENV;
 use hydro_optimize::deploy_and_analyze::{
     BenchmarkArgs, BenchmarkConfig, Optimizations, ReusableClusters, ReusableProcesses,
     benchmark_protocol,
@@ -70,10 +67,7 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
             },
         },
         &clients,
-        clients.singleton(q!(std::env::var(NUM_CLIENTS_PER_NODE_ENV)
-            .unwrap()
-            .parse::<usize>()
-            .unwrap())),
+        clients.singleton(q!(1usize)),
         &client_aggregator,
         &replicas,
         print_result_frequency / 10,
@@ -115,6 +109,7 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
         (client_aggregator.id(), "client_aggregator".to_string()),
     ]);
     location_id_to_cluster.extend(new_proposer_ids_with_names);
+    let client_id = clients.id();
 
     let new_proposer_keys_with_name_num = new_proposer_ids_with_name_num
         .into_iter()
@@ -128,19 +123,14 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
     let processes = ReusableProcesses::default().with_process(client_aggregator);
     let optimizations = Optimizations::default();
 
-    let output_dir = Path::new("benchmark_results").join(format!(
-        "greedy_decouple_paxos_{}",
-        Local::now().format("%Y-%m-%d_%H-%M-%S")
-    ));
-
     BenchmarkConfig {
-        name: "Greedy Decouple Paxos".to_string(),
+        name: "Greedy_Decouple_Paxos".to_string(),
         builder: new_builder,
         clusters,
         processes,
+        client_id,
         optimizations,
         location_id_to_cluster,
-        output_dir,
     }
 }
 
