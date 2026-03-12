@@ -1,7 +1,7 @@
-pub mod chain_replication_bench;
 pub mod cas;
 pub mod cas_distributed;
 pub mod cas_like;
+pub mod chain_replication_bench;
 
 use hydro_lang::live_collections::stream::TotalOrder;
 use hydro_lang::location::MemberId;
@@ -16,6 +16,7 @@ use std::fmt::Debug;
 use std::time::Duration;
 use tokio::time::Instant;
 
+use crate::black_hole;
 use crate::chain_replication::cas_like::{CASLike, CASState};
 
 // ---------------------------------------------------------------------------
@@ -290,7 +291,7 @@ pub fn chain_replication<'a, CAS, Payload, Replica>(
     Stream<(u64, Payload), Cluster<'a, Replica>, Unbounded, NoOrder>,
 )
 where
-    CAS: CASLike<'a, Configuration<Replica>, Replica>,
+    CAS: CASLike<'a, Configuration<Replica>, MemberId<Replica>, Replica>,
     Payload: PartialEq + Eq + Ord + Debug + Clone + Serialize + DeserializeOwned,
     Replica: 'a + Clone + Serialize + DeserializeOwned + Debug + Eq,
 {
@@ -309,8 +310,14 @@ where
 
     // Send writes to CAS, subscribe to latest config from CAS
     let (cas_writes_complete, cas_writes) = replicas.forward_ref();
-    let cas_subscribe = replicas.singleton(q!(CLUSTER_SELF_ID));
-    let cas_config = cas.build(cas_writes, cas_subscribe, replicas);
+    // Empty stream for reads since we just subscribe
+    let cas_no_reads = replicas.source_iter(q!([]));
+    let cas_subscribe = replicas.singleton(q!(CLUSTER_SELF_ID)).into_stream();
+    let cas_output = cas.build(cas_writes, cas_no_reads, cas_subscribe, replicas);
+    // TODO: Throw away unneeded outputs. Remove once Hydro supports dangling HydroNodes.
+    black_hole(cas_output.write_processed);
+    black_hole(cas_output.read_result.entries());
+    let cas_config = cas_output.subscribe_updates;
 
     // Calculate initial config without CAS
     let replica_members = replicas.source_cluster_members(replicas);
@@ -376,7 +383,14 @@ where
     // Forward message to the next member + Logging + Preventing acceptor logging after death detected
     // -------------------------------------------------------------
     let nondet_latest_config = nondet!(/** Messages are forwarded or rejected based on the config at the time of arrival */);
-    let (unsequenced_to_next, sequenced_to_next, committed_to_client, log, new_log_values, stopped_version) = sliced! {
+    let (
+        unsequenced_to_next,
+        sequenced_to_next,
+        committed_to_client,
+        log,
+        new_log_values,
+        stopped_version,
+    ) = sliced! {
         // Sequencing
         let config = use(config.clone(), nondet_latest_config);
         let client_payloads = use(client_payloads, nondet_latest_config);
@@ -532,8 +546,7 @@ where
     // ---------------------------------------------------------------------------
     // Catchup during reconfiguration
     // ---------------------------------------------------------------------------
-    let nondet_catchup =
-        nondet!(/** Send current state of log, whatever it is when the Heartbeat message arrives */);
+    let nondet_catchup = nondet!(/** Send current state of log, whatever it is when the Heartbeat message arrives */);
     let catchup_log = sliced! {
         let config = use(config.clone(), nondet_catchup);
         let latest_heartbeat_received = use(latest_heartbeat_received.clone(), nondet_catchup);
@@ -560,18 +573,17 @@ where
             ))
     };
 
-    let sequenced_to_committers_send_ready = sequenced_to_committer
-        .map(q!(|(
-            (zero_index, (payload, (next_member, config_version))),
-            curr_slot,
-        )| (
-            next_member,
-            SequencedPayloadMsg {
-                payload,
-                slot: zero_index as u64 + curr_slot,
-                config_version,
-            }
-        )));
+    let sequenced_to_committers_send_ready = sequenced_to_committer.map(q!(|(
+        (zero_index, (payload, (next_member, config_version))),
+        curr_slot,
+    )| (
+        next_member,
+        SequencedPayloadMsg {
+            payload,
+            slot: zero_index as u64 + curr_slot,
+            config_version,
+        }
+    )));
     let sequenced_pass_along = sequenced_to_next.map(q!(|(
         payload,
         (next_member, _config_version),
@@ -764,7 +776,9 @@ where
             version,
             state: conf
         }))
-        .interleave(watermark_to_cas);
+        .interleave(watermark_to_cas)
+        .map(q!(move |cas_state| (CLUSTER_SELF_ID.clone(), cas_state)))
+        .into_keyed();
     cas_writes_complete.complete(cas_write_out);
 
     (just_became_acceptor, output)

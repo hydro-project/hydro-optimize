@@ -26,7 +26,7 @@ pub struct Aggregator;
 pub fn chain_replication_bench<'a>(
     replicas: &Cluster<'a, Replica>,
     num_replicas: usize,
-    cas: impl CASLike<'a, Configuration<Replica>, Replica>,
+    cas: impl CASLike<'a, Configuration<Replica>, MemberId<Replica>, Replica>,
     clients: &Cluster<'a, Client>,
     num_clients_per_node: Singleton<usize, Cluster<'a, Client>, Bounded>,
     client_aggregator: &Process<'a, Aggregator>,

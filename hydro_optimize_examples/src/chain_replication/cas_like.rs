@@ -1,17 +1,28 @@
+use hydro_lang::live_collections::boundedness::Boundedness;
+use hydro_lang::live_collections::stream::Ordering;
 use hydro_lang::prelude::*;
 use hydro_lang::{live_collections::stream::NoOrder, location::MemberId};
 use serde::{Deserialize, Serialize};
 
-// ---------------------------------------------------------------------------
-// Request / response types
-// ---------------------------------------------------------------------------
-
 /// Version-guarded write request. Accepted only if
 /// `version = current_version + 1` in the register.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CASState<S> {
+pub struct CASState<State> {
     pub version: u64,
-    pub state: S,
+    pub state: State,
+}
+
+/// `RequestId` is what allows the clients to uniquely identify each request.
+/// We assume that there is at most one outgoing request per ID at any time.
+///
+/// # Fields
+/// - `write_processed`: ACK to each processed write. Processed != successfully updated
+/// - `read_result`: Result of read request
+/// - `subscribe_updates`: Stream of state updates for subscribers. Not guaranteed to contain all updates
+pub struct CASOutput<'a, State, RequestId, Sender> {
+    pub write_processed: Stream<RequestId, Cluster<'a, Sender>, Unbounded, NoOrder>,
+    pub read_result: KeyedStream<RequestId, CASState<State>, Cluster<'a, Sender>, Unbounded, NoOrder>,
+    pub subscribe_updates: Stream<CASState<State>, Cluster<'a, Sender>, Unbounded, NoOrder>,
 }
 
 impl<S: PartialOrd> PartialOrd for CASState<S> {
@@ -29,34 +40,28 @@ impl<S: Ord> Ord for CASState<S> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Trait
-// ---------------------------------------------------------------------------
-
 /// Stream-based versioned atomic-register interface.
 ///
 /// The register holds a state of type `S` with a monotonic version.
-/// Writes are accepted only when the request's version is >= the stored version.
 ///
 /// The trait is agnostic about the underlying location — implementations
-/// choose whether CAS runs on a `Process`, `Cluster`, or anything else.
-pub trait CASLike<'a, S, Sender>: Sized
+/// choose whether CAS runs on a `Process` or `Cluster`.
+pub trait CASLike<'a, State, RequestId, Sender>: Sized
 where
-    S: Clone + Serialize + for<'de> Deserialize<'de> + 'a,
+    State: Clone + Serialize + for<'de> Deserialize<'de> + 'a,
+    RequestId: Clone + Serialize + for<'de> Deserialize<'de> + 'a,
 {
-    /// Construct the CAS dataflow.
-    ///
     /// Input streams:
     /// - `writes`: version-guarded state writes from sender location.
     /// - `reads`: reads current state.
-    /// - `subscribe`: IDs of senders that would like to learn of any updates to the configuration.
+    /// - `subscribe`: IDs of senders that would like to learn of updates to the configuration.
+    ///   Note: Subscribers are not guaranteed to receive every update.
     /// - `sender`: the location of the sender.
-    ///
-    /// Returns a stream containing any state updates.
     fn build(
         self,
-        writes: Stream<CASState<S>, Cluster<'a, Sender>, Unbounded, NoOrder>,
-        subscribe: Singleton<MemberId<Sender>, Cluster<'a, Sender>, Bounded>,
+        writes: KeyedStream<RequestId, CASState<State>, Cluster<'a, Sender>, impl Boundedness, impl Ordering>,
+        reads: Stream<RequestId, Cluster<'a, Sender>, impl Boundedness, impl Ordering>,
+        subscribe: Stream<MemberId<Sender>, Cluster<'a, Sender>, impl Boundedness, impl Ordering>,
         sender: &Cluster<'a, Sender>,
-    ) -> Stream<CASState<S>, Cluster<'a, Sender>, Unbounded, NoOrder>;
+    ) -> CASOutput<'a, State, RequestId, Sender>;
 }
