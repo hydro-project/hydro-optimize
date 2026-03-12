@@ -118,7 +118,7 @@ impl ReusableHosts {
                 "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off"
             }
             InitializedHostType::Localhost => {
-                "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off"
+                "" // Compile fast! Localhost is used for debugging
             }
         }
         .to_string()
