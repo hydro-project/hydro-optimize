@@ -18,7 +18,7 @@ pub struct CASState<State> {
 /// # Fields
 /// - `write_processed`: ACK to each processed write. Processed != successfully updated
 /// - `read_result`: Result of read request
-/// - `subscribe_updates`: Stream of state updates for subscribers. Not guaranteed to contain all updates
+/// - `subscribe_updates`: Stream of state updates for subscribers
 pub struct CASOutput<'a, State, RequestId, Sender> {
     pub write_processed: Stream<RequestId, Cluster<'a, Sender>, Unbounded, NoOrder>,
     pub read_result: KeyedStream<RequestId, CASState<State>, Cluster<'a, Sender>, Unbounded, NoOrder>,
@@ -55,7 +55,6 @@ where
     /// - `writes`: version-guarded state writes from sender location.
     /// - `reads`: reads current state.
     /// - `subscribe`: IDs of senders that would like to learn of updates to the configuration.
-    ///   Note: Subscribers are not guaranteed to receive every update.
     /// - `sender`: the location of the sender.
     fn build(
         self,

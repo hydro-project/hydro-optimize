@@ -23,7 +23,13 @@ where
 {
     fn build(
         self,
-        writes: KeyedStream<RequestId, CASState<State>, Cluster<'a, Sender>, impl Boundedness, impl Ordering>,
+        writes: KeyedStream<
+            RequestId,
+            CASState<State>,
+            Cluster<'a, Sender>,
+            impl Boundedness,
+            impl Ordering,
+        >,
         reads: Stream<RequestId, Cluster<'a, Sender>, impl Boundedness, impl Ordering>,
         subscribe: Stream<MemberId<Sender>, Cluster<'a, Sender>, impl Boundedness, impl Ordering>,
         sender: &Cluster<'a, Sender>,
@@ -58,14 +64,13 @@ where
                 .zip(last_write.clone().into_singleton())
                 .filter_map(q!(|(((writer, _req_id), write), prev)| {
                     // Allow the same version if it's from the same writer
-                    if let Some((prev_writer, prev_write)) = prev {
-                        if write.version != prev_write.version + 1
+                    if let Some((prev_writer, prev_write)) = prev
+                        && write.version != prev_write.version + 1
                             && !(write.version == prev_write.version
                                 && prev_writer == writer) {
-                            println!("Rejecting CASState with version {}, our version is {}",
-                                write.version, prev_write.version);
-                            return None;
-                        }
+                        println!("Rejecting CASState with version {}, our version is {}",
+                            write.version, prev_write.version);
+                        return None;
                     }
                     Some((writer, write))
                 }));

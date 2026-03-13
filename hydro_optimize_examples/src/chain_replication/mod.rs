@@ -124,10 +124,6 @@ fn next_member<'a, Replica: 'a>(
     config: Singleton<(Configuration<Replica>, u64), Tick<Cluster<'a, Replica>>, Bounded>,
 ) -> Optional<(MemberId<Replica>, u64), Tick<Cluster<'a, Replica>>, Bounded> {
     config.filter_map(q!(move |(conf, version)| {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "sorting after keys() makes the result deterministic"
-        )]
         let mut members: Vec<_> = conf.roles.keys().cloned().collect();
         members.sort();
         let my_pos = members.iter().position(|m| *m == CLUSTER_SELF_ID)?;
@@ -198,10 +194,6 @@ fn propose_new_config<'a, Replica: 'a + Clone + Debug>(
     let new_highest = version
         .filter_if_some(caught_up.clone())
         .unwrap_or(highest_proposed_new_config_version);
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "find_map result is independent of iteration order -- the predicate matches at most one member"
-    )]
     let new_config = config
         .zip(caught_up)
         .zip(slot)
@@ -735,7 +727,6 @@ where
         let latest_heartbeat_check = heartbeat_check_interval.first();
         let my_role = get_my_role(config.clone());
         let i_am_standby = i_am_standby(my_role);
-        #[expect(clippy::disallowed_methods, reason = "find_map result is independent of iteration order -- the predicate matches at most one member")]
         let other_acceptor_committer = config
             .clone()
             .filter_if_none(i_am_standby)
