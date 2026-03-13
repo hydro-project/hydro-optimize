@@ -12,6 +12,7 @@ pub mod parse_results;
 pub mod partition_node_analysis;
 pub mod partition_syn_analysis;
 pub mod partitioner;
+pub mod reduce_pushdown_analysis;
 pub mod repair;
 pub mod rewrites;
 
