@@ -283,7 +283,7 @@ pub async fn deploy_and_optimize<'a>(
     processes: ReusableProcesses,
     optimizations: Optimizations,
     client_id: &LocationId,
-    PHYSICAL_CLIENTS_per_node: usize,
+    num_clients_per_node: usize,
     num_seconds: Option<usize>,
     stability_second: Option<usize>,
     analyze: bool,
@@ -305,7 +305,7 @@ pub async fn deploy_and_optimize<'a>(
         );
     }
     assert!(
-        PHYSICAL_CLIENTS_per_node > 0,
+        num_clients_per_node > 0,
         "Must have at least 1 client per node"
     );
 
@@ -327,7 +327,7 @@ pub async fn deploy_and_optimize<'a>(
         for (cluster_id, name, num_hosts) in clusters.named_clusters.iter() {
             if *cluster_id == client_id.key() {
                 let mut client_hosts = vec![];
-                for i in 0..PHYSICAL_CLIENTS_per_node {
+                for i in 0..num_clients_per_node {
                     let pin_to_core = i % reusable_hosts.num_cores();
                     client_hosts.push(reusable_hosts.get_cluster_hosts(
                         deployment,
@@ -437,8 +437,8 @@ fn write_metrics_csv(
     output_dir: &Path,
     run_metadata: &RunMetadata,
     location_id_to_cluster: &HashMap<LocationId, String>,
-    PHYSICAL_CLIENTS: usize,
-    PHYSICAL_CLIENTS_per_node: usize,
+    num_clients: usize,
+    num_clients_per_node: usize,
     run: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(output_dir)?;
@@ -451,7 +451,7 @@ fn write_metrics_csv(
         let location_name = location_id_to_cluster.get(location).unwrap();
         let filename = output_dir.join(format!(
             "{}_{}c_{}vc_r{}.csv",
-            location_name, PHYSICAL_CLIENTS, PHYSICAL_CLIENTS_per_node, run
+            location_name, num_clients, num_clients_per_node, run
         ));
         let num_rows = stats
             .len()
@@ -522,8 +522,8 @@ async fn output_metrics(
     run_metadata: RunMetadata,
     location_id_to_cluster: &HashMap<LocationId, String>,
     output_dir: &Path,
-    PHYSICAL_CLIENTS: usize,
-    PHYSICAL_CLIENTS_per_node: usize,
+    num_clients: usize,
+    num_clients_per_node: usize,
     measurement_second: usize,
     run: usize,
 ) {
@@ -562,8 +562,8 @@ async fn output_metrics(
         output_dir,
         &run_metadata,
         location_id_to_cluster,
-        PHYSICAL_CLIENTS,
-        PHYSICAL_CLIENTS_per_node,
+        num_clients,
+        num_clients_per_node,
         run,
     ) {
         eprintln!("Failed to write CSV: {}", e);

@@ -429,7 +429,13 @@ pub async fn analyze_cluster_results(
                 async { parse_latency(drain_receiver(&mut metrics.latencies).await) },
             );
             println!("Parsed stats from cluster {:?}: {}", name, idx);
-            ((location, name, idx), sar_stats, op_to_count, throughputs, latencies)
+            (
+                (location, name, idx),
+                sar_stats,
+                op_to_count,
+                throughputs,
+                latencies,
+            )
         });
     }
 
@@ -456,7 +462,10 @@ pub async fn analyze_cluster_results(
                 .and_then(|s| max_data.0.get(s))
                 .or_else(|| max_data.0.last());
             match (stat, max_stat) {
-                (Some(s), Some(ms)) if s.cpu.all_stats.user + s.cpu.all_stats.system > ms.cpu.all_stats.user + ms.cpu.all_stats.system => {
+                (Some(s), Some(ms))
+                    if s.cpu.all_stats.user + s.cpu.all_stats.system
+                        > ms.cpu.all_stats.user + ms.cpu.all_stats.system =>
+                {
                     data
                 }
                 _ => max_data,

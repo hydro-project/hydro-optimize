@@ -69,7 +69,7 @@ impl ReusableHosts {
     pub fn insert_env(&mut self, key: String, value: String) {
         self.env.insert(key, value);
     }
-   
+
     pub fn num_cores(&self) -> usize {
         match &self.host_type {
             InitializedHostType::Gcp { .. } => GCP_NUM_CORES,
@@ -175,7 +175,13 @@ impl ReusableHosts {
         pin_to_core: usize,
     ) -> Vec<TrybuildHost> {
         (0..num_hosts)
-            .map(|i| self.get_no_perf_process_hosts(deployment, format!("{}{}", cluster_name, i), pin_to_core))
+            .map(|i| {
+                self.get_no_perf_process_hosts(
+                    deployment,
+                    format!("{}{}", cluster_name, i),
+                    pin_to_core,
+                )
+            })
             .collect()
     }
 }
