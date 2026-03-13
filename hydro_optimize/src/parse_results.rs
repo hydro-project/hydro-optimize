@@ -451,7 +451,10 @@ pub async fn analyze_cluster_results(
                 .and_then(|s| max_data.0.get(s))
                 .or_else(|| max_data.0.last());
             match (stat, max_stat) {
-                (Some(s), Some(ms)) if s.cpu.all_stats.user + s.cpu.all_stats.system > ms.cpu.all_stats.user + ms.cpu.all_stats.system => {
+                (Some(s), Some(ms))
+                    if s.cpu.all_stats.user + s.cpu.all_stats.system
+                        > ms.cpu.all_stats.user + ms.cpu.all_stats.system =>
+                {
                     data
                 }
                 _ => max_data,

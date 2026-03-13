@@ -1196,7 +1196,8 @@ mod tests {
             .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values()
             .partition(q!(|(a, _b)| a % 2 == 0));
-        evens.assume_ordering::<TotalOrder>(nondet!(/** test */))
+        evens
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
             .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|(b, a2)| {
                 println!("b: {}, a+2: {}", b, a2);
