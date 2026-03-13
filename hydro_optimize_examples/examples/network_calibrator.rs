@@ -1,11 +1,8 @@
 use std::collections::HashMap;
-use std::path::Path;
 
-use chrono::Local;
 use clap::{ArgAction, Parser};
 use hydro_lang::location::Location;
 use hydro_lang::viz::config::GraphConfig;
-use hydro_optimize::deploy_and_analyze::NUM_CLIENTS_PER_NODE_ENV;
 use hydro_optimize::deploy_and_analyze::{
     BenchmarkArgs, BenchmarkConfig, Optimizations, ReusableClusters, ReusableProcesses,
     benchmark_protocol,
@@ -46,15 +43,13 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
         (clients.id(), "client".to_string()),
         (client_aggregator.id(), "client_aggregator".to_string()),
     ]);
+    let client_id = clients.id();
 
     network_calibrator(
         message_size,
         &server,
         &clients,
-        clients.singleton(q!(std::env::var(NUM_CLIENTS_PER_NODE_ENV)
-            .unwrap()
-            .parse::<usize>()
-            .unwrap())),
+        clients.singleton(q!(1usize)),
         &client_aggregator,
         print_result_frequency,
     );
@@ -65,19 +60,14 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
     let processes = ReusableProcesses::default().with_process(client_aggregator);
     let optimizations = Optimizations::default();
 
-    let output_dir = Path::new("benchmark_results").join(format!(
-        "network_{}",
-        Local::now().format("%Y-%m-%d_%H-%M-%S")
-    ));
-
     BenchmarkConfig {
-        name: "Network Calibrator".to_string(),
+        name: "Network".to_string(),
         builder,
         clusters,
         processes,
+        client_id,
         optimizations,
         location_id_to_cluster,
-        output_dir,
     }
 }
 
