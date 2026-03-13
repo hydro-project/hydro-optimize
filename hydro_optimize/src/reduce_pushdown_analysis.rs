@@ -263,7 +263,9 @@ pub fn reduce_pushdown_decision(
         let mut cant_push_to_some_parent = false;
 
         for parent in parents {
-            if !metadata.possible_locations.contains_key(&parent) && !metadata.observe_nondet_possibilities.contains_key(&parent) {
+            if !metadata.possible_locations.contains_key(&parent)
+                && !metadata.observe_nondet_possibilities.contains_key(&parent)
+            {
                 cant_push_to_some_parent = true;
             }
         }
