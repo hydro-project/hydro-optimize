@@ -63,12 +63,13 @@ async fn main() {
         &participants,
         num_participants,
         &clients,
-        clients.singleton(q!(num_clients_per_node)),
+        clients.singleton(q!(1)),
         &client_aggregator,
         print_result_frequency / 10,
         print_result_frequency,
         print_parseable_bench_results,
     );
+    let client_id = clients.id();
 
     deploy_and_optimize(
         &mut reusable_hosts,
@@ -84,6 +85,8 @@ async fn main() {
             .with_partitioning()
             .excluding::<Client>()
             .excluding::<Aggregator>(),
+        &client_id,
+        num_clients_per_node,
         Some(run_seconds),
         Some(measurement_second),
         true,

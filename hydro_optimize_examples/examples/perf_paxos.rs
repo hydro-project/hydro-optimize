@@ -74,13 +74,14 @@ async fn main() {
             },
         },
         &clients,
-        clients.singleton(q!(num_clients_per_node)),
+        clients.singleton(q!(1usize)),
         &client_aggregator,
         &replicas,
         print_result_frequency / 10,
         print_result_frequency,
         pretty_print_bench_results, // Note: Throughput/latency numbers won't be accessible to deploy_and_optimize
     );
+    let client_id = clients.id();
 
     // Deploy
     let mut reusable_hosts = ReusableHosts::new(&host_type);
@@ -103,6 +104,8 @@ async fn main() {
             .excluding::<Client>()
             .excluding::<Aggregator>()
             .with_iterations(num_times_to_optimize),
+        &client_id,
+        num_clients_per_node,
         Some(run_seconds),
         Some(measurement_second),
         true,

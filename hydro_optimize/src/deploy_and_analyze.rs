@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
+use chrono::Local;
 use hydro_deploy::Deployment;
 use hydro_lang::compile::built::BuiltFlow;
 use hydro_lang::compile::deploy::DeployResult;
@@ -29,8 +30,6 @@ pub(crate) const CPU_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_CPU:";
 pub(crate) const SAR_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_SAR:";
 pub(crate) const LATENCY_PREFIX: &str = "HYDRO_OPTIMIZE_LAT:";
 pub(crate) const THROUGHPUT_PREFIX: &str = "HYDRO_OPTIMIZE_THR:";
-
-pub const NUM_CLIENTS_PER_NODE_ENV: &str = "NUM_CLIENTS_PER_NODE";
 
 // Note: Ensure edits to the match arms are consistent with inject_count_node
 fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration: syn::Expr) {
@@ -283,6 +282,8 @@ pub async fn deploy_and_optimize<'a>(
     mut clusters: ReusableClusters,
     processes: ReusableProcesses,
     optimizations: Optimizations,
+    client_id: &LocationId,
+    num_clients_per_node: usize,
     num_seconds: Option<usize>,
     stability_second: Option<usize>,
     analyze: bool,
@@ -303,6 +304,10 @@ pub async fn deploy_and_optimize<'a>(
             "Must select stability_second and enable analysis with optimizations"
         );
     }
+    assert!(
+        num_clients_per_node > 0,
+        "Must have at least 1 client per node"
+    );
 
     let counter_output_duration =
         syn::parse_quote!(std::time::Duration::from_secs(#METRIC_INTERVAL_SECS));
@@ -320,15 +325,29 @@ pub async fn deploy_and_optimize<'a>(
         // Insert all clusters & processes
         let mut deployable = optimized.into_deploy();
         for (cluster_id, name, num_hosts) in clusters.named_clusters.iter() {
-            deployable = deployable.with_cluster_erased(
-                *cluster_id,
-                reusable_hosts.get_cluster_hosts(deployment, name.clone(), *num_hosts),
-            );
+            if *cluster_id == client_id.key() {
+                let mut client_hosts = vec![];
+                for i in 0..num_clients_per_node {
+                    let pin_to_core = i % reusable_hosts.num_cores();
+                    client_hosts.push(reusable_hosts.get_cluster_hosts(
+                        deployment,
+                        name.clone(),
+                        *num_hosts,
+                        pin_to_core,
+                    ));
+                }
+                deployable = deployable.with_cluster_erased(*cluster_id, client_hosts.concat());
+            } else {
+                deployable = deployable.with_cluster_erased(
+                    *cluster_id,
+                    reusable_hosts.get_cluster_hosts(deployment, name.clone(), *num_hosts, 0),
+                );
+            }
         }
         for (process_id, name) in processes.named_processes.iter() {
             deployable = deployable.with_process_erased(
                 *process_id,
-                reusable_hosts.get_no_perf_process_hosts(deployment, name.clone()),
+                reusable_hosts.get_no_perf_process_hosts(deployment, name.clone(), 0),
             );
         }
 
@@ -367,7 +386,8 @@ pub async fn deploy_and_optimize<'a>(
         if analyze {
             // Parse results to get metrics
             run_metadata =
-                analyze_cluster_results(&nodes, &mut ir, metrics, stability_second).await;
+                analyze_cluster_results(&nodes, &mut ir, metrics, client_id, stability_second)
+                    .await;
             // Remove HydroNode::Counter (since we don't want to consider decoupling those)
             remove_counter(&mut ir);
 
@@ -560,16 +580,16 @@ pub struct BenchmarkConfig<'a> {
     pub builder: FlowBuilder<'a>,
     pub clusters: ReusableClusters,
     pub processes: ReusableProcesses,
+    pub client_id: LocationId,
     pub optimizations: Optimizations,
     pub location_id_to_cluster: HashMap<LocationId, String>,
-    pub output_dir: PathBuf,
 }
 
 pub async fn benchmark_protocol<'a>(
     args: BenchmarkArgs,
     num_runs: usize,
     run_benchmark: fn(
-        usize, // num_clients
+        usize, // PHYSICAL_CLIENTS
     ) -> BenchmarkConfig<'a>,
 ) {
     assert!(
@@ -591,180 +611,97 @@ pub async fn benchmark_protocol<'a>(
     const START_MEASUREMENT_SECOND: usize = 30;
     const MEASUREMENT_SECOND: usize = 59;
     const RUN_SECONDS: usize = 90;
-    const PHYSICAL_CLIENTS_MIN: usize = 1;
-    const PHYSICAL_CLIENTS_MAX: usize = 10;
-    const VIRTUAL_CLIENTS_STEP: usize = 100;
-    const STALL_PATIENCE: usize = 3;
+    const PHYSICAL_CLIENTS: usize = 10;
+    const VIRTUAL_CLIENTS_MAX: usize = 50 * PHYSICAL_CLIENTS; // Based on manual testing, an 8-core m5.2xlarge's CPU saturates around 50 clients.
+    const VIRTUAL_CLIENTS_STEP: usize = 50; // Can tweak to get finer-grained numbers
     const NUM_RUNS_NO_THROUGHPUT: usize = 3;
 
-    const INIT_WARMUP_VIRTUAL_CLIENTS: usize = 1000;
-    const INIT_WARMUP_SECONDS: usize = 600;
+    let benchmark_config = run_benchmark(PHYSICAL_CLIENTS);
+    // Set up FlowBuilder for cloning
+    let built = benchmark_config.builder.finalize();
+    let ir = built.ir();
+    let output_dir = Path::new("benchmark_results").join(format!(
+        "{}_{}",
+        benchmark_config.name,
+        Local::now().format("%Y-%m-%d_%H-%M-%S")
+    ));
 
-    let mut best_throughput: usize = 0;
-    let mut best_config: (usize, usize) = (0, 0);
-    let mut output_dir = None;
-
-    for num_clients in (PHYSICAL_CLIENTS_MIN..=PHYSICAL_CLIENTS_MAX).step_by(1) {
-        let mut round_best_throughput = 0;
-        let mut round_best_virtual = 0;
-        let mut stall_count = 0;
-
-        let benchmark_config = run_benchmark(num_clients);
-        // Set up FlowBuilder for cloning
-        let built = benchmark_config.builder.finalize();
-        let ir = built.ir();
-        let output_dir = output_dir.get_or_insert(benchmark_config.output_dir);
-
-        if num_clients == PHYSICAL_CLIENTS_MIN && host_type != HostType::Localhost {
+    for num_virtual in (1..=VIRTUAL_CLIENTS_MAX).step_by(VIRTUAL_CLIENTS_STEP) {
+        let mut throughput_sum = 0;
+        let mut successful_runs = 0;
+        let mut zero_throughput_count = 0;
+        let mut run = 0;
+        while successful_runs < num_runs {
             println!(
-                "Warming up {} with {} clients and {} virtual clients for {} seconds",
-                benchmark_config.name,
-                num_clients,
-                INIT_WARMUP_VIRTUAL_CLIENTS,
-                INIT_WARMUP_SECONDS
-            );
-            // Set num virtual clients
-            reusable_hosts.insert_env(
-                NUM_CLIENTS_PER_NODE_ENV.to_string(),
-                INIT_WARMUP_VIRTUAL_CLIENTS.to_string(),
+                "Running {} with {} clients (run {})",
+                benchmark_config.name, num_virtual, run
             );
 
             let mut builder = FlowBuilder::from_built(&built);
             builder.replace_ir(deep_clone(ir));
-            let _ = deploy_and_optimize(
+            let run_metadata = deploy_and_optimize(
                 &mut reusable_hosts,
                 &mut deployment,
                 builder.finalize(),
                 benchmark_config.clusters.clone(),
                 benchmark_config.processes.clone(),
                 benchmark_config.optimizations.clone(),
-                Some(INIT_WARMUP_SECONDS),
+                &benchmark_config.client_id.clone(),
+                std::cmp::max(1, num_virtual / PHYSICAL_CLIENTS), // clients per node
+                Some(RUN_SECONDS),
                 Some(MEASUREMENT_SECOND),
-                false,
+                true,
             )
             .await;
-        }
 
-        // Start at the per-node count that yields roughly the same total
-        // virtual clients as the previous round's best throughput config,
-        // rounded down to the nearest step (minimum 1).
-        let mut num_virtual = std::cmp::max(1, best_config.0 * best_config.1 / num_clients);
-        while stall_count < STALL_PATIENCE {
-            // Set num virtual clients
-            reusable_hosts.insert_env(
-                NUM_CLIENTS_PER_NODE_ENV.to_string(),
-                num_virtual.to_string(),
+            let run_throughput = run_metadata.throughputs
+                [START_MEASUREMENT_SECOND..=MEASUREMENT_SECOND]
+                .iter()
+                .sum::<usize>()
+                / (MEASUREMENT_SECOND - START_MEASUREMENT_SECOND + 1);
+            println!(
+                "clients={}, run={}, throughput@{}s={}",
+                num_virtual,
+                run,
+                MEASUREMENT_SECOND + 1,
+                run_throughput
             );
 
-            let mut throughput_sum = 0;
-            let mut successful_runs = 0;
-            let mut zero_throughput_count = 0;
-            let mut run = 0;
-            while successful_runs < num_runs {
+            output_metrics(
+                run_metadata,
+                &benchmark_config.location_id_to_cluster,
+                &output_dir,
+                PHYSICAL_CLIENTS,
+                num_virtual,
+                MEASUREMENT_SECOND,
+                run,
+            )
+            .await;
+
+            if run_throughput == 0 {
+                zero_throughput_count += 1;
                 println!(
-                    "Running {} with {} clients and {} virtual clients (run {})",
-                    benchmark_config.name, num_clients, num_virtual, run
+                    "Zero throughput detected ({}/{})",
+                    zero_throughput_count, NUM_RUNS_NO_THROUGHPUT
                 );
-
-                let mut builder = FlowBuilder::from_built(&built);
-                builder.replace_ir(deep_clone(ir));
-                let run_metadata = deploy_and_optimize(
-                    &mut reusable_hosts,
-                    &mut deployment,
-                    builder.finalize(),
-                    benchmark_config.clusters.clone(),
-                    benchmark_config.processes.clone(),
-                    benchmark_config.optimizations.clone(),
-                    Some(RUN_SECONDS),
-                    Some(MEASUREMENT_SECOND),
-                    true,
-                )
-                .await;
-
-                let run_throughput = run_metadata.throughputs
-                    [START_MEASUREMENT_SECOND..=MEASUREMENT_SECOND]
-                    .iter()
-                    .sum::<usize>()
-                    / (MEASUREMENT_SECOND - START_MEASUREMENT_SECOND + 1);
-                println!(
-                    "physical_clients={}, virtual_clients={}, run={}, throughput@{}s={}",
-                    num_clients,
-                    num_virtual,
-                    run,
-                    MEASUREMENT_SECOND + 1,
-                    run_throughput
-                );
-
-                output_metrics(
-                    run_metadata,
-                    &benchmark_config.location_id_to_cluster,
-                    output_dir,
-                    num_clients,
-                    num_virtual,
-                    MEASUREMENT_SECOND,
-                    run,
-                )
-                .await;
-
-                if run_throughput == 0 {
-                    zero_throughput_count += 1;
+                if zero_throughput_count > NUM_RUNS_NO_THROUGHPUT {
                     println!(
-                        "Zero throughput detected ({}/{})",
-                        zero_throughput_count, NUM_RUNS_NO_THROUGHPUT
+                        "Exceeded {} zero-throughput runs for this config. Terminating benchmark.",
+                        NUM_RUNS_NO_THROUGHPUT
                     );
-                    if zero_throughput_count > NUM_RUNS_NO_THROUGHPUT {
-                        println!(
-                            "Exceeded {} zero-throughput runs for this config. Terminating benchmark.",
-                            NUM_RUNS_NO_THROUGHPUT
-                        );
-                        return;
-                    }
-                } else {
-                    throughput_sum += run_throughput;
-                    successful_runs += 1;
+                    return;
                 }
-                run += 1;
-            }
-
-            let current_throughput = throughput_sum / num_runs;
-            println!(
-                "physical_clients={}, virtual_clients={}, avg_throughput={}",
-                num_clients, num_virtual, current_throughput
-            );
-
-            if current_throughput > round_best_throughput {
-                round_best_throughput = current_throughput;
-                round_best_virtual = num_virtual;
-                stall_count = 0;
             } else {
-                stall_count += 1;
+                throughput_sum += run_throughput;
+                successful_runs += 1;
             }
-
-            num_virtual += VIRTUAL_CLIENTS_STEP / num_clients;
+            run += 1;
         }
 
+        let current_throughput = throughput_sum / num_runs;
         println!(
-            "Throughput stalled for {} configs at {} physical clients \
-                     (best={} at {}vc). Moving to next physical client count.",
-            STALL_PATIENCE, num_clients, round_best_throughput, round_best_virtual
+            "clients={}, avg_throughput={}",
+            num_virtual, current_throughput
         );
-
-        if round_best_throughput > best_throughput {
-            best_throughput = round_best_throughput;
-            best_config = (num_clients, round_best_virtual);
-        } else {
-            println!(
-                "Throughput still saturated after increasing physical clients \
-                 (prior best={}, current_peak={}). Stopping search.",
-                best_throughput, round_best_throughput
-            );
-            break;
-        }
     }
-
-    println!("\n=== Benchmark Summary ===");
-    println!(
-        "Best throughput: {} rps with {} physical clients and {} virtual clients",
-        best_throughput, best_config.0, best_config.1
-    );
 }
