@@ -38,3 +38,7 @@ include_mdtests.workspace = true
 [build-dependencies]
 stageleft_tool.workspace = true
 hydro_build_utils.workspace = true
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ["cfg(nightly)"]
