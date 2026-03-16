@@ -6,8 +6,8 @@ use std::{
 
 use hydro_lang::compile::builder::FlowBuilder;
 use hydro_lang::compile::ir::{
-    DebugInstantiate, HydroIrMetadata, HydroIrOpMetadata, HydroNode, HydroRoot, SharedNode,
-    transform_bottom_up, traverse_dfir,
+    BoundKind, CollectionKind, DebugInstantiate, HydroIrMetadata, HydroIrOpMetadata, HydroNode,
+    HydroRoot, SharedNode, StreamOrder, StreamRetry, transform_bottom_up, traverse_dfir,
 };
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::location::{Cluster, Location};
@@ -165,6 +165,77 @@ fn add_tee(
     *node = teed_node;
 }
 
+/// Decouples the output of an Optional.
+/// 1. Creates a Scan after the optional to only send messages when the value changes. Outputs Some(None) if the value hasn't changed, Some(Some(new)) if it has. (Can't output None since that would terminate the stream.
+/// 2. Creates a FlatMap after the Scan to remove Nones.
+/// 3. Adds networking
+/// 4. Creates a Reduce after the network to only save the latest value.
+fn decouple_optional(node: &mut HydroNode, new_location: &LocationId) {
+    let node_content = std::mem::replace(node, HydroNode::Placeholder);
+    let metadata = node_content.metadata().clone();
+    let node_type = collection_kind_to_debug_type(&metadata.collection_kind);
+
+    // 1. Scan
+    let scan_output_type: syn::Type = syn::parse_quote!(Option<#node_type>);
+    let scan_init: syn::Expr = syn::parse_quote!(|| #scan_output_type::None);
+    let scan_acc: syn::Expr = syn::parse_quote!(|prev: #scan_output_type, new: #node_type| {
+        if prev.as_ref() == Some(&new) {
+            Some(None)
+        } else {
+            *prev = Some(new.clone());
+            Some(Some(new))
+        }
+    });
+    let scan_collection_kind = CollectionKind::Stream {
+        bound: BoundKind::Unbounded,
+        order: StreamOrder::NoOrder,
+        retry: StreamRetry::ExactlyOnce,
+        element_type: scan_output_type.into(),
+    };
+    let scan = HydroNode::Scan {
+        init: scan_init.into(),
+        acc: scan_acc.into(),
+        input: Box::new(node_content),
+        metadata: HydroIrMetadata {
+            collection_kind: scan_collection_kind.clone(),
+            ..metadata.clone()
+        },
+    };
+
+    // 2. FlatMap
+    let flat_map_f: syn::Expr = syn::parse_quote!(|x: &Option<#node_type>| x);
+    let mut flat_map = HydroNode::FlatMap {
+        f: flat_map_f.into(),
+        input: Box::new(scan),
+        metadata: HydroIrMetadata {
+            collection_kind: scan_collection_kind,
+            ..metadata.clone()
+        },
+    };
+
+    // 3. Networking
+    add_network(&mut flat_map, &metadata.location_id, new_location);
+
+    // 4. Reduce
+    let reduce_f: syn::Expr = syn::parse_quote!(|prev: #node_type, new: #node_type| {
+        *prev = new;
+    });
+    let reduce = HydroNode::Reduce {
+        f: reduce_f.into(),
+        input: Box::new(flat_map),
+        metadata: HydroIrMetadata {
+            collection_kind: CollectionKind::Optional {
+                element_type: node_type,
+                bound: BoundKind::Unbounded,
+            },
+            location_id: new_location.clone(),
+            ..metadata
+        },
+    };
+
+    *node = reduce;
+}
+
 /// Places nodes based on location specified in `decision` and adds networking:
 /// 1. If the node is a source, change its location.
 /// 2. Otherwise, if the node's location differs from its input's location, then add a
@@ -280,7 +351,12 @@ fn decouple_node(
         output_location, op_id
     );
     let input_location = location_map.get(input_location_idx).unwrap();
-    add_network(node, input_location, output_location);
+    match node.metadata().collection_kind {
+        CollectionKind::Optional { .. } => {
+            decouple_optional(node, output_location);
+        }
+        _ => add_network(node, input_location, output_location),
+    }
 }
 
 fn fix_cluster_self_id_root(root: &mut HydroRoot, mut locations: ClusterSelfIdReplace) {
@@ -384,4 +460,44 @@ pub fn decouple<'a>(
     }
 
     new_clusters
+}
+
+#[cfg(test)]
+mod tests {
+    use hydro_build_utils::assert_debug_snapshot;
+    use hydro_lang::{compile::ir::deep_clone, location::Location, prelude::FlowBuilder};
+    use stageleft::q;
+
+    use crate::{
+        decoupler::decouple,
+        greedy_decouple_analysis::greedy_decouple_analysis,
+        repair::{cycle_source_to_sink_input, inject_id, inject_location},
+    };
+
+    #[test]
+    fn test_decouple_optional() {
+        let mut builder = FlowBuilder::new();
+        let cluster = builder.cluster::<()>();
+        cluster
+            .source_iter(q!([1, 2, 3, 4, 5]))
+            .max()
+            .map(q!(|x| x + 1))
+            .sample_eager(nondet!(/** test */))
+            .for_each(q!(|x| println!("{}", x)));
+
+        let built = builder.optimize_with(|ir| {
+            inject_id(ir);
+            let cycle_data = cycle_source_to_sink_input(ir);
+            inject_location(ir, &cycle_data);
+        });
+        let mut ir = deep_clone(built.ir());
+        let decision = greedy_decouple_analysis(&mut ir, &cluster.id());
+        let mut builder = FlowBuilder::from_built(&built);
+        decouple(&mut ir, decision, &cluster.id(), &mut builder);
+        builder.replace_ir(ir);
+
+        hydro_lang::compile::ir::dbg_dedup_tee(|| {
+            assert_debug_snapshot!(built.ir());
+        });
+    }
 }
