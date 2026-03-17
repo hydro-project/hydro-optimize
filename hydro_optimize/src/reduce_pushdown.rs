@@ -98,14 +98,13 @@ mod tests {
                 println!("max value: {}", max_val);
             }));
 
-        let built = builder
-            .optimize_with(|ir| {
-                inject_id(ir);
-                let cycle_data = cycle_source_to_sink_input(ir);
-                inject_location(ir, &cycle_data);
-                let decision = reduce_pushdown_decision(ir, &cluster2.id());
-                reduce_pushdown(ir, decision);
-            });
+        let built = builder.optimize_with(|ir| {
+            inject_id(ir);
+            let cycle_data = cycle_source_to_sink_input(ir);
+            inject_location(ir, &cycle_data);
+            let decision = reduce_pushdown_decision(ir, &cluster2.id());
+            reduce_pushdown(ir, decision);
+        });
 
         hydro_lang::compile::ir::dbg_dedup_tee(|| {
             assert_debug_snapshot!(built.ir());

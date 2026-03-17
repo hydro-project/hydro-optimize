@@ -6,8 +6,8 @@ use std::{
 
 use hydro_lang::compile::builder::FlowBuilder;
 use hydro_lang::compile::ir::{
-    DebugInstantiate, HydroIrMetadata, HydroIrOpMetadata, HydroNode, HydroRoot, SharedNode,
-    transform_bottom_up, traverse_dfir,
+    BoundKind, CollectionKind, DebugInstantiate, HydroIrMetadata, HydroIrOpMetadata, HydroNode,
+    HydroRoot, SharedNode, StreamOrder, StreamRetry, transform_bottom_up, traverse_dfir,
 };
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::location::{Cluster, Location};
@@ -16,6 +16,7 @@ use proc_macro2::Span;
 use stageleft::quote_type;
 use syn::visit_mut::VisitMut;
 
+use crate::debug::print_id;
 use crate::repair::{cycle_source_to_sink_input, inject_id, inject_location};
 use crate::rewrites::{
     ClusterSelfIdReplace, collection_kind_to_debug_type, deserialize_bincode_with_type,
@@ -165,6 +166,159 @@ fn add_tee(
     *node = teed_node;
 }
 
+/// Decouples the output of an Optional.
+/// # Goal
+/// Detect whenever the value of the Optional changes, and only send those changes over the network.
+///
+/// # Mechanism
+/// 1. Find the current value, whether it is Some or None.
+/// - Map the Optional to Some(value)
+/// - Create a Singleton with None
+/// - ChainFirst to either get a Some(value) or None every tick
+/// 2. Detect changes.
+/// - Creates Scan. Output Some(None) if the value hasn't changed, Some(Some(new)) if it has. (Can't output None since that would terminate the stream.). Note that if the value changed to None, we would output Some(Some(None)). The Scan then unwraps 1 layer on output.
+/// 3. Only send on change.
+/// - FlatMap to remove 1 layer and reveal the new value (either None or Some(value))
+/// - Add networking
+/// 4. Turn back into an Optional at the recipient.
+/// - Reduce to store the latest value
+/// - FilterMap to convert into Optional
+fn decouple_optional(node: &mut HydroNode, input_location: &LocationId, new_location: &LocationId) {
+    let node_content = std::mem::replace(node, HydroNode::Placeholder);
+    let mut metadata = node_content.metadata().clone();
+    metadata.location_id = input_location.clone();
+    let node_type = collection_kind_to_debug_type(&metadata.collection_kind);
+
+    // 1.1 Map to Some(value)
+    let map_f: syn::Expr = syn::parse_quote!(|x| Some(x));
+    let optional_node_type: syn::Type = syn::parse_quote!(Option<#node_type>);
+    let optional_collection_kind = CollectionKind::Optional {
+        bound: BoundKind::Unbounded,
+        element_type: optional_node_type.clone().into(),
+    };
+    let map = HydroNode::Map {
+        f: map_f.into(),
+        input: Box::new(node_content),
+        metadata: HydroIrMetadata {
+            collection_kind: optional_collection_kind.clone(),
+            ..metadata.clone()
+        },
+    };
+
+    // 1.2 Create Singleton with None
+    let singleton_value: syn::Expr = syn::parse_quote!(None);
+    let singleton = HydroNode::SingletonSource {
+        value: singleton_value.into(),
+        first_tick_only: false,
+        metadata: HydroIrMetadata {
+            collection_kind: CollectionKind::Singleton {
+                bound: BoundKind::Unbounded,
+                element_type: optional_node_type.clone().into(),
+            },
+            ..metadata.clone()
+        },
+    };
+
+    // 1.3 ChainFirst
+    // NOTE: We technically need to batch the map and singleton before we chain. We don't for 2 reasons: 1) We can't create the ClockId needed for the Tick, since it is private, and 2) It's technically OK because the singleton is static.
+    let chain = HydroNode::ChainFirst {
+        first: Box::new(map),
+        second: Box::new(singleton),
+        metadata: HydroIrMetadata {
+            collection_kind: optional_collection_kind.clone(),
+            ..metadata.clone()
+        },
+    };
+
+    // 2.1. Scan to detect changes
+    // - If the value hasn't changed, output Some(None)
+    // - If the value changed to nothing, output Some(Some(None))
+    // - If the value changed to something, output Some(Some(Some(new)))
+    // Note that the output type will rip off the outermost Some.
+    let scan_output_type: syn::Type = syn::parse_quote!(Option<Option<#node_type>>);
+    let scan_init: syn::Expr = syn::parse_quote!(|| None);
+    let scan_acc: syn::Expr = syn::parse_quote!(|prev: &mut #optional_node_type, new: #optional_node_type| {
+        if *prev == new {
+            Some(None)
+        } else {
+            *prev = new.clone();
+            Some(Some(new))
+        }
+    });
+    let scan_collection_kind = CollectionKind::Stream {
+        bound: BoundKind::Unbounded,
+        order: StreamOrder::NoOrder,
+        retry: StreamRetry::ExactlyOnce,
+        element_type: scan_output_type.into(),
+    };
+    let scan = HydroNode::Scan {
+        init: scan_init.into(),
+        acc: scan_acc.into(),
+        input: Box::new(chain),
+        metadata: HydroIrMetadata {
+            collection_kind: scan_collection_kind,
+            ..metadata.clone()
+        },
+    };
+
+    // 3.1. FlatMap to reveal the new value
+    let flat_map_f: syn::Expr = syn::parse_quote!(|x| x);
+    let flat_map_collection_kind = CollectionKind::Stream {
+        bound: BoundKind::Unbounded,
+        order: StreamOrder::NoOrder,
+        retry: StreamRetry::ExactlyOnce,
+        element_type: optional_node_type.clone().into(),
+    };
+    let mut flat_map = HydroNode::FlatMap {
+        f: flat_map_f.into(),
+        input: Box::new(scan),
+        metadata: HydroIrMetadata {
+            collection_kind: flat_map_collection_kind,
+            ..metadata.clone()
+        },
+    };
+
+    // 3.2. Networking
+    add_network(&mut flat_map, &metadata.location_id, new_location);
+
+    // 4.1. Reduce
+    // - If there is no value, is an empty stream
+    // - If the value was erased, is a stream with None
+    // - If the value was changed to something, is a stream with Some(value)
+    let reduce_f: syn::Expr = syn::parse_quote!(|prev: &mut #optional_node_type, new: #optional_node_type| {
+        *prev = new;
+    });
+    let reduce = HydroNode::Reduce {
+        f: reduce_f.into(),
+        input: Box::new(flat_map), // Has been replaced with network
+        metadata: HydroIrMetadata {
+            collection_kind: CollectionKind::Optional {
+                element_type: optional_node_type.into(),
+                bound: BoundKind::Unbounded,
+            },
+            location_id: new_location.clone(),
+            ..metadata.clone()
+        },
+    };
+
+    // 4.2 FilterMap (so Nones disappear)
+    let filter_map_f: syn::Expr = syn::parse_quote!(|x| x);
+    let filter_map = HydroNode::FilterMap {
+        f: filter_map_f.into(),
+        input: Box::new(reduce),
+        metadata: HydroIrMetadata {
+            collection_kind: CollectionKind::Optional {
+                element_type: node_type,
+                bound: BoundKind::Unbounded,
+            },
+            location_id: new_location.clone(),
+            ..metadata
+        },
+    };
+
+    *node = filter_map;
+}
+
 /// Places nodes based on location specified in `decision` and adds networking:
 /// 1. If the node is a source, change its location.
 /// 2. Otherwise, if the node's location differs from its input's location, then add a
@@ -280,7 +434,12 @@ fn decouple_node(
         output_location, op_id
     );
     let input_location = location_map.get(input_location_idx).unwrap();
-    add_network(node, input_location, output_location);
+    match node.metadata().collection_kind {
+        CollectionKind::Optional { .. } => {
+            decouple_optional(node, input_location, output_location);
+        }
+        _ => add_network(node, input_location, output_location),
+    }
 }
 
 fn fix_cluster_self_id_root(root: &mut HydroRoot, mut locations: ClusterSelfIdReplace) {
@@ -382,6 +541,8 @@ pub fn decouple<'a>(
             true,
         );
     }
+    // TODO: Check Paxos timeout path, make sure optional decoupling didn't break it?
+    print_id(ir);
 
     new_clusters
 }
