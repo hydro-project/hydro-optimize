@@ -78,6 +78,14 @@ impl ReusableHosts {
         }
     }
 
+    pub fn num_cores(&self) -> usize {
+        match &self.host_type {
+            InitializedHostType::Gcp { .. } => GCP_NUM_CORES,
+            InitializedHostType::Aws { .. } => AWS_NUM_CORES,
+            InitializedHostType::Localhost => 1, // Can't pin to cores locally anyway
+        }
+    }
+
     // NOTE: Creating hosts with the same display_name in the same deployment will result in undefined behavior.
     fn lazy_create_host(
         &mut self,
@@ -175,7 +183,13 @@ impl ReusableHosts {
         pin_to_core: usize,
     ) -> Vec<TrybuildHost> {
         (0..num_hosts)
-            .map(|i| self.get_no_perf_process_hosts(deployment, format!("{}{}", cluster_name, i), pin_to_core))
+            .map(|i| {
+                self.get_no_perf_process_hosts(
+                    deployment,
+                    format!("{}{}", cluster_name, i),
+                    pin_to_core,
+                )
+            })
             .collect()
     }
 }

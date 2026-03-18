@@ -159,5 +159,6 @@ pub fn greedy_decouple_analysis(
     for (op_id, key) in op_to_key {
         decision.insert(op_id, key_to_loc.find(key).0 as usize);
     }
+    println!("Greedy decouple decision: {:#?}", decision);
     decision
 }
