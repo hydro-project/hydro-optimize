@@ -69,14 +69,6 @@ impl ReusableHosts {
     pub fn insert_env(&mut self, key: String, value: String) {
         self.env.insert(key, value);
     }
-   
-    pub fn num_cores(&self) -> usize {
-        match &self.host_type {
-            InitializedHostType::Gcp { .. } => GCP_NUM_CORES,
-            InitializedHostType::Aws { .. } => AWS_NUM_CORES,
-            InitializedHostType::Localhost => 1, // Can't pin to cores locally anyway
-        }
-    }
 
     pub fn num_cores(&self) -> usize {
         match &self.host_type {
