@@ -52,7 +52,6 @@ impl Ord for Ballot {
 struct ReadRequest<RequestId, Sender> {
     request_id: RequestId,
     client_id: MemberId<Sender>,
-    ballot: Ballot,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -82,7 +81,6 @@ struct Response<State, RequestId, Sender> {
     request_id: RequestId,
     client_id: MemberId<Sender>,
     ballot: Ballot,
-    max_ballot: Ballot,
     state: Option<CASState<State>>,
 }
 
@@ -95,7 +93,7 @@ impl<'a, 'b> DistributedCAS<'a, 'b> {
         MemberId<Sender>,
         Payload,
         Cluster<'a, DistributedCASNode>,
-        impl Boundedness,
+        Unbounded,
         impl Ordering,
     >
     where
@@ -120,10 +118,10 @@ impl<'a, 'b> DistributedCAS<'a, 'b> {
         }
     }
 
-    /// Don't send to self
-    fn broadcast_to_everyone_else<Payload>(
+    /// Send the message over the network to all other replicas, but just pass the message onwards for ourselves.
+    fn smart_broadcast<Payload>(
         &self,
-        stream: Stream<Payload, Cluster<'a, DistributedCASNode>, impl Boundedness, impl Ordering>,
+        stream: Stream<Payload, Cluster<'a, DistributedCASNode>, Unbounded, impl Ordering>,
     ) -> KeyedStream<
         MemberId<DistributedCASNode>,
         Payload,
@@ -139,7 +137,7 @@ impl<'a, 'b> DistributedCAS<'a, 'b> {
 
         let nondet_membership = nondet!(/** Membership is static */);
         let stream_with_dest = sliced! {
-            let stream = use(stream, nondet_membership);
+            let stream = use(stream.clone(), nondet_membership);
             let curr_replicas = use(curr_replicas, nondet_membership);
 
             curr_replicas
@@ -148,7 +146,30 @@ impl<'a, 'b> DistributedCAS<'a, 'b> {
                 .filter_map(q!(move |(member_id, present)| (present && member_id != CLUSTER_SELF_ID).then_some(member_id)))
                 .cross_product(stream)
         };
-        stream_with_dest.demux(self.cluster, TCP.fail_stop().bincode())
+        let sent_stream = stream_with_dest.demux(self.cluster, TCP.fail_stop().bincode());
+
+        // Add a stream to ourselves but not over the network
+        let stream_to_self = stream.map(q!(move |payload| (CLUSTER_SELF_ID.clone(), payload))).into_keyed();
+        sent_stream.interleave(stream_to_self)
+    }
+
+    /// Similar to `smart_broadcast`, but for sending to a single destination.
+    fn smart_demux<Payload>(
+        &self,
+        stream: Stream<(MemberId<DistributedCASNode>, Payload), Cluster<'a, DistributedCASNode>, Unbounded, impl Ordering>,
+    ) -> KeyedStream<
+        MemberId<DistributedCASNode>,
+        Payload,
+        Cluster<'a, DistributedCASNode>,
+        Unbounded,
+        NoOrder,
+    >
+    where
+        Payload: Clone + Serialize + for<'de> Deserialize<'de> + 'a,
+    {
+        let (should_pass, should_demux) = stream.partition(q!(move |(member_id, _payload)| *member_id == CLUSTER_SELF_ID));
+        let demuxed = should_demux.demux(self.cluster, TCP.fail_stop().bincode());
+        should_pass.into_keyed().interleave(demuxed)
     }
 
     /// Returns the state associated with the respondent with the highest ballot, and whether all agree
@@ -274,15 +295,15 @@ where
                     node: CLUSTER_SELF_ID.clone()
                 }));
 
-        let (incoming_read_requests_complete, incoming_read_requests) =
-            self.cluster.forward_ref::<KeyedStream<
-                MemberId<DistributedCASNode>,
-                ReadRequest<RequestId, Sender>,
-                Cluster<'a, DistributedCASNode>,
-                Unbounded,
-                NoOrder,
-                ExactlyOnce,
-            >>();
+        // Broadcast client reads
+        let incoming_read_requests = self.smart_broadcast(client_reads.entries().map(q!(
+            |(client_id, request_id)| {
+                ReadRequest {
+                    request_id,
+                    client_id,
+                }
+            }
+        )));
 
         let (incoming_write_requests_complete, incoming_write_requests) =
             self.cluster.forward_ref::<KeyedStream<
@@ -298,8 +319,7 @@ where
         // Election and state
         // -------------------------------------------------------------
         let nondet_ballot = nondet!(/** The ballot used depends on the time of message arrival */);
-        let (reads_with_ballot, election_read_responses) = sliced! {
-            let client_reads = use(client_reads.entries(), nondet_ballot);
+        let (election_read_responses,) = sliced! {
             let incoming_read_requests = use(incoming_read_requests.entries(), nondet_ballot);
             let incoming_write_requests = use(incoming_write_requests.entries(), nondet_ballot);
             let max_preemption_ballot = use(max_preemption_ballot, nondet_ballot);
@@ -323,42 +343,28 @@ where
                 .filter_map(q!(|((_, write_req), ballot)| (write_req.ballot >= ballot).then_some(write_req.state)))
                 .or(state);
 
-            let reads_with_ballot = client_reads
-                .cross_singleton(ballot.clone());
             let election_read_responses = incoming_read_requests
                 .cross_singleton(ballot)
                 .cross_singleton(next_state.clone().into_singleton());
 
             state = next_state;
 
-            (reads_with_ballot, election_read_responses)
+            (election_read_responses,)
         };
 
-        let sent_read_requests = self.broadcast_to_everyone_else(reads_with_ballot.map(q!(
-            |((client_id, request_id), ballot)| {
-                ReadRequest {
-                    request_id,
-                    client_id,
-                    ballot,
-                }
-            }
-        )));
-        incoming_read_requests_complete.complete(sent_read_requests);
 
-        let read_responses = election_read_responses
-            .map(q!(|(((sender, request), max_ballot), state)| {
+        let read_responses = self.smart_demux(election_read_responses
+            .map(q!(|(((sender, request), ballot), state)| {
                 (
                     sender,
                     Response {
                         request_id: request.request_id,
                         client_id: request.client_id,
-                        ballot: request.ballot,
-                        max_ballot,
+                        ballot,
                         state,
                     },
                 )
-            }))
-            .demux(self.cluster, TCP.fail_stop().bincode())
+            })))
             .values()
             .map(q!(|response| (response.request_id.clone(), response)))
             .into_keyed();
