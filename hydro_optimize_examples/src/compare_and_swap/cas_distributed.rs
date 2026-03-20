@@ -76,11 +76,14 @@ impl<State: Eq, RequestId: Eq, Sender: Eq> Ord for WriteRequest<State, RequestId
     }
 }
 
+/// - `ballot`: The ballot of the request, if applicable (e.g. for writes).
+/// - `max_ballot`: The max ballot seen by the respondent, which the leader can use to determine if it has been preempted.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Response<State, RequestId, Sender> {
     request_id: RequestId,
     client_id: MemberId<Sender>,
-    ballot: Ballot,
+    ballot: Option<Ballot>,
+    max_ballot: Ballot,
     state: Option<CASState<State>>,
 }
 
@@ -221,11 +224,11 @@ impl<'a, 'b> DistributedCAS<'a, 'b> {
                     if prev_response.state != response.state {
                         *all_agree = false;
                     }
-                    if prev_response.ballot < response.ballot {
+                    if prev_response.max_ballot < response.max_ballot {
                         *prev_response = response;
                     }
                 }, commutative = manual_proof!(/** Max is order independent. No two writes will use the same ballot. */)));    
-            // TODO: Increment ballot on each write
+            // TODO: Remember to increment ballot on each write
             
             reached_quorum = just_quorum.into_keyed().keys();
             prev_responses = current_responses.filter_key_not_in(all_quorum.into_keyed().keys()).entries();
@@ -319,7 +322,8 @@ where
         // Election and state
         // -------------------------------------------------------------
         let nondet_ballot = nondet!(/** The ballot used depends on the time of message arrival */);
-        let (election_read_responses,) = sliced! {
+        let (read_responses, write_requests, write_responses) = sliced! {
+            let client_writes = use(client_writes.entries(), nondet_ballot);
             let incoming_read_requests = use(incoming_read_requests.entries(), nondet_ballot);
             let incoming_write_requests = use(incoming_write_requests.entries(), nondet_ballot);
             let max_preemption_ballot = use(max_preemption_ballot, nondet_ballot);
@@ -335,32 +339,41 @@ where
             })));
 
             let winning_write = incoming_write_requests
+                .clone()
                 .sort()
                 .last();
-
             let next_state = winning_write
                 .zip(ballot.clone())
                 .filter_map(q!(|((_, write_req), ballot)| (write_req.ballot >= ballot).then_some(write_req.state)))
                 .or(state);
 
-            let election_read_responses = incoming_read_requests
+            // TODO: Queue requests, do one at a time, and increment our ballot. Don't attempt to write if there is a reconciling write
+            let write_requests = client_writes
+                .cross_singleton(ballot.clone());
+            let read_responses = incoming_read_requests
+                .cross_singleton(ballot.clone())
+                .cross_singleton(next_state.clone().into_singleton());
+            let write_responses = incoming_write_requests
                 .cross_singleton(ballot)
                 .cross_singleton(next_state.clone().into_singleton());
 
             state = next_state;
 
-            (election_read_responses,)
+            (read_responses, write_requests, write_responses)
         };
 
-
-        let read_responses = self.smart_demux(election_read_responses
-            .map(q!(|(((sender, request), ballot), state)| {
+        // -------------------------------------------------------------
+        // Process read responses.
+        // -------------------------------------------------------------
+        let sent_read_responses = self.smart_demux(read_responses
+            .map(q!(|(((sender, request), max_ballot), state)| {
                 (
                     sender,
                     Response {
                         request_id: request.request_id,
                         client_id: request.client_id,
-                        ballot,
+                        ballot: None,
+                        max_ballot,
                         state,
                     },
                 )
@@ -368,21 +381,81 @@ where
             .values()
             .map(q!(|response| (response.request_id.clone(), response)))
             .into_keyed();
-
         // See if all reads agree
-        let read_responses_agree = self.check_all_agree(read_responses).entries();
+        let read_responses_agree = self.check_all_agree(sent_read_responses).entries();
         let (read_success, read_needs_commit) = read_responses_agree.partition(q!(|(_request_id, (_response, all_agree))| *all_agree));
-
         let read_result = read_success
             .map(q!(|(request_id, (response, _all_agree))| (response.client_id, (request_id, response.state))))
             .demux(sender, TCP.fail_stop().bincode())
             .values()
             .into_keyed();
 
+        // -------------------------------------------------------------
+        // Broadcast write requests.
+        // -------------------------------------------------------------
+        let sent_write_requests = self.smart_broadcast(write_requests.map(q!(|((sender, (request_id, write)), ballot)| WriteRequest {
+                request_id,
+                client_id: sender,
+                ballot,
+                state: write,
+            })));
+        incoming_write_requests_complete.complete(sent_write_requests);
+
+        // -------------------------------------------------------------
+        // Process write responses.
+        // -------------------------------------------------------------
+        let sent_write_responses = self.smart_demux(write_responses
+            .map(q!(|(((sender, request), max_ballot), state)| {
+                (
+                    sender,
+                    Response {
+                        request_id: request.request_id,
+                        client_id: request.client_id,
+                        ballot: Some(request.ballot),
+                        max_ballot,
+                        state,
+                    },
+                )
+            })))
+            .values()
+            .map(q!(|response| (response.request_id.clone(), response)))
+            .into_keyed();
+        // See if our writes were successful
+        let write_responses_agree = self.check_all_agree(sent_write_responses).entries();
+        let (write_success, write_needs_election) = write_responses_agree
+            .partition(q!(|(_request_id, (response, _all_agree))| response.ballot.clone().is_some_and(|ballot| ballot == response.max_ballot)));
+        let write_processed = write_success
+            .clone()
+            .map(q!(|(request_id, (response, _all_agree))| (response.client_id, request_id)))
+            .demux(sender, TCP.fail_stop().bincode())
+            .values();
+
+        // -------------------------------------------------------------
+        // Broadcast successful writes to current subscribers.
+        // -------------------------------------------------------------
+        let nondet_subscribe = nondet!(/** The "current" set of subscribers depends on message arrival order */);
+        let writes_to_subscribers = sliced! {
+            let new_subscribers = use(client_subscribes.values(), nondet_subscribe);
+            let write_success = use(write_success, nondet_subscribe);
+            let mut prev_subscribers = use::state_null::<Stream<MemberId<Sender>, Tick<_>, Bounded, NoOrder>>();
+
+            let current_subscribers = prev_subscribers.chain(new_subscribers);
+            let writes_to_subscribers = current_subscribers
+                .clone()
+                .cross_product(write_success)
+                .filter_map(q!(|(subscriber, (_request_id, (response, _all_agree)))| response.state.map(|state| (subscriber, state))));
+
+            prev_subscribers = current_subscribers;
+            writes_to_subscribers
+        };
+        let subscribe_updates = writes_to_subscribers
+            .demux(sender, TCP.fail_stop().bincode())
+            .values();
+
         CASOutput {
             read_result,
-            write_processed: todo!(),
-            subscribe_updates: todo!(),
+            write_processed,
+            subscribe_updates,
         }
     }
 }
