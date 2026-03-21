@@ -21,7 +21,8 @@ pub struct CASState<State> {
 /// - `subscribe_updates`: Stream of state updates for subscribers
 pub struct CASOutput<'a, State, RequestId, Sender> {
     pub write_processed: Stream<RequestId, Cluster<'a, Sender>, Unbounded, NoOrder>,
-    pub read_result: KeyedStream<RequestId, Option<CASState<State>>, Cluster<'a, Sender>, Unbounded, NoOrder>,
+    pub read_result:
+        KeyedStream<RequestId, Option<CASState<State>>, Cluster<'a, Sender>, Unbounded, NoOrder>,
     pub subscribe_updates: Stream<CASState<State>, Cluster<'a, Sender>, Unbounded, NoOrder>,
 }
 
@@ -36,7 +37,9 @@ impl<S: PartialOrd> PartialOrd for CASState<S> {
 
 impl<S: Ord> Ord for CASState<S> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.version.cmp(&other.version).then_with(|| self.state.cmp(&other.state))
+        self.version
+            .cmp(&other.version)
+            .then_with(|| self.state.cmp(&other.state))
     }
 }
 
@@ -58,7 +61,13 @@ where
     /// - `sender`: the location of the sender.
     fn build(
         self,
-        writes: KeyedStream<RequestId, CASState<State>, Cluster<'a, Sender>, impl Boundedness, impl Ordering>,
+        writes: KeyedStream<
+            RequestId,
+            CASState<State>,
+            Cluster<'a, Sender>,
+            impl Boundedness,
+            impl Ordering,
+        >,
         reads: Stream<RequestId, Cluster<'a, Sender>, impl Boundedness, impl Ordering>,
         subscribe: Stream<MemberId<Sender>, Cluster<'a, Sender>, impl Boundedness, impl Ordering>,
         sender: &Cluster<'a, Sender>,

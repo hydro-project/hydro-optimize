@@ -84,10 +84,8 @@ where
         };
 
         let write_outputs = atomic_writes.end_atomic().keys();
-        let read_outputs = read_outputs.map(q!(|((sender, req_id), state)| (
-            sender,
-            (req_id, state)
-        )));
+        let read_outputs =
+            read_outputs.map(q!(|((sender, req_id), state)| (sender, (req_id, state))));
 
         let state_updates = state_updates.map(q!(|(_writer, write)| write));
         let nondet_subscribe = nondet!(/** Subscribes that arrive after a state change may not hear of thet state change */);
