@@ -52,8 +52,9 @@ impl Ord for Ballot {
 struct Request<State, RequestId, Sender> {
     request_id: RequestId,
     client_id: MemberId<Sender>,
-    ballot: Ballot,
+    ballot: Option<Ballot>,
     state: Option<CASState<State>>,
+    is_reconciling: bool,
 }
 
 impl<State: Eq, RequestId: Eq, Sender: Eq> PartialOrd for Request<State, RequestId, Sender> {
@@ -217,7 +218,6 @@ impl<'a, 'b> DistributedCAS<'a, 'b> {
                         *prev_response = response;
                     }
                 }, commutative = manual_proof!(/** Max is order independent. No two writes will use the same ballot. */)));
-            // TODO: Remember to increment ballot on each write
 
             reached_quorum = just_quorum.into_keyed().keys();
             prev_responses = current_responses.filter_key_not_in(all_quorum.into_keyed().keys()).entries();
@@ -286,7 +286,7 @@ where
         >>();
         let max_preemption_ballot = incoming_preemption_ballots.max();
 
-        let (incoming_read_requests_complete, incoming_read_requests) =
+        let (incoming_requests_complete, incoming_requests) =
             self.cluster.forward_ref::<KeyedStream<
                 MemberId<Replica>,
                 Request<State, RequestId, Sender>,
@@ -296,55 +296,14 @@ where
                 ExactlyOnce,
             >>();
 
-        let (incoming_write_requests_complete, incoming_write_requests) =
-            self.cluster.forward_ref::<KeyedStream<
-                MemberId<Replica>,
-                Request<State, RequestId, Sender>,
-                Cluster<'a, Replica>,
-                Unbounded,
-                NoOrder,
-                ExactlyOnce,
-            >>();
-
-        // Quorum responses to read requests.
-        let (incoming_read_uncommitted_responses_complete, incoming_read_uncommitted_responses) =
-            self.cluster.forward_ref::<Stream<
-                (RequestId, Response<State, RequestId, Sender>),
-                Cluster<'a, Replica>,
-                Unbounded,
-                NoOrder,
-                ExactlyOnce,
-            >>();
-
-        // Quorum responses to write requests where not all respondents agree.
-        let (incoming_write_uncommitted_responses_complete, incoming_write_uncommitted_responses) =
-            self.cluster.forward_ref::<Stream<
-                (RequestId, Response<State, RequestId, Sender>),
-                Cluster<'a, Replica>,
-                Unbounded,
-                NoOrder,
-                ExactlyOnce,
-            >>();
-
-        // Quorum responses to write requests where all respondents agree, but our write failed.
-        let (incoming_write_preempted_responses_complete, incoming_write_preempted_responses) =
-            self.cluster.forward_ref::<Stream<
-                RequestId,
-                Cluster<'a, Replica>,
-                Unbounded,
-                NoOrder,
-                ExactlyOnce,
-            >>();
-
-        // Quorum responses to write requests where all respondents agree and our write succeeded.
-        let (incoming_write_success_responses_complete, incoming_write_success_responses) =
-            self.cluster.forward_ref::<Stream<
-                RequestId,
-                Cluster<'a, Replica>,
-                Unbounded,
-                NoOrder,
-                ExactlyOnce,
-            >>();
+        // Quorum responses. bool = whether all agree on the highest ballot value
+        let (incoming_responses_complete, incoming_responses) = self.cluster.forward_ref::<Stream<
+            (Response<State, RequestId, Sender>, bool),
+            Cluster<'a, Replica>,
+            Unbounded,
+            NoOrder,
+            ExactlyOnce,
+        >>();
 
         // -------------------------------------------------------------
         // Election and state
@@ -356,29 +315,18 @@ where
         // 3. No writes reuse the same ballot.
         // -------------------------------------------------------------
         let nondet_ballot = nondet!(/** The ballot used depends on the time of message arrival */);
-        let (read_requests, read_responses, write_requests, write_responses, unblocked_reads,) = sliced! {
-            let client_reads = use(client_reads.entries(), nondet_ballot);
+        let (write_requests, responses, unblocked_reads) = sliced! {
             let client_writes = use(client_writes.entries(), nondet_ballot);
-            let incoming_read_requests = use(incoming_read_requests.entries(), nondet_ballot);
-            let incoming_write_requests = use(incoming_write_requests.entries(), nondet_ballot);
+            let incoming_requests = use(incoming_requests, nondet_ballot);
             let max_preemption_ballot = use(max_preemption_ballot, nondet_ballot);
-            // TODO: We might be able to decide which write to send & the ballot to attach to it in different slices.
-            let incoming_read_uncommitted_responses = use(incoming_read_uncommitted_responses, nondet_ballot);
-            let incoming_write_uncommitted_responses = use(incoming_write_uncommitted_responses, nondet_ballot);
-            let incoming_write_preempted_responses = use(incoming_write_preempted_responses, nondet_ballot);
-            let incoming_write_success_responses = use(incoming_write_success_responses, nondet_ballot);
+            let incoming_responses = use(incoming_responses, nondet_ballot);
             let mut state = use::state_null::<Optional<CASState<State>, Tick<_>, Bounded>>();
-            // The current outgoing write to reconcile uncommitted state, if any.
-            // If we find new uncommitted state, we take the max based on ballot.
-            let mut current_uncommitted_state = use::state_null::<Optional<(RequestId, Ballot, CASState<State>), Tick<_>, Bounded>>();
-            // The current client write we wish to commit, if any. This write may be outgoing (if there is no uncommitted state) or blocking on that state to become committed.
-            let mut current_client_write = use::state_null::<Optional<(RequestId, MemberId<Sender>, CASState<State>), Tick<_>, Bounded>>();
-            // Writes waiting to be replicated in order. A write can only proceed if there is no outgoing write
+            // Last state where we know a majority of replicas agreed.
+            let mut committed_state = use::state_null::<Optional<(Ballot, CASState<State>), Tick<_>, Bounded>>();
+            // Writes blocking in reconcilation or election
             let mut write_queue = use::state_null::<Stream<(RequestId, MemberId<Sender>, CASState<State>), Tick<_>, Bounded, TotalOrder>>();
-            // Reads that are waiting for the latest write to complete, before returning with the value of that write.
-            let mut reads_blocked_on_outgoing_write = use::state_null::<Stream<(RequestId, MemberId<Sender>), Tick<_>, Bounded, NoOrder>>();
-            // Reads that were invoked after the latest write began and in order to preserve causality, cannot return until a new write starts and completes.
-            let mut reads_blocked_on_next_write = use::state_null::<Stream<(RequestId, MemberId<Sender>), Tick<_>, Bounded, NoOrder>>();
+            // Reads blocking on reconciliation
+            let mut blocked_reads = use::state_null::<Stream<Response<State, RequestId, Sender>, Tick<_>, Bounded, NoOrder>>();
 
             // let max_leader_ballot = incoming_election_reads.clone().map(q!(|(_sender, request)| request.ballot))
             //     .chain(incoming_election_writes
@@ -390,200 +338,128 @@ where
                     node: CLUSTER_SELF_ID.clone(),
             })));
 
-            // Queue blocked reads based on whether a write was successful.
-            let successful_write_id = incoming_write_success_responses
+            // Unblock reads if we observe a committed state that is higher than the ballot they observed
+            let unblocked_reads = blocked_reads
                 .clone()
-                .assume_ordering::<TotalOrder>(nondet!(/** There is at most one outgoing write, thus at most one success signal at a time */))
-                .first();
-            let successful_reconciled_write = successful_write_id
-                .clone()
-                .zip(current_uncommitted_state.clone())
-                .filter_map(q!(|(request_id, (uncommitted_request_id, _ballot, uncommitted_state))| (request_id == uncommitted_request_id).then_some(uncommitted_state)));
-            let successful_client_write = successful_write_id
-                .zip(current_client_write.clone())
-                .filter_map(q!(|(request_id, (client_request_id, _client, client_write))| (request_id == client_request_id).then_some(client_write)));
-            let successful_write = successful_reconciled_write.or(successful_client_write);
-            let (unblocked_reads, reads_still_blocked_on_outgoing) = reads_blocked_on_outgoing_write
-                .clone()
-                .cross_singleton(successful_write.clone().into_singleton())
-                .partition(q!(|((_request_id, _client), written)| written.is_some()));
-            let (reads_now_blocked_on_outgoing, reads_still_blocked_on_next) = reads_blocked_on_next_write
-                .clone()
-                .cross_singleton(successful_write.into_singleton())
-                .partition(q!(|((_request_id, _client), written)| written.is_some()));
-            let new_reads_blocked_on_outgoing = reads_still_blocked_on_outgoing
-                .chain(reads_now_blocked_on_outgoing)
-                .map(q!(|((request_id, client), _)| (request_id, client)));
-            let new_reads_blocked_on_next = reads_still_blocked_on_next
-                .map(q!(|((request_id, client), _)| (request_id, client)))
-                .chain(incoming_read_uncommitted_responses.clone().map(q!(|(request_id, response)| (request_id, response.request.client_id))));
-            // TODO: Incoming reads should block on outgoing if there is no current outgoing write
-
-            // Determine what the next uncommitted state is
-            // If there is a current_uncommitted_state, then it is inflight and we shouldn't overwrite it (its responses will tell itself it needs to be updated).
-            let uncommitted_state_responses = incoming_read_uncommitted_responses
-                .chain(incoming_write_uncommitted_responses)
-                .filter_map(q!(|(_request_id, response)|
-                    response.state.map(|state| (response.max_ballot, state))))
-                .max()
-                .map(q!(|(ballot, uncommitted_state)| (RequestId::generate(), ballot, uncommitted_state)));
-            let next_uncommitted_state = current_uncommitted_state.or(uncommitted_state_responses);
-
-
-            // Determine which write to process next
+                .cross_singleton(committed_state.clone())
+                .filter_map(q!(|(response, (ballot, state))|
+                    (ballot >= response.max_ballot)
+                        .then_some((response.request.client_id, (response.request.request_id, Some(state.clone()))))
+                ));
 
             // Determine local state based on incoming write requests
-            let winning_write = incoming_write_requests
+            let winning_write = incoming_requests
                 .clone()
+                .values()
                 .sort()
-                .last();
+                .last()
+                .filter_map(q!(|request| request.ballot.zip(request.state)));
             let next_state = winning_write
                 .zip(ballot.clone())
-                .filter_map(q!(|((_, write_req), ballot)| (write_req.ballot >= ballot).then_some(write_req.state.unwrap())))
+                .filter_map(q!(|((write_ballot, state), ballot)| (write_ballot >= ballot).then_some(state)))
                 .or(state);
 
             // Attach ballots to requests and responses
-            let read_requests = client_reads
-                .cross_singleton(ballot.clone());
-            // TODO: Queue requests, do one at a time, and increment our ballot. Don't attempt to write if there is a reconciling write
+            // TODO: Only pick a client write if last committed equals our ballot?
             let write_requests = client_writes
                 .cross_singleton(ballot.clone());
-            let read_responses = incoming_read_requests
+            let responses = incoming_requests
                 .cross_singleton(ballot.clone())
-                .cross_singleton(next_state.clone().into_singleton());
-            let write_responses = incoming_write_requests
-                .cross_singleton(ballot)
                 .cross_singleton(next_state.clone().into_singleton());
 
             state = next_state;
-            reads_blocked_on_outgoing_write = new_reads_blocked_on_outgoing;
-            reads_blocked_on_next_write = new_reads_blocked_on_next;
-            current_uncommitted_state = next_uncommitted_state;
 
-            (read_requests, read_responses, write_requests, write_responses, unblocked_reads,)
+            (write_requests, responses, unblocked_reads,)
         };
 
         // -------------------------------------------------------------
-        // Broadcast read requests.
+        // Broadcast requests.
         // -------------------------------------------------------------
-        let sent_read_requests =
-            self.smart_broadcast(read_requests.map(q!(|((client_id, request_id), ballot)| {
-                Request {
+        // TODO: Include election
+        let sent_requests = self.smart_broadcast(
+            client_reads
+                .entries()
+                .map(q!(|(client_id, request_id)| Request {
                     request_id,
                     client_id,
-                    ballot,
+                    ballot: None,
                     state: None,
-                }
-            })));
-        incoming_read_requests_complete.complete(sent_read_requests);
+                    is_reconciling: false,
+                }))
+                .interleave(write_requests.map(q!(|(
+                    (client_id, (request_id, write)),
+                    ballot,
+                )| Request {
+                    request_id,
+                    client_id,
+                    ballot: Some(ballot),
+                    state: Some(write),
+                    is_reconciling: false,
+                }))),
+        );
+        incoming_requests_complete.complete(sent_requests);
 
         // -------------------------------------------------------------
-        // Process read responses.
+        // Reply to requests with responses.
         // -------------------------------------------------------------
-        let sent_read_responses = self
-            .smart_demux(
-                read_responses.map(q!(|(((sender, request), max_ballot), state)| {
-                    (
-                        sender,
-                        Response {
-                            request,
-                            max_ballot,
-                            state,
-                        },
-                    )
-                })),
-            )
+        let sent_responses =
+            self.smart_demux(responses.entries().map(q!(|(
+                sender,
+                ((request, max_ballot), state),
+            )| {
+                (
+                    sender,
+                    Response {
+                        request,
+                        max_ballot,
+                        state,
+                    },
+                )
+            })))
             .values()
             .map(q!(|response| (
                 response.request.request_id.clone(),
                 response
             )))
             .into_keyed();
-        // See if all reads agree
-        let read_responses_agree = self.check_all_agree(sent_read_responses).entries();
-        let (read_success, read_uncommitted) = read_responses_agree
+
+        // -------------------------------------------------------------
+        // Process responses.
+        // -------------------------------------------------------------
+        let responses_agree = self.check_all_agree(sent_responses).entries();
+        // Reads are responses without a ballot
+        let read_result = responses_agree
             .clone()
-            .partition(q!(|(_request_id, (_response, all_agree))| *all_agree));
-        incoming_read_uncommitted_responses_complete.complete(read_uncommitted.map(q!(
-            |(request_id, (response, _all_agree))| (request_id, response)
-        )));
-        let read_result = read_success
-            .map(q!(|(request_id, (response, _all_agree))| (
+            .filter_map(q!(|(_request_id, (response, all_agree))| (response
+                .request
+                .ballot
+                .is_none() // If this is a read
+                && response.request.state.is_none_or(|_state| all_agree)) // And either all agree or there's no state
+            .then_some((
                 response.request.client_id,
-                (request_id, response.state)
-            )))
-            .interleave(unblocked_reads.map(q!(|((request_id, client_id), state)| (client_id, (request_id, state)))))
+                (response.request.request_id, response.state.clone())
+            ))))
+            .interleave(unblocked_reads)
             .demux(sender, TCP.fail_stop().bincode())
             .values()
             .into_keyed();
-
-        // -------------------------------------------------------------
-        // Broadcast write requests.
-        // -------------------------------------------------------------
-        let sent_write_requests =
-            self.smart_broadcast(write_requests.map(q!(|(
-                (sender, (request_id, write)),
-                ballot,
-            )| Request {
-                request_id,
-                client_id: sender,
-                ballot,
-                state: Some(write),
-            })));
-        incoming_write_requests_complete.complete(sent_write_requests);
-
-        // -------------------------------------------------------------
-        // Process write responses.
-        // -------------------------------------------------------------
-        let sent_write_responses = self
-            .smart_demux(
-                write_responses.map(q!(|(((sender, request), max_ballot), state)| {
-                    (
-                        sender,
-                        Response {
-                            request,
-                            max_ballot,
-                            state,
-                        },
-                    )
-                })),
-            )
-            .values()
-            .map(q!(|response| (
-                response.request.request_id.clone(),
-                response
-            )))
-            .into_keyed();
-        // See if our writes were successful
-        let write_responses_agree = self.check_all_agree(sent_write_responses).entries();
-        let (write_all_agree, write_disagree) =
-            write_responses_agree.clone().partition(q!(|(_request_id, (_response, all_agree))| *all_agree));
-        let (write_success, write_preempted) =
-            write_all_agree.partition(q!(|(_request_id, (response, _all_agree))| response
+        let write_success =
+            responses_agree
+                .clone()
+                .filter_map(q!(|(request_id, (response, _all_agree))| (response
                 .request
                 .ballot
-                == response.max_ballot));
-        incoming_write_uncommitted_responses_complete.complete(write_disagree.map(q!(|(
-            request_id,
-            (response, _all_agree),
-        )| (
-            request_id, response
-        ))));
-        incoming_write_preempted_responses_complete.complete(write_preempted.map(q!(|(
-            _request_id,
-            (response, _all_agree),
-        )| {
-            response.request.request_id
-        })));
-        incoming_write_success_responses_complete.complete(write_success.clone().map(q!(
-            |(_request_id, (response, _all_agree))| response.request.request_id
-        )));
+                .is_some_and(|ballot| ballot == response.max_ballot) // If we weren't preempted
+                && response.request.state.is_some() // And this is a write (not election)
+                && !response.request.is_reconciling) // And this is not a reconciling write
+                    .then_some((
+                        response.request.client_id,
+                        request_id,
+                        response.state.clone().unwrap()
+                    ))));
         let write_processed = write_success
             .clone()
-            .map(q!(|(request_id, (response, _all_agree))| (
-                response.request.client_id,
-                request_id
-            )))
+            .map(q!(|(client_id, request_id, _state)| (client_id, request_id)))
             .demux(sender, TCP.fail_stop().bincode())
             .values();
 
@@ -601,7 +477,7 @@ where
             let writes_to_subscribers = current_subscribers
                 .clone()
                 .cross_product(write_success)
-                .filter_map(q!(|(subscriber, (_request_id, (response, _all_agree)))| response.state.map(|state| (subscriber, state))));
+                .map(q!(|(subscriber, (_client_id, _request_id, state))| (subscriber, state)));
 
             prev_subscribers = current_subscribers;
             writes_to_subscribers
@@ -613,15 +489,10 @@ where
         // -------------------------------------------------------------
         // Gather all ballots received as a response.
         // -------------------------------------------------------------
-        let received_ballots = read_responses_agree
-            .map(q!(
+        let received_ballots =
+            responses_agree.map(q!(
                 |(_request_id, (response, _all_agree))| response.max_ballot
-            ))
-            .interleave(
-                write_responses_agree.map(q!(
-                    |(_request_id, (response, _all_agree))| response.max_ballot
-                )),
-            );
+            ));
         incoming_preemption_ballots_complete.complete(received_ballots);
 
         CASOutput {
