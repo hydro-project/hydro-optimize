@@ -97,7 +97,6 @@ pub fn cas_write_bench<'a>(
 ///
 /// RequestId = UniqueRequestId
 /// The State in CASState<State> = u64
-/// TODO: Actually, CAS detects the sender's identity to decide how to handle versions, so multiple clients won't help. We need to spoof the writer's identity
 fn write_workload_generator<'a, Client: 'a>(
     ids_and_prev_payloads: KeyedStream<u32, Option<u64>, Cluster<'a, Client>, Unbounded, NoOrder>,
 ) -> KeyedStream<u32, (UniqueRequestId, CASState<u64>), Cluster<'a, Client>, Unbounded, NoOrder> {
@@ -115,6 +114,7 @@ fn write_workload_generator<'a, Client: 'a>(
             },
             CASState {
                 version: 0,
+                writer: 0, // Spoof all writes to use the same writer so ordering doesn't reduce goodput
                 state: request_id,
             },
         )

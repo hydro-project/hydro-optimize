@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 pub struct CASState<State> {
     pub version: u64,
     pub state: State,
+    pub writer: u64,
 }
 
 /// `RequestId` is what allows the clients to uniquely identify each request.

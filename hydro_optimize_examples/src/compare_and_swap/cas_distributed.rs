@@ -387,8 +387,9 @@ where
                 .entries()
                 .cross_product(won_election_write_complete)
                 .filter_map(q!(|((request_id, (client_id, state)), (response, _all_agree))|
-                // TODO: Include previous writer in response's state so we can let the same version number through
-                    response.state.is_none_or(|curr_state| curr_state.version + 1 == state.version)
+                    // Allow write if version is prev+1 or the writer is the same and the version hasn't changed
+                    response.state.is_none_or(|curr_state| curr_state.version + 1 == state.version ||
+                        (curr_state.writer == state.writer && curr_state.version == state.version))
                         .then_some((request_id, (Some(client_id), state)))
                 ))
                 .assume_ordering::<TotalOrder>(nondet!(/** The order of input arrival determines which write we send first */))

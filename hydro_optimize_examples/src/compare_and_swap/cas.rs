@@ -47,38 +47,32 @@ where
         let nondet_state =
             nondet!(/** State updates and reads are non-deterministic based on arrival order */);
         let (state_updates, read_outputs) = sliced! {
-            let mut last_write = use::state_null::<Optional<(MemberId<Sender>, CASState<State>), _, _>>();
+            let mut last_write = use::state_null::<Optional<CASState<State>, _, _>>();
             let writes = use::atomic(atomic_writes.clone(), nondet_state);
             let reads = use(incoming_reads, nondet_state);
 
             let winning_write = writes
                 .clone()
-                .entries()
-                // Can't use .max() unfortunately, because MemberId isn't ordered
-                .reduce(q!(|(max_writer_and_req_id, max_write), (next_writer_and_req_id, next_write)| {
-                    if *max_write < next_write {
-                        *max_writer_and_req_id = next_writer_and_req_id;
-                        *max_write = next_write;
-                    }
-                }, commutative = manual_proof!(/** max is commutative */)))
+                .values()
+                .max()
                 .zip(last_write.clone().into_singleton())
-                .filter_map(q!(|(((writer, _req_id), write), prev)| {
+                .filter_map(q!(|(write, prev)| {
                     // Allow the same version if it's from the same writer
-                    if let Some((prev_writer, prev_write)) = prev
+                    if let Some(prev_write) = prev
                         && write.version != prev_write.version + 1
                             && !(write.version == prev_write.version
-                                && prev_writer == writer) {
+                                && write.writer == prev_write.writer) {
                         println!("Rejecting CASState with version {}, our version is {}",
                             write.version, prev_write.version);
                         return None;
                     }
-                    Some((writer, write))
+                    Some(write)
                 }));
             let curr_state = winning_write.or(last_write);
             last_write = curr_state.clone();
 
             let read_outputs = reads
-                .cross_singleton(curr_state.clone().map(q!(|(_sender, state)| state)).into_singleton());
+                .cross_singleton(curr_state.clone().into_singleton());
 
             (curr_state.into_stream(), read_outputs)
         };
@@ -87,7 +81,6 @@ where
         let read_outputs =
             read_outputs.map(q!(|((sender, req_id), state)| (sender, (req_id, state))));
 
-        let state_updates = state_updates.map(q!(|(_writer, write)| write));
         let nondet_subscribe = nondet!(/** Subscribes that arrive after a state change may not hear of thet state change */);
         let subscribe_outputs = sliced! {
             let subscribes = use(incoming_subscribes, nondet_subscribe);
