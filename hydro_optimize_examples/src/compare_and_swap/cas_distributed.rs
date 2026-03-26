@@ -9,6 +9,7 @@ use hydro_lang::{
     nondet::nondet,
     prelude::{Bounded, Cluster, KeyedStream, Optional, Singleton, Stream, TCP, Tick, Unbounded},
 };
+use hydro_std::membership::track_membership;
 use serde::{Deserialize, Serialize};
 use stageleft::q;
 use std::{fmt::Debug, hash::Hash, time::Duration};
@@ -116,28 +117,33 @@ impl<'a, 'b> DistributedCAS<'a, 'b> {
         Payload: Clone + Serialize + for<'de> Deserialize<'de> + 'a,
     {
         let nondet_membership = nondet!(/** Membership is static */);
-        stream.broadcast(self.cluster, TCP.fail_stop().bincode(), nondet_membership)
-        // TODO: Revert once I figure out how to send to self without creating a negative cycle
-        // let members = self.cluster.source_cluster_members(self.cluster);
-        // let curr_replicas = track_membership(members);
-        //
-        // let stream_with_dest = sliced! {
-        //     let stream = use(stream.clone(), nondet_membership);
-        //     let curr_replicas = use(curr_replicas, nondet_membership);
-        //
-        //     curr_replicas
-        //         .into_keyed_stream()
-        //         .entries()
-        //         .filter_map(q!(move |(member_id, present)| (present && member_id != CLUSTER_SELF_ID).then_some(member_id)))
-        //         .cross_product(stream)
-        // };
-        // let sent_stream = stream_with_dest.demux(self.cluster, TCP.fail_stop().bincode());
-        //
-        // // Add a stream to ourselves but not over the network
-        // let stream_to_self = stream
-        //     .map(q!(move |payload| (CLUSTER_SELF_ID.clone(), payload)))
-        //     .into_keyed();
-        // sent_stream.merge_unordered(stream_to_self)
+        let members = self.cluster.source_cluster_members(self.cluster);
+        let curr_replicas = track_membership(members);
+
+        let stream_with_dest = sliced! {
+            let stream = use(stream.clone(), nondet_membership);
+            let curr_replicas = use(curr_replicas, nondet_membership);
+
+            curr_replicas
+                .into_keyed_stream()
+                .entries()
+                .filter_map(q!(move |(member_id, present)| (present && member_id != CLUSTER_SELF_ID).then_some(member_id)))
+                .cross_product(stream)
+        };
+        let sent_stream = stream_with_dest.demux(self.cluster, TCP.fail_stop().bincode());
+
+        // Add a stream to ourselves but not over the network
+        let tick = self.cluster.tick();
+        let stream_to_self = stream
+            .map(q!(move |payload| (CLUSTER_SELF_ID.clone(), payload)))
+            .into_keyed()
+            .batch(
+                &tick,
+                nondet!(/** Only exists to defer_tick and avoid cycle with negation */),
+            )
+            .defer_tick()
+            .all_ticks();
+        sent_stream.merge_unordered(stream_to_self)
     }
 
     /// Similar to `smart_broadcast`, but for sending to a single destination.
@@ -148,14 +154,21 @@ impl<'a, 'b> DistributedCAS<'a, 'b> {
     where
         Payload: Clone + Serialize + for<'de> Deserialize<'de> + 'a,
     {
-        stream.demux(self.cluster, TCP.fail_stop().bincode())
-        // TODO: Revert once I figure out how to send to self without creating a negative cycle
-        // let (should_pass, should_demux) =
-        //     stream.partition(q!(
-        //         move |(member_id, _payload)| *member_id == CLUSTER_SELF_ID
-        //     ));
-        // let demuxed = should_demux.demux(self.cluster, TCP.fail_stop().bincode());
-        // should_pass.into_keyed().merge_unordered(demuxed)
+        let (should_pass, should_demux) =
+            stream.partition(q!(
+                move |(member_id, _payload)| *member_id == CLUSTER_SELF_ID
+            ));
+        let demuxed = should_demux.demux(self.cluster, TCP.fail_stop().bincode());
+        let tick = self.cluster.tick();
+        should_pass
+            .into_keyed()
+            .batch(
+                &tick,
+                nondet!(/** Only exists to defer_tick and avoid cycle with negation */),
+            )
+            .defer_tick()
+            .all_ticks()
+            .merge_unordered(demuxed)
     }
 
     /// Returns the state associated with the respondent with the highest ballot, and whether all agree
@@ -232,8 +245,7 @@ impl<'a, 'b> DistributedCAS<'a, 'b> {
 /// # Assumptions:
 /// 1. No 2 operations share the same `UniqueRequestId`.
 /// 2. Each client subscribes at most once. (Doesn't break correctness but will duplicate messages).
-impl<'a, 'b, State, Sender> CASLike<'a, State, Sender>
-    for DistributedCAS<'a, 'b>
+impl<'a, 'b, State, Sender> CASLike<'a, State, Sender> for DistributedCAS<'a, 'b>
 where
     State: Clone + Debug + Serialize + for<'de> Deserialize<'de> + Ord + 'a,
     Sender: Clone + Debug + Serialize + for<'de> Deserialize<'de> + Eq + Hash + 'a,
@@ -544,7 +556,10 @@ where
                 .is_none() // If this is a read
                 && response.request.state.is_none_or(|_state| all_agree)) // And either all agree or there's no state
             .then(|| (
-                response.request.client_id.expect("read result missing client_id"),
+                response
+                    .request
+                    .client_id
+                    .expect("read result missing client_id"),
                 (response.request.id, response.state.clone())
             ))))
             .merge_unordered(unblocked_reads)
@@ -560,14 +575,18 @@ where
                 && response.request.state.is_some() // And this is a write (not election)
                 && response.request.client_id.is_some()) // And this is not a reconciling write
             .then(|| (
-                response.request.client_id.expect("write success missing client_id"),
+                response
+                    .request
+                    .client_id
+                    .expect("write success missing client_id"),
                 response.request.id,
                 response.state.clone().expect("write success missing state")
             ))));
         let write_processed = write_success
             .clone()
             .map(q!(|(client_id, request_id, _state)| (
-                client_id, (request_id, true)
+                client_id,
+                (request_id, true)
             )))
             .merge_unordered(invalid_writes)
             .demux(sender, TCP.fail_stop().bincode())
