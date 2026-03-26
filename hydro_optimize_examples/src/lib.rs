@@ -15,8 +15,10 @@ use std::time::Duration;
 
 /// Note: Must remain synchronized with definitions in hydro_optimize/deploy_and_analyze.
 /// Redefined here because we don't want to import hydro_optimize as a dependency.
-pub(crate) const LATENCY_PREFIX: &str = "HYDRO_OPTIMIZE_LAT:";
-pub(crate) const THROUGHPUT_PREFIX: &str = "HYDRO_OPTIMIZE_THR:";
+// pub(crate) const LATENCY_PREFIX: &str = "HYDRO_OPTIMIZE_LAT:";
+// pub(crate) const THROUGHPUT_PREFIX: &str = "HYDRO_OPTIMIZE_THR:";
+pub(crate) const LATENCY_PREFIX: &str = "Latency:";
+pub(crate) const THROUGHPUT_PREFIX: &str = "Throughput:";
 
 pub fn print_parseable_bench_results<'a, Aggregator>(
     aggregate_results: BenchResult<Process<'a, Aggregator>>,

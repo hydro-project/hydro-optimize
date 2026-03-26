@@ -192,6 +192,7 @@ fn reduce_pushdown_analysis_node(
         | HydroNode::Enumerate { .. }
         | HydroNode::ResolveFutures { .. }
         | HydroNode::ResolveFuturesOrdered { .. }
+        | HydroNode::ResolveFuturesBlocking { .. }
         | HydroNode::Fold { .. }
         | HydroNode::FoldKeyed { .. }
         | HydroNode::Scan { .. }

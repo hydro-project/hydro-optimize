@@ -112,7 +112,7 @@ where
 
     let lock_state = lock_id_acquires
         .clone()
-        .interleave(lock_id_releases)
+        .merge_unordered(lock_id_releases)
         .assume_ordering(nondet!(/** Process in arrival order */))
         .fold(
             q!(|| None),

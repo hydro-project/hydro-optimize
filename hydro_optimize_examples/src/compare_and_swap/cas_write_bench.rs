@@ -1,46 +1,32 @@
 use hydro_lang::{
-    live_collections::stream::NoOrder,
+    live_collections::{sliced::sliced, stream::NoOrder},
     location::{Location, cluster::CLUSTER_SELF_ID},
     nondet::nondet,
-    prelude::{Bounded, Cluster, KeyedStream, Process, Singleton, Unbounded},
+    prelude::{Cluster, KeyedStream, Process, Unbounded},
 };
-use hydro_std::bench_client::{aggregate_bench_results, bench_client, compute_throughput_latency};
-use rand::random;
+use hydro_std::{
+    bench_client::{aggregate_bench_results, bench_client, compute_throughput_latency},
+    membership::track_membership,
+};
 use serde::{Deserialize, Serialize};
 use stageleft::q;
 
 use crate::{
     compare_and_swap::{
-        cas_distributed::{DistributedCAS, Replica, Uuid},
-        cas_like::{CASLike, CASState},
+        cas_distributed::{DistributedCAS, Replica},
+        cas_like::{CASLike, CASState, UniqueRequestId},
     },
     print_parseable_bench_results,
 };
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct Client;
 pub struct Aggregator;
-
-#[derive(Copy, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-struct UniqueRequestId {
-    id: u64,
-    is_generated: bool,
-}
-
-impl Uuid for UniqueRequestId {
-    fn generate() -> Self {
-        Self {
-            id: random(),
-            is_generated: true,
-        }
-    }
-}
 
 pub fn cas_write_bench<'a>(
     replicas: &Cluster<'a, Replica>,
     f: usize,
     clients: &Cluster<'a, Client>,
-    num_clients_per_node: Singleton<usize, Cluster<'a, Client>, Bounded>,
     client_aggregator: &Process<'a, Aggregator>,
     retry_timeout: u64,
     interval_millis: u64,
@@ -54,10 +40,12 @@ pub fn cas_write_bench<'a>(
 
     let latencies = bench_client(
         clients,
-        num_clients_per_node.clone(),
+        clients.singleton(q!(1usize)),
         write_workload_generator,
         |input| {
-            let payloads = input.values().into_keyed();
+            let payloads = input
+                .values()
+                .into_keyed();
 
             let cas_output = cas.build(
                 payloads,
@@ -69,11 +57,7 @@ pub fn cas_write_bench<'a>(
             // TODO: Only consider goodput? Mark writes rejected differently?
             cas_output
                 .write_processed
-                .cross_singleton(num_clients_per_node)
-                .map(q!(|(request_id, num_virtual_clients)| (
-                    (request_id.id % num_virtual_clients as u64) as u32,
-                    request_id.id
-                )))
+                .map(q!(|request_id| (0, request_id.id)))
                 .into_keyed()
         },
     )
@@ -100,23 +84,38 @@ pub fn cas_write_bench<'a>(
 fn write_workload_generator<'a, Client: 'a>(
     ids_and_prev_payloads: KeyedStream<u32, Option<u64>, Cluster<'a, Client>, Unbounded, NoOrder>,
 ) -> KeyedStream<u32, (UniqueRequestId, CASState<u64>), Cluster<'a, Client>, Unbounded, NoOrder> {
-    ids_and_prev_payloads.map(q!(move |payload| {
-        let id = CLUSTER_SELF_ID.get_raw_id() as u64;
-        let request_id = if let Some(counter) = payload {
-            counter + id
-        } else {
-            id
-        };
-        (
-            UniqueRequestId {
-                id: request_id,
-                is_generated: false,
-            },
-            CASState {
-                version: 0,
-                writer: 0, // Spoof all writes to use the same writer so ordering doesn't reduce goodput
-                state: request_id,
-            },
-        )
-    }))
+    let clients = ids_and_prev_payloads.location();
+    let members = track_membership(clients.source_cluster_members(clients));
+
+    let nondet_members = nondet!(/** Client membership does not change */);
+    sliced! {
+        let members = use(members, nondet_members);
+        let ids_and_prev_payloads = use(ids_and_prev_payloads, nondet_members);
+
+        let num_members = members
+            .entries()
+            .filter_map(q!(|(member, is_active)| is_active.then_some(member)))
+            .count();
+        ids_and_prev_payloads
+            .cross_singleton(num_members)
+            .map(q!(move |(payload, num_members)| {
+                let request_id = if let Some(count) = payload {
+                    count + num_members as u64
+                }
+                else {
+                    CLUSTER_SELF_ID.clone().get_raw_id() as u64
+                };
+                (
+                    UniqueRequestId {
+                        id: request_id,
+                        is_generated: false,
+                    },
+                    CASState {
+                        version: 0,
+                        writer: 0, // Spoof all writes to use the same writer so ordering doesn't reduce goodput
+                        state: request_id,
+                    },
+                )
+            }))
+    }
 }

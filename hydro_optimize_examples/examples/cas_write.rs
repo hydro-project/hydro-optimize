@@ -9,8 +9,6 @@ use hydro_optimize::deploy_and_analyze::{
 };
 use hydro_optimize_examples::compare_and_swap::cas_write_bench::cas_write_bench;
 
-use stageleft::q;
-
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, group(
     clap::ArgGroup::new("cloud")
@@ -50,7 +48,6 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
         &replicas,
         f,
         &clients,
-        clients.singleton(q!(1usize)),
         &client_aggregator,
         retry_timeout,
         print_result_frequency,

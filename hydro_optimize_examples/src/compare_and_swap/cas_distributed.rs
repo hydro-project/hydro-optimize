@@ -9,14 +9,11 @@ use hydro_lang::{
     nondet::nondet,
     prelude::{Bounded, Cluster, KeyedStream, Optional, Singleton, Stream, TCP, Tick, Unbounded},
 };
-use hydro_std::membership::track_membership;
 use serde::{Deserialize, Serialize};
 use stageleft::q;
-use std::{hash::Hash, time::Duration};
+use std::{fmt::Debug, hash::Hash, time::Duration};
 
-use crate::compare_and_swap::cas_like::CASOutput;
-
-use super::cas_like::{CASLike, CASState};
+use super::cas_like::{CASLike, CASOutput, CASState, UniqueRequestId};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct Replica {}
@@ -30,9 +27,9 @@ pub struct DistributedCAS<'a, 'b> {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-struct Ballot {
-    num: u64,
-    node: MemberId<Replica>,
+pub struct Ballot {
+    pub num: u64,
+    pub node: MemberId<Replica>,
 }
 
 impl PartialOrd for Ballot {
@@ -53,20 +50,20 @@ impl Ord for Ballot {
 /// No `ballot`: Read request
 /// No `state`: Read and election request
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct Request<State, RequestId, Sender> {
-    id: RequestId,
-    client_id: Option<MemberId<Sender>>,
-    ballot: Option<Ballot>,
-    state: Option<CASState<State>>,
+pub struct Request<State, Sender> {
+    pub id: UniqueRequestId,
+    pub client_id: Option<MemberId<Sender>>,
+    pub ballot: Option<Ballot>,
+    pub state: Option<CASState<State>>,
 }
 
-impl<State: Eq, RequestId: Eq, Sender: Eq> PartialOrd for Request<State, RequestId, Sender> {
+impl<State: Eq, Sender: Eq> PartialOrd for Request<State, Sender> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<State: Eq, RequestId: Eq, Sender: Eq> Ord for Request<State, RequestId, Sender> {
+impl<State: Eq, Sender: Eq> Ord for Request<State, Sender> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.ballot
             .cmp(&other.ballot)
@@ -79,16 +76,10 @@ impl<State: Eq, RequestId: Eq, Sender: Eq> Ord for Request<State, RequestId, Sen
 
 /// - `max_ballot`: The max ballot seen by the respondent, which the leader can use to determine if it has been preempted.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct Response<State, RequestId, Sender> {
-    request: Request<State, RequestId, Sender>,
-    max_ballot: Ballot,
-    state: Option<CASState<State>>,
-}
-
-/// A type that we can call `generate` on to get a new unique ID.
-/// We will need to generate unique IDs to commit uncommitted writes (and count the number of votes in the response).
-pub trait Uuid {
-    fn generate() -> Self;
+pub struct Response<State, Sender> {
+    pub request: Request<State, Sender>,
+    pub max_ballot: Ballot,
+    pub state: Option<CASState<State>>,
 }
 
 impl<'a, 'b> DistributedCAS<'a, 'b> {
@@ -119,87 +110,85 @@ impl<'a, 'b> DistributedCAS<'a, 'b> {
     /// Send the message over the network to all other replicas, but just pass the message onwards for ourselves.
     fn smart_broadcast<Payload>(
         &self,
-        stream: Stream<Payload, Cluster<'a, Replica>, Unbounded, impl Ordering>,
+        stream: Stream<Payload, Cluster<'a, Replica>, Unbounded, NoOrder>,
     ) -> KeyedStream<MemberId<Replica>, Payload, Cluster<'a, Replica>, Unbounded, NoOrder>
     where
         Payload: Clone + Serialize + for<'de> Deserialize<'de> + 'a,
     {
-        let members = self.cluster.source_cluster_members(self.cluster);
-        let curr_replicas = track_membership(members);
-
         let nondet_membership = nondet!(/** Membership is static */);
-        let stream_with_dest = sliced! {
-            let stream = use(stream.clone(), nondet_membership);
-            let curr_replicas = use(curr_replicas, nondet_membership);
-
-            curr_replicas
-                .into_keyed_stream()
-                .entries()
-                .filter_map(q!(move |(member_id, present)| (present && member_id != CLUSTER_SELF_ID).then_some(member_id)))
-                .cross_product(stream)
-        };
-        let sent_stream = stream_with_dest.demux(self.cluster, TCP.fail_stop().bincode());
-
-        // Add a stream to ourselves but not over the network
-        let stream_to_self = stream
-            .map(q!(move |payload| (CLUSTER_SELF_ID.clone(), payload)))
-            .into_keyed();
-        sent_stream.merge_unordered(stream_to_self)
+        stream.broadcast(self.cluster, TCP.fail_stop().bincode(), nondet_membership)
+        // TODO: Revert once I figure out how to send to self without creating a negative cycle
+        // let members = self.cluster.source_cluster_members(self.cluster);
+        // let curr_replicas = track_membership(members);
+        //
+        // let stream_with_dest = sliced! {
+        //     let stream = use(stream.clone(), nondet_membership);
+        //     let curr_replicas = use(curr_replicas, nondet_membership);
+        //
+        //     curr_replicas
+        //         .into_keyed_stream()
+        //         .entries()
+        //         .filter_map(q!(move |(member_id, present)| (present && member_id != CLUSTER_SELF_ID).then_some(member_id)))
+        //         .cross_product(stream)
+        // };
+        // let sent_stream = stream_with_dest.demux(self.cluster, TCP.fail_stop().bincode());
+        //
+        // // Add a stream to ourselves but not over the network
+        // let stream_to_self = stream
+        //     .map(q!(move |payload| (CLUSTER_SELF_ID.clone(), payload)))
+        //     .into_keyed();
+        // sent_stream.merge_unordered(stream_to_self)
     }
 
     /// Similar to `smart_broadcast`, but for sending to a single destination.
     fn smart_demux<Payload>(
         &self,
-        stream: Stream<
-            (MemberId<Replica>, Payload),
-            Cluster<'a, Replica>,
-            Unbounded,
-            impl Ordering,
-        >,
+        stream: Stream<(MemberId<Replica>, Payload), Cluster<'a, Replica>, Unbounded, NoOrder>,
     ) -> KeyedStream<MemberId<Replica>, Payload, Cluster<'a, Replica>, Unbounded, NoOrder>
     where
         Payload: Clone + Serialize + for<'de> Deserialize<'de> + 'a,
     {
-        let (should_pass, should_demux) =
-            stream.partition(q!(
-                move |(member_id, _payload)| *member_id == CLUSTER_SELF_ID
-            ));
-        let demuxed = should_demux.demux(self.cluster, TCP.fail_stop().bincode());
-        should_pass.into_keyed().merge_unordered(demuxed)
+        stream.demux(self.cluster, TCP.fail_stop().bincode())
+        // TODO: Revert once I figure out how to send to self without creating a negative cycle
+        // let (should_pass, should_demux) =
+        //     stream.partition(q!(
+        //         move |(member_id, _payload)| *member_id == CLUSTER_SELF_ID
+        //     ));
+        // let demuxed = should_demux.demux(self.cluster, TCP.fail_stop().bincode());
+        // should_pass.into_keyed().merge_unordered(demuxed)
     }
 
     /// Returns the state associated with the respondent with the highest ballot, and whether all agree
     /// Returns only 1 response per request ID, on the tick the quorum is first reached.
     #[expect(clippy::type_complexity, reason = "Stream type")]
-    fn check_all_agree<State, RequestId, Sender>(
+    fn check_all_agree<State, Sender>(
         &self,
         responses: KeyedStream<
-            RequestId,
-            Response<State, RequestId, Sender>,
+            UniqueRequestId,
+            Response<State, Sender>,
             Cluster<'a, Replica>,
             Unbounded,
             NoOrder,
         >,
-    ) -> Stream<(Response<State, RequestId, Sender>, bool), Cluster<'a, Replica>, Unbounded, NoOrder>
+    ) -> Stream<(Response<State, Sender>, bool), Cluster<'a, Replica>, Unbounded, NoOrder>
     where
-        State: Clone + Eq,
-        RequestId: Clone + Eq + Hash,
-        Sender: Clone,
+        State: Clone + Debug + Eq,
+        Sender: Clone + Debug,
     {
         let f = self.f;
         sliced! {
             let responses = use(responses.entries(), nondet!(/** The order in which inputs are collected at the quorum affects what is outputted */));
-            let mut reached_quorum = use::state_null::<Stream<RequestId, Tick<_>, Bounded, NoOrder>>();
-            let mut prev_responses = use::state_null::<Stream<(RequestId, Response<State, RequestId, Sender>), Tick<_>, Bounded, NoOrder>>();
+            let mut reached_quorum = use::state_null::<Stream<UniqueRequestId, Tick<_>, Bounded, NoOrder>>();
+            let mut prev_responses = use::state_null::<Stream<(UniqueRequestId, Response<State, Sender>), Tick<_>, Bounded, NoOrder>>();
 
             let current_responses = prev_responses.clone().chain(responses).into_keyed();
             let count_per_key = current_responses.clone().value_counts();
 
             let (no_quorum, quorum) = count_per_key
                 .entries()
-                .partition(q!(move |(_request_id, count)| *count < f));
+                .partition(q!(move |(_request_id, count)| *count < f + 1));
             let (just_quorum, all_quorum) = quorum
-                .partition(q!(move |(_request_id, count)| *count < 2 * f));
+                .partition(q!(move |(_request_id, count)| *count < 2 * f + 1));
 
             let just_reached_quorum = current_responses
                 .clone()
@@ -241,28 +230,27 @@ impl<'a, 'b> DistributedCAS<'a, 'b> {
 /// 4. Return the max read value.
 ///
 /// # Assumptions:
-/// 1. No 2 operations share the same `RequestId`.
+/// 1. No 2 operations share the same `UniqueRequestId`.
 /// 2. Each client subscribes at most once. (Doesn't break correctness but will duplicate messages).
-impl<'a, 'b, State, RequestId, Sender> CASLike<'a, State, RequestId, Sender>
+impl<'a, 'b, State, Sender> CASLike<'a, State, Sender>
     for DistributedCAS<'a, 'b>
 where
-    State: Clone + Serialize + for<'de> Deserialize<'de> + Ord + 'a,
-    RequestId: Uuid + Copy + Clone + Serialize + for<'de> Deserialize<'de> + Eq + Hash + 'a,
-    Sender: Clone + Serialize + for<'de> Deserialize<'de> + Eq + Hash + 'a,
+    State: Clone + Debug + Serialize + for<'de> Deserialize<'de> + Ord + 'a,
+    Sender: Clone + Debug + Serialize + for<'de> Deserialize<'de> + Eq + Hash + 'a,
 {
     fn build(
         self,
         writes: KeyedStream<
-            RequestId,
+            UniqueRequestId,
             CASState<State>,
             Cluster<'a, Sender>,
             impl Boundedness,
             impl Ordering,
         >,
-        reads: Stream<RequestId, Cluster<'a, Sender>, impl Boundedness, impl Ordering>,
+        reads: Stream<UniqueRequestId, Cluster<'a, Sender>, impl Boundedness, impl Ordering>,
         subscribe: Stream<MemberId<Sender>, Cluster<'a, Sender>, impl Boundedness, impl Ordering>,
         sender: &Cluster<'a, Sender>,
-    ) -> CASOutput<'a, State, RequestId, Sender> {
+    ) -> CASOutput<'a, State, Sender> {
         // -------------------------------------------------------------
         // Route incoming messages.
         // Note that if subscribes are routed to a non-leader, it will not receive all writes.
@@ -280,7 +268,7 @@ where
         let (incoming_requests_complete, incoming_requests) =
             self.cluster.forward_ref::<KeyedStream<
                 MemberId<Replica>,
-                Request<State, RequestId, Sender>,
+                Request<State, Sender>,
                 Cluster<'a, Replica>,
                 Unbounded,
                 NoOrder,
@@ -289,7 +277,7 @@ where
 
         // Quorum responses. bool = whether all agree on the highest ballot value
         let (incoming_responses_complete, incoming_responses) = self.cluster.forward_ref::<Stream<
-            (Response<State, RequestId, Sender>, bool),
+            (Response<State, Sender>, bool),
             Cluster<'a, Replica>,
             Unbounded,
             NoOrder,
@@ -325,11 +313,11 @@ where
             })));
             let mut state = use::state_null::<Optional<CASState<State>, _, Bounded>>();
             // Last state where we know a majority of replicas agreed.
-            let mut committed_state = use::state_null::<Optional<(Ballot, CASState<State>), _, Bounded>>();
+            let mut committed_state = use::state_null::<Optional<(Ballot, Option<CASState<State>>), _, Bounded>>();
             // Writes blocking in reconcilation or election
-            let mut write_queue = use::state_null::<KeyedStream<RequestId, (MemberId<Sender>, CASState<State>), _, Bounded, NoOrder>>();
+            let mut write_queue = use::state_null::<KeyedStream<UniqueRequestId, (MemberId<Sender>, CASState<State>), _, Bounded, NoOrder>>();
             // Reads blocking on reconciliation
-            let mut blocked_reads = use::state_null::<KeyedStream<RequestId, Response<State, RequestId, Sender>, _, Bounded, NoOrder>>();
+            let mut blocked_reads = use::state_null::<KeyedStream<UniqueRequestId, Response<State, Sender>, _, Bounded, NoOrder>>();
 
             let request_ballots = incoming_requests.clone().values().filter_map(q!(|request| request.ballot));
             let max_ballot_no_default = request_ballots
@@ -350,7 +338,7 @@ where
             let (election_responses, write_responses) = election_or_write_responses
                 .partition(q!(|(response, _all_agree)| response.request.state.is_none()));
             let (write_successes, write_failures) = write_responses
-                .partition(q!(|(response, _all_agree)| response.request.ballot.clone().unwrap() == response.max_ballot));
+                .partition(q!(|(response, _all_agree)| response.request.ballot.clone().expect("write response missing ballot") == response.max_ballot));
 
             // 1. Reads responses
             // Unblock reads if we observe a committed state that is higher than the ballot they observed
@@ -363,7 +351,7 @@ where
                 .cross_singleton(committed_state.clone())
                 .filter_map(q!(|(response, (ballot, state))|
                     (ballot >= response.max_ballot)
-                        .then_some((response.request.client_id.unwrap(), (response.request.id, Some(state.clone()))))
+                        .then(|| (response.request.client_id.expect("read response missing client_id"), (response.request.id, state.clone())))
                 ));
             let new_blocked_reads = all_blocked_reads.filter_key_not_in(unblocked_reads.clone().keys());
 
@@ -375,10 +363,10 @@ where
                 .partition(q!(|(_response, all_agree)| *all_agree));
             // Propose reconciling write if some replicas disagree
             let proposed_reconciling_write = won_election_write_uncommitted
-                .map(q!(|(response, _all_agree)| (response.request.id, (None, response.state.unwrap()))));
+                .map(q!(|(response, _all_agree)| (response.request.id, (None, response.state.expect("uncommitted election response missing state")))));
             let new_committed_state = won_election_write_complete
                 .clone()
-                .map(q!(|(response, _all_agree)| (response.max_ballot, response.state.unwrap())))
+                .map(q!(|(response, _all_agree)| (response.max_ballot, response.state)))
                 .chain(committed_state.into_stream())
                 .max();
             // Propose a valid client write if the election is succesful and all agree
@@ -388,9 +376,14 @@ where
                 .cross_product(won_election_write_complete)
                 .filter_map(q!(|((request_id, (client_id, state)), (response, _all_agree))|
                     // Allow write if version is prev+1 or the writer is the same and the version hasn't changed
-                    response.state.is_none_or(|curr_state| curr_state.version + 1 == state.version ||
-                        (curr_state.writer == state.writer && curr_state.version == state.version))
-                        .then_some((request_id, (Some(client_id), state)))
+                    if response.state.is_none_or(|curr_state| curr_state.version + 1 == state.version ||
+                        (curr_state.writer == state.writer && curr_state.version == state.version)) {
+                        Some((request_id, (Some(client_id), state)))
+                    }
+                    else {
+                        println!("Rejecting invalid write: {:?}, state: {:?}", request_id, state);
+                        None
+                    }
                 ))
                 .assume_ordering::<TotalOrder>(nondet!(/** The order of input arrival determines which write we send first */))
                 .first();
@@ -400,7 +393,7 @@ where
                 .entries()
                 .cross_singleton(new_committed_state.clone())
                 .filter_map(q!(|((request_id, (client_id, state)), (_ballot, committed_state))|
-                    (committed_state.version > state.version).then_some((client_id, request_id))));
+                    committed_state.is_none_or(|committed| committed.version > state.version).then_some((client_id, request_id))));
             let invalid_write_ids = invalid_writes
                 .clone()
                 .into_keyed()
@@ -408,10 +401,12 @@ where
 
             // 3. Write responses
             let successful_write = write_successes
+                .clone()
                 .map(q!(|(response, _all_agree)| response.request.id));
 
             // Increment new ballot when:
-            // - Beginning election
+            // - Beginning election (no previous writes/reads)
+            // - Consecutive election (previous write completed)
             // - Retrying election
             let new_write_queue = write_queue
                 .clone()
@@ -427,7 +422,8 @@ where
                 .is_empty()
                 .and(new_blocked_reads.clone().entries().is_empty());
             let ready_for_new_election = had_no_writes_or_uncommitted_reads
-                .and(!will_have_no_writes_or_uncommitted_reads);
+                .and(!will_have_no_writes_or_uncommitted_reads.clone());
+            let ready_for_consecutive_election = !(write_successes.is_empty().or(will_have_no_writes_or_uncommitted_reads));
             let ready_to_retry_election = retry_election_count
                 .clone()
                 .into_stream()
@@ -470,7 +466,7 @@ where
                 .cross_singleton(write_ballot.clone());
             let election_requests = write_ballot
                 .clone()
-                .filter_if(ready_to_retry_election.or(ready_for_new_election))
+                .filter_if(ready_to_retry_election.or(ready_for_new_election).or(ready_for_consecutive_election))
                 .into_stream();
             let responses = incoming_requests
                 .cross_singleton(max_ballot)
@@ -497,7 +493,7 @@ where
                     state: None,
                 }))
                 .merge_unordered(election_requests.map(q!(|ballot| Request {
-                    id: RequestId::generate(),
+                    id: UniqueRequestId::generate(),
                     client_id: None,
                     ballot: Some(ballot),
                     state: None,
@@ -548,8 +544,8 @@ where
                 .ballot
                 .is_none() // If this is a read
                 && response.request.state.is_none_or(|_state| all_agree)) // And either all agree or there's no state
-            .then_some((
-                response.request.client_id.unwrap(),
+            .then(|| (
+                response.request.client_id.expect("read result missing client_id"),
                 (response.request.id, response.state.clone())
             ))))
             .merge_unordered(unblocked_reads)
@@ -564,10 +560,10 @@ where
                 .is_some_and(|ballot| ballot == response.max_ballot) // If we weren't preempted
                 && response.request.state.is_some() // And this is a write (not election)
                 && response.request.client_id.is_some()) // And this is not a reconciling write
-            .then_some((
-                response.request.client_id.unwrap(),
+            .then(|| (
+                response.request.client_id.expect("write success missing client_id"),
                 response.request.id,
-                response.state.clone().unwrap()
+                response.state.clone().expect("write success missing state")
             ))));
         let write_processed = write_success
             .clone()

@@ -5,9 +5,7 @@ use hydro_lang::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::hash::Hash;
 
-use crate::compare_and_swap::cas_like::CASOutput;
-
-use super::cas_like::{CASLike, CASState};
+use super::cas_like::{CASLike, CASOutput, CASState, UniqueRequestId};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CASNode {}
@@ -16,24 +14,24 @@ pub struct CAS<'a, 'b> {
     pub process: &'b Process<'a, CASNode>,
 }
 
-impl<'a, 'b, State, RequestId, Sender> CASLike<'a, State, RequestId, Sender> for CAS<'a, 'b>
+impl<'a, 'b, State, Sender> CASLike<'a, State, Sender> for CAS<'a, 'b>
 where
     State: Clone + Serialize + for<'de> Deserialize<'de> + Ord + 'a,
-    RequestId: Clone + Serialize + for<'de> Deserialize<'de> + Eq + Hash + 'a,
+    Sender: Clone + Serialize + for<'de> Deserialize<'de> + Eq + Hash + 'a,
 {
     fn build(
         self,
         writes: KeyedStream<
-            RequestId,
+            UniqueRequestId,
             CASState<State>,
             Cluster<'a, Sender>,
             impl Boundedness,
             impl Ordering,
         >,
-        reads: Stream<RequestId, Cluster<'a, Sender>, impl Boundedness, impl Ordering>,
+        reads: Stream<UniqueRequestId, Cluster<'a, Sender>, impl Boundedness, impl Ordering>,
         subscribe: Stream<MemberId<Sender>, Cluster<'a, Sender>, impl Boundedness, impl Ordering>,
         sender: &Cluster<'a, Sender>,
-    ) -> CASOutput<'a, State, RequestId, Sender> {
+    ) -> CASOutput<'a, State, Sender> {
         let incoming_writes = writes.send(self.process, TCP.fail_stop().bincode());
         let incoming_reads = reads
             .send(self.process, TCP.fail_stop().bincode())

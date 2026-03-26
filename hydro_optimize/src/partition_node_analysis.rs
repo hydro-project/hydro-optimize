@@ -165,6 +165,7 @@ fn input_dependency_analysis_node(
         | HydroNode::Tee { .. }
         | HydroNode::ResolveFutures { .. }
         | HydroNode::ResolveFuturesOrdered { .. }
+        | HydroNode::ResolveFuturesBlocking { .. }
         | HydroNode::DeferTick { .. }
         | HydroNode::Unique { .. }
         | HydroNode::Sort { .. }
@@ -556,6 +557,7 @@ fn partitioning_constraint_analysis_node(
             | HydroNode::ChainFirst { .. }
             | HydroNode::ResolveFutures { .. }
             | HydroNode::ResolveFuturesOrdered { .. }
+            | HydroNode::ResolveFuturesBlocking { .. }
             | HydroNode::Map { .. }
             | HydroNode::FlatMap { .. }
             | HydroNode::Filter { .. }
