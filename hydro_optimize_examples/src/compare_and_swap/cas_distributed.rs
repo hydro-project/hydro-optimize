@@ -393,11 +393,10 @@ where
                 .entries()
                 .cross_singleton(new_committed_state.clone())
                 .filter_map(q!(|((request_id, (client_id, state)), (_ballot, committed_state))|
-                    committed_state.is_none_or(|committed| committed.version > state.version).then_some((client_id, request_id))));
+                    committed_state.is_none_or(|committed| committed.version > state.version).then_some((client_id, (request_id, false)))));
             let invalid_write_ids = invalid_writes
                 .clone()
-                .into_keyed()
-                .values();
+                .map(q!(|(_client_id, (request_id, _successful))| request_id));
 
             // 3. Write responses
             let successful_write = write_successes
@@ -568,11 +567,12 @@ where
         let write_processed = write_success
             .clone()
             .map(q!(|(client_id, request_id, _state)| (
-                client_id, request_id
+                client_id, (request_id, true)
             )))
-            .merge_unordered(invalid_writes) // TODO: Mark writes as failed?
+            .merge_unordered(invalid_writes)
             .demux(sender, TCP.fail_stop().bincode())
-            .values();
+            .values()
+            .into_keyed();
 
         // -------------------------------------------------------------
         // Broadcast successful writes to current subscribers.

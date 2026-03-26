@@ -18,11 +18,11 @@ pub struct CASState<State> {
 /// We assume that there is at most one outgoing request per ID at any time.
 ///
 /// # Fields
-/// - `write_processed`: ACK to each processed write. Processed != successfully updated
+/// - `write_processed`: ACK to each processed write, true if successful, false otherwise
 /// - `read_result`: Result of read request
 /// - `subscribe_updates`: Stream of state updates for subscribers
 pub struct CASOutput<'a, State, Sender> {
-    pub write_processed: Stream<UniqueRequestId, Cluster<'a, Sender>, Unbounded, NoOrder>,
+    pub write_processed: KeyedStream<UniqueRequestId, bool, Cluster<'a, Sender>, Unbounded, NoOrder>,
     pub read_result:
         KeyedStream<UniqueRequestId, Option<CASState<State>>, Cluster<'a, Sender>, Unbounded, NoOrder>,
     pub subscribe_updates: Stream<CASState<State>, Cluster<'a, Sender>, Unbounded, NoOrder>,
