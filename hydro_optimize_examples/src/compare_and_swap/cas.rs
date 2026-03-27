@@ -49,7 +49,7 @@ where
             let write_outputs = writes
                 .entries()
                 .assume_ordering::<TotalOrder>(nondet_state)
-                .across_ticks(|s| s.scan(q!(|| Option::<CASState<State>>::None),
+                .across_ticks(|s| s.scan(q!(|| Option::<CASState<_>>::None),
                     q!(|prev, ((client_id, request_id), write)| {
                         // Allow the same version if it's from the same writer
                         if let Some(prev_write) = prev
