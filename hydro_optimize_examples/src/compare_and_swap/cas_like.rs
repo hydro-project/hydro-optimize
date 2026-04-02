@@ -22,9 +22,15 @@ pub struct CASState<State> {
 /// - `read_result`: Result of read request
 /// - `subscribe_updates`: Stream of state updates for subscribers
 pub struct CASOutput<'a, State, Sender> {
-    pub write_processed: KeyedStream<UniqueRequestId, bool, Cluster<'a, Sender>, Unbounded, NoOrder>,
-    pub read_result:
-        KeyedStream<UniqueRequestId, Option<CASState<State>>, Cluster<'a, Sender>, Unbounded, NoOrder>,
+    pub write_processed:
+        KeyedStream<UniqueRequestId, bool, Cluster<'a, Sender>, Unbounded, NoOrder>,
+    pub read_result: KeyedStream<
+        UniqueRequestId,
+        Option<CASState<State>>,
+        Cluster<'a, Sender>,
+        Unbounded,
+        NoOrder,
+    >,
     pub subscribe_updates: Stream<CASState<State>, Cluster<'a, Sender>, Unbounded, NoOrder>,
 }
 
@@ -59,7 +65,6 @@ impl UniqueRequestId {
         }
     }
 }
-
 
 /// Stream-based versioned atomic-register interface.
 ///

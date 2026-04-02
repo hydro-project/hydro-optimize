@@ -43,9 +43,7 @@ pub fn cas_write_bench<'a>(
         clients.singleton(q!(1usize)),
         write_workload_generator,
         |input| {
-            let payloads = input
-                .values()
-                .into_keyed();
+            let payloads = input.values().into_keyed();
 
             let cas_output = cas.build(
                 payloads,
@@ -57,13 +55,18 @@ pub fn cas_write_bench<'a>(
             cas_output
                 .write_processed
                 .entries()
-                .map(q!(|(request_id, successful)| (0, (request_id.id, successful))))
+                .map(q!(|(request_id, successful)| (
+                    0,
+                    (request_id.id, successful)
+                )))
                 .into_keyed()
         },
     )
     .values()
     // NOTE: This only counts goodput
-    .filter_map(q!(|((_request_id, successful), latency)| successful.then_some(latency)));
+    .filter_map(q!(
+        |((_request_id, successful), latency)| successful.then_some(latency)
+    ));
 
     let bench_results = compute_throughput_latency(
         clients,
@@ -83,7 +86,13 @@ pub fn cas_write_bench<'a>(
 /// RequestId = UniqueRequestId
 /// The State in CASState<State> = u64
 fn write_workload_generator<'a, Client: 'a>(
-    ids_and_prev_payloads: KeyedStream<u32, Option<(u64, bool)>, Cluster<'a, Client>, Unbounded, NoOrder>,
+    ids_and_prev_payloads: KeyedStream<
+        u32,
+        Option<(u64, bool)>,
+        Cluster<'a, Client>,
+        Unbounded,
+        NoOrder,
+    >,
 ) -> KeyedStream<u32, (UniqueRequestId, CASState<u64>), Cluster<'a, Client>, Unbounded, NoOrder> {
     let clients = ids_and_prev_payloads.location();
     let members = track_membership(clients.source_cluster_members(clients));

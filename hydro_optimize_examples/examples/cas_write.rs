@@ -54,7 +54,7 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
     );
 
     let clusters = ReusableClusters::default()
-        .with_cluster(replicas, 2*f+1)
+        .with_cluster(replicas, 2 * f + 1)
         .with_cluster(clients, num_clients);
     let processes = ReusableProcesses::default().with_process(client_aggregator);
     let optimizations = Optimizations::default();
