@@ -324,7 +324,7 @@ mod tests {
             .weaken_ordering::<NoOrder>();
         input
             .clone()
-            .interleave(input)
+            .merge_unordered(input)
             .max()
             .sample_eager(nondet!(/** test */))
             .assume_ordering::<TotalOrder>(nondet!(/** test */))

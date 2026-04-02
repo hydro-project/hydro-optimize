@@ -76,11 +76,8 @@ pub fn lobsters<'a, Client>(
 where
     Client: Eq + Hash + Clone,
 {
-    let user_auth_tick = server.tick();
-    let stories_tick = server.tick();
-
     // Add users
-    let atomic_add_user = add_user.atomic(&user_auth_tick);
+    let atomic_add_user = add_user.atomic();
     let user_key_add_user = atomic_add_user
         .clone()
         .entries()

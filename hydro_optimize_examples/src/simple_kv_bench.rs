@@ -26,9 +26,8 @@ pub fn simple_kv_bench<'a>(
         num_clients_per_node,
         inc_i32_workload_generator,
         |input| {
-            let k_tick = kv.tick();
             // Use atomic to prevent outputting to the client before values are inserted to the KV store
-            let k_payloads = input.send(kv, TCP.fail_stop().bincode()).atomic(&k_tick);
+            let k_payloads = input.send(kv, TCP.fail_stop().bincode()).atomic();
 
             let for_each_tick = kv.tick();
             // Insert each payload into the KV store
