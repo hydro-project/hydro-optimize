@@ -92,6 +92,7 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
         | HydroNode::YieldConcat { .. }
         | HydroNode::ResolveFutures { .. }
         | HydroNode::ResolveFuturesOrdered { .. }
+        | HydroNode::ResolveFuturesBlocking { .. }
          => {}
     }
 }

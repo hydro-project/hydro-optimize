@@ -1,6 +1,7 @@
 #[cfg(stageleft_runtime)]
 hydro_lang::setup!();
 
+pub mod compare_and_swap;
 pub mod lock_server;
 pub mod network_calibrator;
 pub mod simple_kv_bench;
@@ -16,6 +17,8 @@ use std::time::Duration;
 /// Redefined here because we don't want to import hydro_optimize as a dependency.
 pub(crate) const LATENCY_PREFIX: &str = "HYDRO_OPTIMIZE_LAT:";
 pub(crate) const THROUGHPUT_PREFIX: &str = "HYDRO_OPTIMIZE_THR:";
+// pub(crate) const LATENCY_PREFIX: &str = "Latency:";
+// pub(crate) const THROUGHPUT_PREFIX: &str = "Throughput:";
 
 pub fn print_parseable_bench_results<'a, Aggregator>(
     aggregate_results: BenchResult<Process<'a, Aggregator>>,

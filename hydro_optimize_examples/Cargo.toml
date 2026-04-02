@@ -12,6 +12,7 @@ hdrhistogram = "7.5.4"
 hydro_lang.workspace = true
 hydro_std.workspace = true
 hydro_test.workspace = true
+rand = "0.10.0"
 serde.workspace = true
 sha2 = "0.10.9"
 stageleft.workspace = true

@@ -366,6 +366,7 @@ fn inject_count_node(
         | HydroNode::YieldConcat { inner: input, metadata }
         | HydroNode::ResolveFutures { input, metadata }
         | HydroNode::ResolveFuturesOrdered { input, metadata }
+        | HydroNode::ResolveFuturesBlocking { input, metadata }
         => {
             metadata.cardinality = input.metadata().cardinality;
         }

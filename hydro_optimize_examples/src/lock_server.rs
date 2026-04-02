@@ -3,7 +3,6 @@ use hydro_lang::{
         sliced::sliced,
         stream::{NoOrder, TotalOrder},
     },
-    location::Location,
     nondet::nondet,
     prelude::{KeyedStream, Process, Stream, Unbounded},
 };
@@ -22,7 +21,6 @@ pub struct Server {}
 ///
 #[expect(clippy::type_complexity, reason = "internal Lock Server code // TODO")]
 pub fn lock_server<'a, Client>(
-    server: &Process<'a, Server>,
     acquires: KeyedStream<Client, u32, Process<'a, Server>, Unbounded, NoOrder>,
     releases: KeyedStream<Client, u32, Process<'a, Server>, Unbounded, NoOrder>,
 ) -> (
@@ -32,13 +30,12 @@ pub fn lock_server<'a, Client>(
 where
     Client: Eq + Hash + Clone,
 {
-    let server_tick = server.tick();
     let mapped_acquires = acquires
         .clone()
         .entries()
         .map(q!(|(client, lock_id)| (lock_id, client)))
         .into_keyed();
-    let atomic_releases = releases.atomic(&server_tick);
+    let atomic_releases = releases.atomic();
     let mapped_releases = atomic_releases.clone().values();
 
     let acquire_results = sliced! {
@@ -87,7 +84,6 @@ where
 /// This version iterates through each request in order, as one might on a single-threaded server.
 #[expect(clippy::type_complexity, reason = "internal Lock Server code // TODO")]
 pub fn assume_order_lock_server<'a, Client>(
-    server: &Process<'a, Server>,
     acquires: KeyedStream<Client, u32, Process<'a, Server>, Unbounded, NoOrder>,
     releases: KeyedStream<Client, u32, Process<'a, Server>, Unbounded, NoOrder>,
 ) -> (
@@ -97,13 +93,12 @@ pub fn assume_order_lock_server<'a, Client>(
 where
     Client: Eq + Hash + Clone,
 {
-    let server_tick = server.tick();
-    let atomic_acquires = acquires.atomic(&server_tick);
+    let atomic_acquires = acquires.atomic();
     let lock_id_acquires = atomic_acquires
         .entries()
         .map(q!(|(client, lock_id)| (lock_id, (client, true))))
         .into_keyed();
-    let atomic_releases = releases.atomic(&server_tick);
+    let atomic_releases = releases.atomic();
     let lock_id_releases = atomic_releases
         .clone()
         .entries()
@@ -112,7 +107,7 @@ where
 
     let lock_state = lock_id_acquires
         .clone()
-        .interleave(lock_id_releases)
+        .merge_unordered(lock_id_releases)
         .assume_ordering(nondet!(/** Process in arrival order */))
         .fold(
             q!(|| None),
