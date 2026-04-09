@@ -74,33 +74,42 @@ pub fn q2<'a, PerformanceKey>(
     }))
 }
 
-pub fn q3<'a>(
-    auction_stream: Stream<Auction, Process<'a, Queries>, Unbounded>,
-    person_stream: Stream<Person, Process<'a, Queries>, Unbounded>,
-) -> Stream<(String, String, String, i64), Process<'a, Queries>, Unbounded, NoOrder> {
+pub fn q3<'a, PerformanceKey>(
+    auction_stream: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
+    person_stream: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
+) -> KeyedStream<
+    PerformanceKey,
+    (String, String, String, i64),
+    Process<'a, Queries>,
+    Unbounded,
+    NoOrder,
+> {
     /*
         Who is selling in OR, ID or CA in category 10, and for what auction ids?
         Illustrates an incremental join (using per-key state and timer) and filter.
     */
-    let cat10_auctions = auction_stream.filter_map(q!(|a| {
+    let cat10_auctions = auction_stream.entries().filter_map(q!(|(pk, a)| {
         if a.category == 10 {
-            Some((a.seller, a))
+            Some((a.seller, (a, pk)))
         } else {
             None
         }
     }));
-    let or_id_ca_persons = person_stream.filter_map(q!(|p| {
+    let or_id_ca_persons = person_stream.entries().filter_map(q!(|(pk, p)| {
         if p.state == "OR" || p.state == "CA" || p.state == "ID" {
-            Some((p.id, p))
+            Some((p.id, (p, pk)))
         } else {
             None
         }
     }));
 
-    or_id_ca_persons.join(cat10_auctions).map(q!(|p_a| {
-        let (p, a) = p_a.1;
-        (p.name, p.city, p.state, a.id)
-    }))
+    or_id_ca_persons
+        .join(cat10_auctions)
+        .map(q!(|p_a| {
+            let (p_pk, a_pk) = p_a.1;
+            (p_pk.1, (p_pk.0.name, p_pk.0.city, p_pk.0.state, a_pk.0.id))
+        }))
+        .into_keyed()
 }
 
 pub fn q11<'a, PerformanceKey: Ord + Clone>(
@@ -360,35 +369,46 @@ pub fn q19<'a, PerformanceKey: Ord + Clone>(
     sorted_price
 }
 
-pub fn q20<'a>(
-    bid_stream: Stream<Bid, Process<'a, Queries>, Unbounded>,
-    auction_stream: Stream<Auction, Process<'a, Queries>, Unbounded>,
-) -> Stream<(i64, i64, String, i64, i64, i64), Process<'a, Queries>, Unbounded, NoOrder> {
+pub fn q20<'a, PerformanceKey>(
+    auction_stream: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
+    bid_stream: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
+) -> KeyedStream<
+    PerformanceKey,
+    (i64, i64, String, i64, i64, i64),
+    Process<'a, Queries>,
+    Unbounded,
+    NoOrder,
+> {
     /*
         Get bids with the corresponding auction information where category is 10.
         Illustrates a filter join.
     */
-    let cat_10_auctions = auction_stream.filter_map(q!(|a| {
+    let cat_10_auctions = auction_stream.entries().filter_map(q!(|(pk, a)| {
         if a.category == 10 {
-            Some((a.id, a))
+            Some((a.id, (a, pk)))
         } else {
             None
         }
     }));
 
-    let formatted_bids = bid_stream.map(q!(|b| (b.auction, b)));
+    let formatted_bids = bid_stream.entries().map(q!(|(pk, b)| (b.auction, (b, pk))));
     let join = cat_10_auctions.join(formatted_bids);
-    let select = join.map(q!(|elem| {
-        let (a, b) = elem.1;
-        (
-            b.auction,
-            b.date_time,
-            a.item_name,
-            a.date_time,
-            a.seller,
-            a.category,
-        )
-    }));
+    let select = join
+        .map(q!(|elem| {
+            let ((a, pk1), (b, _)) = elem.1;
+            (
+                pk1,
+                (
+                    b.auction,
+                    b.date_time,
+                    a.item_name,
+                    a.date_time,
+                    a.seller,
+                    a.category,
+                ),
+            )
+        }))
+        .into_keyed();
 
     select
 }
@@ -420,23 +440,26 @@ pub fn q22<'a, PerformanceKey>(
     }))
 }
 
-pub fn q23<'a>(
-    auction_stream: Stream<Auction, Process<'a, Queries>, Unbounded>,
-    bid_stream: Stream<Bid, Process<'a, Queries>, Unbounded>,
-    person_stream: Stream<Person, Process<'a, Queries>, Unbounded>,
-) -> Stream<(Auction, Bid, Person), Process<'a, Queries>, Unbounded, NoOrder> {
+pub fn q23<'a, PerformanceKey>(
+    auction_stream: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
+    bid_stream: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
+    person_stream: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
+) -> KeyedStream<PerformanceKey, (Auction, Bid, Person), Process<'a, Queries>, Unbounded, NoOrder> {
     /*
         Find all bids made by a person who has also listed an item for auction
         Illustrates a multi-way join.
     */
-    let prepared_persons = person_stream.map(q!(|p| (p.id, p)));
-    let prepared_bidders = bid_stream.map(q!(|b| (b.bidder, b)));
-    let prepared_auctions = auction_stream.map(q!(|a| (a.seller, a)));
+    let prepared_persons = person_stream.entries().map(q!(|(pk, p)| (p.id, (p, pk))));
+    let prepared_bidders = bid_stream.entries().map(q!(|(pk, b)| (b.bidder, (b, pk))));
+    let prepared_auctions = auction_stream
+        .entries()
+        .map(q!(|(pk, a)| (a.seller, (a, pk))));
 
-    let joined_persons_bidders = prepared_persons
-        .join(prepared_bidders)
-        .map(q!(|(_, (p, b))| (b.bidder, (p, b))));
+    let joined_persons_bidders =
+        prepared_persons
+            .join(prepared_bidders)
+            .map(q!(|(_, ((p, pk), (b, _)))| (b.bidder, (p, b, pk))));
     let join = joined_persons_bidders.join(prepared_auctions);
-    let select = join.map(q!(|(_, ((p, b), a))| (a, b, p)));
-    select
+    let select = join.map(q!(|(_, ((p, b, pk), (a, _)))| (pk, (a, b, p))));
+    select.into_keyed()
 }

@@ -3,9 +3,10 @@ use hydro_optimize::deploy_and_analyze::{
     BenchmarkArgs, BenchmarkConfig, Optimizations, ReusableClusters, ReusableProcesses,
     benchmark_protocol,
 };
-use hydro_optimize_examples::flink_queries::flink_queries::{Bid, Queries, q1};
-use hydro_optimize_examples::flink_queries::flink_queries_bench::{
-    Client, bid_workload_generator, queries_bench,
+use hydro_optimize_examples::flink_queries::{
+    flink_queries::{Bid, Queries, q1},
+    flink_queries_bench::{Client, queries_bench_single},
+    flink_workload_generators::bid_workload_generator,
 };
 use stageleft::q;
 use std::collections::HashMap;
@@ -25,7 +26,7 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
     let client_id = clients.id();
 
     // Output Type depends on which query you're running
-    queries_bench::<Bid>(
+    queries_bench_single::<Bid, Bid>(
         &query_sys,
         &clients,
         clients.singleton(q!(1usize)),
