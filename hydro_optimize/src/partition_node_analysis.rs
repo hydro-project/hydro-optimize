@@ -332,6 +332,7 @@ fn input_dependency_analysis_node(
         | HydroNode::Fold { .. }
         | HydroNode::Scan { .. }
         | HydroNode::FlatMap { .. }
+        | HydroNode::FlatMapStreamBlocking { .. }
         | HydroNode::Source { .. }
         | HydroNode::SingletonSource { .. } => {
             input_dependencies_entry.clear();
@@ -560,6 +561,7 @@ fn partitioning_constraint_analysis_node(
             | HydroNode::ResolveFuturesBlocking { .. }
             | HydroNode::Map { .. }
             | HydroNode::FlatMap { .. }
+            | HydroNode::FlatMapStreamBlocking { .. }
             | HydroNode::Filter { .. }
             | HydroNode::FilterMap { .. }
             | HydroNode::DeferTick { .. }
