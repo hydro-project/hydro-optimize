@@ -328,6 +328,7 @@ fn inject_count_node(
         | HydroNode::Difference { metadata, .. }
         | HydroNode::AntiJoin { metadata, .. }
         | HydroNode::FlatMap { metadata, .. }
+        | HydroNode::FlatMapStreamBlocking { metadata, .. }
         | HydroNode::Filter { metadata, .. }
         | HydroNode::FilterMap { metadata, .. }
         | HydroNode::Unique { metadata, .. }

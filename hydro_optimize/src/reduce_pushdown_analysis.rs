@@ -185,6 +185,7 @@ fn reduce_pushdown_analysis_node(
         | HydroNode::YieldConcat { .. }
         | HydroNode::Map { .. } // Type changes, reduce not defined over the parent type
         | HydroNode::FlatMap { .. }
+        | HydroNode::FlatMapStreamBlocking { .. }
         | HydroNode::FilterMap { .. }
         | HydroNode::CrossSingleton { .. }
         | HydroNode::CrossProduct { .. }

@@ -48,6 +48,7 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
         | HydroNode::Difference { metadata, .. }
         | HydroNode::AntiJoin { metadata, .. }
         | HydroNode::FlatMap { metadata, .. }
+        | HydroNode::FlatMapStreamBlocking { metadata, .. }
         | HydroNode::Filter { metadata, .. }
         | HydroNode::FilterMap { metadata, .. }
         | HydroNode::Unique { metadata, .. }
