@@ -19,8 +19,8 @@ use crate::rewrites::{collection_kind_to_debug_type, prepend_member_id_to_collec
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PartialPartitioner {
-    pub nodes_to_partition: HashMap<usize, StructOrTupleIndex>,
-    pub nodes_to_replicate: HashSet<usize>,
+    pub nodes_to_partition: HashMap<usize, StructOrTupleIndex>, /* ID of node right before a Network -> what to partition on */
+    pub nodes_to_replicate: HashSet<usize>, /* ID of Network */
     pub num_partitions: usize,
     pub location_id: LocationKey,
     pub new_cluster_id: Option<LocationKey>,
@@ -35,6 +35,8 @@ struct PartialPartitionState {
     coordinator_tick: LocationId,
     /// The cluster location (partitions).
     cluster_location: LocationId,
+    /// Tick within the partition cluster.
+    partition_tick: LocationId,
     /// Number of partitions.
     num_partitions: usize,
 
@@ -44,19 +46,27 @@ struct PartialPartitionState {
     /// Singleton<usize> = max_assigned_clock.
     max_assigned_clock_tee: Option<Rc<RefCell<HydroNode>>>,
 
+    // ── Partition state tees (within partition tick) ──
+    /// Singleton<(bool, usize)> = (is_idle, logical_clock) on partitions.
+    p_state_tee: Option<Rc<RefCell<HydroNode>>>,
+    /// CycleId for partition state feedback.
+    p_state_cycle: CycleId,
+    /// CycleId for partition prepare signal (fed by replicated input arrivals).
+    p_prepare_signal_cycle: Option<CycleId>,
+
     // ── Broadcasts (at cluster location, unbounded) ──
     /// Commit broadcast: Stream<usize> (committed clock) at cluster_location.
     commit_at_partitions_shared: Option<Rc<RefCell<HydroNode>>>,
     /// Prepare clock: Optional<usize> at coordinator_location (unbounded).
     /// Each replicated input tees this to gate its own (clock, T) broadcast.
     c_prepare_clock_tee: Option<Rc<RefCell<HydroNode>>>,
+    /// Prepare clock keyed for Join: Optional<(usize, ())> within coordinator tick.
+    c_prepare_keyed_tee: Option<Rc<RefCell<HydroNode>>>,
 
     // ── Cycle IDs ──
     max_assigned_clock_cycle: CycleId,
     /// Ack cycle: all replicated inputs' ack networks feed into this.
     ack_cycle: CycleId,
-    /// Last max_assigned_clock update from replicated inputs.
-    last_max_assigned_clock_update: Option<HydroNode>,
 }
 
 fn metadata_at(
@@ -179,9 +189,28 @@ fn send_to_coordinator(
     *node = mapped;
 }
 
+/// Creates a DeferTick stream cycle chained with new values.
+/// CycleSource → DeferTick → Chain(deferred, new_values). Returns the Chain node.
+fn persisted_stream_with_initial(
+    cycle_id: CycleId,
+    new_values: HydroNode,
+    element_type: syn::Type,
+    tick_loc: &LocationId,
+    bt: &HydroIrMetadata,
+) -> HydroNode {
+    let kind = bounded_stream(element_type);
+    let source = HydroNode::CycleSource { cycle_id, metadata: metadata_at(tick_loc, kind.clone(), bt) };
+    let deferred = HydroNode::DeferTick { input: Box::new(source), metadata: metadata_at(tick_loc, kind.clone(), bt) };
+    HydroNode::Chain {
+        first: Box::new(deferred),
+        second: Box::new(new_values),
+        metadata: metadata_at(tick_loc, kind, bt),
+    }
+}
+
 /// Creates a DeferTick singleton cycle with a default initial value.
 /// Returns an `Rc<RefCell<HydroNode>>` suitable for Tee'ing.
-fn deferred_state(
+fn persisted_singleton_with_initial(
     cycle_id: CycleId,
     initial_value: syn::Expr,
     element_type: syn::Type,
@@ -202,6 +231,52 @@ fn deferred_state(
         metadata: metadata_at(tick_loc, kind, bt),
     };
     Rc::new(RefCell::new(this_tick))
+}
+
+/// Creates a (is_idle, logical_clock) state with DeferTick cycle.
+/// Returns (state_tee, cycle_id). The caller wires commit/prepare updates
+/// and pushes the CycleSink.
+fn build_state(
+    builder: &mut FlowBuilder,
+    tick_loc: &LocationId,
+    bt: &HydroIrMetadata,
+) -> (Rc<RefCell<HydroNode>>, CycleId) {
+    let state_type: syn::Type = syn::parse_quote! { (bool, usize) };
+    let cycle_id = builder.next_cycle_id();
+    let state_tee = persisted_singleton_with_initial(cycle_id, syn::parse_quote!((true, 0usize)), state_type, tick_loc, bt);
+    (state_tee, cycle_id)
+}
+
+/// Updates state in the following priority: prepare update → commit update → previous state.
+fn update_state(
+    pending_roots: &mut Vec<HydroRoot>,
+    state_tee: &Rc<RefCell<HydroNode>>,
+    cycle_id: CycleId,
+    commit_update: HydroNode,
+    prepare_update: HydroNode,
+    tick_loc: &LocationId,
+    bt: &HydroIrMetadata,
+) {
+    let state_type: syn::Type = syn::parse_quote! { (bool, usize) };
+    let prev = HydroNode::Tee {
+        inner: SharedNode(state_tee.clone()),
+        metadata: metadata_at(tick_loc, bounded_singleton(state_type.clone()), bt),
+    };
+    let prepare_or_commit = HydroNode::ChainFirst {
+        first: Box::new(prepare_update),
+        second: Box::new(commit_update),
+        metadata: metadata_at(tick_loc, bounded_optional(state_type.clone()), bt),
+    };
+    let updated = HydroNode::ChainFirst {
+        first: Box::new(prepare_or_commit),
+        second: Box::new(prev),
+        metadata: metadata_at(tick_loc, bounded_singleton(state_type), bt),
+    };
+    pending_roots.push(HydroRoot::CycleSink {
+        cycle_id,
+        input: Box::new(updated),
+        op_metadata: op_meta(bt),
+    });
 }
 
 /// Build the coordinator on a separate single-member Cluster.
@@ -227,22 +302,15 @@ fn build_coordinator(
     let num_partitions = state.num_partitions;
     let bt = backtrace_source;
 
-    let coordinator_state_cycle = builder.next_cycle_id();
-
     let usize_type: syn::Type = syn::parse_quote! { usize };
     let coord_state_type: syn::Type = syn::parse_quote! { (bool, usize) };
 
-    // State: Current status. (is_idle, logical clock)
-    let c_state_tee = deferred_state(
-        coordinator_state_cycle,
-        syn::parse_quote!((true, 0usize)),
-        coord_state_type.clone(),
-        coord_tick, bt,
-    );
+    // Coordinator state: (is_idle, logical_clock)
+    let (c_state_tee, coordinator_state_cycle) = build_state(builder, coord_tick, bt);
     state.coordinator_state_tee = Some(c_state_tee.clone());
 
     // State: Logical clock to assign to next message
-    let c_max_clock_tee = deferred_state(
+    let c_max_clock_tee = persisted_singleton_with_initial(
         state.max_assigned_clock_cycle,
         syn::parse_quote!(0usize),
         usize_type.clone(),
@@ -275,6 +343,18 @@ fn build_coordinator(
     };
     let c_prepare_clock_shared = Rc::new(RefCell::new(c_prepare_clock_optional));
     state.c_prepare_clock_tee = Some(c_prepare_clock_shared.clone());
+    // Prepare clock keyed for Join: (clock, ()) — shared across all replicated inputs
+    let c_prepare_keyed = HydroNode::Tee {
+        inner: SharedNode(c_prepare_clock_shared.clone()),
+        metadata: metadata_at(coord_tick, bounded_optional(usize_type.clone()), bt),
+    };
+    let c_prepare_keyed_type: syn::Type = syn::parse_quote! { (usize, ()) };
+    let c_prepare_keyed_mapped = HydroNode::Map {
+        f: { let e: syn::Expr = syn::parse_quote!(|clock: usize| (clock, ())); e.into() },
+        input: Box::new(c_prepare_keyed),
+        metadata: metadata_at(coord_tick, bounded_optional(c_prepare_keyed_type), bt),
+    };
+    state.c_prepare_keyed_tee = Some(Rc::new(RefCell::new(c_prepare_keyed_mapped)));
     // Change state from Idle to Prepared if a prepare is ready
     let c_prepare_for_state = HydroNode::Tee {
         inner: SharedNode(c_prepare_clock_shared.clone()),
@@ -343,25 +423,76 @@ fn build_coordinator(
         input: Box::new(c_commit_feedback_batched),
         metadata: metadata_at(coord_tick, bounded_optional(coord_state_type.clone()), bt),
     };
-    let c_prev_state = HydroNode::Tee {
-        inner: SharedNode(c_state_tee),
-        metadata: metadata_at(coord_tick, bounded_singleton(coord_state_type.clone()), bt),
+    update_state(
+        &mut state.pending_roots, &c_state_tee, coordinator_state_cycle,
+        c_state_after_commit, c_state_after_prepare, coord_tick, bt,
+    );
+}
+
+/// Build partition-side state: (is_idle, logical_clock).
+/// Commit update: filter matching clock from commit broadcast.
+/// Prepare update: cycle fed by replicated input arrivals.
+fn build_partition_state(
+    state: &mut PartialPartitionState,
+    builder: &mut FlowBuilder,
+    backtrace_source: &HydroIrMetadata,
+) {
+    let p_tick = &state.partition_tick.clone();
+    let cluster_loc = &state.cluster_location.clone();
+    let bt = backtrace_source;
+    let usize_type: syn::Type = syn::parse_quote! { usize };
+    let state_type: syn::Type = syn::parse_quote! { (bool, usize) };
+
+    let (p_state_tee, p_cycle) = build_state(builder, p_tick, bt);
+    state.p_state_tee = Some(p_state_tee.clone());
+    state.p_state_cycle = p_cycle;
+
+    // 1. Upon receiving a commit, change state if it is not stale
+    let p_commit_stream = HydroNode::Tee {
+        inner: SharedNode(state.commit_at_partitions_shared.as_ref().unwrap().clone()),
+        metadata: metadata_at(cluster_loc, unbounded_stream(usize_type.clone()), bt),
     };
-    let c_commit_or_prepare = HydroNode::ChainFirst {
-        first: Box::new(c_state_after_commit),
-        second: Box::new(c_state_after_prepare),
-        metadata: metadata_at(coord_tick, bounded_optional(coord_state_type.clone()), bt),
+    let p_commit_batched = HydroNode::Batch {
+        inner: Box::new(p_commit_stream),
+        metadata: metadata_at(p_tick, bounded_stream(usize_type.clone()), bt),
     };
-    let c_updated_state = HydroNode::ChainFirst {
-        first: Box::new(c_commit_or_prepare),
-        second: Box::new(c_prev_state),
-        metadata: metadata_at(coord_tick, bounded_singleton(coord_state_type), bt),
+    let p_state_for_commit = HydroNode::Tee {
+        inner: SharedNode(p_state_tee.clone()),
+        metadata: metadata_at(p_tick, bounded_singleton(state_type.clone()), bt),
     };
-    state.pending_roots.push(HydroRoot::CycleSink {
-        cycle_id: coordinator_state_cycle,
-        input: Box::new(c_updated_state),
-        op_metadata: op_meta(bt),
-    });
+    let commit_with_state_type: syn::Type = syn::parse_quote! { (usize, (bool, usize)) };
+    let p_commit_with_state = HydroNode::CrossSingleton {
+        left: Box::new(p_commit_batched),
+        right: Box::new(p_state_for_commit),
+        metadata: metadata_at(p_tick, bounded_stream(commit_with_state_type), bt),
+    };
+    let p_state_after_commit = HydroNode::FilterMap {
+        f: { let e: syn::Expr = syn::parse_quote!(
+            |(committed_clock, (_is_idle, logical_clock)): (usize, (bool, usize))|
+                if committed_clock == logical_clock { Some((true, logical_clock + 1)) } else { None }
+        ); e.into() },
+        input: Box::new(p_commit_with_state),
+        metadata: metadata_at(p_tick, bounded_optional(state_type.clone()), bt),
+    };
+
+    // Prepare update: cycle fed by replicated input arrivals
+    let p_prepare_cycle = builder.next_cycle_id();
+    let p_prepare_source = HydroNode::CycleSource {
+        cycle_id: p_prepare_cycle,
+        metadata: metadata_at(p_tick, bounded_stream(usize_type), bt),
+    };
+    let p_state_after_prepare = HydroNode::Map {
+        f: { let e: syn::Expr = syn::parse_quote!(|clock: usize| (false, clock)); e.into() },
+        input: Box::new(p_prepare_source),
+        metadata: metadata_at(p_tick, bounded_optional(state_type), bt),
+    };
+
+    update_state(
+        &mut state.pending_roots, &p_state_tee, p_cycle,
+        p_state_after_commit, p_state_after_prepare, p_tick, bt,
+    );
+
+    state.p_prepare_signal_cycle = Some(p_prepare_cycle);
 }
 
 /// Per replicated input:
@@ -386,23 +517,20 @@ fn handle_replicated_input(
 
     let value_buffer_cycle = builder.next_cycle_id();
 
-    // ── Network input from cluster → coordinator ──
+    // 1. Reroute from sender to coordinator
     let mut c_input = original_node;
-    send_to_coordinator(&mut c_input, cluster_loc, coord_loc);
+    send_to_coordinator(&mut c_input, &node_metadata.location_id, coord_loc);
 
-    // ── Batch into coordinator tick ──
+    // 2. Assign logical clock
     let c_batched_input = HydroNode::Batch {
         inner: Box::new(c_input),
         metadata: metadata_at(coord_tick, bounded_stream(element_type.clone()), bt),
     };
-
-    // ── Assign future clocks: enumerate + cross with max_assigned_clock ──
     let enumerated_type: syn::Type = syn::parse_quote! { (usize, #element_type) };
     let c_enumerated = HydroNode::Enumerate {
         input: Box::new(c_batched_input),
         metadata: metadata_at(coord_tick, bounded_stream(enumerated_type.clone()), bt),
     };
-
     let c_max_clock_for_assign = HydroNode::Tee {
         inner: SharedNode(state.max_assigned_clock_tee.as_ref().unwrap().clone()),
         metadata: metadata_at(coord_tick, bounded_singleton(syn::parse_quote!(usize)), bt),
@@ -413,7 +541,6 @@ fn handle_replicated_input(
         right: Box::new(c_max_clock_for_assign),
         metadata: metadata_at(coord_tick, bounded_stream(with_base_type), bt),
     };
-
     let clocked_type: syn::Type = syn::parse_quote! { (usize, #element_type) };
     let c_clocked_values = HydroNode::Map {
         f: { let e: syn::Expr = syn::parse_quote!(
@@ -422,90 +549,67 @@ fn handle_replicated_input(
         input: Box::new(c_enumerated_with_base),
         metadata: metadata_at(coord_tick, bounded_stream(clocked_type.clone()), bt),
     };
-
-    // ── Update max_assigned_clock ──
+    // ── Update max_assigned_clock: max(clock) + 1 from clocked values ──
     let c_clocked_shared = Rc::new(RefCell::new(c_clocked_values));
-
-    let c_clocked_for_count = HydroNode::Tee {
+    let c_clocked_for_max = HydroNode::Tee {
         inner: SharedNode(c_clocked_shared.clone()),
         metadata: metadata_at(coord_tick, bounded_stream(clocked_type.clone()), bt),
     };
-    let c_input_count = HydroNode::Fold {
-        init: { let e: syn::Expr = syn::parse_quote!(|| 0usize); e.into() },
-        acc: { let e: syn::Expr = syn::parse_quote!(|count: &mut usize, _: (usize, _)| { *count += 1; }); e.into() },
-        input: Box::new(c_clocked_for_count),
-        metadata: metadata_at(coord_tick, bounded_singleton(syn::parse_quote!(usize)), bt),
+    let c_new_max = HydroNode::Reduce {
+        f: { let e: syn::Expr = syn::parse_quote!(
+            |max: &mut usize, next: usize| { if next > *max { *max = next; } }
+        ); e.into() },
+        input: Box::new(HydroNode::Map {
+            f: { let e: syn::Expr = syn::parse_quote!(|(clock, _val): (usize, _)| clock + 1); e.into() },
+            input: Box::new(c_clocked_for_max),
+            metadata: metadata_at(coord_tick, bounded_stream(syn::parse_quote!(usize)), bt),
+        }),
+        metadata: metadata_at(coord_tick, bounded_optional(syn::parse_quote!(usize)), bt),
     };
-    let c_prev_max = HydroNode::Tee {
+    // Update the tee so the next replicated input starts from this new max.
+    // ChainFirst: use new max if this input had values, else keep previous max
+    let c_prev_max_fallback = HydroNode::Tee {
         inner: SharedNode(state.max_assigned_clock_tee.as_ref().unwrap().clone()),
         metadata: metadata_at(coord_tick, bounded_singleton(syn::parse_quote!(usize)), bt),
     };
-    let count_with_base_type: syn::Type = syn::parse_quote! { (usize, usize) };
-    let c_count_with_base = HydroNode::CrossSingleton {
-        left: Box::new(c_input_count),
-        right: Box::new(c_prev_max),
-        metadata: metadata_at(coord_tick, bounded_singleton(count_with_base_type), bt),
-    };
-    let c_new_max = HydroNode::Map {
-        f: { let e: syn::Expr = syn::parse_quote!(|(count, base)| base + count); e.into() },
-        input: Box::new(c_count_with_base),
+    let c_updated_max = HydroNode::ChainFirst {
+        first: Box::new(c_new_max),
+        second: Box::new(c_prev_max_fallback),
         metadata: metadata_at(coord_tick, bounded_singleton(syn::parse_quote!(usize)), bt),
     };
-    state.last_max_assigned_clock_update = Some(c_new_max);
+    let c_new_max_tee = Rc::new(RefCell::new(c_updated_max));
+    state.max_assigned_clock_tee = Some(c_new_max_tee);
 
-    // ── Buffer in DeferTick stream cycle ──
+    // 3. Buffer replicated values
     let c_clocked_for_buffer = HydroNode::Tee {
         inner: SharedNode(c_clocked_shared),
         metadata: metadata_at(coord_tick, bounded_stream(clocked_type.clone()), bt),
     };
-    let c_buffer_source = HydroNode::CycleSource {
-        cycle_id: value_buffer_cycle,
-        metadata: metadata_at(coord_tick, bounded_stream(clocked_type.clone()), bt),
-    };
-    let c_buffer_deferred = HydroNode::DeferTick {
-        input: Box::new(c_buffer_source),
-        metadata: metadata_at(coord_tick, bounded_stream(clocked_type.clone()), bt),
-    };
-    let c_all_buffered = HydroNode::Chain {
-        first: Box::new(c_buffer_deferred),
-        second: Box::new(c_clocked_for_buffer),
-        metadata: metadata_at(coord_tick, bounded_stream(clocked_type.clone()), bt),
-    };
-
-    // ── Release value when clock matches prepare_clock ──
-    let c_prepare_for_release = HydroNode::Tee {
-        inner: SharedNode(state.c_prepare_clock_tee.as_ref().unwrap().clone()),
-        metadata: metadata_at(coord_tick, bounded_optional(syn::parse_quote!(usize)), bt),
-    };
-    let c_prepare_for_release_tee = Rc::new(RefCell::new(c_prepare_for_release));
-
+    let c_all_buffered = persisted_stream_with_initial(
+        value_buffer_cycle, c_clocked_for_buffer, clocked_type.clone(), coord_tick, bt,
+    );
     let all_buffered_tee = Rc::new(RefCell::new(c_all_buffered));
 
-    // Release path: filter clock == prepare_clock
+    // 4. Release value when clock matches prepare_clock (Join on clock)
+    let c_prepare_keyed = HydroNode::Tee {
+        inner: SharedNode(state.c_prepare_keyed_tee.as_ref().unwrap().clone()),
+        metadata: metadata_at(coord_tick, bounded_optional(syn::parse_quote!((usize, ()))), bt),
+    };
     let c_buffered_for_release = HydroNode::Tee {
         inner: SharedNode(all_buffered_tee.clone()),
         metadata: metadata_at(coord_tick, bounded_stream(clocked_type.clone()), bt),
     };
-    let c_prepare_for_release = HydroNode::Tee {
-        inner: SharedNode(c_prepare_for_release_tee.clone()),
-        metadata: metadata_at(coord_tick, bounded_optional(syn::parse_quote!(usize)), bt),
-    };
-    let buffered_with_prepare_type: syn::Type = syn::parse_quote! { ((usize, #element_type), usize) };
-    let c_buffered_with_prepare = HydroNode::CrossSingleton {
+    let joined_type: syn::Type = syn::parse_quote! { (usize, (#element_type, ())) };
+    let c_joined = HydroNode::Join {
         left: Box::new(c_buffered_for_release),
-        right: Box::new(c_prepare_for_release),
-        metadata: metadata_at(coord_tick, bounded_stream(buffered_with_prepare_type.clone()), bt),
+        right: Box::new(c_prepare_keyed),
+        metadata: metadata_at(coord_tick, bounded_stream(joined_type), bt),
     };
-    let c_released = HydroNode::FilterMap {
-        f: { let e: syn::Expr = syn::parse_quote!(
-            |((clock, value), prepare_clock): ((usize, _), usize)|
-                if clock == prepare_clock { Some((clock, value)) } else { None }
-        ); e.into() },
-        input: Box::new(c_buffered_with_prepare),
+    let c_released = HydroNode::Map {
+        f: { let e: syn::Expr = syn::parse_quote!(|(clock, (value, ()))| (clock, value)); e.into() },
+        input: Box::new(c_joined),
         metadata: metadata_at(coord_tick, bounded_stream(clocked_type.clone()), bt),
     };
-
-    // YieldConcat + Network: broadcast (clock, T) to all partitions
     let c_released_unbounded = HydroNode::YieldConcat {
         inner: Box::new(c_released),
         metadata: metadata_at(coord_loc, unbounded_stream(clocked_type.clone()), bt),
@@ -513,20 +617,43 @@ fn handle_replicated_input(
     let mut c_prepare_broadcast = c_released_unbounded;
     broadcast_to_partitions(&mut c_prepare_broadcast, coord_loc, cluster_loc, state.num_partitions);
 
-    // Tee at partitions: one branch → extract T (output), one branch → ack clock back
+    // 5. Partitions receive the prepare and ACK
     let p_prepare_shared = Rc::new(RefCell::new(c_prepare_broadcast));
-
-    // Output: extract T from (clock, T)
+    let p_tick = &state.partition_tick.clone();
+    // Output: extract T from (clock, T) — batched into partition tick
     let p_value_tee = HydroNode::Tee {
         inner: SharedNode(p_prepare_shared.clone()),
         metadata: metadata_at(cluster_loc, unbounded_stream(clocked_type.clone()), bt),
     };
+    let p_value_batched = HydroNode::Batch {
+        inner: Box::new(p_value_tee),
+        metadata: metadata_at(p_tick, bounded_stream(clocked_type.clone()), bt),
+    };
     let p_output_value = HydroNode::Map {
         f: { let e: syn::Expr = syn::parse_quote!(|(_clock, value)| value); e.into() },
-        input: Box::new(p_value_tee),
-        metadata: metadata_at(cluster_loc, node_metadata.collection_kind.clone(), bt),
+        input: Box::new(p_value_batched),
+        metadata: metadata_at(p_tick, node_metadata.collection_kind.clone(), bt),
     };
-
+    *node = p_output_value;
+    // Feed prepare signal: extract clock, Reduce to single Optional<usize>
+    let p_prepare_signal_tee = HydroNode::Tee {
+        inner: SharedNode(p_prepare_shared.clone()),
+        metadata: metadata_at(cluster_loc, unbounded_stream(clocked_type.clone()), bt),
+    };
+    let p_prepare_clock = HydroNode::Map {
+        f: { let e: syn::Expr = syn::parse_quote!(|(clock, _value): (usize, _)| clock); e.into() },
+        input: Box::new(p_prepare_signal_tee),
+        metadata: metadata_at(cluster_loc, unbounded_stream(syn::parse_quote!(usize)), bt),
+    };
+    let p_prepare_clock_batched = HydroNode::Batch {
+        inner: Box::new(p_prepare_clock),
+        metadata: metadata_at(p_tick, bounded_stream(syn::parse_quote!(usize)), bt),
+    };
+    state.pending_roots.push(HydroRoot::CycleSink {
+        cycle_id: state.p_prepare_signal_cycle.unwrap(),
+        input: Box::new(p_prepare_clock_batched),
+        op_metadata: op_meta(bt),
+    });
     // Ack: extract clock, Network back to coordinator
     let p_ack_tee = HydroNode::Tee {
         inner: SharedNode(p_prepare_shared),
@@ -539,7 +666,6 @@ fn handle_replicated_input(
     };
     let mut p_ack_to_coordinator = p_ack_clock;
     send_to_coordinator(&mut p_ack_to_coordinator, cluster_loc, coord_loc);
-
     // Feed acks into the shared ack cycle
     state.pending_roots.push(HydroRoot::CycleSink {
         cycle_id: state.ack_cycle,
@@ -547,26 +673,18 @@ fn handle_replicated_input(
         op_metadata: op_meta(bt),
     });
 
-    // ── Re-buffer: keep values whose clock != prepare_clock ──
+    // 6. Coordinator keeps un-released values in the buffer
     let c_buffered_for_rebuffer = HydroNode::Tee {
         inner: SharedNode(all_buffered_tee),
         metadata: metadata_at(coord_tick, bounded_stream(syn::parse_quote!((usize, #element_type))), bt),
     };
     let c_prepare_for_rebuffer = HydroNode::Tee {
-        inner: SharedNode(c_prepare_for_release_tee),
+        inner: SharedNode(state.c_prepare_clock_tee.as_ref().unwrap().clone()),
         metadata: metadata_at(coord_tick, bounded_optional(syn::parse_quote!(usize)), bt),
     };
-    let c_rebuffer_with_prepare = HydroNode::CrossSingleton {
-        left: Box::new(c_buffered_for_rebuffer),
-        right: Box::new(c_prepare_for_rebuffer),
-        metadata: metadata_at(coord_tick, bounded_stream(buffered_with_prepare_type), bt),
-    };
-    let c_remaining_buffered = HydroNode::FilterMap {
-        f: { let e: syn::Expr = syn::parse_quote!(
-            |((clock, value), prepare_clock): ((usize, _), usize)|
-                if clock != prepare_clock { Some((clock, value)) } else { None }
-        ); e.into() },
-        input: Box::new(c_rebuffer_with_prepare),
+    let c_remaining_buffered = HydroNode::AntiJoin {
+        pos: Box::new(c_buffered_for_rebuffer),
+        neg: Box::new(c_prepare_for_rebuffer),
         metadata: metadata_at(coord_tick, bounded_stream(syn::parse_quote!((usize, #element_type))), bt),
     };
     state.pending_roots.push(HydroRoot::CycleSink {
@@ -575,82 +693,73 @@ fn handle_replicated_input(
         op_metadata: op_meta(bt),
     });
 
-    *node = p_output_value;
 }
 
-/// Per partitioned input: freeze during Prepare.
-/// Uses the coordinator state (is_idle) broadcast. Since the coordinator is a separate
-/// Process, we need to get the idle signal to the partitions. We derive it from the
-/// commit broadcast (commit → idle) and prepare broadcast absence (no prepare → stay idle).
+/// Per partitioned input: buffer during Prepare, passthrough when Idle.
 ///
-/// Simpler approach: use the commit_at_partitions_shared at the cluster. Between a prepare
-/// broadcast arriving and a commit broadcast arriving, the partition is in Prepare state.
-/// We track this with a Scan on the cluster side.
+/// 1. Chain(DeferTick buffer, new inputs) into one stream
+/// 2. CrossSingleton with partition state
+/// 3. Partition: is_idle → passthrough (output), !is_idle → DeferTick (back to buffer)
 fn handle_partitioned_input(
     node: &mut HydroNode,
-    state: &PartialPartitionState,
+    state: &mut PartialPartitionState,
+    builder: &mut FlowBuilder,
     _next_stmt_id: &mut usize,
 ) {
-    let node_metadata = node.metadata().clone();
-    let cluster_loc = &state.cluster_location;
+    let original_node = std::mem::replace(node, HydroNode::Placeholder);
+    let node_metadata = original_node.metadata().clone();
     let element_type: syn::Type = (*collection_kind_to_debug_type(&node_metadata.collection_kind).0).clone();
+    let p_tick = &state.partition_tick.clone();
     let bt = &node_metadata;
 
-    // Scan on commit broadcasts: track idle state.
-    // Commit → true (idle). Between commits, if a prepare arrived, we're not idle.
-    // But we don't have a prepare signal at the cluster level for partitioned inputs...
-    // Actually, the prepare broadcast (clock, T) arrives at the cluster for each replicated input.
-    // We can use the commit_at_partitions_shared: after commit, idle=true.
-    // The partition becomes non-idle when it receives a prepare (replicated input value).
-    // But partitioned inputs don't see the prepare directly.
-    //
-    // Simplest correct approach: the coordinator broadcasts its is_idle state to partitions.
-    // But that requires another network. Instead, we can observe that:
-    // - Partition is idle when no 2PC is in progress
-    // - 2PC starts when a prepare (replicated value) arrives at the partition
-    // - 2PC ends when a commit arrives
-    //
-    // Since the replicated input values arrive at the partition via Network from coordinator,
-    // and commits also arrive via Network, we can track state with a Scan:
-    // replicated_value_arrived → false, commit_arrived → true, default → true
-    //
-    // But handle_partitioned_input doesn't have access to the per-replicated-input broadcasts.
-    // The simplest approach: broadcast a "prepare started" signal from coordinator to cluster.
-    // We already have commit_at_partitions_shared. Let's also create a prepare_signal_broadcast_tee.
-    //
-    // Actually, even simpler: the partition just needs to know "is a 2PC in progress?"
-    // The commit broadcast tells it "2PC done". The prepare broadcast (replicated value)
-    // tells it "2PC started". Since we may have multiple replicated inputs, any of them
-    // arriving means 2PC started.
-    //
-    // For now, use a conservative approach: freeze partitioned inputs for one tick after
-    // any replicated value arrives, unfreeze on commit. This requires a Scan.
-    //
-    // TODO: This needs the prepare signal at the cluster. For now, we'll skip freezing
-    // and rely on the 2PC ordering guarantee (prepare arrives before commit).
-    // The partitioned inputs will be processed in the same tick as the replicated value,
-    // which is correct because the replicated value is already committed by the time
-    // it arrives at the partition.
+    // 1. Chain incoming messages with buffered messages
+    let p_input_batched = HydroNode::Batch {
+        inner: Box::new(original_node),
+        metadata: metadata_at(p_tick, bounded_stream(element_type.clone()), bt),
+    };
+    let buffer_cycle = builder.next_cycle_id();
+    let p_all = persisted_stream_with_initial(buffer_cycle, p_input_batched, element_type.clone(), p_tick, bt);
 
-    // Actually, rethinking: the replicated value only arrives at the partition AFTER
-    // the full 2PC completes (prepare → ack → commit → release). So by the time the
-    // partition sees the replicated value, it's already committed. The partitioned inputs
-    // don't need to be frozen because the replicated value is delivered atomically
-    // with the commit.
-    //
-    // Wait, no. The replicated value arrives at the partition as part of the prepare
-    // broadcast. The partition holds it until commit. But partitioned inputs could
-    // arrive and be processed before the commit, seeing stale replicated state.
-    //
-    // The correct approach: freeze partitioned inputs between prepare and commit.
-    // We need a signal at the cluster. Let's use the commit_at_partitions_shared and
-    // create a prepare_signal from the replicated input broadcasts.
+    // 2. Check current state
+    let p_state = HydroNode::Tee {
+        inner: SharedNode(state.p_state_tee.as_ref().unwrap().clone()),
+        metadata: metadata_at(p_tick, bounded_singleton(syn::parse_quote!((bool, usize))), bt),
+    };
+    let with_state_type: syn::Type = syn::parse_quote! { (#element_type, (bool, usize)) };
+    let p_with_state = HydroNode::CrossSingleton {
+        left: Box::new(p_all),
+        right: Box::new(p_state),
+        metadata: metadata_at(p_tick, bounded_stream(with_state_type.clone()), bt),
+    };
+    let shared = Rc::new(RefCell::new(p_with_state));
+    let f: syn::Expr = syn::parse_quote!(|(_, (is_idle, _)): &(_, (bool, usize))| *is_idle);
+    let p_pass = HydroNode::Partition {
+        inner: SharedNode(shared.clone()), f: f.clone().into(), is_true: true,
+        metadata: metadata_at(p_tick, bounded_stream(with_state_type.clone()), bt),
+    };
+    let p_buf = HydroNode::Partition {
+        inner: SharedNode(shared), f: f.into(), is_true: false,
+        metadata: metadata_at(p_tick, bounded_stream(with_state_type), bt),
+    };
 
-    // For now, leave partitioned inputs unchanged (no freezing).
-    // TODO: implement freezing once prepare signal is available at cluster.
-    let _ = element_type;
-    let _ = cluster_loc;
-    let _ = bt;
+    // 2. ALlow passthrough if idle, continue buffering otherwise
+    let p_output = HydroNode::Map {
+        f: { let e: syn::Expr = syn::parse_quote!(|(elem, _)| elem); e.into() },
+        input: Box::new(p_pass),
+        metadata: metadata_at(p_tick, bounded_stream(element_type.clone()), bt),
+    };
+    *node = p_output;
+    // Buffer
+    let p_buffered = HydroNode::Map {
+        f: { let e: syn::Expr = syn::parse_quote!(|(elem, _)| elem); e.into() },
+        input: Box::new(p_buf),
+        metadata: metadata_at(p_tick, bounded_stream(element_type), bt),
+    };
+    state.pending_roots.push(HydroRoot::CycleSink {
+        cycle_id: buffer_cycle,
+        input: Box::new(p_buffered),
+        op_metadata: op_meta(bt),
+    });
 }
 
 /// Limitations: Can only partition 1 cluster at a time.
@@ -671,6 +780,8 @@ pub fn partial_partition(builder: &mut FlowBuilder, ir: &mut Vec<HydroRoot>, par
     let clock_id = builder.next_clock_id();
     let coordinator_tick = LocationId::Tick(clock_id, Box::new(coordinator_location.clone()));
     let cluster_location = LocationId::Cluster(partitioner.location_id);
+    let partition_clock_id = builder.next_clock_id();
+    let partition_tick = LocationId::Tick(partition_clock_id, Box::new(cluster_location.clone()));
     let max_assigned_clock_cycle = builder.next_cycle_id();
     let ack_cycle = builder.next_cycle_id();
     let backtrace_source = ir[0].input_metadata().clone();
@@ -680,20 +791,27 @@ pub fn partial_partition(builder: &mut FlowBuilder, ir: &mut Vec<HydroRoot>, par
         coordinator_location,
         coordinator_tick,
         cluster_location,
+        partition_tick,
         num_partitions: partitioner.num_partitions,
         coordinator_state_tee: None,
         max_assigned_clock_tee: None,
+        p_state_tee: None,
+        p_state_cycle: builder.next_cycle_id(), // placeholder, overwritten by build_state
+        p_prepare_signal_cycle: None,
         commit_at_partitions_shared: None,
         c_prepare_clock_tee: None,
+        c_prepare_keyed_tee: None,
         max_assigned_clock_cycle,
         ack_cycle,
-        last_max_assigned_clock_update: None,
     };
 
     // 1. Build coordinator on separate single-member Cluster
     build_coordinator(&mut state, builder, &backtrace_source);
 
-    // 2. Per-node processing
+    // 2. Build partition state: (is_idle, logical_clock)
+    build_partition_state(&mut state, builder, &backtrace_source);
+
+    // 3. Per-node processing
     traverse_dfir(
         ir,
         |_, _| {},
@@ -701,19 +819,25 @@ pub fn partial_partition(builder: &mut FlowBuilder, ir: &mut Vec<HydroRoot>, par
             if partitioner.nodes_to_replicate.contains(next_stmt_id) {
                 handle_replicated_input(node, &mut state, builder, next_stmt_id);
             } else if partitioner.nodes_to_partition.contains_key(next_stmt_id) {
-                handle_partitioned_input(node, &state, next_stmt_id);
+                handle_partitioned_input(node, &mut state, builder, next_stmt_id);
             }
         },
     );
 
-    // 3. CycleSink for max_assigned_clock
-    if let Some(last_max_update) = state.last_max_assigned_clock_update {
-        state.pending_roots.push(HydroRoot::CycleSink {
-            cycle_id: max_assigned_clock_cycle,
-            input: Box::new(last_max_update),
-            op_metadata: op_meta(&backtrace_source),
-        });
-    }
+    // 3. CycleSink for max_assigned_clock (uses the final chained tee after all replicated inputs)
+    let final_max = HydroNode::Tee {
+        inner: SharedNode(state.max_assigned_clock_tee.as_ref().unwrap().clone()),
+        metadata: metadata_at(
+            &state.coordinator_tick,
+            bounded_singleton(syn::parse_quote!(usize)),
+            &backtrace_source,
+        ),
+    };
+    state.pending_roots.push(HydroRoot::CycleSink {
+        cycle_id: max_assigned_clock_cycle,
+        input: Box::new(final_max),
+        op_metadata: op_meta(&backtrace_source),
+    });
 
     // 4. Add pending roots
     ir.extend(state.pending_roots);
