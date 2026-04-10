@@ -7,7 +7,7 @@ use std::{
 use hydro_lang::compile::builder::FlowBuilder;
 use hydro_lang::compile::ir::{
     BoundKind, CollectionKind, DebugInstantiate, HydroIrMetadata, HydroIrOpMetadata, HydroNode,
-    HydroRoot, SharedNode, StreamOrder, StreamRetry, transform_bottom_up, traverse_dfir,
+    HydroRoot, SharedNode, SingletonBoundKind, StreamOrder, StreamRetry, transform_bottom_up, traverse_dfir,
 };
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::location::{Cluster, Location};
@@ -38,47 +38,20 @@ pub type DecoupleDecision = HashMap<usize, usize>;
 /// 1. Map (to add destination member id)
 /// 2. Network
 /// 3. Map (to remove member id)
-fn add_network(node: &mut HydroNode, send_location: &LocationId, recv_location: &LocationId) {
+/// Adds a Network node to `node`, which must already be mapped to `(MemberId, T)`.
+/// After the network, strips the MemberId on the receiver side.
+///
+/// `original_collection_kind` is the collection kind of the inner `T` (without MemberId).
+pub fn add_network_raw(
+    node: &mut HydroNode,
+    recv_location: &LocationId,
+    original_collection_kind: &CollectionKind,
+) {
     let metadata = node.metadata().clone();
-    // If the decoupled node is a cluster, then we must ensure that after a decoupling,
-    // each node sends to its own respective decoupled member.
-    // Doesn't matter which location we use; it will be replaced with `ClusterSelfIdReplace`.
-    let member_id = send_location.key();
+    let new_collection_kind = metadata.collection_kind.clone();
     let node_content = std::mem::replace(node, HydroNode::Placeholder);
 
-    // Map from b to (MemberId, b)
-    let ident = syn::Ident::new(
-        &format!("__hydro_lang_cluster_self_id_{}", member_id),
-        Span::call_site(),
-    );
-    let f: syn::Expr = syn::parse_quote!(|b| (
-        hydro_lang::location::MemberId::<()>::from_tagless(#ident.clone()),
-        b
-    ));
-
-    // Calculate the new CollectionKind
-    let original_collection_kind = metadata.collection_kind.clone();
-    let new_collection_kind = prepend_member_id_to_collection_kind(&original_collection_kind);
-
-    let mapped_node = HydroNode::Map {
-        f: f.into(),
-        input: Box::new(node_content),
-        metadata: HydroIrMetadata {
-            location_id: send_location.clone(),
-            collection_kind: new_collection_kind.clone(),
-            cardinality: None,
-            tag: None,
-            op: HydroIrOpMetadata {
-                backtrace: metadata.op.backtrace.clone(),
-                cpu_usage: None,
-                network_recv_cpu_usage: None,
-                id: None,
-            },
-        },
-    };
-
-    // Set up the network node
-    let output_debug_type = collection_kind_to_debug_type(&original_collection_kind);
+    let output_debug_type = collection_kind_to_debug_type(original_collection_kind);
     let network_node = HydroNode::Network {
         name: None,
         networking_info: NetworkingInfo::Tcp {
@@ -91,7 +64,7 @@ fn add_network(node: &mut HydroNode, send_location: &LocationId, recv_location: 
             &output_debug_type,
         ))
         .map(|e| e.into()),
-        input: Box::new(mapped_node),
+        input: Box::new(node_content),
         metadata: HydroIrMetadata {
             location_id: recv_location.clone(),
             collection_kind: new_collection_kind,
@@ -106,14 +79,13 @@ fn add_network(node: &mut HydroNode, send_location: &LocationId, recv_location: 
         },
     };
 
-    // Map again to remove the member Id
     let f: syn::Expr = syn::parse_quote!(|(_, b)| b);
-    let mapped_node = HydroNode::Map {
+    *node = HydroNode::Map {
         f: f.into(),
         input: Box::new(network_node),
         metadata: HydroIrMetadata {
             location_id: recv_location.clone(),
-            collection_kind: original_collection_kind,
+            collection_kind: original_collection_kind.clone(),
             cardinality: None,
             tag: None,
             op: HydroIrOpMetadata {
@@ -124,6 +96,46 @@ fn add_network(node: &mut HydroNode, send_location: &LocationId, recv_location: 
             },
         },
     };
+}
+
+/// Adds networking between two locations. Maps each element to `(sender_MemberId, element)`,
+/// sends over the network, then strips the MemberId on the receiver side.
+/// This is 1:1 routing (each sender maps to its corresponding receiver).
+pub fn add_network_to_node_with_same_id(node: &mut HydroNode, send_location: &LocationId, recv_location: &LocationId) {
+    let metadata = node.metadata().clone();
+    let member_id = send_location.key();
+    let node_content = std::mem::replace(node, HydroNode::Placeholder);
+
+    let ident = syn::Ident::new(
+        &format!("__hydro_lang_cluster_self_id_{}", member_id),
+        Span::call_site(),
+    );
+    let f: syn::Expr = syn::parse_quote!(|b| (
+        hydro_lang::location::MemberId::<()>::from_tagless(#ident.clone()),
+        b
+    ));
+
+    let original_collection_kind = metadata.collection_kind.clone();
+    let new_collection_kind = prepend_member_id_to_collection_kind(&original_collection_kind);
+
+    let mut mapped_node = HydroNode::Map {
+        f: f.into(),
+        input: Box::new(node_content),
+        metadata: HydroIrMetadata {
+            location_id: send_location.clone(),
+            collection_kind: new_collection_kind,
+            cardinality: None,
+            tag: None,
+            op: HydroIrOpMetadata {
+                backtrace: metadata.op.backtrace,
+                cpu_usage: None,
+                network_recv_cpu_usage: None,
+                id: None,
+            },
+        },
+    };
+
+    add_network_raw(&mut mapped_node, recv_location, &original_collection_kind);
     *node = mapped_node;
 }
 
@@ -153,7 +165,7 @@ fn add_tee(
                 "Adding network before Tee to location {:?} after id: {}",
                 new_location, inner_id
             );
-            add_network(node, inner_location, new_location);
+            add_network_to_node_with_same_id(node, inner_location, new_location);
             let node_content = std::mem::replace(node, HydroNode::Placeholder);
             Rc::new(RefCell::new(node_content))
         })
@@ -212,7 +224,7 @@ fn decouple_optional(node: &mut HydroNode, input_location: &LocationId, new_loca
         first_tick_only: false,
         metadata: HydroIrMetadata {
             collection_kind: CollectionKind::Singleton {
-                bound: BoundKind::Unbounded,
+                bound: SingletonBoundKind::Unbounded,
                 element_type: optional_node_type.clone().into(),
             },
             ..metadata.clone()
@@ -279,7 +291,7 @@ fn decouple_optional(node: &mut HydroNode, input_location: &LocationId, new_loca
     };
 
     // 3.2. Networking
-    add_network(&mut flat_map, &metadata.location_id, new_location);
+    add_network_to_node_with_same_id(&mut flat_map, &metadata.location_id, new_location);
 
     // 4.1. Reduce
     // - If there is no value, is an empty stream
@@ -438,7 +450,7 @@ fn decouple_node(
         CollectionKind::Optional { .. } => {
             decouple_optional(node, input_location, output_location);
         }
-        _ => add_network(node, input_location, output_location),
+        _ => add_network_to_node_with_same_id(node, input_location, output_location),
     }
 }
 

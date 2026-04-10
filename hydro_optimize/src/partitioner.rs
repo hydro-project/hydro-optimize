@@ -308,7 +308,7 @@ fn partition_node(node: &mut HydroNode, partitioner: &Partitioner, next_stmt_id:
     }
 }
 
-/// Limitations: Can only partition sends to clusters (not processes). Can only partition sends to 1 cluster at a time. Assumes that the partitioned attribute can be casted to usize.
+/// Limitations: Can only partition 1 cluster at a time. Assumes that the partitioned attribute can be casted to usize.
 pub fn partition(ir: &mut [HydroRoot], partitioner: &Partitioner) {
     traverse_dfir(
         ir,
