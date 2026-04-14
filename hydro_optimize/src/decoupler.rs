@@ -7,7 +7,8 @@ use std::{
 use hydro_lang::compile::builder::FlowBuilder;
 use hydro_lang::compile::ir::{
     BoundKind, CollectionKind, DebugInstantiate, HydroIrMetadata, HydroIrOpMetadata, HydroNode,
-    HydroRoot, SharedNode, SingletonBoundKind, StreamOrder, StreamRetry, transform_bottom_up, traverse_dfir,
+    HydroRoot, SharedNode, SingletonBoundKind, StreamOrder, StreamRetry, transform_bottom_up,
+    traverse_dfir,
 };
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::location::{Cluster, Location};
@@ -38,6 +39,7 @@ pub type DecoupleDecision = HashMap<usize, usize>;
 /// 1. Map (to add destination member id)
 /// 2. Network
 /// 3. Map (to remove member id)
+///
 /// Adds a Network node to `node`, which must already be mapped to `(MemberId, T)`.
 /// After the network, strips the MemberId on the receiver side.
 ///
@@ -101,7 +103,11 @@ pub fn add_network_raw(
 /// Adds networking between two locations. Maps each element to `(sender_MemberId, element)`,
 /// sends over the network, then strips the MemberId on the receiver side.
 /// This is 1:1 routing (each sender maps to its corresponding receiver).
-pub fn add_network_to_node_with_same_id(node: &mut HydroNode, send_location: &LocationId, recv_location: &LocationId) {
+pub fn add_network_to_node_with_same_id(
+    node: &mut HydroNode,
+    send_location: &LocationId,
+    recv_location: &LocationId,
+) {
     let metadata = node.metadata().clone();
     let member_id = send_location.key();
     let node_content = std::mem::replace(node, HydroNode::Placeholder);

@@ -2131,6 +2131,7 @@ dependencies = [
  "chrono",
  "ctor 0.2.9",
  "ena",
+ "futures",
  "good_lp",
  "hydro_build_utils",
  "hydro_deploy",

@@ -13,13 +13,13 @@ use crate::{repair::cycle_source_to_sink_input, rewrites::op_id_to_inputs};
 /// - `reduce_op_id`: The op_id of the `Reduce` that can pushed after this node
 /// - `distance_from_reduce`: Number of nodes between this node and the `Reduce`. If this node's child is Reduce, the distance is 0.
 #[derive(Clone, Copy, Debug)]
-struct ReduceRef {
-    reduce_op_id: usize,
-    distance_from_reduce: usize,
+pub struct ReduceRef {
+    pub reduce_op_id: usize,
+    pub distance_from_reduce: usize,
 }
 
 impl ReduceRef {
-    fn increment_distance(&self) -> Self {
+    pub fn increment_distance(&self) -> Self {
         Self {
             reduce_op_id: self.reduce_op_id,
             distance_from_reduce: self.distance_from_reduce + 1,

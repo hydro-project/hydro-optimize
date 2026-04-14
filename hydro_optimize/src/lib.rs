@@ -1,5 +1,4 @@
 #[cfg(stageleft_runtime)]
-#[cfg(test)]
 hydro_lang::setup!();
 
 pub mod debug;
@@ -10,6 +9,7 @@ pub mod deploy_and_analyze;
 pub mod greedy_decouple_analysis;
 pub mod parse_results;
 pub mod partial_partitioner;
+pub mod partial_partitioner_sealed;
 pub mod partition_node_analysis;
 pub mod partition_syn_analysis;
 pub mod partitioner;
