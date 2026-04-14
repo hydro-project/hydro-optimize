@@ -3,7 +3,7 @@ use hydro_lang::{
     live_collections::stream::NoOrder,
     prelude::{Cluster, KeyedStream, Unbounded},
 };
-use rand::Rng;
+use rand;
 
 use stageleft::q;
 
@@ -39,36 +39,35 @@ pub fn bid_workload_generator<'a, Client>(
 pub fn auction_workload_generator<'a, Client>(
     ids: KeyedStream<u32, (), Cluster<'a, Client>, Unbounded, NoOrder>,
 ) -> KeyedStream<u32, Auction, Cluster<'a, Client>, Unbounded, NoOrder> {
-    ids.map(q!(|_| {
+    ids.map_with_key(q!(|(id, _)| {
         Auction {
-            id: rand::random_range(0..5), // foreign key with Bid.auction
+            id: (id % 4) as i64, // foreign key with Bid.auction
             item_name: "".to_string(),
             description: "".to_string(),
             initial_bid: rand::random_range(0..100),
             reserve: 0,
-            date_time: rand::random_range(100..1000),
+            date_time: id as i64,
             expires: 0,
-            seller: rand::random_range(0..5), // foreign key with Person.id
-            category: rand::random_range(8..11), // q3 & q20 filters on = 10
+            seller: (id % 4) as i64,             // foreign key with Person.id
+            category: rand::random_range(9..11), // q3 & q20 filters on = 10
             extra: "".to_string(),
         }
     }))
 }
 
-// TODO
 // Usable for queries_bench_dual for queries with an auction input stream
 pub fn bid_workload_generator_no_prev<'a, Client>(
     ids: KeyedStream<u32, (), Cluster<'a, Client>, Unbounded, NoOrder>,
 ) -> KeyedStream<u32, Bid, Cluster<'a, Client>, Unbounded, NoOrder> {
-    ids.map(q!(|_| {
+    ids.map_with_key(q!(|(id, _)| {
         Bid {
-            auction: rand::random_range(0..5), // foreign key with Auction.id
-            bidder: rand::random_range(0..5),
+            auction: (id % 4) as i64, // foreign key with Auction.id
+            bidder: (id + 1 % 4) as i64,
             price: rand::random_range(5000..10000),
-            date_time: rand::random_range(100..1000),
+            date_time: (id + 7) as i64,
             extra: "".to_string(),
-            channel: "".to_string(), // TODO
-            url: "".to_string(),     // TODO
+            channel: format!("Channel {}", id).to_string(),
+            url: format!("{}/{}/{}/{}/{}/{}/{}", id, id, id, id, id, id, id).to_string(),
         }
     }))
 }
@@ -77,14 +76,15 @@ pub fn bid_workload_generator_no_prev<'a, Client>(
 pub fn person_workload_generator<'a, Client>(
     ids: KeyedStream<u32, (), Cluster<'a, Client>, Unbounded, NoOrder>,
 ) -> KeyedStream<u32, Person, Cluster<'a, Client>, Unbounded, NoOrder> {
-    ids.map(q!(|_| {
+    ids.map_with_key(q!(|(id, _)| {
         Person {
-            id: rand::random_range(0..5), // foreign key with Auction.seller
-            name: "John Doe".to_string(),
+            id: (id % 4) as i64, // foreign key with Auction.seller
+            name: format!("John {}", id).to_string(),
             email: "john.doe@berkeley.edu".to_string(),
             credit_card: "0123456789".to_string(),
-            city: "".to_string(),
-            state: ["OR", "CA", "ID", "KT", "FL"][rand::random_range(0..5)].to_string(), // q3 filters on in [OR, CA, ID]
+            city: ["Oakland", "Berkeley", "Seattle", "Fort Lauderdale"][rand::random_range(0..4)]
+                .to_string(),
+            state: ["OR", "CA", "ID", "KT"][rand::random_range(0..4)].to_string(), // q3 filters on in [OR, CA, ID]
             date_time: rand::random_range(100..1000),
             extra: "".to_string(),
         }
