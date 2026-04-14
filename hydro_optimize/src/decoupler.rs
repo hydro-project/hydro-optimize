@@ -6,8 +6,7 @@ use std::{
 
 use hydro_lang::compile::builder::FlowBuilder;
 use hydro_lang::compile::ir::{
-    BoundKind, CollectionKind, DebugInstantiate, HydroIrMetadata, HydroIrOpMetadata, HydroNode,
-    HydroRoot, SharedNode, SingletonBoundKind, StreamOrder, StreamRetry, transform_bottom_up,
+    CollectionKind, DebugInstantiate, HydroNode, HydroRoot, SharedNode, transform_bottom_up,
     traverse_dfir,
 };
 use hydro_lang::location::dynamic::LocationId;
@@ -22,7 +21,7 @@ use crate::repair::{cycle_source_to_sink_input, inject_id, inject_location};
 use crate::rewrites::{
     ClusterSelfIdReplace, collection_kind_to_debug_type, deserialize_bincode_with_type,
     op_id_to_inputs, prepend_member_id_to_collection_kind, serialize_bincode_with_type,
-    tee_to_inner_id,
+    tee_to_inner_id, unbounded_optional, unbounded_singleton, unbounded_stream,
 };
 
 /// Mapping from op id to location index, starting from 0.
@@ -67,36 +66,14 @@ pub fn add_network_raw(
         ))
         .map(|e| e.into()),
         input: Box::new(node_content),
-        metadata: HydroIrMetadata {
-            location_id: recv_location.clone(),
-            collection_kind: new_collection_kind,
-            cardinality: None,
-            tag: None,
-            op: HydroIrOpMetadata {
-                backtrace: metadata.op.backtrace.clone(),
-                cpu_usage: None,
-                network_recv_cpu_usage: None,
-                id: None,
-            },
-        },
+        metadata: recv_location.clone().new_node_metadata(new_collection_kind),
     };
 
     let f: syn::Expr = syn::parse_quote!(|(_, b)| b);
     *node = HydroNode::Map {
         f: f.into(),
         input: Box::new(network_node),
-        metadata: HydroIrMetadata {
-            location_id: recv_location.clone(),
-            collection_kind: original_collection_kind.clone(),
-            cardinality: None,
-            tag: None,
-            op: HydroIrOpMetadata {
-                backtrace: metadata.op.backtrace,
-                cpu_usage: None,
-                network_recv_cpu_usage: None,
-                id: None,
-            },
-        },
+        metadata: recv_location.clone().new_node_metadata(original_collection_kind.clone()),
     };
 }
 
@@ -127,18 +104,7 @@ pub fn add_network_to_node_with_same_id(
     let mut mapped_node = HydroNode::Map {
         f: f.into(),
         input: Box::new(node_content),
-        metadata: HydroIrMetadata {
-            location_id: send_location.clone(),
-            collection_kind: new_collection_kind,
-            cardinality: None,
-            tag: None,
-            op: HydroIrOpMetadata {
-                backtrace: metadata.op.backtrace,
-                cpu_usage: None,
-                network_recv_cpu_usage: None,
-                id: None,
-            },
-        },
+        metadata: send_location.clone().new_node_metadata(new_collection_kind),
     };
 
     add_network_raw(&mut mapped_node, recv_location, &original_collection_kind);
@@ -203,24 +169,17 @@ fn add_tee(
 /// - FilterMap to convert into Optional
 fn decouple_optional(node: &mut HydroNode, input_location: &LocationId, new_location: &LocationId) {
     let node_content = std::mem::replace(node, HydroNode::Placeholder);
-    let mut metadata = node_content.metadata().clone();
-    metadata.location_id = input_location.clone();
-    let node_type = collection_kind_to_debug_type(&metadata.collection_kind);
+    let node_type: syn::Type =
+        (*collection_kind_to_debug_type(&node_content.metadata().collection_kind).0).clone();
 
     // 1.1 Map to Some(value)
     let map_f: syn::Expr = syn::parse_quote!(|x| Some(x));
     let optional_node_type: syn::Type = syn::parse_quote!(Option<#node_type>);
-    let optional_collection_kind = CollectionKind::Optional {
-        bound: BoundKind::Unbounded,
-        element_type: optional_node_type.clone().into(),
-    };
+    let optional_collection_kind = unbounded_optional(optional_node_type.clone());
     let map = HydroNode::Map {
         f: map_f.into(),
         input: Box::new(node_content),
-        metadata: HydroIrMetadata {
-            collection_kind: optional_collection_kind.clone(),
-            ..metadata.clone()
-        },
+        metadata: input_location.clone().new_node_metadata(optional_collection_kind.clone()),
     };
 
     // 1.2 Create Singleton with None
@@ -228,13 +187,7 @@ fn decouple_optional(node: &mut HydroNode, input_location: &LocationId, new_loca
     let singleton = HydroNode::SingletonSource {
         value: singleton_value.into(),
         first_tick_only: false,
-        metadata: HydroIrMetadata {
-            collection_kind: CollectionKind::Singleton {
-                bound: SingletonBoundKind::Unbounded,
-                element_type: optional_node_type.clone().into(),
-            },
-            ..metadata.clone()
-        },
+        metadata: input_location.clone().new_node_metadata(unbounded_singleton(optional_node_type.clone())),
     };
 
     // 1.3 ChainFirst
@@ -242,10 +195,7 @@ fn decouple_optional(node: &mut HydroNode, input_location: &LocationId, new_loca
     let chain = HydroNode::ChainFirst {
         first: Box::new(map),
         second: Box::new(singleton),
-        metadata: HydroIrMetadata {
-            collection_kind: optional_collection_kind.clone(),
-            ..metadata.clone()
-        },
+        metadata: input_location.clone().new_node_metadata(optional_collection_kind.clone()),
     };
 
     // 2.1. Scan to detect changes
@@ -263,41 +213,23 @@ fn decouple_optional(node: &mut HydroNode, input_location: &LocationId, new_loca
             Some(Some(new))
         }
     });
-    let scan_collection_kind = CollectionKind::Stream {
-        bound: BoundKind::Unbounded,
-        order: StreamOrder::NoOrder,
-        retry: StreamRetry::ExactlyOnce,
-        element_type: scan_output_type.into(),
-    };
     let scan = HydroNode::Scan {
         init: scan_init.into(),
         acc: scan_acc.into(),
         input: Box::new(chain),
-        metadata: HydroIrMetadata {
-            collection_kind: scan_collection_kind,
-            ..metadata.clone()
-        },
+        metadata: input_location.clone().new_node_metadata(unbounded_stream(scan_output_type)),
     };
 
     // 3.1. FlatMap to reveal the new value
     let flat_map_f: syn::Expr = syn::parse_quote!(|x| x);
-    let flat_map_collection_kind = CollectionKind::Stream {
-        bound: BoundKind::Unbounded,
-        order: StreamOrder::NoOrder,
-        retry: StreamRetry::ExactlyOnce,
-        element_type: optional_node_type.clone().into(),
-    };
     let mut flat_map = HydroNode::FlatMap {
         f: flat_map_f.into(),
         input: Box::new(scan),
-        metadata: HydroIrMetadata {
-            collection_kind: flat_map_collection_kind,
-            ..metadata.clone()
-        },
+        metadata: input_location.clone().new_node_metadata(unbounded_stream(optional_node_type.clone())),
     };
 
     // 3.2. Networking
-    add_network_to_node_with_same_id(&mut flat_map, &metadata.location_id, new_location);
+    add_network_to_node_with_same_id(&mut flat_map, input_location, new_location);
 
     // 4.1. Reduce
     // - If there is no value, is an empty stream
@@ -309,14 +241,7 @@ fn decouple_optional(node: &mut HydroNode, input_location: &LocationId, new_loca
     let reduce = HydroNode::Reduce {
         f: reduce_f.into(),
         input: Box::new(flat_map), // Has been replaced with network
-        metadata: HydroIrMetadata {
-            collection_kind: CollectionKind::Optional {
-                element_type: optional_node_type.into(),
-                bound: BoundKind::Unbounded,
-            },
-            location_id: new_location.clone(),
-            ..metadata.clone()
-        },
+        metadata: new_location.clone().new_node_metadata(unbounded_optional(optional_node_type)),
     };
 
     // 4.2 FilterMap (so Nones disappear)
@@ -324,14 +249,7 @@ fn decouple_optional(node: &mut HydroNode, input_location: &LocationId, new_loca
     let filter_map = HydroNode::FilterMap {
         f: filter_map_f.into(),
         input: Box::new(reduce),
-        metadata: HydroIrMetadata {
-            collection_kind: CollectionKind::Optional {
-                element_type: node_type,
-                bound: BoundKind::Unbounded,
-            },
-            location_id: new_location.clone(),
-            ..metadata
-        },
+        metadata: new_location.clone().new_node_metadata(unbounded_optional(node_type)),
     };
 
     *node = filter_map;

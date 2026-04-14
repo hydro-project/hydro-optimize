@@ -1,16 +1,15 @@
 use std::collections::HashMap;
 
 use hydro_lang::compile::builder::FlowBuilder;
-use hydro_lang::compile::ir::{
-    BoundKind, CollectionKind, HydroIrMetadata, HydroIrOpMetadata, HydroNode, HydroRoot,
-    SharedNode, SingletonBoundKind, StreamOrder, StreamRetry, traverse_dfir,
-};
+use hydro_lang::compile::ir::{HydroNode, HydroRoot, SharedNode, traverse_dfir};
 use serde::{Deserialize, Serialize};
 
 use crate::partial_partitioner::{PartialPartitioner, partial_partition};
 use crate::partition_syn_analysis::StructOrTupleIndex;
 use crate::partitioner::quoted_struct_or_tuple_index;
-use crate::rewrites::collection_kind_to_debug_type;
+use crate::rewrites::{
+    bounded_singleton, bounded_stream, collection_kind_to_debug_type, unbounded_stream,
+};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PartialPartitionerSealed {
@@ -85,7 +84,6 @@ pub fn partial_partition_sealed(
                     .expect("No HashMap found in sealed node's element type");
                 sealed_types.insert(after_id, (element_type.clone(), hashmap_index));
 
-                let bt = &metadata;
                 let state_type: syn::Type = syn::parse_quote! { (bool, usize) };
                 let with_state_type: syn::Type =
                     syn::parse_quote! { (#element_type, (bool, usize)) };
@@ -96,35 +94,13 @@ pub fn partial_partition_sealed(
                 // Tee the partition state to read the logical clock
                 let p_state = HydroNode::Tee {
                     inner: SharedNode(p_state_tee.clone()),
-                    metadata: HydroIrMetadata {
-                        location_id: partition_tick.clone(),
-                        collection_kind: CollectionKind::Singleton {
-                            bound: SingletonBoundKind::Bounded,
-                            element_type: state_type.into(),
-                        },
-                        cardinality: None,
-                        tag: None,
-                        op: HydroIrOpMetadata {
-                            backtrace: bt.op.backtrace.clone(),
-                            cpu_usage: None,
-                            network_recv_cpu_usage: None,
-                            id: None,
-                        },
-                    },
+                    metadata: partition_tick.clone().new_node_metadata(bounded_singleton(state_type)),
                 };
 
                 let cross = HydroNode::CrossSingleton {
                     left: Box::new(node_content),
                     right: Box::new(p_state),
-                    metadata: HydroIrMetadata {
-                        collection_kind: CollectionKind::Stream {
-                            bound: BoundKind::Bounded,
-                            order: StreamOrder::NoOrder,
-                            retry: StreamRetry::ExactlyOnce,
-                            element_type: with_state_type.into(),
-                        },
-                        ..metadata.clone()
-                    },
+                    metadata: metadata.location_id.clone().new_node_metadata(bounded_stream(with_state_type)),
                 };
 
                 *node = HydroNode::Map {
@@ -135,15 +111,7 @@ pub fn partial_partition_sealed(
                         e.into()
                     },
                     input: Box::new(cross),
-                    metadata: HydroIrMetadata {
-                        collection_kind: CollectionKind::Stream {
-                            bound: BoundKind::Bounded,
-                            order: StreamOrder::NoOrder,
-                            retry: StreamRetry::ExactlyOnce,
-                            element_type: clocked_type.into(),
-                        },
-                        ..metadata
-                    },
+                    metadata: metadata.location_id.clone().new_node_metadata(bounded_stream(clocked_type)),
                 };
             }
         },
@@ -211,15 +179,7 @@ fn insert_merge_scan(
             e.into()
         },
         input: Box::new(node_content),
-        metadata: HydroIrMetadata {
-            collection_kind: CollectionKind::Stream {
-                bound: BoundKind::Unbounded,
-                order: StreamOrder::NoOrder,
-                retry: StreamRetry::ExactlyOnce,
-                element_type: scan_output_type.into(),
-            },
-            ..metadata.clone()
-        },
+        metadata: metadata.location_id.clone().new_node_metadata(unbounded_stream(scan_output_type)),
     };
 
     // FilterMap to extract Some values
@@ -229,9 +189,6 @@ fn insert_merge_scan(
             e.into()
         },
         input: Box::new(scan_node),
-        metadata: HydroIrMetadata {
-            collection_kind: metadata.collection_kind.clone(),
-            ..metadata
-        },
+        metadata: metadata.location_id.clone().new_node_metadata(metadata.collection_kind.clone()),
     };
 }
