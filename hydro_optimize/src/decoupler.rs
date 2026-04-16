@@ -73,7 +73,9 @@ pub fn add_network_raw(
     *node = HydroNode::Map {
         f: f.into(),
         input: Box::new(network_node),
-        metadata: recv_location.clone().new_node_metadata(original_collection_kind.clone()),
+        metadata: recv_location
+            .clone()
+            .new_node_metadata(original_collection_kind.clone()),
     };
 }
 
@@ -179,7 +181,9 @@ fn decouple_optional(node: &mut HydroNode, input_location: &LocationId, new_loca
     let map = HydroNode::Map {
         f: map_f.into(),
         input: Box::new(node_content),
-        metadata: input_location.clone().new_node_metadata(optional_collection_kind.clone()),
+        metadata: input_location
+            .clone()
+            .new_node_metadata(optional_collection_kind.clone()),
     };
 
     // 1.2 Create Singleton with None
@@ -187,7 +191,9 @@ fn decouple_optional(node: &mut HydroNode, input_location: &LocationId, new_loca
     let singleton = HydroNode::SingletonSource {
         value: singleton_value.into(),
         first_tick_only: false,
-        metadata: input_location.clone().new_node_metadata(unbounded_singleton(optional_node_type.clone())),
+        metadata: input_location
+            .clone()
+            .new_node_metadata(unbounded_singleton(optional_node_type.clone())),
     };
 
     // 1.3 ChainFirst
@@ -195,7 +201,9 @@ fn decouple_optional(node: &mut HydroNode, input_location: &LocationId, new_loca
     let chain = HydroNode::ChainFirst {
         first: Box::new(map),
         second: Box::new(singleton),
-        metadata: input_location.clone().new_node_metadata(optional_collection_kind.clone()),
+        metadata: input_location
+            .clone()
+            .new_node_metadata(optional_collection_kind.clone()),
     };
 
     // 2.1. Scan to detect changes
@@ -217,7 +225,9 @@ fn decouple_optional(node: &mut HydroNode, input_location: &LocationId, new_loca
         init: scan_init.into(),
         acc: scan_acc.into(),
         input: Box::new(chain),
-        metadata: input_location.clone().new_node_metadata(unbounded_stream(scan_output_type)),
+        metadata: input_location
+            .clone()
+            .new_node_metadata(unbounded_stream(scan_output_type)),
     };
 
     // 3.1. FlatMap to reveal the new value
@@ -225,7 +235,9 @@ fn decouple_optional(node: &mut HydroNode, input_location: &LocationId, new_loca
     let mut flat_map = HydroNode::FlatMap {
         f: flat_map_f.into(),
         input: Box::new(scan),
-        metadata: input_location.clone().new_node_metadata(unbounded_stream(optional_node_type.clone())),
+        metadata: input_location
+            .clone()
+            .new_node_metadata(unbounded_stream(optional_node_type.clone())),
     };
 
     // 3.2. Networking
@@ -241,7 +253,9 @@ fn decouple_optional(node: &mut HydroNode, input_location: &LocationId, new_loca
     let reduce = HydroNode::Reduce {
         f: reduce_f.into(),
         input: Box::new(flat_map), // Has been replaced with network
-        metadata: new_location.clone().new_node_metadata(unbounded_optional(optional_node_type)),
+        metadata: new_location
+            .clone()
+            .new_node_metadata(unbounded_optional(optional_node_type)),
     };
 
     // 4.2 FilterMap (so Nones disappear)
@@ -249,7 +263,9 @@ fn decouple_optional(node: &mut HydroNode, input_location: &LocationId, new_loca
     let filter_map = HydroNode::FilterMap {
         f: filter_map_f.into(),
         input: Box::new(reduce),
-        metadata: new_location.clone().new_node_metadata(unbounded_optional(node_type)),
+        metadata: new_location
+            .clone()
+            .new_node_metadata(unbounded_optional(node_type)),
     };
 
     *node = filter_map;

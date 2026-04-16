@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use hydro_lang::compile::builder::FlowBuilder;
 use hydro_lang::compile::built::BuiltFlow;
 use hydro_lang::compile::ir::{
-    BoundKind, CollectionKind, DebugType, HydroIrMetadata, HydroNode, HydroRoot, KeyedSingletonBoundKind, SingletonBoundKind, StreamOrder, StreamRetry, deep_clone, traverse_dfir
+    BoundKind, CollectionKind, DebugType, HydroIrMetadata, HydroNode, HydroRoot,
+    KeyedSingletonBoundKind, SingletonBoundKind, StreamOrder, StreamRetry, deep_clone,
+    traverse_dfir,
 };
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::location::{Cluster, LocationKey};
@@ -437,4 +439,3 @@ pub fn unbounded_singleton(element_type: syn::Type) -> CollectionKind {
         element_type: element_type.into(),
     }
 }
-

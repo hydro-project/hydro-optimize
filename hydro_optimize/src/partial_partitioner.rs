@@ -10,12 +10,15 @@ use hydro_lang::location::LocationKey;
 use hydro_lang::location::dynamic::LocationId;
 use serde::{Deserialize, Serialize};
 
+use stageleft::quote_type;
+
 use crate::decoupler::add_network_raw;
 use crate::partition_syn_analysis::StructOrTupleIndex;
 use crate::partitioner::{Partitioner, partition};
 use crate::rewrites::{
     bounded_optional, bounded_singleton, bounded_stream, collection_kind_to_debug_type,
-    prepend_member_id_to_collection_kind, unbounded_stream,
+    deserialize_bincode_with_type, prepend_member_id_to_collection_kind,
+    serialize_bincode_with_type, unbounded_stream,
 };
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -23,6 +26,8 @@ pub struct PartialPartitioner {
     pub nodes_before_partitioned_input: HashMap<usize, StructOrTupleIndex>, /* ID of node right before a Network -> what to partition on */
     pub nodes_after_partitioned_input: HashSet<usize>, /* ID of Network recv node at the partitioned cluster */
     pub nodes_to_replicate: HashSet<usize>,            /* ID of node right before a Network */
+    pub nodes_before_replicated_output: HashSet<usize>, /* ID of node right before a Network send for replicated output */
+    pub nodes_after_replicated_output: HashSet<usize>, /* ID of Network recv node for replicated output */
     pub nodes_for_garbage_collection: HashSet<usize>,  /* ID of Network */
     pub num_partitions: usize,
     pub location_id: LocationKey,
@@ -980,8 +985,183 @@ fn handle_garbage_collection_input(node: &mut HydroNode, num_partitions: usize) 
     }
 }
 
+/// Extract the payload type `T` from a Network node's collection kind.
+/// - `KeyedStream<MemberId, T>` → returns `T`
+/// - `Stream<(MemberId, T)>` → destructures the tuple and returns `T`
+fn network_payload_type(kind: &CollectionKind) -> syn::Type {
+    match kind {
+        CollectionKind::KeyedStream { value_type, .. } => (*value_type.0).clone(),
+        CollectionKind::Stream { element_type, .. } => match &*element_type.0 {
+            syn::Type::Tuple(tuple) if tuple.elems.len() == 2 => tuple.elems[1].clone(),
+            other => panic!(
+                "Expected a 2-element tuple (MemberId, T) for Stream collection kind, found: {:?}",
+                other
+            ),
+        },
+        other => panic!(
+            "Expected a KeyedStream or Stream collection kind for replicated output, found: {:?}",
+            other
+        ),
+    }
+}
+
+/// Per replicated output send: prepend the partition's logical clock to the payload.
+/// The node's element type is `(MemberId, T)` (KeyedStream). Output becomes `(MemberId, (usize, T))`.
+fn handle_replicated_output_send(node: &mut HydroNode, state: &PartialPartitionState) {
+    let original = std::mem::replace(node, HydroNode::Placeholder);
+    let metadata = original.metadata().clone();
+    let element_type: syn::Type =
+        (*collection_kind_to_debug_type(&metadata.collection_kind).0).clone();
+    let value_type = network_payload_type(&metadata.collection_kind);
+    let p_tick = &state.partition_tick;
+    let cluster_loc = &metadata.location_id;
+
+    let batched = HydroNode::Batch {
+        inner: Box::new(original),
+        metadata: p_tick
+            .clone()
+            .new_node_metadata(bounded_stream(element_type.clone())),
+    };
+
+    // CrossSingleton with p_state_tee to get (element, (is_idle, clock))
+    let p_state = HydroNode::Tee {
+        inner: SharedNode(state.p_state_tee.as_ref().unwrap().clone()),
+        metadata: p_tick
+            .clone()
+            .new_node_metadata(bounded_singleton(syn::parse_quote!((bool, usize)))),
+    };
+    let with_state_type: syn::Type = syn::parse_quote! { (#element_type, (bool, usize)) };
+    let with_state = HydroNode::CrossSingleton {
+        left: Box::new(batched),
+        right: Box::new(p_state),
+        metadata: p_tick
+            .clone()
+            .new_node_metadata(bounded_stream(with_state_type)),
+    };
+
+    // Map ((MemberId, T), (bool, usize)) → (MemberId, (usize, T))
+    let clocked_element_type: syn::Type =
+        syn::parse_quote! { (hydro_lang::location::MemberId<()>, (usize, #value_type)) };
+    let mapped = HydroNode::Map {
+        f: {
+            let e: syn::Expr = syn::parse_quote!(
+                |((dest, value), (_is_idle, clock)): (#element_type, (bool, usize))| (dest, (clock, value))
+            );
+            e.into()
+        },
+        input: Box::new(with_state),
+        metadata: p_tick
+            .clone()
+            .new_node_metadata(bounded_stream(clocked_element_type.clone())),
+    };
+
+    *node = HydroNode::YieldConcat {
+        inner: Box::new(mapped),
+        metadata: cluster_loc
+            .clone()
+            .new_node_metadata(unbounded_stream(clocked_element_type)),
+    };
+}
+
+/// Per replicated output recv: update the Network's serialize/deserialize for `(usize, T)`,
+/// then collect `num_partitions` responses per clock via Scan, assert equality, and emit `T`.
+fn handle_replicated_output_recv(node: &mut HydroNode, num_partitions: usize) {
+    // The Network deserializes type T and outputs (MemberId, T).
+    // Extract T and the original (MemberId, T) from the collection kind before modifying it.
+    let send_payload_type = network_payload_type(&node.metadata().collection_kind);
+    let original_output_type = collection_kind_to_debug_type(&node.metadata().collection_kind);
+    let original_output_type: syn::Type = (*original_output_type.0).clone();
+    let clocked_type: syn::Type = syn::parse_quote! { (usize, #send_payload_type) };
+    let clocked_debug_type = hydro_lang::compile::ir::DebugType::from(clocked_type.clone());
+
+    if let HydroNode::Network {
+        serialize_fn,
+        deserialize_fn,
+        metadata,
+        ..
+    } = node
+    {
+        *serialize_fn =
+            Some(serialize_bincode_with_type(true, &clocked_debug_type)).map(|e| e.into());
+        *deserialize_fn = Some(deserialize_bincode_with_type(
+            Some(&quote_type::<()>()),
+            &clocked_debug_type,
+        ))
+        .map(|e| e.into());
+        // Update the Network's output metadata: Stream<(MemberId<()>, (usize, T))>
+        let member_id_type: syn::Type = syn::parse_quote! { ::hydro_lang::location::MemberId<()> };
+        let new_element: syn::Type = syn::parse_quote! { (#member_id_type, #clocked_type) };
+        metadata.collection_kind = unbounded_stream(new_element);
+    } else {
+        panic!("Expected a Network node for replicated output recv");
+    }
+
+    // Now wrap: Network → Map to extract clock → Scan quorum → FilterMap
+    // Preserve (MemberId, T) in output so downstream .values() still works.
+    let network_node = std::mem::replace(node, HydroNode::Placeholder);
+    let recv_loc = network_node.metadata().location_id.clone();
+
+    // Map: (MemberId, (usize, T)) → (usize, (MemberId, T))
+    let clocked_with_member: syn::Type = syn::parse_quote! { (usize, #original_output_type) };
+    let rekey = HydroNode::Map {
+        f: {
+            let e: syn::Expr = syn::parse_quote!(|(member, (clock, val))| (clock, (member, val)));
+            e.into()
+        },
+        input: Box::new(network_node),
+        metadata: recv_loc
+            .clone()
+            .new_node_metadata(unbounded_stream(clocked_with_member.clone())),
+    };
+
+    // Scan: accumulate per-clock in HashMap, emit Some((MemberId, T)) on quorum, None otherwise.
+    let scan_output_type: syn::Type = syn::parse_quote! { Option<#original_output_type> };
+    let scan = HydroNode::Scan {
+        init: {
+            let e: syn::Expr = syn::parse_quote!(
+                || std::collections::HashMap::<usize, (usize, #original_output_type)>::new()
+            );
+            e.into()
+        },
+        acc: {
+            let e: syn::Expr = syn::parse_quote!(
+                |state: &mut std::collections::HashMap<usize, (usize, #original_output_type)>,
+                 (clock, value): (usize, #original_output_type)|
+                 -> Option<Option<#original_output_type>> {
+                    let entry = state.entry(clock).or_insert((0, value.clone()));
+                    assert!(entry.1 == value, "Replicated output mismatch across partitions");
+                    entry.0 += 1;
+                    if entry.0 == #num_partitions {
+                        let (_, val) = state.remove(&clock).unwrap();
+                        Some(Some(val))
+                    } else {
+                        Some(None)
+                    }
+                }
+            );
+            e.into()
+        },
+        input: Box::new(rekey),
+        metadata: recv_loc
+            .clone()
+            .new_node_metadata(unbounded_stream(scan_output_type)),
+    };
+
+    // FilterMap: extract Some values → (MemberId, T), matching original Network output
+    *node = HydroNode::FilterMap {
+        f: {
+            let e: syn::Expr = syn::parse_quote!(|v: Option<#original_output_type>| v);
+            e.into()
+        },
+        input: Box::new(scan),
+        metadata: recv_loc
+            .clone()
+            .new_node_metadata(unbounded_stream(original_output_type)),
+    };
+}
+
 /// Limitations: Can only partition 1 cluster at a time.
-/// Assumes that the coordinator is colocated with the partitioned nodes?
+/// Assumes that the partitioned node only outputs to a cluster; if it outputs to a process, then the logic for nodes_before/after_replicated_output needs to account for different metadata types.
 pub fn partial_partition(
     builder: &mut FlowBuilder,
     ir: &mut Vec<HydroRoot>,
@@ -1048,6 +1228,10 @@ pub fn partial_partition(
                 handle_partitioned_input(node, &mut state, builder);
             } else if partitioner.nodes_for_garbage_collection.contains(&op_id) {
                 handle_garbage_collection_input(node, partitioner.num_partitions);
+            } else if partitioner.nodes_before_replicated_output.contains(&op_id) {
+                handle_replicated_output_send(node, &state);
+            } else if partitioner.nodes_after_replicated_output.contains(&op_id) {
+                handle_replicated_output_recv(node, partitioner.num_partitions);
             }
         },
     );
@@ -1126,22 +1310,35 @@ mod tests {
 
         let mut recv_networks: Vec<usize> = vec![];
         let mut send_nodes: Vec<(usize, usize)> = vec![]; // (send-side input op_id, recv Network op_id)
+        let mut send_networks: Vec<(usize, usize)> = vec![]; // (send-side input op_id, recv Network op_id) for outputs FROM server
         traverse_dfir(
             &mut ir,
             |_, _| {},
-            |node, next_stmt_id| {
-                if matches!(get_network_type(node, &server_key), Some(NetworkType::Recv)) {
-                    if let HydroNode::Network { input, .. } = node {
-                        if let Some(send_id) = input.op_metadata().id {
-                            send_nodes.push((send_id, *next_stmt_id));
-                        }
+            |node, next_stmt_id| match get_network_type(node, &server_key) {
+                Some(NetworkType::Recv) => {
+                    if let HydroNode::Network { input, .. } = node
+                        && let Some(send_id) = input.op_metadata().id
+                    {
+                        send_nodes.push((send_id, *next_stmt_id));
                     }
                     recv_networks.push(*next_stmt_id);
                 }
+                Some(NetworkType::Send) => {
+                    if let HydroNode::Network { input, .. } = node
+                        && let Some(send_id) = input.op_metadata().id
+                    {
+                        send_networks.push((send_id, *next_stmt_id));
+                    }
+                }
+                _ => {}
             },
         );
         assert_eq!(recv_networks.len(), 2);
         assert_eq!(send_nodes.len(), 2);
+        assert!(
+            !send_networks.is_empty(),
+            "Expected at least one send network from server"
+        );
 
         let partitioner = PartialPartitioner {
             nodes_to_replicate: HashSet::from([recv_networks[0]]),
@@ -1150,6 +1347,8 @@ mod tests {
                 vec!["0".to_string()],
             )]),
             nodes_after_partitioned_input: HashSet::from([send_nodes[1].1]),
+            nodes_before_replicated_output: HashSet::from([send_networks[0].0]),
+            nodes_after_replicated_output: HashSet::from([send_networks[0].1]),
             nodes_for_garbage_collection: HashSet::new(),
             num_partitions: 3,
             location_id: server_key,
@@ -1162,61 +1361,13 @@ mod tests {
         new_builder
     }
 
-    #[test]
-    fn test_partial_partition_ir() {
-        let mut builder = FlowBuilder::new();
-        let client = builder.cluster::<()>();
-        let server = builder.cluster::<()>();
-        let server_key = hydro_lang::location::Location::id(&server).key();
-
-        let state_input = client
-            .source_iter(q!(vec![42usize]))
-            .broadcast(&server, TCP.fail_stop().bincode(), nondet!(/** test */))
-            .values();
-        let kv_input = client
-            .source_iter(q!(vec![(1usize, 2usize)]))
-            .broadcast(&server, TCP.fail_stop().bincode(), nondet!(/** test */))
-            .values();
-        let tick = server.tick();
-
-        state_input
-            .batch(&tick, nondet!(/** test */))
-            .assume_ordering::<TotalOrder>(nondet!(/** test */))
-            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
-            .reduce(q!(|prev, new| {
-                *prev = new;
-            }))
-            .all_ticks()
-            .assume_ordering::<TotalOrder>(nondet!(/** test */))
-            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
-            .for_each(q!(|_: usize| {}));
-
-        kv_input
-            .batch(&tick, nondet!(/** test */))
-            .assume_ordering::<TotalOrder>(nondet!(/** test */))
-            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
-            .into_keyed()
-            .reduce(q!(|prev, new| {
-                *prev = new;
-            }))
-            .entries()
-            .all_ticks()
-            .assume_ordering::<TotalOrder>(nondet!(/** test */))
-            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
-            .for_each(q!(|_: (usize, usize)| {}));
-
-        let built = builder.optimize_with(|_| {});
-        let new_builder = apply_partial_partition(&built, server_key);
-        let _ = new_builder.finalize();
-    }
-
     #[tokio::test]
-    async fn test_partial_partition_e2e() {
+    async fn test_partial_partition() {
         run_e2e(true).await;
     }
 
     #[tokio::test]
-    async fn test_e2e_no_partition() {
+    async fn test_no_partition() {
         run_e2e(false).await;
     }
 
@@ -1226,22 +1377,28 @@ mod tests {
 
         let mut builder = FlowBuilder::new();
         let external = builder.external::<()>();
-        let client = builder.process::<()>();
+        let gateway = builder.process::<()>();
+        let client = builder.cluster::<()>();
         let server = builder.cluster::<()>();
         let server_key = hydro_lang::location::Location::id(&server).key();
 
-        let (state_send, state_external) =
-            client.source_external_bincode::<_, usize, _, _>(&external);
-        let state_input =
-            state_external.broadcast(&server, TCP.fail_stop().bincode(), nondet!(/** test */));
+        // External → gateway process → client cluster → server cluster
+        let (state_send, state_gw) = gateway.source_external_bincode::<_, usize, _, _>(&external);
+        let state_input = state_gw
+            .broadcast(&client, TCP.fail_stop().bincode(), nondet!(/** test */))
+            .broadcast(&server, TCP.fail_stop().bincode(), nondet!(/** test */))
+            .values();
 
-        let (kv_send, kv_external) =
-            client.source_external_bincode::<_, (usize, usize), _, _>(&external);
-        let kv_input =
-            kv_external.broadcast(&server, TCP.fail_stop().bincode(), nondet!(/** test */));
+        let (kv_send, kv_gw) =
+            gateway.source_external_bincode::<_, (usize, usize), _, _>(&external);
+        let kv_input = kv_gw
+            .broadcast(&client, TCP.fail_stop().bincode(), nondet!(/** test */))
+            .broadcast(&server, TCP.fail_stop().bincode(), nondet!(/** test */))
+            .values();
 
         let tick = server.tick();
 
+        // server → client cluster (replicated output), then client → gateway → external
         let state_out = state_input
             .batch(&tick, nondet!(/** test */))
             .assume_ordering::<TotalOrder>(nondet!(/** test */))
@@ -1250,7 +1407,9 @@ mod tests {
                 *prev = new;
             }))
             .all_ticks()
-            .send(&client, TCP.fail_stop().bincode())
+            .broadcast(&client, TCP.fail_stop().bincode(), nondet!(/** test */))
+            .values()
+            .send(&gateway, TCP.fail_stop().bincode())
             .values()
             .send_bincode_external(&external);
 
@@ -1264,7 +1423,9 @@ mod tests {
             }))
             .entries()
             .all_ticks()
-            .send(&client, TCP.fail_stop().bincode())
+            .broadcast(&client, TCP.fail_stop().bincode(), nondet!(/** test */))
+            .values()
+            .send(&gateway, TCP.fail_stop().bincode())
             .values()
             .send_bincode_external(&external);
 
@@ -1275,7 +1436,8 @@ mod tests {
         let nodes = if apply_partition {
             let new_builder = apply_partial_partition(&built, server_key);
             new_builder
-                .with_process(&client, deployment.Localhost())
+                .with_process(&gateway, deployment.Localhost())
+                .with_cluster(&client, vec![deployment.Localhost()])
                 .with_external(&external, deployment.Localhost())
                 .with_remaining_clusters(|| {
                     (0..num_partitions)
@@ -1285,7 +1447,8 @@ mod tests {
                 .deploy(&mut deployment)
         } else {
             built
-                .with_process(&client, deployment.Localhost())
+                .with_process(&gateway, deployment.Localhost())
+                .with_cluster(&client, vec![deployment.Localhost()])
                 .with_external(&external, deployment.Localhost())
                 .with_remaining_clusters(|| vec![deployment.Localhost()])
                 .deploy(&mut deployment)
@@ -1312,7 +1475,7 @@ mod tests {
         let timeout = std::time::Duration::from_secs(30);
 
         // Expect state=42
-        let state_val = tokio::time::timeout(timeout, state_out.next())
+        let state_val: usize = tokio::time::timeout(timeout, state_out.next())
             .await
             .expect("timeout waiting for state")
             .expect("state channel closed");

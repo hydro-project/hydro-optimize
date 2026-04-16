@@ -16,8 +16,8 @@ hydro_build_utils = { version = "0.0.1", git = "https://github.com/hydro-project
 hydro_deploy = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git", features = ["profile-folding"] }
 include_mdtests = { version = "0.0.0", git = "https://github.com/hydro-project/hydro.git" }
 serde = { version = "1.0.197", features = ["derive"] }
-stageleft = "0.13.3"
-stageleft_tool = "0.13.3"
+stageleft = "0.13.4"
+stageleft_tool = "0.13.4"
 tokio = { version = "1.29.0", features = ["full"] }
 ctor = "0.2"
 clap = { version = "4.4", features = ["derive"] }
@@ -35,11 +35,11 @@ regex = "1.11.1"
 # include_mdtests = { path = "/local/home/chudc/hydroflow/include_mdtests" }
 
 # Uncomment to use local hydro checkout on Mac
-[patch."https://github.com/hydro-project/hydro.git"]
-hydro_lang = { path = "/Users/chudc/Desktop/hydro/hydro_lang" }
-hydro_std = { path = "/Users/chudc/Desktop/hydro/hydro_std" }
-hydro_test = { path = "/Users/chudc/Desktop/hydro/hydro_test" }
-dfir_lang = { path = "/Users/chudc/Desktop/hydro/dfir_lang" }
-hydro_build_utils = { path = "/Users/chudc/Desktop/hydro/hydro_build_utils" }
-hydro_deploy = { path = "/Users/chudc/Desktop/hydro/hydro_deploy/core" }
-include_mdtests = { path = "/Users/chudc/Desktop/hydro/include_mdtests" }
+# [patch."https://github.com/hydro-project/hydro.git"]
+# hydro_lang = { path = "/Users/chudc/Desktop/hydro/hydro_lang" }
+# hydro_std = { path = "/Users/chudc/Desktop/hydro/hydro_std" }
+# hydro_test = { path = "/Users/chudc/Desktop/hydro/hydro_test" }
+# dfir_lang = { path = "/Users/chudc/Desktop/hydro/dfir_lang" }
+# hydro_build_utils = { path = "/Users/chudc/Desktop/hydro/hydro_build_utils" }
+# hydro_deploy = { path = "/Users/chudc/Desktop/hydro/hydro_deploy/core" }
+# include_mdtests = { path = "/Users/chudc/Desktop/hydro/include_mdtests" }
