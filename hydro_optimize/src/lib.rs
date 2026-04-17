@@ -1,5 +1,6 @@
 #[cfg(stageleft_runtime)]
 // hydro_lang::setup!();
+// TODO: Temporary stageleft hack from Shadaj to get tests and dependent repos working
 #[allow(
     ambiguous_glob_reexports,
     mismatched_lifetime_syntaxes,
@@ -18,12 +19,12 @@ pub mod __staged {
         "lib_pub.rs"
     ));
 
-    #[cfg(test)]
-    include!(concat!(
-        env!("OUT_DIR"),
-        stageleft::PATH_SEPARATOR!(),
-        "staged_deps.rs"
-    ));
+    // #[cfg(test)]
+    // include!(concat!(
+    //     env!("OUT_DIR"),
+    //     stageleft::PATH_SEPARATOR!(),
+    //     "staged_deps.rs"
+    // ));
 }
 
 #[cfg(stageleft_runtime)]
