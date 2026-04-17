@@ -1,72 +1,44 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hash;
-
 use syn::visit::Visit;
 
-pub(crate) type StructOrTupleIndex = Vec<String>; // Ex: ["a", "b"] represents x.a.b
+pub type StructOrTupleIndex = Vec<String>; // Ex: ["a", "b"] represents x.a.b
 
 // Invariant: Cannot have both a dependency and fields (fields are more specific)
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub(crate) struct StructOrTuple {
-    dependencies: BTreeSet<StructOrTupleIndex>, /* Parent tuple indices this tuple is equal to, if any */
+pub struct StructOrTuple {
+    dependencies: BTreeSet<StructOrTupleIndex>, /* Input tuple indices this tuple is equal to, if any */
     fields: BTreeMap<String, Box<StructOrTuple>>, // Fields 1 layer deep
     could_be_none: bool, // True if this field could also be None (used for FilterMap)
 }
 
 impl StructOrTuple {
-    pub(crate) fn new_completely_dependent() -> Self {
+    pub fn new_completely_dependent() -> Self {
         StructOrTuple {
-            dependencies: BTreeSet::from([vec![]]), /* Empty vec means it is completely dependent on the parent tuple */
+            dependencies: BTreeSet::from([vec![]]), /* Empty vec means it is completely dependent on the input tuple */
             fields: BTreeMap::new(),
             could_be_none: false,
         }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.dependencies.is_empty() && self.fields.is_empty()
     }
 
-    /// Create the child field if necessary, and duplicate any general dependencies to the child field.
-    /// Returns the child field, and whether any mutations were made.
-    pub(crate) fn create_child(&mut self, index: StructOrTupleIndex) -> (&mut StructOrTuple, bool) {
-        let mut deps = self.dependencies.clone();
+    fn create_child(&mut self, index: StructOrTupleIndex) -> &mut StructOrTuple {
         let mut child = self;
-        let mut mutated = false;
-        
         for i in index {
             child = &mut **child
                 .fields
-                .entry(i.clone())
-                .or_insert_with(|| {
-                    mutated = true;
-                    Box::new(StructOrTuple::default())
-                });
-
-            // Create more specific dependencies
-            let mut new_deps = BTreeSet::new();
-            for dependency in &deps {
-                let mut new_dependency = dependency.clone();
-                new_dependency.push(i.clone());
-                new_deps.insert(new_dependency);
-            }
-
-            // Add any existing dependencies in the child to the deps to track
-            deps = child.dependencies.clone();
-            // Modify the child's dependencies with more specific ones
-            let prev_num_child_dependencies = child.dependencies.len();
-            child.dependencies.extend(new_deps.clone());
-            if child.dependencies.len() > prev_num_child_dependencies {
-                mutated = true;
-            }
-            // Add new dependencies to track
-            deps.extend(new_deps);
+                .entry(i)
+                .or_insert_with(|| Box::new(StructOrTuple::default()));
         }
-        (child, mutated)
+        child
     }
 
     /// Copy dependencies from RHS, extending it with rhs_index
     /// Note: Does NOT copy RHS fields
-    pub(crate) fn add_dependencies(&mut self, rhs: &StructOrTuple, rhs_index: &StructOrTupleIndex) {
+    pub fn add_dependencies(&mut self, rhs: &StructOrTuple, rhs_index: &StructOrTupleIndex) {
         for dependency in &rhs.dependencies {
             let mut dependency = dependency.clone();
             dependency.extend_from_slice(rhs_index);
@@ -77,7 +49,7 @@ impl StructOrTuple {
     /// Overwrite self at index with rhs at rhs_index, creating the necessary indices when necessary
     /// Note: Results in undefined behavior when used on a "unioned" tuple (where a StructOrTuple with a dependency also has fields).
     /// A broader dependency may conflict with a specific narrower dependency in its field.
-    pub(crate) fn set_dependencies(
+    pub fn set_dependencies(
         &mut self,
         index: &StructOrTupleIndex,
         mut rhs: &StructOrTuple,
@@ -89,7 +61,7 @@ impl StructOrTuple {
                 rhs = child.as_ref();
             } else if !rhs.dependencies.is_empty() {
                 // Create a child if necessary and set the dependency
-                let (child, _) = self.create_child(index.clone());
+                let child = self.create_child(index.clone());
                 child.add_dependencies(rhs, rhs_index);
                 child.could_be_none = rhs.could_be_none;
                 return;
@@ -100,32 +72,32 @@ impl StructOrTuple {
         }
 
         // Create a child if necessary and copy everything from the RHS
-        let (child, _) = self.create_child(index.clone());
+        let child = self.create_child(index.clone());
         child.dependencies.extend(rhs.dependencies.clone());
         child.fields = rhs.fields.clone();
         child.could_be_none = rhs.could_be_none;
     }
 
-    pub(crate) fn add_dependency(
+    pub fn add_dependency(
         &mut self,
         index: &StructOrTupleIndex,
-        parent_tuple_index: StructOrTupleIndex,
+        input_tuple_index: StructOrTupleIndex,
     ) {
-        let (child, _) = self.create_child(index.clone());
-        child.dependencies.insert(parent_tuple_index);
+        let child = self.create_child(index.clone());
+        child.dependencies.insert(input_tuple_index);
     }
 
     /// Note: May return redundant dependencies; no easy fix given we can the same field can depend on multiple things
-    pub(crate) fn get_dependencies(&self, index: &StructOrTupleIndex) -> Option<StructOrTuple> {
+    pub fn get_dependencies(&self, index: &StructOrTupleIndex) -> Option<StructOrTuple> {
         let mut child = self.clone();
-        for field in index {
+        for (i, field) in index.iter().enumerate() {
             if let Some(grandchild) = child.fields.get(field) {
                 let mut temp_grandchild = *grandchild.clone();
-                temp_grandchild.add_dependencies(&child, &vec![field.clone()]);
+                temp_grandchild.add_dependencies(&child, &index[i..].to_vec());
                 child = temp_grandchild;
             } else if !child.dependencies.is_empty() {
                 let mut new_child = StructOrTuple::default();
-                new_child.add_dependencies(&child, &vec![field.clone()]);
+                new_child.add_dependencies(&child, &index[i..].to_vec());
                 return Some(new_child);
             } else {
                 return None; // No dependency or child
@@ -134,42 +106,8 @@ impl StructOrTuple {
         Some(child)
     }
 
-    pub(crate) fn get_dependency(&self) -> BTreeSet<StructOrTupleIndex> {
-        self.dependencies.clone()
-    }
-
-    pub(crate) fn get_all_nested_dependencies(&self) -> BTreeSet<StructOrTupleIndex> {
-        let mut all_dependencies = self.dependencies.clone();
-        for (_, child) in &self.fields {
-            let child_dependencies = child.get_all_nested_dependencies();
-            all_dependencies.extend(child_dependencies);
-        }
-        all_dependencies
-    }
-
-    fn get_nested_fields(&self, prefix: StructOrTupleIndex) -> BTreeSet<StructOrTupleIndex> {
-        let mut all_fields = BTreeSet::new();
-        for (field, child) in &self.fields {
-            let mut cloned_prefix = prefix.clone();
-            cloned_prefix.push(field.clone());
-            all_fields.insert(cloned_prefix.clone());
-
-            let child_fields = child.get_nested_fields(cloned_prefix);
-            all_fields.extend(child_fields);
-        }
-        all_fields
-    }
-
-    /// Returns all known fields, including nested fields.
-    /// If there are more and less specific versions of the same field, return both.
-    pub(crate) fn get_all_nested_fields(&self) -> BTreeSet<StructOrTupleIndex> {
-        let mut nested_fields = self.get_nested_fields(vec![]);
-        nested_fields.insert(vec![]); // Include the entire struct/tuple as a field
-        nested_fields
-    }
-
     /// Remove any fields that could be None. If a parent could be None, then remove all children.
-    pub(crate) fn remove_none_fields(&self, keep_topmost_none: bool) -> Option<StructOrTuple> {
+    pub fn remove_none_fields(&self, keep_topmost_none: bool) -> Option<StructOrTuple> {
         if !keep_topmost_none && self.could_be_none {
             return None;
         }
@@ -187,7 +125,7 @@ impl StructOrTuple {
     }
 
     /// Create a tuple representing dependencies present in both tuples, keeping the more specific dependency if there is one
-    pub(crate) fn intersect(tuple1: &StructOrTuple, tuple2: &StructOrTuple) -> Option<StructOrTuple> {
+    pub fn intersect(tuple1: &StructOrTuple, tuple2: &StructOrTuple) -> Option<StructOrTuple> {
         // If either tuple1 or tuple2 are empty and None, just return the other tuple
         for (tuple, other) in [(tuple1, tuple2), (tuple2, tuple1)] {
             if tuple.is_empty() && tuple.could_be_none {
@@ -235,7 +173,7 @@ impl StructOrTuple {
     }
 
     /// Find the intersection between all tuples (calling intersect n-1 times)
-    pub(crate) fn intersect_tuples(tuples: &[StructOrTuple]) -> Option<StructOrTuple> {
+    pub fn intersect_tuples(tuples: &[StructOrTuple]) -> Option<StructOrTuple> {
         if tuples.is_empty() {
             return None;
         }
@@ -254,7 +192,7 @@ impl StructOrTuple {
     /// Find the fields where all tuples have a dependency, regardless of what that dependency is.
     /// For each such field, record the dependency index of each tuple.
     /// Return an array of such arrays
-    pub(crate) fn intersect_dependencies_with_matching_fields(
+    pub fn intersect_dependencies_with_matching_fields(
         tuples: &[StructOrTuple],
     ) -> Vec<Vec<StructOrTupleIndex>> {
         let mut intersections = Vec::new();
@@ -322,7 +260,7 @@ impl StructOrTuple {
         intersections
     }
 
-    pub(crate) fn index_intersection(
+    pub fn index_intersection(
         index1: &StructOrTupleIndex,
         index2: &StructOrTupleIndex,
     ) -> Option<StructOrTupleIndex> {
@@ -343,7 +281,7 @@ impl StructOrTuple {
         Some(index2.clone())
     }
 
-    pub(crate) fn union(tuple1: &StructOrTuple, tuple2: &StructOrTuple) -> Option<StructOrTuple> {
+    pub fn union(tuple1: &StructOrTuple, tuple2: &StructOrTuple) -> Option<StructOrTuple> {
         if tuple1.is_empty() && tuple2.is_empty() {
             return None;
         }
@@ -360,7 +298,7 @@ impl StructOrTuple {
             if let Some(child2) = tuple2.get_dependencies(&vec![field.clone()]) {
                 // Recursively compute unions. If child2 is empty, then just keep child1
                 if let Some(new_child) = StructOrTuple::union(child1, &child2) {
-                    *child1 = Box::new(new_child);
+                    **child1 = new_child;
                 }
             }
         }
@@ -375,7 +313,6 @@ impl StructOrTuple {
         if new_tuple.is_empty() {
             None
         } else {
-            println!("Unioned {:?} and {:?} into {:?}", tuple1, tuple2, new_tuple);
             Some(new_tuple)
         }
     }
@@ -384,7 +321,7 @@ impl StructOrTuple {
     ///
     /// The parent's dependencies are absolute (dependency on an input to the node);
     /// the child's dependencies are relative (dependency within the function).
-    pub(crate) fn project_parent(parent: &StructOrTuple, child: &StructOrTuple) -> Option<StructOrTuple> {
+    pub fn project_parent(parent: &StructOrTuple, child: &StructOrTuple) -> Option<StructOrTuple> {
         let mut new_child = StructOrTuple::default();
         assert!(
             !parent.could_be_none && !child.could_be_none,
@@ -441,7 +378,7 @@ impl StructOrTupleUseRhs {
     }
 
     fn set_field_could_be_none(&mut self) {
-        let (field, _) = self.rhs_tuple.create_child(self.field_index.clone());
+        let field = self.rhs_tuple.create_child(self.field_index.clone());
         field.could_be_none = true;
     }
 }
@@ -626,16 +563,6 @@ impl Visit<'_> for StructOrTupleUseRhs {
         }
     }
 
-    fn visit_expr_unary(&mut self, unary: &syn::ExprUnary) {
-        match unary.op {
-            syn::UnOp::Deref(_) => {
-                // Allow deref
-                self.visit_expr(&unary.expr);
-            }
-            _ => {}
-        }
-    }
-
     fn visit_expr(&mut self, expr: &syn::Expr) {
         match expr {
             syn::Expr::Path(path) => self.visit_expr_path(path),
@@ -648,7 +575,6 @@ impl Visit<'_> for StructOrTupleUseRhs {
             syn::Expr::If(if_expr) => self.visit_expr_if(if_expr),
             syn::Expr::Match(match_expr) => self.visit_expr_match(match_expr),
             syn::Expr::Call(call_expr) => self.visit_expr_call(call_expr),
-            syn::Expr::Unary(unary_expr) => self.visit_expr_unary(unary_expr),
             _ => println!(
                 "StructOrTupleUseRhs skipping unsupported RHS expression: {:?}",
                 expr
@@ -657,7 +583,7 @@ impl Visit<'_> for StructOrTupleUseRhs {
     }
 }
 
-// Create a mapping from Ident to tuple indices (Note: Not necessarily parent tuple indices)
+// Create a mapping from Ident to tuple indices (Note: Not necessarily input tuple indices)
 // For example, (a, (b, c)) -> { a: [0], b: [1, 0], c: [1, 1] }
 #[derive(Default)]
 struct TupleDeclareLhs {
@@ -696,22 +622,14 @@ impl Visit<'_> for TupleDeclareLhs {
                 }
             }
             syn::Pat::TupleStruct(tuple_struct) => {
-                match tuple_struct.path.get_ident() {
-                    Some(ident) if ident == "Some" => {
-                        assert_eq!(tuple_struct.elems.len(), 1); // Some should have exactly one element
-                        self.visit_pat(tuple_struct.elems.first().unwrap());
-                    }
-                    Some(ident) if ident == "Ok" => {
-                        assert_eq!(tuple_struct.elems.len(), 1); // Ok should have exactly one element
-                        self.visit_pat(tuple_struct.elems.first().unwrap());
-                    }
-                    Some(ident) if ident == "Err" => {} // Ignore dependencies from Err
-                    Some(_) | None => {
-                        panic!(
-                            "TupleDeclareLhs does not support generic tuple structs: {:?}",
-                            tuple_struct
-                        );
-                    }
+                if tuple_struct.path.is_ident("Some") {
+                    assert_eq!(tuple_struct.elems.len(), 1); // Some should have exactly one element
+                    self.visit_pat(tuple_struct.elems.first().unwrap());
+                } else {
+                    panic!(
+                        "TupleDeclareLhs does not support tuple structs: {:?}",
+                        tuple_struct
+                    );
                 }
             }
             syn::Pat::Wild(_) | syn::Pat::Lit(_) => {} // Ignore wildcards, literals
@@ -734,8 +652,8 @@ struct EqualityAnalysis {
 impl EqualityAnalysis {
     pub fn visit_assignment(&mut self, lhs: &syn::Pat, rhs: Option<Box<syn::Expr>>) {
         // Analyze LHS
-        let mut parent_analysis: TupleDeclareLhs = TupleDeclareLhs::default();
-        parent_analysis.visit_pat(lhs);
+        let mut input_analysis: TupleDeclareLhs = TupleDeclareLhs::default();
+        input_analysis.visit_pat(lhs);
 
         // Analyze RHS
         let mut analysis = StructOrTupleUseRhs::default();
@@ -746,7 +664,7 @@ impl EqualityAnalysis {
         }
 
         // Set dependencies from LHS to RHS
-        for (lhs, tuple_index) in parent_analysis.lhs_tuple.iter() {
+        for (lhs, tuple_index) in input_analysis.lhs_tuple.iter() {
             let mut tuple = StructOrTuple::default();
             tuple.set_dependencies(tuple_index, &analysis.rhs_tuple, tuple_index);
             if tuple.is_empty() {
@@ -811,9 +729,9 @@ impl Visit<'_> for EqualityAnalysis {
 }
 
 #[derive(Default)]
-pub(crate) struct AnalyzeClosure {
+pub struct AnalyzeClosure {
     found_closure: bool, // Used to avoid executing visit_pat on anything but the function body
-    pub(crate) output_dependencies: StructOrTuple,
+    pub output_dependencies: StructOrTuple,
 }
 
 impl Visit<'_> for AnalyzeClosure {
@@ -822,25 +740,25 @@ impl Visit<'_> for AnalyzeClosure {
             panic!("Nested closures found in a single Expr during partitioning analysis.");
         }
 
-        // Find all parent vars
+        // Find all input vars
         self.output_dependencies = StructOrTuple::default();
         self.found_closure = true;
         if closure.inputs.len() > 1 {
             panic!(
-                "Partitioning analysis does not currently support closures with multiple parents (such as reduce): {:?}.",
+                "Partitioning analysis does not currently support closures with multiple inputs (such as reduce): {:?}.",
                 closure
             );
         }
-        let mut parent_analysis = TupleDeclareLhs::default();
-        parent_analysis.visit_pat(&closure.inputs[0]);
+        let mut input_analysis = TupleDeclareLhs::default();
+        input_analysis.visit_pat(&closure.inputs[0]);
         println!(
             "Input idents to tuple indices: {:?}",
-            parent_analysis.lhs_tuple
+            input_analysis.lhs_tuple
         );
 
         // Perform dependency analysis on the body
         let mut analyzer = EqualityAnalysis {
-            dependencies: parent_analysis.into_tuples(),
+            dependencies: input_analysis.into_tuples(),
             ..Default::default()
         };
         analyzer.visit_expr(&closure.body);
@@ -941,8 +859,8 @@ mod tests {
     }
 
     #[test]
-    fn test_tuple_parent_assignment() {
-        let builder = FlowBuilder::new();
+    fn test_tuple_input_assignment() {
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -954,8 +872,8 @@ mod tests {
     }
 
     #[test]
-    fn test_tuple_parent_implicit_nesting() {
-        let builder = FlowBuilder::new();
+    fn test_tuple_input_implicit_nesting() {
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -968,7 +886,7 @@ mod tests {
 
     #[test]
     fn test_tuple_assignment() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -984,7 +902,7 @@ mod tests {
 
     #[test]
     fn test_tuple_creation() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1000,7 +918,7 @@ mod tests {
 
     #[test]
     fn test_tuple_output_implicit_nesting() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1015,8 +933,8 @@ mod tests {
     }
 
     #[test]
-    fn test_tuple_parent_output_implicit_nesting() {
-        let builder = FlowBuilder::new();
+    fn test_tuple_input_output_implicit_nesting() {
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1032,7 +950,7 @@ mod tests {
 
     #[test]
     fn test_tuple_no_block() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1045,7 +963,7 @@ mod tests {
 
     #[test]
     fn test_if_shared_intersection() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1062,7 +980,7 @@ mod tests {
 
     #[test]
     fn test_if_conflicting_intersection() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1078,7 +996,7 @@ mod tests {
 
     #[test]
     fn test_if_implicit_expansion() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1093,7 +1011,7 @@ mod tests {
 
     #[test]
     fn test_if_let() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1118,7 +1036,7 @@ mod tests {
 
     #[test]
     fn test_else_if() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1146,7 +1064,7 @@ mod tests {
 
     #[test]
     fn test_if_option() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1159,7 +1077,7 @@ mod tests {
 
     #[test]
     fn test_match() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1181,7 +1099,7 @@ mod tests {
 
     #[test]
     fn test_match_assign() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1202,7 +1120,7 @@ mod tests {
 
     #[test]
     fn test_block() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1222,7 +1140,7 @@ mod tests {
 
     #[test]
     fn test_nested_block() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1245,7 +1163,7 @@ mod tests {
 
     #[test]
     fn test_block_shadowing() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1268,7 +1186,7 @@ mod tests {
 
     #[test]
     fn test_full_assignment() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([(1, 2, (3, (4,)), 5)]))
@@ -1325,7 +1243,7 @@ mod tests {
 
     #[test]
     fn test_nested_struct() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([TestStruct {
@@ -1357,7 +1275,7 @@ mod tests {
 
     #[test]
     fn test_nested_struct_declaration() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([TestStruct {
@@ -1387,7 +1305,7 @@ mod tests {
 
     #[test]
     fn test_struct_implicit_field() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
             .source_iter(q!([TestStruct {

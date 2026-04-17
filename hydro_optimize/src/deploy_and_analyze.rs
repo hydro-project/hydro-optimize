@@ -1,27 +1,35 @@
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::Path;
 use std::time::Duration;
 
+use chrono::Local;
 use hydro_deploy::Deployment;
-use hydro_lang::compile::builder::{FlowBuilder, RewriteIrFlowBuilder};
+use hydro_lang::compile::built::BuiltFlow;
 use hydro_lang::compile::deploy::DeployResult;
 use hydro_lang::compile::ir::{HydroNode, HydroRoot, deep_clone, traverse_dfir};
 use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::deploy::deploy_graph::DeployCrateWrapper;
+use hydro_lang::location::Location;
+use hydro_lang::location::LocationKey;
 use hydro_lang::location::dynamic::LocationId;
+use hydro_lang::prelude::{Cluster, FlowBuilder, Process};
+use hydro_lang::telemetry::Sidecar;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::decouple_analysis::decouple_analysis;
-use crate::decoupler::Decoupler;
-use crate::deploy::ReusableHosts;
-use crate::parse_results::{
-    MultiRunMetadata, analyze_cluster_results, analyze_send_recv_overheads,
-    compare_expected_performance, get_or_append_run_metadata,
-};
-use crate::repair::{cycle_source_to_sink_parent, inject_id, remove_counter};
+use crate::decoupler;
+use crate::deploy::{HostType, ReusableHosts};
+use crate::parse_results::{CPUStat, RunMetadata, SarStats, analyze_cluster_results};
+use crate::repair::{cycle_source_to_sink_input, inject_id, remove_counter};
 
+pub(crate) const METRIC_INTERVAL_SECS: u64 = 1;
 const COUNTER_PREFIX: &str = "_optimize_counter";
 pub(crate) const CPU_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_CPU:";
+pub(crate) const SAR_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_SAR:";
+pub(crate) const LATENCY_PREFIX: &str = "HYDRO_OPTIMIZE_LAT:";
+pub(crate) const THROUGHPUT_PREFIX: &str = "HYDRO_OPTIMIZE_THR:";
 
 // Note: Ensure edits to the match arms are consistent with inject_count_node
 fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration: syn::Expr) {
@@ -32,7 +40,6 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
         }
         HydroNode::Source { metadata, .. }
         | HydroNode::CycleSource { metadata, .. }
-        | HydroNode::Persist { metadata, .. }
         | HydroNode::Chain { metadata, .. } // Can technically be derived by summing parent cardinalities
         | HydroNode::ChainFirst { metadata, .. } // Can technically be derived by taking parent cardinality + 1
         | HydroNode::CrossSingleton { metadata, .. }
@@ -41,10 +48,12 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
         | HydroNode::Difference { metadata, .. }
         | HydroNode::AntiJoin { metadata, .. }
         | HydroNode::FlatMap { metadata, .. }
+        | HydroNode::FlatMapStreamBlocking { metadata, .. }
         | HydroNode::Filter { metadata, .. }
         | HydroNode::FilterMap { metadata, .. }
         | HydroNode::Unique { metadata, .. }
         | HydroNode::Scan { metadata, .. }
+        | HydroNode::ScanAsyncBlocking { metadata, .. }
         | HydroNode::Fold { metadata, .. } // Output 1 value per tick
         | HydroNode::Reduce { metadata, .. } // Output 1 value per tick
         | HydroNode::FoldKeyed { metadata, .. }
@@ -53,6 +62,7 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
         | HydroNode::Network { metadata, .. }
         | HydroNode::ExternalInput { metadata, .. }
         | HydroNode::SingletonSource { metadata, .. }
+        | HydroNode::Partition { metadata, .. }
          => {
             let metadata = metadata.clone();
             let node_content = std::mem::replace(node, HydroNode::Placeholder);
@@ -84,11 +94,12 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
         | HydroNode::YieldConcat { .. }
         | HydroNode::ResolveFutures { .. }
         | HydroNode::ResolveFuturesOrdered { .. }
+        | HydroNode::ResolveFuturesBlocking { .. }
          => {}
     }
 }
 
-fn insert_counter(ir: &mut [HydroRoot], duration: syn::Expr) {
+fn insert_counter(ir: &mut [HydroRoot], duration: &syn::Expr) {
     traverse_dfir(
         ir,
         |_, _| {},
@@ -98,172 +109,602 @@ fn insert_counter(ir: &mut [HydroRoot], duration: syn::Expr) {
     );
 }
 
-async fn track_process_usage_cardinality(
-    process: &impl DeployCrateWrapper,
-) -> (UnboundedReceiver<String>, UnboundedReceiver<String>) {
-    (
-        process.stdout_filter(CPU_USAGE_PREFIX).await,
-        process.stdout_filter(COUNTER_PREFIX).await,
-    )
+pub struct MetricLogs {
+    pub throughputs: UnboundedReceiver<String>,
+    pub latencies: UnboundedReceiver<String>,
+    pub cpu: UnboundedReceiver<String>,
+    pub sar: UnboundedReceiver<String>,
+    pub counters: UnboundedReceiver<String>,
 }
 
-async fn track_cluster_usage_cardinality(
+async fn track_process_metrics(process: &impl DeployCrateWrapper) -> MetricLogs {
+    MetricLogs {
+        throughputs: process.stdout_filter(THROUGHPUT_PREFIX),
+        latencies: process.stdout_filter(LATENCY_PREFIX),
+        cpu: process.stdout_filter(CPU_USAGE_PREFIX),
+        sar: process.stdout_filter(SAR_USAGE_PREFIX),
+        counters: process.stdout_filter(COUNTER_PREFIX),
+    }
+}
+
+async fn track_cluster_metrics(
     nodes: &DeployResult<'_, HydroDeploy>,
-) -> (
-    HashMap<(LocationId, String, usize), UnboundedReceiver<String>>,
-    HashMap<(LocationId, String, usize), UnboundedReceiver<String>>,
-) {
-    let mut usage_out = HashMap::new();
-    let mut cardinality_out = HashMap::new();
+) -> HashMap<(LocationId, String, usize), MetricLogs> {
+    let mut cluster_to_metrics = HashMap::new();
     for (id, name, cluster) in nodes.get_all_clusters() {
         for (idx, node) in cluster.members().iter().enumerate() {
-            let (node_usage_out, node_cardinality_out) =
-                track_process_usage_cardinality(node).await;
-            usage_out.insert((id.clone(), name.clone(), idx), node_usage_out);
-            cardinality_out.insert((id.clone(), name.clone(), idx), node_cardinality_out);
+            let metrics = track_process_metrics(node).await;
+            cluster_to_metrics.insert((id.clone(), name.to_string(), idx), metrics);
         }
     }
     for (id, name, process) in nodes.get_all_processes() {
-        let (process_usage_out, process_cardinality_out) =
-            track_process_usage_cardinality(process).await;
-        usage_out.insert((id.clone(), name.clone(), 0), process_usage_out);
-        cardinality_out.insert((id.clone(), name.clone(), 0), process_cardinality_out);
+        let metrics = track_process_metrics(process).await;
+        cluster_to_metrics.insert((id.clone(), name.to_string(), 0), metrics);
     }
-    (usage_out, cardinality_out)
+    cluster_to_metrics
 }
 
-/// TODO: Return type should be changed to also include Partitioner
-#[expect(clippy::too_many_arguments, reason = "Optimizer internal function")]
-#[expect(
-    clippy::await_holding_refcell_ref,
-    reason = "Await function needs to write to data in RefCell"
-)]
-pub async fn deploy_and_analyze<'a>(
+struct ScriptSidecar {
+    script: String,
+    prefix: String,
+}
+
+impl Sidecar for ScriptSidecar {
+    fn to_expr(
+        &self,
+        _flow_name: &str,
+        location_key: hydro_lang::location::LocationKey,
+        _location_type: hydro_lang::location::LocationType,
+        _location_name: &str,
+        _dfir_ident: &syn::Ident,
+    ) -> syn::Expr {
+        let script = &self.script;
+        let prefix = &self.prefix;
+        let location_key_str = format!("{:?}", location_key);
+
+        syn::parse_quote! {
+            async {
+                use tokio::process::Command;
+                use tokio::io::{BufReader, AsyncBufReadExt};
+                use std::process::Stdio;
+
+                let mut child = Command::new("sh")
+                    .arg("-c")
+                    .arg(#script)
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .expect("Failed to spawn sidecar");
+
+                let stdout = child.stdout.take().expect("Failed to open sidecar stdout");
+                let mut reader = BufReader::new(stdout).lines();
+                while let Some(line) = reader.next_line().await.expect("Failed to read line from sidecar") {
+                    println!("{}{}: {}", #prefix, #location_key_str, line);
+                }
+
+                child.wait().await.expect("Failed to wait for sidecar");
+            }
+        }
+    }
+}
+
+#[derive(Default, Clone)]
+pub struct ReusableClusters {
+    named_clusters: Vec<(LocationKey, String, usize)>,
+}
+
+impl ReusableClusters {
+    pub fn with_cluster<C>(mut self, cluster: Cluster<'_, C>, num_members: usize) -> Self {
+        self.named_clusters.push((
+            cluster.id().key(),
+            std::any::type_name::<C>().to_string(),
+            num_members,
+        ));
+        self
+    }
+
+    pub fn from(named_clusters: Vec<(LocationKey, String, usize)>) -> Self {
+        Self { named_clusters }
+    }
+
+    fn location_name_and_num(&self, location: &LocationId) -> Option<(String, usize)> {
+        self.named_clusters
+            .iter()
+            .find(|(key, _, _)| location.key() == *key)
+            .map(|(_, name, count)| (name.clone(), *count))
+    }
+}
+
+#[derive(Default, Clone)]
+pub struct ReusableProcesses {
+    named_processes: Vec<(LocationKey, String)>,
+}
+
+impl ReusableProcesses {
+    pub fn with_process<P>(mut self, process: Process<'_, P>) -> Self {
+        self.named_processes
+            .push((process.id().key(), std::any::type_name::<P>().to_string()));
+        self
+    }
+
+    fn location_name(&self, location: &LocationId) -> Option<String> {
+        self.named_processes
+            .iter()
+            .find(|(key, _)| &location.key() == key)
+            .map(|(_, name)| name.clone())
+    }
+}
+
+#[derive(Clone)]
+pub struct Optimizations {
+    decoupling: bool,
+    partitioning: bool,
+    exclude: Vec<String>,
+    iterations: usize, // Must be at least 1
+}
+
+impl Default for Optimizations {
+    fn default() -> Self {
+        Self {
+            decoupling: false,
+            partitioning: false,
+            exclude: vec![],
+            iterations: 1,
+        }
+    }
+}
+
+impl Optimizations {
+    pub fn with_decoupling(mut self) -> Self {
+        self.decoupling = true;
+        self
+    }
+
+    pub fn with_partitioning(mut self) -> Self {
+        self.partitioning = true;
+        self
+    }
+
+    pub fn excluding<T>(mut self) -> Self {
+        self.exclude.push(std::any::type_name::<T>().to_string());
+        self
+    }
+
+    pub fn with_iterations(mut self, iterations: usize) -> Self {
+        assert!(iterations > 0);
+        self.iterations = iterations;
+        self
+    }
+}
+
+/// `stability_second`: The second in which the protocol is expected to be stable, and its performance can be used as the basis for optimization.
+#[allow(clippy::too_many_arguments)]
+pub async fn deploy_and_optimize<'a>(
     reusable_hosts: &mut ReusableHosts,
     deployment: &mut Deployment,
-    builder: FlowBuilder<'a>,
-    clusters: &Vec<(usize, String, usize)>,
-    processes: &Vec<(usize, String)>,
-    exclude_from_decoupling: Vec<String>,
+    mut builder: BuiltFlow<'a>,
+    mut clusters: ReusableClusters,
+    processes: ReusableProcesses,
+    optimizations: Optimizations,
+    client_id: &LocationId,
+    num_clients_per_node: usize,
     num_seconds: Option<usize>,
-    multi_run_metadata: &RefCell<MultiRunMetadata>,
-    iteration: usize, // Starts at 0, how many times this function has been called
-) -> (
-    RewriteIrFlowBuilder<'a>,
-    Vec<HydroRoot>,
-    Decoupler,
-    String,
-    usize,
-) {
-    let counter_output_duration = syn::parse_quote!(std::time::Duration::from_secs(1));
-
-    // Rewrite with counter tracking
-    let rewritten_ir_builder = builder.rewritten_ir_builder();
-    let optimized = builder.optimize_with(|leaf| {
-        inject_id(leaf);
-        insert_counter(leaf, counter_output_duration);
-    });
-    let mut ir = deep_clone(optimized.ir());
-
-    // Insert all clusters & processes
-    let mut deployable = optimized.into_deploy();
-    for (cluster_id, name, num_hosts) in clusters {
-        deployable = deployable.with_cluster_id_name(
-            *cluster_id,
-            name.clone(),
-            reusable_hosts.get_cluster_hosts(deployment, name.clone(), *num_hosts),
+    stability_second: Option<usize>,
+    analyze: bool,
+) -> RunMetadata {
+    assert!(
+        optimizations.iterations < 1 || num_seconds.is_some(),
+        "Cannot specify multiple iterations without bounding run time"
+    );
+    if let Some(num_seconds) = num_seconds {
+        assert!(
+            stability_second.is_some_and(|stability_time| stability_time < num_seconds),
+            "Invariant: stability_second < num_seconds"
         );
     }
-    for (process_id, name) in processes {
-        deployable = deployable.with_process_id_name(
-            *process_id,
-            name.clone(),
-            reusable_hosts.get_process_hosts(deployment, name.clone()),
+    if optimizations.decoupling || optimizations.partitioning {
+        assert!(
+            stability_second.is_some() && analyze,
+            "Must select stability_second and enable analysis with optimizations"
         );
     }
-    let nodes = deployable.deploy(deployment);
-    deployment.deploy().await.unwrap();
-
-    let (mut usage_out, mut cardinality_out) = track_cluster_usage_cardinality(&nodes).await;
-
-    // Wait for user to input a newline
-    deployment
-        .start_until(async {
-            if let Some(seconds) = num_seconds {
-                // Wait for some number of seconds
-                tokio::time::sleep(Duration::from_secs(seconds as u64)).await;
-            } else {
-                // Wait for a new line
-                eprintln!("Press enter to stop deployment and analyze results");
-                let _ = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(
-                    tokio::io::stdin(),
-                ))
-                .next_line()
-                .await
-                .unwrap();
-            }
-        })
-        .await
-        .unwrap();
-
-    // Add metadata for this run
-    let mut mut_multi_run_metadata = multi_run_metadata.borrow_mut();
-    let run_metadata = get_or_append_run_metadata(&mut mut_multi_run_metadata, iteration);
-    let (bottleneck, bottleneck_name, bottleneck_num_nodes) = analyze_cluster_results(
-        &nodes,
-        &mut ir,
-        &mut usage_out,
-        &mut cardinality_out,
-        run_metadata,
-        exclude_from_decoupling,
-    )
-    .await;
-    // Remove HydroNode::Counter (since we don't want to consider decoupling those)
-    remove_counter(&mut ir);
-
-    // Create a mapping from each CycleSink to its corresponding CycleSource
-    let cycle_source_to_sink_parent = cycle_source_to_sink_parent(&mut ir);
-    analyze_send_recv_overheads(&mut ir, run_metadata);
-    let send_overhead = run_metadata
-        .send_overhead
-        .get(&bottleneck)
-        .cloned()
-        .unwrap_or_default();
-    let recv_overhead = run_metadata
-        .recv_overhead
-        .get(&bottleneck)
-        .cloned()
-        .unwrap_or_default();
-
-    // Check the expected/actual CPU usages before/after rewrites
-    std::mem::drop(mut_multi_run_metadata); // Release borrow
-    compare_expected_performance(&mut ir, multi_run_metadata, iteration);
-
-    // TODO: Remove hard-coded 2 decoupling
-    let num_locations = 2;
-    let (new_networks, place_on_loc) = decouple_analysis(
-        &mut ir,
-        &bottleneck,
-        send_overhead,
-        recv_overhead,
-        num_locations,
-        &cycle_source_to_sink_parent,
-        true,
+    assert!(
+        num_clients_per_node > 0,
+        "Must have at least 1 client per node"
     );
 
-    // TODO: Save decoupling decision to file
+    let counter_output_duration =
+        syn::parse_quote!(std::time::Duration::from_secs(#METRIC_INTERVAL_SECS));
+    let mut run_metadata = RunMetadata::default();
 
-    (
-        rewritten_ir_builder,
-        ir,
-        Decoupler {
-            output_to_decoupled_machine_after: new_networks.get(&(0, 1)).cloned().unwrap_or(HashSet::new()),
-            output_to_original_machine_after: new_networks.get(&(1, 0)).cloned().unwrap_or(HashSet::new()),
-            place_on_decoupled_machine: place_on_loc.get(&1).cloned().unwrap_or_default(),
-            orig_location: bottleneck.clone(),
-            decoupled_location: LocationId::Process(0), // Placeholder, must replace
-        },
-        bottleneck_name,
-        bottleneck_num_nodes,
-    )
+    for iteration in 0..optimizations.iterations {
+        // Rewrite with counter tracking
+        let mut post_rewrite_builder = FlowBuilder::from_built(&builder);
+        let optimized = builder.optimize_with(|leaf| {
+            inject_id(leaf);
+            insert_counter(leaf, &counter_output_duration);
+        });
+        let mut ir = deep_clone(optimized.ir());
+
+        // Insert all clusters & processes
+        let mut deployable = optimized.into_deploy();
+        for (cluster_id, name, num_hosts) in clusters.named_clusters.iter() {
+            if *cluster_id == client_id.key() {
+                let mut client_hosts = vec![];
+                for i in 0..num_clients_per_node {
+                    let pin_to_core = i % reusable_hosts.num_cores();
+                    client_hosts.push(reusable_hosts.get_cluster_hosts(
+                        deployment,
+                        name.clone(),
+                        *num_hosts,
+                        pin_to_core,
+                    ));
+                }
+                deployable = deployable.with_cluster_erased(*cluster_id, client_hosts.concat());
+            } else {
+                deployable = deployable.with_cluster_erased(
+                    *cluster_id,
+                    reusable_hosts.get_cluster_hosts(deployment, name.clone(), *num_hosts, 0),
+                );
+            }
+        }
+        for (process_id, name) in processes.named_processes.iter() {
+            deployable = deployable.with_process_erased(
+                *process_id,
+                reusable_hosts.get_no_perf_process_hosts(deployment, name.clone(), 0),
+            );
+        }
+
+        // Measure network (-n DEV) and CPU (-u) usage. -P ALL measures all CPUs on the machine
+        let sar_sidecar = ScriptSidecar {
+            script: "sar -n DEV -u -P ALL 1".to_string(),
+            prefix: SAR_USAGE_PREFIX.to_string(),
+        };
+        let nodes = deployable
+            .with_sidecar_all(&sar_sidecar) // Measure network usage
+            .deploy(deployment);
+        deployment.deploy().await.unwrap();
+
+        let metrics = track_cluster_metrics(&nodes).await;
+
+        // Wait for user to input a newline
+        deployment
+            .start_until(async {
+                if let Some(seconds) = num_seconds {
+                    // Wait for some number of seconds
+                    tokio::time::sleep(Duration::from_secs(seconds as u64)).await;
+                } else {
+                    // Wait for a new line
+                    eprintln!("Press enter to stop deployment and analyze results");
+                    let _ = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(
+                        tokio::io::stdin(),
+                    ))
+                    .next_line()
+                    .await
+                    .unwrap();
+                }
+            })
+            .await
+            .unwrap();
+
+        if analyze {
+            // Parse results to get metrics
+            run_metadata =
+                analyze_cluster_results(&nodes, &mut ir, metrics, client_id, stability_second)
+                    .await;
+            // Remove HydroNode::Counter (since we don't want to consider decoupling those)
+            remove_counter(&mut ir);
+
+            // Create a mapping from each CycleSink to its corresponding CycleSource
+            let cycle_source_to_sink_input = cycle_source_to_sink_input(&mut ir);
+
+            if optimizations.decoupling {
+                let bottleneck = run_metadata.cpu_bottleneck(stability_second.unwrap());
+                // The bottleneck is either a process or cluster. Panic otherwise.
+                let (bottleneck_name, bottleneck_num_nodes) = processes
+                    .location_name(&bottleneck)
+                    .map(|name| (name, 1))
+                    .unwrap_or_else(|| clusters.location_name_and_num(&bottleneck).unwrap());
+
+                let decision = decouple_analysis(
+                    &mut ir,
+                    &bottleneck,
+                    0.01, // TODO: Deprecate use of send/recv overheads, since they are inaccurate anyway
+                    0.01,
+                    &cycle_source_to_sink_input,
+                );
+
+                // Apply decoupling — creates new clusters as needed
+                let new_clusters =
+                    decoupler::decouple(&mut ir, decision, &bottleneck, &mut post_rewrite_builder);
+                for cluster in new_clusters {
+                    clusters.named_clusters.push((
+                        cluster.id().key(),
+                        format!("{}-decouple-{}", bottleneck_name, iteration),
+                        bottleneck_num_nodes,
+                    ));
+                }
+                // TODO: Save decoupling decision to file
+            }
+        }
+
+        post_rewrite_builder.replace_ir(ir);
+        builder = post_rewrite_builder.finalize();
+    }
+
+    run_metadata
+}
+
+/// Writes per-second metrics CSV for each location, combining sar stats with
+/// the shared throughput and latency time series.
+fn write_metrics_csv(
+    output_dir: &Path,
+    run_metadata: &RunMetadata,
+    location_id_to_cluster: &HashMap<LocationId, String>,
+    num_clients: usize,
+    num_clients_per_node: usize,
+    run: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(output_dir)?;
+
+    for (location, stats) in &run_metadata.sar_stats {
+        if stats.is_empty() {
+            continue;
+        }
+
+        let location_name = location_id_to_cluster.get(location).unwrap();
+        let filename = output_dir.join(format!(
+            "{}_{}c_{}vc_r{}.csv",
+            location_name, num_clients, num_clients_per_node, run
+        ));
+        let num_rows = stats
+            .len()
+            .max(run_metadata.throughputs.len())
+            .max(run_metadata.latencies.len());
+
+        let num_cores = stats
+            .iter()
+            .map(|s| s.cpu.core_stats.len())
+            .max()
+            .unwrap_or(0);
+
+        let mut file = File::create(&filename)?;
+        // Header
+        write!(file, "time_s,cpu_user,cpu_system,cpu_idle")?;
+        for c in 0..num_cores {
+            write!(file, ",core{}_user,core{}_system,core{}_idle", c, c, c)?;
+        }
+        writeln!(
+            file,
+            ",network_tx_packets_per_sec,network_rx_packets_per_sec,\
+             network_tx_bytes_per_sec,network_rx_bytes_per_sec,\
+             throughput_rps,latency_p50_ms,latency_p99_ms,latency_p999_ms,latency_samples",
+        )?;
+
+        let default_sar = SarStats::default();
+        for i in 0..num_rows {
+            let sar = stats.get(i).unwrap_or(&default_sar);
+            let thr = run_metadata.throughputs.get(i).copied().unwrap_or(0);
+            let (p50, p99, p999, count) =
+                run_metadata.latencies.get(i).copied().unwrap_or_default();
+            write!(
+                file,
+                "{},{:.2},{:.2},{:.2}",
+                i, sar.cpu.all_stats.user, sar.cpu.all_stats.system, sar.cpu.all_stats.idle,
+            )?;
+            let default_core = CPUStat::default();
+            for c in 0..num_cores {
+                let core = sar.cpu.core_stats.get(c).unwrap_or(&default_core);
+                write!(
+                    file,
+                    ",{:.2},{:.2},{:.2}",
+                    core.user, core.system, core.idle
+                )?;
+            }
+            writeln!(
+                file,
+                ",{:.2},{:.2},{:.2},{:.2},{},{:.3},{:.3},{:.3},{}",
+                sar.network.tx_packets_per_sec,
+                sar.network.rx_packets_per_sec,
+                sar.network.tx_bytes_per_sec,
+                sar.network.rx_bytes_per_sec,
+                thr,
+                p50,
+                p99,
+                p999,
+                count,
+            )?;
+        }
+
+        println!("Generated CSV: {}", filename.display());
+    }
+
+    Ok(())
+}
+
+async fn output_metrics(
+    run_metadata: RunMetadata,
+    location_id_to_cluster: &HashMap<LocationId, String>,
+    output_dir: &Path,
+    num_clients: usize,
+    num_clients_per_node: usize,
+    measurement_second: usize,
+    run: usize,
+) {
+    if let Some(&throughput) = run_metadata.throughputs.get(measurement_second) {
+        println!(
+            "Throughput @{}s: {} requests/s",
+            measurement_second + 1,
+            throughput
+        );
+    }
+    if let Some(&(p50, p99, p999, samples)) = run_metadata.latencies.get(measurement_second) {
+        println!(
+            "Latency @{}s: p50: {:.3} | p99 {:.3} | p999 {:.3} ms ({} samples)",
+            measurement_second + 1,
+            p50,
+            p99,
+            p999,
+            samples
+        );
+    }
+    run_metadata
+        .sar_stats
+        .iter()
+        .for_each(|(location, sar_stats)| {
+            println!(
+                "{} CPU: {:.2}%",
+                location_id_to_cluster.get(location).unwrap(),
+                sar_stats
+                    .last()
+                    .map(|stats| stats.cpu.all_stats.user + stats.cpu.all_stats.system)
+                    .unwrap_or_default()
+            )
+        });
+
+    if let Err(e) = write_metrics_csv(
+        output_dir,
+        &run_metadata,
+        location_id_to_cluster,
+        num_clients,
+        num_clients_per_node,
+        run,
+    ) {
+        eprintln!("Failed to write CSV: {}", e);
+    }
+}
+
+pub struct BenchmarkArgs {
+    pub gcp: Option<String>,
+    pub aws: bool,
+}
+
+pub struct BenchmarkConfig<'a> {
+    pub name: String,
+    pub builder: FlowBuilder<'a>,
+    pub clusters: ReusableClusters,
+    pub processes: ReusableProcesses,
+    pub client_id: LocationId,
+    pub optimizations: Optimizations,
+    pub location_id_to_cluster: HashMap<LocationId, String>,
+}
+
+pub async fn benchmark_protocol<'a>(
+    args: BenchmarkArgs,
+    num_runs: usize,
+    run_benchmark: fn(
+        usize, // PHYSICAL_CLIENTS
+    ) -> BenchmarkConfig<'a>,
+) {
+    assert!(
+        num_runs > 0,
+        "Must run at least one iteration of the benchmark"
+    );
+
+    let mut deployment = Deployment::new();
+    let host_type: HostType = if let Some(project) = args.gcp {
+        HostType::Gcp { project }
+    } else if args.aws {
+        HostType::Aws
+    } else {
+        HostType::Localhost
+    };
+
+    let mut reusable_hosts = ReusableHosts::new(&host_type);
+
+    const START_MEASUREMENT_SECOND: usize = 30;
+    const MEASUREMENT_SECOND: usize = 59;
+    const RUN_SECONDS: usize = 90;
+    const PHYSICAL_CLIENTS: usize = 10;
+    const VIRTUAL_CLIENTS_MAX: usize = 50 * PHYSICAL_CLIENTS; // Based on manual testing, an 8-core m5.2xlarge's CPU saturates around 50 clients.
+    const VIRTUAL_CLIENTS_STEP: usize = 50; // Can tweak to get finer-grained numbers
+    const NUM_RUNS_NO_THROUGHPUT: usize = 3;
+
+    let benchmark_config = run_benchmark(PHYSICAL_CLIENTS);
+    // Set up FlowBuilder for cloning
+    let built = benchmark_config.builder.finalize();
+    let ir = built.ir();
+    let output_dir = Path::new("benchmark_results").join(format!(
+        "{}_{}",
+        benchmark_config.name,
+        Local::now().format("%Y-%m-%d_%H-%M-%S")
+    ));
+
+    for num_virtual in (1..=VIRTUAL_CLIENTS_MAX).step_by(VIRTUAL_CLIENTS_STEP) {
+        let mut throughput_sum = 0;
+        let mut successful_runs = 0;
+        let mut zero_throughput_count = 0;
+        let mut run = 0;
+        while successful_runs < num_runs {
+            println!(
+                "Running {} with {} clients (run {})",
+                benchmark_config.name, num_virtual, run
+            );
+
+            let mut builder = FlowBuilder::from_built(&built);
+            builder.replace_ir(deep_clone(ir));
+            let run_metadata = deploy_and_optimize(
+                &mut reusable_hosts,
+                &mut deployment,
+                builder.finalize(),
+                benchmark_config.clusters.clone(),
+                benchmark_config.processes.clone(),
+                benchmark_config.optimizations.clone(),
+                &benchmark_config.client_id.clone(),
+                std::cmp::max(1, num_virtual / PHYSICAL_CLIENTS), // clients per node
+                Some(RUN_SECONDS),
+                Some(MEASUREMENT_SECOND),
+                true,
+            )
+            .await;
+
+            let run_throughput = run_metadata.throughputs
+                [START_MEASUREMENT_SECOND..=MEASUREMENT_SECOND]
+                .iter()
+                .sum::<usize>()
+                / (MEASUREMENT_SECOND - START_MEASUREMENT_SECOND + 1);
+            println!(
+                "clients={}, run={}, throughput@{}s={}",
+                num_virtual,
+                run,
+                MEASUREMENT_SECOND + 1,
+                run_throughput
+            );
+
+            output_metrics(
+                run_metadata,
+                &benchmark_config.location_id_to_cluster,
+                &output_dir,
+                PHYSICAL_CLIENTS,
+                num_virtual,
+                MEASUREMENT_SECOND,
+                run,
+            )
+            .await;
+
+            if run_throughput == 0 {
+                zero_throughput_count += 1;
+                println!(
+                    "Zero throughput detected ({}/{})",
+                    zero_throughput_count, NUM_RUNS_NO_THROUGHPUT
+                );
+                if zero_throughput_count > NUM_RUNS_NO_THROUGHPUT {
+                    println!(
+                        "Exceeded {} zero-throughput runs for this config. Terminating benchmark.",
+                        NUM_RUNS_NO_THROUGHPUT
+                    );
+                    return;
+                }
+            } else {
+                throughput_sum += run_throughput;
+                successful_runs += 1;
+            }
+            run += 1;
+        }
+
+        let current_throughput = throughput_sum / num_runs;
+        println!(
+            "clients={}, avg_throughput={}",
+            num_virtual, current_throughput
+        );
+    }
 }

@@ -1,34 +1,66 @@
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use hydro_lang::compile::deploy::DeployResult;
-use hydro_lang::compile::ir::{
-    HydroIrMetadata, HydroIrOpMetadata, HydroNode, HydroRoot, traverse_dfir,
-};
+use hydro_lang::compile::ir::{HydroNode, HydroRoot, traverse_dfir};
 use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::deploy::deploy_graph::DeployCrateWrapper;
 use hydro_lang::location::dynamic::LocationId;
 use regex::Regex;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::debug::print_id;
+use crate::deploy_and_analyze::MetricLogs;
 
 #[derive(Default)]
 pub struct RunMetadata {
+    pub throughputs: Vec<usize>,
+    pub latencies: Vec<(f64, f64, f64, u64)>, // per-second: (p50, p99, p999, count)
     pub send_overhead: HashMap<LocationId, f64>,
     pub recv_overhead: HashMap<LocationId, f64>,
     pub unaccounted_perf: HashMap<LocationId, f64>, // % of perf samples not mapped to any operator
-    pub total_usage: HashMap<LocationId, f64>,      // 100% CPU = 1.0
-    pub op_id_to_prev_iteration_op_id: HashMap<usize, usize>,
-    pub op_id_to_location: HashMap<usize, LocationId>,
-    pub op_id_to_cpu_usage: HashMap<usize, f64>,
-    pub op_id_to_recv_cpu_usage: HashMap<usize, f64>,
-    pub op_id_to_cardinality: HashMap<usize, usize>,
-    pub op_id_to_parent_op_id: HashMap<usize, Vec<usize>>,
-    pub network_op_id: HashSet<usize>,
+    pub sar_stats: HashMap<LocationId, Vec<SarStats>>,
 }
 
-pub type MultiRunMetadata = Vec<RunMetadata>;
+impl RunMetadata {
+    /// Returns the location of the bottlenecked node by comparing CPU usages at `measurement_sec`.
+    /// Panics if no sar_stats exist for the given `measurement_sec`
+    pub fn cpu_bottleneck(&self, measurement_sec: usize) -> LocationId {
+        let (loc, _stats) = self
+            .sar_stats
+            .iter()
+            .reduce(|(max_loc, max_stats), (curr_loc, curr_stats)| {
+                let max_cpu = &max_stats[measurement_sec].cpu.all_stats;
+                let curr_cpu = &curr_stats[measurement_sec].cpu.all_stats;
+                if max_cpu.system + max_cpu.user < curr_cpu.system + curr_cpu.user {
+                    (curr_loc, curr_stats)
+                } else {
+                    (max_loc, max_stats)
+                }
+            })
+            .unwrap();
+        loc.clone()
+    }
+
+    /// Returns the location of the bottlenecked node by comparing network usage at `measurement_sec`.
+    /// Panics if no sar_stats exist for the given `measurement_sec`
+    pub fn network_bottlenck(&self, measurement_sec: usize) -> LocationId {
+        let (loc, _stats) = self
+            .sar_stats
+            .iter()
+            .reduce(|(max_loc, max_stats), (curr_loc, curr_stats)| {
+                let max_network = max_stats[measurement_sec].network;
+                let curr_network = curr_stats[measurement_sec].network;
+                if max_network.rx_bytes_per_sec + max_network.tx_bytes_per_sec
+                    < curr_network.rx_bytes_per_sec + curr_network.tx_bytes_per_sec
+                {
+                    (curr_loc, curr_stats)
+                } else {
+                    (max_loc, max_stats)
+                }
+            })
+            .unwrap();
+        loc.clone()
+    }
+}
 
 pub fn parse_cpu_usage(measurement: String) -> f64 {
     let regex = Regex::new(r"Total (\d+\.\d+)%").unwrap();
@@ -37,6 +69,150 @@ pub fn parse_cpu_usage(measurement: String) -> f64 {
         .last()
         .map(|cap| cap[1].parse::<f64>().unwrap())
         .unwrap_or(0f64)
+}
+
+/// Per-second CPU statistics from sar -u output
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CPUStat {
+    pub user: f64,
+    pub system: f64,
+    pub idle: f64,
+}
+#[derive(Debug, Default, Clone)]
+pub struct CPUStats {
+    pub core_stats: Vec<CPUStat>, // One for each core
+    pub all_stats: CPUStat,
+}
+
+/// Per-second network statistics from sar -n DEV output (eth0 only)
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NetworkStats {
+    pub rx_packets_per_sec: f64,
+    pub tx_packets_per_sec: f64,
+    pub rx_bytes_per_sec: f64,
+    pub tx_bytes_per_sec: f64,
+}
+
+/// Combined per-second sar statistics
+#[derive(Debug, Default, Clone)]
+pub struct SarStats {
+    pub cpu: CPUStats,
+    pub network: NetworkStats,
+}
+
+/// Parses a single CPU line from sar -u -P ALL output.
+/// Returns (is_all, CPUStat) where is_all=true for the "all" aggregate line.
+fn parse_cpu_line(line: &str) -> Option<(bool, CPUStat)> {
+    let cpu_regex = Regex::new(
+        r"\s(all|\d+)\s+(\d+\.?\d*)\s+\d+\.?\d*\s+(\d+\.?\d*)\s+\d+\.?\d*\s+\d+\.?\d*\s+(\d+\.?\d*)$",
+    )
+    .unwrap();
+
+    cpu_regex.captures(line).and_then(|caps| {
+        let is_all = &caps[1] == "all";
+        let user = caps[2].parse::<f64>().ok()?;
+        let system = caps[3].parse::<f64>().ok()?;
+        let idle = caps[4].parse::<f64>().ok()?;
+        Some((is_all, CPUStat { user, system, idle }))
+    })
+}
+
+/// Parses a single network line from sar -n DEV output (any non-loopback interface).
+/// Format: "HH:MM:SS AM/PM IFACE rxpck/s txpck/s rxkB/s txkB/s ..."
+/// Matches eth0, ens5, or any other interface name that isn't "lo".
+fn parse_network_line(line: &str) -> Option<NetworkStats> {
+    // Match any interface: captures interface name followed by numeric stats
+    let iface_regex =
+        Regex::new(r"(\S+)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)").unwrap();
+
+    iface_regex.captures(line).and_then(|caps| {
+        let iface = &caps[1];
+        // Skip loopback and header lines
+        if iface == "lo" || iface == "docker0" || iface == "IFACE" {
+            return None;
+        }
+        let rx_pkt = caps[2].parse::<f64>().ok()?;
+        let tx_pkt = caps[3].parse::<f64>().ok()?;
+        let rx_kb = caps[4].parse::<f64>().ok()?;
+        let tx_kb = caps[5].parse::<f64>().ok()?;
+        Some(NetworkStats {
+            rx_packets_per_sec: rx_pkt,
+            tx_packets_per_sec: tx_pkt,
+            rx_bytes_per_sec: rx_kb * 1024.0,
+            tx_bytes_per_sec: tx_kb * 1024.0,
+        })
+    })
+}
+
+/// Parses `sar -n DEV -u -P ALL` output lines and returns per-second SarStats.
+/// Groups per-core CPU stats with the aggregate "all" line.
+pub fn parse_sar_output(lines: Vec<String>) -> Vec<SarStats> {
+    let mut cpu_usages: Vec<CPUStats> = vec![];
+    let mut network_usages = vec![];
+
+    for line in &lines {
+        if let Some((is_all, stat)) = parse_cpu_line(line) {
+            // Assumes that "all" line comes before per-core lines
+            if is_all {
+                cpu_usages.push(CPUStats {
+                    all_stats: stat,
+                    core_stats: vec![],
+                });
+            } else if let Some(last) = cpu_usages.last_mut() {
+                last.core_stats.push(stat);
+            }
+        } else if let Some(network) = parse_network_line(line) {
+            network_usages.push(network);
+        }
+    }
+
+    assert!(
+        cpu_usages.len().abs_diff(network_usages.len()) <= 1,
+        "sar output mismatch: {} cpu vs {} network entries",
+        cpu_usages.len(),
+        network_usages.len(),
+    );
+
+    cpu_usages
+        .into_iter()
+        .zip(network_usages)
+        .map(|(cpu, network)| SarStats { cpu, network })
+        .collect()
+}
+
+/// Parses throughput output from `print_parseable_bench_results`.
+/// Format: "HYDRO_OPTIMIZE_THR: {throughput} requests/s"
+/// Returns all per-second throughput values found.
+pub fn parse_throughput(lines: Vec<String>) -> Vec<usize> {
+    let regex = Regex::new(r"(\d+\.?\d*)\s*requests/s").unwrap();
+    lines
+        .iter()
+        .filter_map(|line| {
+            regex
+                .captures(line)
+                .map(|cap| cap[1].parse::<f64>().unwrap() as usize)
+        })
+        .collect()
+}
+
+/// Parses latency output from `print_parseable_bench_results`.
+/// Format: "HYDRO_OPTIMIZE_LAT: p50: {p50:.3} | p99 {p99:.3} | p999 {p999:.3} ms ({num_samples} samples)"
+/// Returns all per-second (p50, p99, p999, num_samples) tuples found.
+pub fn parse_latency(lines: Vec<String>) -> Vec<(f64, f64, f64, u64)> {
+    let regex = Regex::new(r"p50:\s*(\d+\.?\d*)\s*\|\s*p99\s+(\d+\.?\d*)\s*\|\s*p999\s+(\d+\.?\d*)\s*ms\s*\((\d+)\s*samples\)").unwrap();
+    lines
+        .iter()
+        .filter_map(|line| {
+            regex.captures(line).map(|cap| {
+                (
+                    cap[1].parse::<f64>().unwrap(),
+                    cap[2].parse::<f64>().unwrap(),
+                    cap[3].parse::<f64>().unwrap(),
+                    cap[4].parse::<u64>().unwrap(),
+                )
+            })
+        })
+        .collect()
 }
 
 /// Returns a map from (operator ID, is network receiver) to percentage of total samples, and the percentage of samples that are unaccounted
@@ -120,12 +296,16 @@ pub fn inject_perf(ir: &mut [HydroRoot], folded_data: Vec<u8>) -> f64 {
 }
 
 /// Returns (op_id, count)
-pub fn parse_counter_usage(measurement: String) -> (usize, usize) {
+pub fn parse_counter_usage(lines: Vec<String>) -> HashMap<usize, usize> {
     let regex = Regex::new(r"\((\d+)\): (\d+)").unwrap();
-    let matches = regex.captures_iter(&measurement).last().unwrap();
-    let op_id = matches[1].parse::<usize>().unwrap();
-    let count = matches[2].parse::<usize>().unwrap();
-    (op_id, count)
+    let mut op_to_count = HashMap::new();
+    for measurement in lines {
+        let matches = regex.captures_iter(&measurement).last().unwrap();
+        let op_id = matches[1].parse::<usize>().unwrap();
+        let count = matches[2].parse::<usize>().unwrap();
+        op_to_count.insert(op_id, count);
+    }
+    op_to_count
 }
 
 // Note: Ensure edits to the match arms are consistent with insert_counter_node
@@ -140,7 +320,6 @@ fn inject_count_node(
         }
         HydroNode::Source { metadata, .. }
         | HydroNode::CycleSource { metadata, .. }
-        | HydroNode::Persist { metadata, .. }
         | HydroNode::Chain { metadata, .. } // Can technically be derived by summing parent cardinalities
         | HydroNode::ChainFirst { metadata, .. } // Can technically be derived by taking parent cardinality + 1
         | HydroNode::CrossSingleton { metadata, .. }
@@ -149,10 +328,12 @@ fn inject_count_node(
         | HydroNode::Difference { metadata, .. }
         | HydroNode::AntiJoin { metadata, .. }
         | HydroNode::FlatMap { metadata, .. }
+        | HydroNode::FlatMapStreamBlocking { metadata, .. }
         | HydroNode::Filter { metadata, .. }
         | HydroNode::FilterMap { metadata, .. }
         | HydroNode::Unique { metadata, .. }
         | HydroNode::Scan { metadata, .. }
+        | HydroNode::ScanAsyncBlocking { metadata, .. }
         | HydroNode::Fold { metadata, .. } // Output 1 value per tick
         | HydroNode::Reduce { metadata, .. } // Output 1 value per tick
         | HydroNode::FoldKeyed { metadata, .. }
@@ -160,7 +341,8 @@ fn inject_count_node(
         | HydroNode::ReduceKeyedWatermark { metadata, .. }
         | HydroNode::Network { metadata, .. }
         | HydroNode::ExternalInput { metadata, .. }
-        | HydroNode::SingletonSource { metadata, .. } => {
+        | HydroNode::SingletonSource { metadata, .. }
+        | HydroNode::Partition { metadata, .. } => {
             if let Some(count) = op_to_count.get(next_stmt_id) {
                 metadata.cardinality = Some(*count);
             }
@@ -169,7 +351,7 @@ fn inject_count_node(
                 metadata.cardinality = Some(1);
             }
         }
-        HydroNode::Tee { inner ,metadata, .. } => {
+        HydroNode::Tee { inner, metadata, .. } => {
             metadata.cardinality = inner.0.borrow().metadata().cardinality;
         }
         | HydroNode::Map { input, metadata, .. } // Equal to parent cardinality
@@ -186,6 +368,7 @@ fn inject_count_node(
         | HydroNode::YieldConcat { inner: input, metadata }
         | HydroNode::ResolveFutures { input, metadata }
         | HydroNode::ResolveFuturesOrdered { input, metadata }
+        | HydroNode::ResolveFuturesBlocking { input, metadata }
         => {
             metadata.cardinality = input.metadata().cardinality;
         }
@@ -202,94 +385,124 @@ pub fn inject_count(ir: &mut [HydroRoot], op_to_count: &HashMap<usize, usize>) {
     );
 }
 
-pub async fn analyze_process_results(
-    process: &impl DeployCrateWrapper,
-    ir: &mut [HydroRoot],
-    op_to_count: &mut HashMap<usize, usize>,
-    node_cardinality: &mut UnboundedReceiver<String>,
-) -> f64 {
-    let perf_results = process.tracing_results().await.unwrap();
-
-    // Inject perf usages into metadata
-    let unidentified_usage = inject_perf(ir, perf_results.folded_data);
-
-    // Get cardinality data. Allow later values to overwrite earlier ones
-    while let Some(measurement) = node_cardinality.recv().await {
-        let (op_id, count) = parse_counter_usage(measurement.clone());
-        op_to_count.insert(op_id, count);
+/// Drains all currently available messages from a receiver into a Vec.
+async fn drain_receiver(receiver: &mut UnboundedReceiver<String>) -> Vec<String> {
+    let mut lines = Vec::new();
+    if receiver.is_empty() {
+        // If the receiver is empty but not closed, calling recv() will block.
+        return lines;
     }
+    while let Some(line) = receiver.recv().await {
+        lines.push(line);
+    }
+    lines
+}
 
-    unidentified_usage
+pub async fn analyze_perf(process: &impl DeployCrateWrapper, ir: &mut [HydroRoot]) -> f64 {
+    let underlying = process.underlying();
+    let perf_results = underlying.tracing_results().unwrap();
+
+    // Inject perf usages into metadata, return unidentified perf
+    inject_perf(ir, perf_results.folded_data.clone())
 }
 
 pub async fn analyze_cluster_results(
     nodes: &DeployResult<'_, HydroDeploy>,
     ir: &mut [HydroRoot],
-    usage_out: &mut HashMap<(LocationId, String, usize), UnboundedReceiver<String>>,
-    cardinality_out: &mut HashMap<(LocationId, String, usize), UnboundedReceiver<String>>,
-    run_metadata: &mut RunMetadata,
-    exclude_from_decoupling: Vec<String>,
-) -> (LocationId, String, usize) {
-    let mut max_usage_cluster_id = None;
-    let mut max_usage_cluster_size = 0;
-    let mut max_usage_cluster_name = String::new();
-    let mut max_usage_overall = 0f64;
+    mut cluster_metrics: HashMap<(LocationId, String, usize), MetricLogs>,
+    client_id: &LocationId,
+    measurement_second: Option<usize>,
+) -> RunMetadata {
+    let mut run_metadata = RunMetadata::default();
     let mut op_to_count = HashMap::new();
 
-    for (id, name, cluster) in nodes.get_all_clusters() {
-        println!("Analyzing cluster {:?}: {}", id, name);
-
-        // Iterate through nodes' usages and keep the max usage one
-        let mut max_usage = None;
-        for (idx, _) in cluster.members().iter().enumerate() {
-            let usage =
-                get_usage(usage_out.get_mut(&(id.clone(), name.clone(), idx)).unwrap()).await;
-            println!("Node {} usage: {}", idx, usage);
-            if let Some((prev_usage, _)) = max_usage {
-                if usage > prev_usage {
-                    max_usage = Some((usage, idx));
-                }
-            } else {
-                max_usage = Some((usage, idx));
-            }
+    // Drain all receivers and parse in parallel across all nodes
+    let mut set = tokio::task::JoinSet::new();
+    for ((location, name, idx), mut metrics) in cluster_metrics.drain() {
+        if location == *client_id && idx > 0 {
+            // Only analyze the client with index 0, since all clients should have similar perf. Saves time
+            continue;
         }
-
-        if let Some((usage, idx)) = max_usage {
-            // Modify IR with perf & cardinality numbers
-            let node_cardinality = cardinality_out
-                .get_mut(&(id.clone(), name.clone(), idx))
-                .unwrap();
-            let unidentified_perf = analyze_process_results(
-                cluster.members().get(idx).unwrap(),
-                ir,
-                &mut op_to_count,
-                node_cardinality,
+        set.spawn(async move {
+            println!("Analyzing cluster {:?}: {}", name, idx);
+            let (sar_stats, op_to_count, throughputs, latencies) = tokio::join!(
+                async { parse_sar_output(drain_receiver(&mut metrics.sar).await) },
+                async { parse_counter_usage(drain_receiver(&mut metrics.counters).await) },
+                async { parse_throughput(drain_receiver(&mut metrics.throughputs).await) },
+                async { parse_latency(drain_receiver(&mut metrics.latencies).await) },
+            );
+            println!("Parsed stats from cluster {:?}: {}", name, idx);
+            (
+                (location, name, idx),
+                sar_stats,
+                op_to_count,
+                throughputs,
+                latencies,
             )
-            .await;
+        });
+    }
 
-            run_metadata.total_usage.insert(id.clone(), usage);
-            run_metadata
-                .unaccounted_perf
-                .insert(id.clone(), unidentified_perf);
+    let mut drained: HashMap<(LocationId, String), Vec<_>> = HashMap::new();
+    while let Some(result) = set.join_next().await {
+        let ((id, name, _idx), sar_stats, op_to_count, throughputs, latencies) = result.unwrap();
+        drained.entry((id, name)).or_default().push((
+            sar_stats,
+            op_to_count,
+            throughputs,
+            latencies,
+        ));
+    }
 
-            // Update cluster with max usage
-            if max_usage_overall < usage && !exclude_from_decoupling.contains(&name) {
-                max_usage_cluster_id = Some(id);
-                max_usage_cluster_name = name.clone();
-                max_usage_cluster_size = cluster.members().len();
-                max_usage_overall = usage;
-                println!("The bottleneck is {}", name);
+    for (id, name, _cluster) in nodes.get_all_clusters() {
+        let cluster_data = drained.get(&(id.clone(), name.to_string())).unwrap();
+
+        // Find the node with max CPU usage
+        let max_usage = cluster_data.iter().reduce(|max_data, data| {
+            let stat = measurement_second
+                .and_then(|s| data.0.get(s))
+                .or_else(|| data.0.last());
+            let max_stat = measurement_second
+                .and_then(|s| max_data.0.get(s))
+                .or_else(|| max_data.0.last());
+            match (stat, max_stat) {
+                (Some(s), Some(ms))
+                    if s.cpu.all_stats.user + s.cpu.all_stats.system
+                        > ms.cpu.all_stats.user + ms.cpu.all_stats.system =>
+                {
+                    data
+                }
+                _ => max_data,
             }
+        });
+
+        if let Some((max_sar_stat, counters, _, _)) = max_usage {
+            // Parse perf
+            // let unidentified_perf = analyze_perf(cluster.members().get(*idx).unwrap(), ir).await;
+            op_to_count.extend(counters.clone());
+
+            // run_metadata
+            //     .unaccounted_perf
+            //     .insert(id.clone(), unidentified_perf);
+            run_metadata
+                .sar_stats
+                .insert(id.clone(), max_sar_stat.clone());
+        }
+    }
+
+    // Collect throughput/latency from all processes (aggregator outputs these)
+    for node_data in drained.into_values().flatten() {
+        let (_, _, throughputs, latencies) = node_data;
+        let has_throughput = !throughputs.is_empty();
+        run_metadata.throughputs.extend(throughputs);
+        run_metadata.latencies.extend(latencies);
+        if has_throughput {
+            // Found aggregator, we're done
+            break;
         }
     }
 
     inject_count(ir, &op_to_count);
-
-    (
-        max_usage_cluster_id.unwrap(),
-        max_usage_cluster_name,
-        max_usage_cluster_size,
-    )
+    run_metadata
 }
 
 pub async fn get_usage(usage_out: &mut UnboundedReceiver<String>) -> f64 {
@@ -307,10 +520,10 @@ pub fn analyze_send_recv_overheads(ir: &mut [HydroRoot], run_metadata: &mut RunM
                 input, metadata, ..
             } = node
             {
-                let sender = input.metadata().location_kind.root();
-                let receiver = metadata.location_kind.root();
+                let sender = input.metadata().location_id.root();
+                let receiver = metadata.location_id.root();
 
-                // Use cardinality from the network's parent, not the network itself.
+                // Use cardinality from the network's input, not the network itself.
                 // Reason: Cardinality is measured at ONE recipient, but the sender may be sending to MANY machines.
                 if let Some(cpu_usage) = metadata.op.cpu_usage
                     && let Some(cardinality) = input.metadata().cardinality
@@ -352,349 +565,5 @@ pub fn analyze_send_recv_overheads(ir: &mut [HydroRoot], run_metadata: &mut RunM
     }
     for (location, overhead) in &run_metadata.recv_overhead {
         println!("Max recv overhead at {:?}: {}", location, overhead);
-    }
-}
-
-pub fn get_or_append_run_metadata(
-    multi_run_metadata: &mut MultiRunMetadata,
-    iteration: usize,
-) -> &mut RunMetadata {
-    while multi_run_metadata.len() < iteration + 1 {
-        multi_run_metadata.push(RunMetadata::default());
-    }
-    multi_run_metadata.get_mut(iteration).unwrap()
-}
-
-fn op_id_to_orig_id(
-    op_id: usize,
-    multi_run_metadata: &RefCell<MultiRunMetadata>,
-    iteration: usize,
-) -> Option<usize> {
-    if iteration == 0 {
-        return Some(op_id);
-    }
-    if let Some(prev_iter_id) = multi_run_metadata
-        .borrow()
-        .get(iteration)
-        .unwrap()
-        .op_id_to_prev_iteration_op_id
-        .get(&op_id)
-    {
-        op_id_to_orig_id(*prev_iter_id, multi_run_metadata, iteration - 1)
-    } else {
-        None
-    }
-}
-
-fn record_metadata(
-    metadata: &HydroIrOpMetadata,
-    input_metadata: Vec<&HydroIrMetadata>,
-    run_metadata: &mut RunMetadata,
-) {
-    let id = metadata.id.unwrap();
-
-    if let Some(cpu_usage) = metadata.cpu_usage {
-        run_metadata.op_id_to_cpu_usage.insert(id, cpu_usage);
-    }
-    if let Some(network_recv_cpu_usage) = metadata.network_recv_cpu_usage {
-        run_metadata
-            .op_id_to_recv_cpu_usage
-            .insert(id, network_recv_cpu_usage);
-    }
-
-    let parent_ids = input_metadata
-        .iter()
-        .filter_map(|parent| parent.op.id)
-        .collect();
-    run_metadata.op_id_to_parent_op_id.insert(id, parent_ids);
-}
-
-fn record_metadata_root(root: &mut HydroRoot, run_metadata: &mut RunMetadata) {
-    record_metadata(
-        root.op_metadata(),
-        vec![root.input_metadata()],
-        run_metadata,
-    );
-
-    // Location = parent's location, cardinality = parent's cardinality
-    let id = root.op_metadata().id.unwrap();
-    let parent = root.input_metadata();
-    run_metadata
-        .op_id_to_location
-        .insert(id, parent.location_kind.root().clone());
-    if let Some(cardinality) = parent.cardinality {
-        run_metadata.op_id_to_cardinality.insert(id, cardinality);
-    }
-}
-
-fn record_metadata_node(node: &mut HydroNode, run_metadata: &mut RunMetadata) {
-    record_metadata(node.op_metadata(), node.input_metadata(), run_metadata);
-
-    let id = node.op_metadata().id.unwrap();
-    let metadata = node.metadata();
-    run_metadata
-        .op_id_to_location
-        .insert(id, metadata.location_kind.root().clone());
-    if let Some(cardinality) = metadata.cardinality {
-        run_metadata.op_id_to_cardinality.insert(id, cardinality);
-    }
-
-    // Track network nodes
-    if let HydroNode::Network { .. } = node {
-        run_metadata.network_op_id.insert(id);
-    }
-}
-
-fn compare_expected_values(
-    new_value: f64,
-    old_value: f64,
-    new_location: &LocationId,
-    old_location: &LocationId,
-    orig_id: usize,
-    value_name: &str,
-) {
-    println!(
-        "New location {:?}, old location {:?}: Operator {} {}, new value {:?}, old value {:?}",
-        new_location, old_location, orig_id, value_name, new_value, old_value
-    );
-}
-
-/// If the op_id is a network node, return the sender's location by checking its parent. Otherwise return the operator's location
-fn sender_location_if_network(run_metadata: &RunMetadata, op_id: usize) -> &LocationId {
-    if run_metadata.network_op_id.contains(&op_id) {
-        let parent = run_metadata.op_id_to_parent_op_id.get(&op_id).unwrap();
-        assert!(
-            parent.len() == 1,
-            "Network operator should have exactly one input"
-        );
-        run_metadata.op_id_to_location.get(&parent[0]).unwrap()
-    } else {
-        run_metadata.op_id_to_location.get(&op_id).unwrap()
-    }
-}
-
-/// Compares the performance of the current iteration against the previous one.
-pub fn compare_expected_performance(
-    ir: &mut [HydroRoot],
-    multi_run_metadata: &RefCell<MultiRunMetadata>,
-    iteration: usize,
-) {
-    print_id(ir);
-
-    // Record run_metadata
-    traverse_dfir(
-        ir,
-        |root, _| {
-            record_metadata_root(
-                root,
-                multi_run_metadata.borrow_mut().get_mut(iteration).unwrap(),
-            );
-        },
-        |node, _| {
-            record_metadata_node(
-                node,
-                multi_run_metadata.borrow_mut().get_mut(iteration).unwrap(),
-            );
-        },
-    );
-
-    // Nothing to compare against for the 1st run, return
-    if iteration == 0 {
-        return;
-    }
-
-    // Compare against previous runs
-    let borrowed_multi_run_metadata = multi_run_metadata.borrow();
-    let run_metadata = borrowed_multi_run_metadata.get(iteration).unwrap();
-    let prev_run_metadata = borrowed_multi_run_metadata.get(iteration - 1).unwrap();
-
-    // 1. Compare operators with an orig_id
-    for (op_id, prev_id) in run_metadata.op_id_to_prev_iteration_op_id.iter() {
-        let orig_id = op_id_to_orig_id(*op_id, multi_run_metadata, iteration).unwrap();
-        let new_location = run_metadata.op_id_to_location.get(op_id).unwrap();
-        let old_location = prev_run_metadata.op_id_to_location.get(prev_id).unwrap();
-
-        // Compare CPU usage
-        if let Some(cpu_usage) = run_metadata.op_id_to_cpu_usage.get(op_id)
-            && let Some(prev_cpu_usage) = prev_run_metadata.op_id_to_cpu_usage.get(prev_id)
-        {
-            compare_expected_values(
-                *cpu_usage,
-                *prev_cpu_usage,
-                sender_location_if_network(run_metadata, *op_id),
-                sender_location_if_network(prev_run_metadata, *prev_id),
-                orig_id,
-                "CPU usage",
-            );
-        }
-
-        // Compare recv CPU usage
-        if let Some(network_recv_cpu_usage) = run_metadata.op_id_to_recv_cpu_usage.get(op_id)
-            && let Some(prev_network_recv_cpu_usage) =
-                prev_run_metadata.op_id_to_recv_cpu_usage.get(prev_id)
-        {
-            compare_expected_values(
-                *network_recv_cpu_usage,
-                *prev_network_recv_cpu_usage,
-                new_location,
-                old_location,
-                orig_id,
-                "recv CPU usage",
-            );
-        }
-
-        // Compare cardinality
-        if let Some(cardinality) = run_metadata.op_id_to_cardinality.get(op_id)
-            && let Some(prev_cardinality) = prev_run_metadata.op_id_to_cardinality.get(prev_id)
-        {
-            compare_expected_values(
-                *cardinality as f64,
-                *prev_cardinality as f64,
-                new_location,
-                old_location,
-                orig_id,
-                "cardinality",
-            );
-        }
-    }
-
-    // 2. Compare operators without orig_id (added by decoupling)
-    let mut prev_id_and_loc_to_send_usage = HashMap::new(); // (id in prev iteration, LocationId of sender) -> CPU usage of decoupled output nodes
-    let mut prev_id_and_loc_to_recv_usage = HashMap::new(); // (id in prev iteration, LocationId of receiver) -> CPU usage of decoupled parent nodes
-    for (id, location) in run_metadata.op_id_to_location.iter() {
-        if run_metadata.op_id_to_prev_iteration_op_id.contains_key(id) {
-            continue;
-        }
-
-        // A. Find the ancestor that existed in the previous iteration
-        let mut parent_id = None;
-        let mut parent_prev_id = None;
-        let mut curr_id = *id;
-        while parent_prev_id.is_none() {
-            let parents = run_metadata.op_id_to_parent_op_id.get(&curr_id).unwrap();
-            assert_eq!(
-                parents.len(),
-                1,
-                "Warning: Location {:?}: Created operator {} has {} parents, expected 1",
-                location,
-                id,
-                parents.len()
-            );
-            let parent = parents[0];
-
-            if let Some(prev_id) = run_metadata.op_id_to_prev_iteration_op_id.get(&parent) {
-                parent_prev_id = Some(*prev_id);
-                parent_id = Some(parent);
-            } else {
-                curr_id = parent;
-            }
-        }
-
-        // B. Add this operator's usages
-        let parent_location = run_metadata
-            .op_id_to_location
-            .get(&parent_id.unwrap())
-            .unwrap();
-        let is_network = run_metadata.network_op_id.contains(id);
-
-        if parent_location == location || is_network {
-            // This operator is on the sender
-            if let Some(cpu_usage) = run_metadata.op_id_to_cpu_usage.get(id) {
-                prev_id_and_loc_to_send_usage
-                    .entry((
-                        parent_prev_id.unwrap(),
-                        sender_location_if_network(run_metadata, *id),
-                    ))
-                    .and_modify(|usage| {
-                        *usage += *cpu_usage;
-                    })
-                    .or_insert_with(|| *cpu_usage);
-            }
-        }
-        if parent_location != location || is_network {
-            // This operator is on the recipient
-            let cpu_usage = if is_network {
-                run_metadata.op_id_to_recv_cpu_usage.get(id)
-            } else {
-                run_metadata.op_id_to_cpu_usage.get(id)
-            };
-
-            if let Some(cpu_usage) = cpu_usage {
-                prev_id_and_loc_to_recv_usage
-                    .entry((parent_prev_id.unwrap(), location.clone()))
-                    .and_modify(|usage| {
-                        *usage += *cpu_usage;
-                    })
-                    .or_insert_with(|| *cpu_usage);
-            }
-        }
-    }
-    // C. Compare changes in send CPU usage
-    for ((prev_id, location), cpu_usage) in prev_id_and_loc_to_send_usage {
-        if let Some(prev_cardinality) = prev_run_metadata.op_id_to_cardinality.get(&prev_id)
-            && let Some(prev_location) = prev_run_metadata.op_id_to_location.get(&prev_id)
-        {
-            compare_expected_values(
-                cpu_usage,
-                prev_run_metadata
-                    .send_overhead
-                    .get(prev_location)
-                    .cloned()
-                    .unwrap_or_default()
-                    * *prev_cardinality as f64,
-                location,
-                prev_location,
-                op_id_to_orig_id(prev_id, multi_run_metadata, iteration - 1).unwrap(),
-                "decoupled send CPU usage",
-            );
-        }
-    }
-    // D. Compare changes in recv CPU usage
-    for ((prev_id, location), cpu_usage) in prev_id_and_loc_to_recv_usage {
-        if let Some(prev_cardinality) = prev_run_metadata.op_id_to_cardinality.get(&prev_id)
-            && let Some(prev_location) = prev_run_metadata.op_id_to_location.get(&prev_id)
-        {
-            compare_expected_values(
-                cpu_usage,
-                prev_run_metadata
-                    .recv_overhead
-                    .get(prev_location)
-                    .cloned()
-                    .unwrap_or_default()
-                    * *prev_cardinality as f64,
-                &location,
-                prev_location,
-                op_id_to_orig_id(prev_id, multi_run_metadata, iteration - 1).unwrap(),
-                "decoupled recv CPU usage",
-            );
-        }
-    }
-
-    // 3. Compare changes in unexplained CPU usage
-    for (location, unexplained) in &run_metadata.unaccounted_perf {
-        if let Some(old_unexplained) = prev_run_metadata.unaccounted_perf.get(location) {
-            println!(
-                "Location {:?}'s unexplained CPU usage changed from {} to {}",
-                location, old_unexplained, unexplained
-            );
-        }
-    }
-
-    // 4. Compare changes in send/recv overheads
-    for (location, send_overhead) in &run_metadata.send_overhead {
-        if let Some(old_send_overhead) = prev_run_metadata.send_overhead.get(location) {
-            println!(
-                "Location {:?}'s send overhead changed from {} to {}",
-                location, old_send_overhead, send_overhead
-            );
-        }
-    }
-    for (location, recv_overhead) in &run_metadata.recv_overhead {
-        if let Some(old_recv_overhead) = prev_run_metadata.recv_overhead.get(location) {
-            println!(
-                "Location {:?}'s recv overhead changed from {} to {}",
-                location, old_recv_overhead, recv_overhead
-            );
-        }
     }
 }

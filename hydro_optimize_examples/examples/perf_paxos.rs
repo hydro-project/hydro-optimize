@@ -1,52 +1,57 @@
-use std::cell::RefCell;
+use clap::{ArgAction, Parser};
+use hydro_deploy::Deployment;
+use hydro_lang::location::Location;
+use hydro_lang::viz::config::GraphConfig;
+use hydro_optimize::deploy::{HostType, ReusableHosts};
+use hydro_optimize::deploy_and_analyze::{
+    Optimizations, ReusableClusters, ReusableProcesses, deploy_and_optimize,
+};
+use hydro_std::bench_client::pretty_print_bench_results;
+use hydro_test::cluster::paxos::{CorePaxos, PaxosConfig};
+use hydro_test::cluster::paxos_bench::{Aggregator, Client};
+use stageleft::q;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None, group(
+    clap::ArgGroup::new("cloud")
+        .args(&["gcp", "aws"])
+        .multiple(false)
+))]
+struct PerfPaxosArgs {
+    #[command(flatten)]
+    graph: GraphConfig,
+
+    /// Use Gcp for deployment (provide project name)
+    #[arg(long)]
+    gcp: Option<String>,
+
+    /// Use Aws, make sure credentials are set up
+    #[arg(long, action = ArgAction::SetTrue)]
+    aws: bool,
+}
 
 #[tokio::main]
 async fn main() {
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
-    use clap::Parser;
-    use hydro_deploy::Deployment;
-    use hydro_deploy::gcp::GcpNetwork;
-    use hydro_lang::location::Location;
-    use hydro_lang::viz::config::GraphConfig;
-    use hydro_optimize::decoupler;
-    use hydro_optimize::deploy::ReusableHosts;
-    use hydro_optimize::deploy_and_analyze::deploy_and_analyze;
-    use hydro_test::cluster::kv_replica::Replica;
-    use hydro_test::cluster::paxos::{Acceptor, CorePaxos, PaxosConfig, Proposer};
-    use hydro_test::cluster::paxos_bench::{Aggregator, Client};
-    use tokio::sync::RwLock;
-
-    #[derive(Parser, Debug)]
-    #[command(author, version, about, long_about = None)]
-    struct PerfPaxosArgs {
-        #[command(flatten)]
-        graph: GraphConfig,
-
-        /// Use GCP for deployment (provide project name)
-        #[arg(long)]
-        gcp: Option<String>,
-    }
-
     let args = PerfPaxosArgs::parse();
 
     let mut deployment = Deployment::new();
-    let (host_arg, project) = if let Some(project) = args.gcp {
-        ("gcp".to_string(), project)
+    let host_type: HostType = if let Some(project) = args.gcp {
+        HostType::Gcp { project }
+    } else if args.aws {
+        HostType::Aws
     } else {
-        ("localhost".to_string(), String::new())
+        HostType::Localhost
     };
-    let network = Arc::new(RwLock::new(GcpNetwork::new(&project, None)));
 
     let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
     let f = 1;
     let num_clients = 3;
-    let num_clients_per_node = 500; // Change based on experiment between 1, 50, 100.
+    let num_clients_per_node: usize = 100; // Change based on experiment between 1, 50, 100.
     let checkpoint_frequency = 1000; // Num log entries
     let i_am_leader_send_timeout = 5; // Sec
     let i_am_leader_check_timeout = 10; // Sec
     let i_am_leader_check_timeout_delay_multiplier = 15;
+    let print_result_frequency = 1000; // Millis
 
     let proposers = builder.cluster();
     let acceptors = builder.cluster();
@@ -55,7 +60,6 @@ async fn main() {
     let replicas = builder.cluster();
 
     hydro_test::cluster::paxos_bench::paxos_bench(
-        num_clients_per_node,
         checkpoint_frequency,
         f,
         f + 1,
@@ -70,87 +74,41 @@ async fn main() {
             },
         },
         &clients,
+        clients.singleton(q!(1usize)),
         &client_aggregator,
         &replicas,
+        print_result_frequency / 10,
+        print_result_frequency,
+        pretty_print_bench_results, // Note: Throughput/latency numbers won't be accessible to deploy_and_optimize
     );
-
-    let mut clusters = vec![
-        (
-            proposers.id().raw_id(),
-            std::any::type_name::<Proposer>().to_string(),
-            f + 1,
-        ),
-        (
-            acceptors.id().raw_id(),
-            std::any::type_name::<Acceptor>().to_string(),
-            2 * f + 1,
-        ),
-        (
-            clients.id().raw_id(),
-            std::any::type_name::<Client>().to_string(),
-            num_clients,
-        ),
-        (
-            replicas.id().raw_id(),
-            std::any::type_name::<Replica>().to_string(),
-            f + 1,
-        ),
-    ];
-    let processes = vec![(
-        client_aggregator.id().raw_id(),
-        std::any::type_name::<Aggregator>().to_string(),
-    )];
+    let client_id = clients.id();
 
     // Deploy
-    let mut reusable_hosts = ReusableHosts {
-        hosts: HashMap::new(),
-        host_arg,
-        project: project.clone(),
-        network: network.clone(),
-    };
-
-    let multi_run_metadata = RefCell::new(vec![]);
+    let mut reusable_hosts = ReusableHosts::new(&host_type);
     let num_times_to_optimize = 2;
+    let run_seconds = 30;
+    let measurement_second = 29;
 
-    for i in 0..num_times_to_optimize {
-        let (rewritten_ir_builder, mut ir, mut decoupler, bottleneck_name, bottleneck_num_nodes) =
-            deploy_and_analyze(
-                &mut reusable_hosts,
-                &mut deployment,
-                builder,
-                &clusters,
-                &processes,
-                vec![
-                    std::any::type_name::<Client>().to_string(),
-                    std::any::type_name::<Aggregator>().to_string(),
-                ],
-                None,
-                &multi_run_metadata,
-                i,
-            )
-            .await;
-
-        // Apply decoupling
-        let mut decoupled_cluster = None;
-        builder = rewritten_ir_builder.build_with(|builder| {
-            let new_cluster = builder.cluster::<()>();
-            decoupler.decoupled_location = new_cluster.id().clone();
-            decoupler::decouple(&mut ir, &decoupler, &multi_run_metadata, i);
-            decoupled_cluster = Some(new_cluster);
-
-            ir
-        });
-        if let Some(new_cluster) = decoupled_cluster {
-            clusters.push((
-                new_cluster.id().raw_id(),
-                format!("{}-decouple-{}", bottleneck_name, i),
-                bottleneck_num_nodes,
-            ));
-        }
-    }
-
-    let built = builder.finalize();
-
-    // Generate graphs if requested
-    _ = built.generate_graph_with_config(&args.graph, None);
+    deploy_and_optimize(
+        &mut reusable_hosts,
+        &mut deployment,
+        builder.finalize(),
+        ReusableClusters::default()
+            .with_cluster(proposers, f + 1)
+            .with_cluster(acceptors, 2 * f + 1)
+            .with_cluster(clients, num_clients)
+            .with_cluster(replicas, f + 1),
+        ReusableProcesses::default().with_process(client_aggregator),
+        Optimizations::default()
+            .with_decoupling()
+            .excluding::<Client>()
+            .excluding::<Aggregator>()
+            .with_iterations(num_times_to_optimize),
+        &client_id,
+        num_clients_per_node,
+        Some(run_seconds),
+        Some(measurement_second),
+        true,
+    )
+    .await;
 }

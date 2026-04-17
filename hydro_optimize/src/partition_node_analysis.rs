@@ -7,15 +7,15 @@ use syn::visit::Visit;
 
 use super::rewrites::{NetworkType, get_network_type};
 use crate::partition_syn_analysis::{AnalyzeClosure, StructOrTuple, StructOrTupleIndex};
-use crate::rewrites::op_id_to_parents;
+use crate::rewrites::op_id_to_inputs;
 
 /// Create a mapping from all input nodes to their parents (across locations)
 fn all_inputs_parents(
     ir: &mut [HydroRoot],
     inputs: &[usize],
-    cycle_source_to_sink_parent: &HashMap<usize, usize>,
+    cycle_source_to_sink_input: &HashMap<usize, usize>,
 ) -> BTreeMap<usize, usize> {
-    op_id_to_parents(ir, None, cycle_source_to_sink_parent)
+    op_id_to_inputs(ir, None, cycle_source_to_sink_input)
         .iter()
         .filter_map(|(op_id, parents)| {
             if inputs.contains(op_id) {
@@ -28,13 +28,13 @@ fn all_inputs_parents(
 }
 
 /// Find all input nodes of a location
-pub(crate) fn all_inputs(ir: &mut [HydroRoot], location: &LocationId) -> Vec<usize> {
+fn all_inputs(ir: &mut [HydroRoot], location: &LocationId) -> Vec<usize> {
     let mut inputs = vec![];
 
     traverse_dfir(
         ir,
         |_, _| {},
-        |node, next_stmt_id| match get_network_type(node, location.root().raw_id()) {
+        |node, next_stmt_id| match get_network_type(node, &location.root().key()) {
             Some(NetworkType::Recv) | Some(NetworkType::SendRecv) => {
                 inputs.push(*next_stmt_id);
             }
@@ -45,16 +45,16 @@ pub(crate) fn all_inputs(ir: &mut [HydroRoot], location: &LocationId) -> Vec<usi
     inputs
 }
 
-pub(crate) struct InputDependencyMetadata {
+pub struct InputDependencyMetadata {
     // Const fields
-    pub(crate) location: LocationId,
-    pub(crate) inputs: Vec<usize>,
-    pub(crate) op_id_to_parents: HashMap<usize, Vec<usize>>,
+    pub location: LocationId,
+    pub inputs: Vec<usize>,
+    pub op_id_to_parents: HashMap<usize, Vec<usize>>,
     // Variables
-    pub(crate) optimistic_phase: bool, /* If true, tuple intersection continues even if one side does not exist */
-    pub(crate) input_taint: BTreeMap<usize, BTreeSet<usize>>, /* op_id -> set of input op_ids that taint this node */
-    pub(crate) input_dependencies: BTreeMap<usize, BTreeMap<usize, StructOrTuple>>, /* op_id -> (input op_id -> index of input in output) */
-    pub(crate) syn_analysis: BTreeMap<usize, StructOrTuple>, /* Cached results for analyzing f for each operator */
+    pub optimistic_phase: bool, /* If true, tuple intersection continues even if one side does not exist */
+    pub input_taint: BTreeMap<usize, BTreeSet<usize>>, /* op_id -> set of input op_ids that taint this node */
+    pub input_dependencies: BTreeMap<usize, BTreeMap<usize, StructOrTuple>>, /* op_id -> (input op_id -> index of input in output) */
+    pub syn_analysis: BTreeMap<usize, StructOrTuple>, /* Cached results for analyzing f for each operator */
 }
 
 impl Hash for InputDependencyMetadata {
@@ -86,7 +86,7 @@ fn input_dependency_analysis_node(
     metadata: &mut InputDependencyMetadata,
 ) {
     // Filter unrelated nodes
-    if metadata.location != *node.metadata().location_kind.root() {
+    if metadata.location != *node.metadata().location_id.root() {
         return;
     }
 
@@ -163,15 +163,15 @@ fn input_dependency_analysis_node(
         // 1:1 to parent
         HydroNode::CycleSource { .. }
         | HydroNode::Tee { .. }
-        | HydroNode::Persist { .. }
         | HydroNode::ResolveFutures { .. }
         | HydroNode::ResolveFuturesOrdered { .. }
+        | HydroNode::ResolveFuturesBlocking { .. }
         | HydroNode::DeferTick { .. }
         | HydroNode::Unique { .. }
         | HydroNode::Sort { .. }
-        | HydroNode::Difference { .. } // [a,b,c] difference [c,d] = [a,b]. Since only a subset of the 1st parent is taken, we only care about its dependencies
+        | HydroNode::Difference { .. } // [a,b,c] difference [c,d] = [a,b]. Since only a subset of the 1st input is taken, we only care about its dependencies
         | HydroNode::AntiJoin { .. } // [(a,1),(b,2)] anti-join [a] = [(b,2)]. Similar to Difference
-        | HydroNode::Filter { .. } // Although it contains a function f, the output is just a subset of the parent, so just inherit from the parent
+        | HydroNode::Filter { .. } // Although it contains a function f, the output is just a subset of the input, so just inherit from the parent
         | HydroNode::Inspect { .. }
         | HydroNode::Network { .. }
         | HydroNode::ExternalInput { .. }
@@ -180,7 +180,8 @@ fn input_dependency_analysis_node(
         | HydroNode::BeginAtomic { .. }
         | HydroNode::EndAtomic { .. }
         | HydroNode::Batch { .. }
-        | HydroNode::YieldConcat { .. } => {
+        | HydroNode::YieldConcat { .. }
+        | HydroNode::Partition { .. } => {
             // For each input the first (and potentially only) parent depends on, take its dependency
             for input_id in input_taint_entry.iter() {
                 if let Some(parent_dependencies_on_input) = parent_input_dependencies.get(input_id) &&
@@ -330,7 +331,9 @@ fn input_dependency_analysis_node(
         HydroNode::Reduce { .. }
         | HydroNode::Fold { .. }
         | HydroNode::Scan { .. }
+        | HydroNode::ScanAsyncBlocking { .. }
         | HydroNode::FlatMap { .. }
+        | HydroNode::FlatMapStreamBlocking { .. }
         | HydroNode::Source { .. }
         | HydroNode::SingletonSource { .. } => {
             input_dependencies_entry.clear();
@@ -545,6 +548,7 @@ fn partitioning_constraint_analysis_node(
             HydroNode::Reduce { .. }
             | HydroNode::Fold { .. }
             | HydroNode::Scan { .. }
+            | HydroNode::ScanAsyncBlocking { .. }
             | HydroNode::Enumerate { .. }
             | HydroNode::CrossProduct { .. }
             | HydroNode::CrossSingleton { .. } => {} // Partitioning is impossible
@@ -552,13 +556,14 @@ fn partitioning_constraint_analysis_node(
             | HydroNode::Source { .. }
             | HydroNode::CycleSource { .. }
             | HydroNode::Tee { .. }
-            | HydroNode::Persist { .. }
             | HydroNode::Chain { .. }
             | HydroNode::ChainFirst { .. }
             | HydroNode::ResolveFutures { .. }
             | HydroNode::ResolveFuturesOrdered { .. }
+            | HydroNode::ResolveFuturesBlocking { .. }
             | HydroNode::Map { .. }
             | HydroNode::FlatMap { .. }
+            | HydroNode::FlatMapStreamBlocking { .. }
             | HydroNode::Filter { .. }
             | HydroNode::FilterMap { .. }
             | HydroNode::DeferTick { .. }
@@ -574,7 +579,8 @@ fn partitioning_constraint_analysis_node(
             | HydroNode::BeginAtomic { .. }
             | HydroNode::EndAtomic { .. }
             | HydroNode::Batch { .. }
-            | HydroNode::YieldConcat { .. } => {
+            | HydroNode::YieldConcat { .. }
+            | HydroNode::Partition { .. } => {
                 // Doesn't impede partitioning, return
                 return;
             }
@@ -602,12 +608,12 @@ fn partitioning_constraint_analysis_node(
 pub fn partitioning_analysis(
     ir: &mut [HydroRoot],
     location: &LocationId,
-    cycle_source_to_sink_parent: &HashMap<usize, usize>,
+    cycle_source_to_sink_input: &HashMap<usize, usize>,
 ) -> Option<(
     Vec<BTreeMap<usize, StructOrTupleIndex>>,
     BTreeMap<usize, usize>,
 )> {
-    let op_id_to_parents = op_id_to_parents(ir, Some(location), cycle_source_to_sink_parent);
+    let op_id_to_parents = op_id_to_inputs(ir, Some(&location.key()), cycle_source_to_sink_input);
     let dependency_metadata = input_dependency_analysis(ir, location, op_id_to_parents);
     let mut possible_partitionings = BTreeMap::new();
 
@@ -666,7 +672,7 @@ pub fn partitioning_analysis(
         println!("No restrictions on partitioning");
         return Some((
             Vec::new(),
-            all_inputs_parents(ir, &dependency_metadata.inputs, cycle_source_to_sink_parent),
+            all_inputs_parents(ir, &dependency_metadata.inputs, cycle_source_to_sink_input),
         ));
     }
 
@@ -726,7 +732,7 @@ pub fn partitioning_analysis(
     }
     Some((
         prev_global_partitionings,
-        all_inputs_parents(ir, &dependency_metadata.inputs, cycle_source_to_sink_parent),
+        all_inputs_parents(ir, &dependency_metadata.inputs, cycle_source_to_sink_input),
     ))
 }
 
@@ -765,13 +771,13 @@ mod tests {
 
     use hydro_lang::compile::ir::deep_clone;
     use hydro_lang::deploy::HydroDeploy;
-    use hydro_lang::live_collections::stream::NoOrder;
+    use hydro_lang::live_collections::stream::{ExactlyOnce, NoOrder, TotalOrder};
     use hydro_lang::location::dynamic::LocationId;
     use hydro_lang::prelude::*;
     use stageleft::q;
 
     use crate::partition_node_analysis::partitioning_analysis;
-    use crate::repair::{cycle_source_to_sink_parent, inject_id, inject_location};
+    use crate::repair::{cycle_source_to_sink_input, inject_id, inject_location};
 
     fn test_input_partitionable(
         builder: FlowBuilder<'_>,
@@ -782,7 +788,7 @@ mod tests {
         let built = builder
             .optimize_with(|ir| {
                 inject_id(ir);
-                cycle_data = cycle_source_to_sink_parent(ir);
+                cycle_data = cycle_source_to_sink_input(ir);
                 inject_location(ir, &cycle_data);
             })
             .into_deploy::<HydroDeploy>();
@@ -794,16 +800,16 @@ mod tests {
 
     #[test]
     fn test_map_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         cluster1
             .source_iter(q!([(1, 2)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values()
             .map(q!(|(a, b)| (b, a + 2)))
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|(b, a2)| {
                 println!("b: {}, a+2: {}", b, a2);
             }));
@@ -813,17 +819,17 @@ mod tests {
 
     #[test]
     fn test_map_complex_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         cluster1
             .source_iter(q!([(1, (2, (3, 4)))]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values()
             .map(q!(|(a, b)| (b.1, a, b.0 - a)))
             .map(q!(|(b1, _a, b0a)| (b0a, b1.0)))
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|(b0a, b10)| {
                 println!("b.0 - a: {}, b.1.0: {}", b0a, b10);
             }));
@@ -833,16 +839,16 @@ mod tests {
 
     #[test]
     fn test_filter_map_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         cluster1
             .source_iter(q!([(1, 2)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values()
             .filter_map(q!(|(a, b)| { if a > 1 { Some((b, a + 2)) } else { None } }))
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|(b, a2)| {
                 println!("b: {}, a+2: {}", b, a2);
             }));
@@ -852,12 +858,12 @@ mod tests {
 
     #[test]
     fn test_filter_map_remove_none_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         cluster1
             .source_iter(q!([(1, 2)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values()
             .filter_map(q!(|(a, b)| {
                 if a > 1 {
@@ -868,8 +874,8 @@ mod tests {
                     None
                 }
             }))
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|(none, a2)| {
                 println!("None: {:?}, a+2: {}", none, a2);
             }));
@@ -879,12 +885,12 @@ mod tests {
 
     #[test]
     fn test_chain_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         let input = cluster1
             .source_iter(q!([(1, (2, 3))]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values();
         let stream1 = input.clone().map(q!(|(a, b)| (b, a + 2)));
         let stream2 = input.map(q!(|(a, b)| ((b.1, b.1), a + 3)));
@@ -893,8 +899,8 @@ mod tests {
             .batch(&tick, nondet!(/** test */))
             .chain(stream1.batch(&tick, nondet!(/** test */)))
             .all_ticks()
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|((x, b1), y)| {
                 println!("x: {}, b.1: {}, y: {}", x, b1, y);
             }));
@@ -904,12 +910,12 @@ mod tests {
 
     #[test]
     fn test_cross_product_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         let input = cluster1
             .source_iter(q!([(1, (2, 3))]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values();
         let stream1 = input.clone().map(q!(|(a, b)| (b, a + 2)));
         let stream2 = input.map(q!(|(a, b)| ((b.1, b.1), a + 3)));
@@ -918,8 +924,8 @@ mod tests {
             .batch(&tick, nondet!(/** test */))
             .cross_product(stream1.batch(&tick, nondet!(/** test */)))
             .all_ticks()
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|(((b1, b1_again), a3), (b, a2))| {
                 println!("((({}, {}), {}), ({:?}, {}))", b1, b1_again, a3, b, a2);
             }));
@@ -929,12 +935,12 @@ mod tests {
 
     #[test]
     fn test_join_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         let input = cluster1
             .source_iter(q!([(1, (2, 3))]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .ir_node_named("network")
             .values();
         let stream1 = input.clone().map(q!(|(a, b)| (b, a)));
@@ -944,8 +950,8 @@ mod tests {
             .batch(&tick, nondet!(/** test */))
             .join(stream1.batch(&tick, nondet!(/** test */)))
             .all_ticks()
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|((b1, b1_again), (a3, a))| {
                 println!("(({}, {}), {}, {})", b1, b1_again, a3, a);
             }));
@@ -955,14 +961,14 @@ mod tests {
 
     #[test]
     fn test_enumerate_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         cluster1
             .source_iter(q!([(1, 2)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values()
-            .assume_ordering(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
             .enumerate()
             .for_each(q!(|(i, (a, b))| {
                 println!("i: {}, a: {}, b: {}", i, a, b);
@@ -973,21 +979,24 @@ mod tests {
 
     #[test]
     fn test_reduce_keyed_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         cluster1
             .source_iter(q!([(1, 2)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .ir_node_named("network")
             .values()
             .batch(&cluster2.tick(), nondet!(/** test */))
             .into_keyed()
-            .reduce_commutative(q!(|acc, b| *acc += b))
+            .reduce(q!(
+                |acc, b| *acc += b,
+                commutative = ManualProof(/* Addition is commutative */)
+            ))
             .entries()
             .all_ticks()
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|(a, b_sum)| {
                 println!("a: {}, b_sum: {}", a, b_sum);
             }));
@@ -997,18 +1006,21 @@ mod tests {
 
     #[test]
     fn test_reduce_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         cluster1
             .source_iter(q!([(1, 2)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values()
             .batch(&cluster2.tick(), nondet!(/** test */))
-            .reduce_commutative(q!(|(acc_a, acc_b), (a, b)| {
-                *acc_a += a;
-                *acc_b += b;
-            }))
+            .reduce(q!(
+                |(acc_a, acc_b), (a, b)| {
+                    *acc_a += a;
+                    *acc_b += b;
+                },
+                commutative = ManualProof(/* Addition is commutative */)
+            ))
             .all_ticks()
             .for_each(q!(|(a_sum, b_sum)| {
                 println!("a_sum: {}, b_sum: {}", a_sum, b_sum);
@@ -1019,12 +1031,12 @@ mod tests {
 
     #[test]
     fn test_cycle_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         let input = cluster1
             .source_iter(q!([(1, 2)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values();
         let cluster2_tick = cluster2.tick();
         let (complete_cycle, cycle) =
@@ -1039,8 +1051,8 @@ mod tests {
 
         cycle
             .all_ticks()
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|(a, b)| {
                 println!("a: {}, b: {}", a, b);
             }));
@@ -1050,12 +1062,12 @@ mod tests {
 
     #[test]
     fn test_nested_cycle_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         let input = cluster1
             .source_iter(q!([(1, 2)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .ir_node_named("network")
             .values();
         let cluster2_tick = cluster2.tick();
@@ -1074,8 +1086,8 @@ mod tests {
         complete_cycle2.complete_next_tick(cycle2_out.clone());
         cycle2_out
             .all_ticks()
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|(b, _)| {
                 println!("b: {}", b);
             }));
@@ -1085,12 +1097,12 @@ mod tests {
 
     #[test]
     fn test_source_iter_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         let input = cluster1
             .source_iter(q!([(1, 2)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values();
         let tick = cluster2.tick();
         let stream1 = input.map(q!(|(a, b)| (b, a + 2)));
@@ -1099,8 +1111,8 @@ mod tests {
             .batch(&tick, nondet!(/** test */))
             .chain(stream1.batch(&tick, nondet!(/** test */)))
             .all_ticks()
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|_| {
                 println!("No dependencies");
             }));
@@ -1110,17 +1122,17 @@ mod tests {
 
     #[test]
     fn test_multiple_inputs_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         let input1 = cluster1
             .source_iter(q!([(1, 2)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .ir_node_named("input1")
             .values();
         let input2 = cluster1
             .source_iter(q!([(3, 4)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .ir_node_named("input2")
             .values();
         let tick = cluster2.tick();
@@ -1134,16 +1146,16 @@ mod tests {
             .clone()
             .chain(stream1.clone())
             .all_ticks()
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|_| {
                 println!("Dependent on both input1.b and input2.b");
             }));
         stream2
             .join(stream1)
             .all_ticks()
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|(_, (a1, a2))| {
                 println!("a*2 from input 1: {}, -a from input 2: {}", a1, a2);
             }));
@@ -1153,17 +1165,17 @@ mod tests {
 
     #[test]
     fn test_difference_partitionable() {
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
         let input1 = cluster1
             .source_iter(q!([(1, 2)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .ir_node_named("input1")
             .values();
         let input2 = cluster1
             .source_iter(q!([(3, 4)]))
-            .broadcast_bincode(&cluster2, nondet!(/** test */))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .ir_node_named("input2")
             .values();
         let tick = cluster2.tick();
@@ -1171,10 +1183,35 @@ mod tests {
             .batch(&tick, nondet!(/** test */))
             .filter_not_in(input2.batch(&tick, nondet!(/** test */)))
             .all_ticks()
-            .assume_ordering(nondet!(/** test */))
-            .assume_retries(nondet!(/** test */))
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
             .for_each(q!(|(a, b)| {
                 println!("a: {}, b: {}", a, b);
+            }));
+
+        test_input_partitionable(builder, cluster2.id(), true);
+    }
+
+    #[test]
+    fn test_partition_partitionable() {
+        let mut builder = FlowBuilder::new();
+        let cluster1 = builder.cluster::<()>();
+        let cluster2 = builder.cluster::<()>();
+        let (evens, odds) = cluster1
+            .source_iter(q!([(1, 2)]))
+            .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
+            .values()
+            .partition(q!(|(a, _b)| a % 2 == 0));
+        evens
+            .assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
+            .for_each(q!(|(b, a2)| {
+                println!("b: {}, a+2: {}", b, a2);
+            }));
+        odds.assume_ordering::<TotalOrder>(nondet!(/** test */))
+            .assume_retries::<ExactlyOnce>(nondet!(/** test */))
+            .for_each(q!(|(b, a2)| {
+                println!("b: {}, a+2: {}", b, a2);
             }));
 
         test_input_partitionable(builder, cluster2.id(), true);

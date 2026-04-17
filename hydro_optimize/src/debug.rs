@@ -2,37 +2,51 @@ use std::collections::HashMap;
 
 use hydro_lang::compile::ir::{HydroNode, HydroRoot, traverse_dfir};
 
+use crate::rewrites::tee_to_inner_id;
+
 fn print_id_root(root: &mut HydroRoot, next_stmt_id: &mut usize) {
-    let parent = root.input_metadata().op.id;
+    let input = root.input_metadata().op.id;
     println!(
-        "{} Root {}, Parents: {:?}",
+        "{} Root {}, Inputs: {:?}",
         next_stmt_id,
         root.print_root(),
-        parent,
+        input,
     );
 }
 
-fn print_id_node(node: &mut HydroNode, next_stmt_id: &mut usize) {
+fn print_id_node(
+    node: &mut HydroNode,
+    next_stmt_id: &mut usize,
+    tee_to_inner: &HashMap<usize, usize>,
+) {
     let metadata = node.metadata();
-    let parents = node
-        .input_metadata()
-        .iter()
-        .map(|m| m.op.id)
-        .collect::<Vec<Option<usize>>>();
+    let inputs = match node {
+        HydroNode::Tee { .. } => {
+            vec![tee_to_inner.get(next_stmt_id).copied()]
+        }
+        _ => node
+            .input_metadata()
+            .iter()
+            .map(|m| m.op.id)
+            .collect::<Vec<Option<usize>>>(),
+    };
     println!(
-        "{} Node {}, {:?}, Cardinality: {:?}, CPU Usage: {:?}, Network Recv CPU Usage: {:?}, Parents: {:?}",
+        "{} Node {}, {:?}, Cardinality: {:?}, CPU Usage: {:?}, Network Recv CPU Usage: {:?}, Inputs: {:?}",
         next_stmt_id,
         node.print_root(),
         metadata,
         metadata.cardinality,
         metadata.op.cpu_usage,
         metadata.op.network_recv_cpu_usage,
-        parents,
+        inputs,
     );
 }
 
 pub fn print_id(ir: &mut [HydroRoot]) {
-    traverse_dfir(ir, print_id_root, print_id_node);
+    let tee_to_inner = tee_to_inner_id(ir);
+    traverse_dfir(ir, print_id_root, |node, op_id| {
+        print_id_node(node, op_id, &tee_to_inner)
+    });
 }
 
 fn name_to_id_node(

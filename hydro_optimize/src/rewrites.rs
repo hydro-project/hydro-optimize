@@ -1,25 +1,30 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use hydro_lang::compile::builder::{FlowBuilder, RewriteIrFlowBuilder};
+use hydro_lang::compile::builder::FlowBuilder;
+use hydro_lang::compile::built::BuiltFlow;
 use hydro_lang::compile::ir::{
     BoundKind, CollectionKind, DebugType, HydroIrMetadata, HydroNode, HydroRoot,
-    KeyedSingletonBoundKind, StreamOrder, StreamRetry, deep_clone, traverse_dfir,
+    KeyedSingletonBoundKind, SingletonBoundKind, StreamOrder, StreamRetry, deep_clone,
+    traverse_dfir,
 };
 use hydro_lang::location::dynamic::LocationId;
-use hydro_lang::location::{Cluster, Location};
+use hydro_lang::location::{Cluster, LocationKey};
 use proc_macro2::{Span, TokenStream};
-use quote::quote;
+use quote::{ToTokens, quote};
 use serde::{Deserialize, Serialize};
 use syn::parse_quote;
 use syn::visit_mut::{self, VisitMut};
 
-use crate::decoupler::{self, Decoupler};
+use crate::decoupler::{self, DecoupleDecision};
 use crate::partitioner::Partitioner;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum Rewrite {
-    Decouple(Decoupler),
+    Decouple {
+        decision: DecoupleDecision,
+        orig_location: LocationId,
+    },
     Partition(Partitioner),
 }
 
@@ -35,47 +40,48 @@ pub type Rewrites = Vec<RewriteMetadata>;
 /// Replays the rewrites in order.
 /// Returns Vec(Cluster, number of nodes) for each created cluster and a new FlowBuilder
 pub fn replay<'a>(
-    rewrites: &mut Rewrites,
-    builder: RewriteIrFlowBuilder<'a>,
-    ir: &[HydroRoot],
+    rewrites: Rewrites,
+    built: BuiltFlow<'a>,
 ) -> (Vec<(Cluster<'a, ()>, usize)>, FlowBuilder<'a>) {
-    let mut new_clusters = vec![];
+    let mut all_new_clusters = vec![];
 
-    let multi_run_metadata = RefCell::new(vec![]);
-    let new_builder = builder.build_with(|builder| {
-        let mut ir = deep_clone(ir);
+    let mut ir = deep_clone(built.ir());
+    let mut builder = FlowBuilder::from_built(&built);
 
-        // Apply decoupling/partitioning in order
-        for rewrite_metadata in rewrites.iter_mut() {
-            let new_cluster = builder.cluster::<()>();
-            match &mut rewrite_metadata.rewrite {
-                Rewrite::Decouple(decoupler) => {
-                    decoupler.decoupled_location = new_cluster.id().clone();
-                    decoupler::decouple(&mut ir, decoupler, &multi_run_metadata, 0);
-                }
-                Rewrite::Partition(_partitioner) => {
-                    panic!("Partitioning is not yet replayable");
+    // Apply decoupling/partitioning in order
+    for rewrite_metadata in rewrites {
+        match rewrite_metadata.rewrite {
+            Rewrite::Decouple {
+                decision,
+                orig_location,
+            } => {
+                let new_clusters =
+                    decoupler::decouple(&mut ir, decision, &orig_location, &mut builder);
+                for cluster in new_clusters {
+                    all_new_clusters.push((cluster, rewrite_metadata.num_nodes));
                 }
             }
-            new_clusters.push((new_cluster, rewrite_metadata.num_nodes));
+            Rewrite::Partition(_partitioner) => {
+                panic!("Partitioning is not yet replayable");
+            }
         }
+    }
 
-        ir
-    });
+    builder.replace_ir(ir);
 
-    (new_clusters, new_builder)
+    (all_new_clusters, builder)
 }
 
 /// Replace CLUSTER_SELF_ID with the ID of the original node the partition is assigned to
 #[derive(Copy, Clone)]
 pub enum ClusterSelfIdReplace {
     Decouple {
-        orig_cluster_id: usize,
-        decoupled_cluster_id: usize,
+        orig_cluster_id: LocationKey,
+        decoupled_cluster_id: LocationKey,
     },
     Partition {
         num_partitions: usize,
-        partitioned_cluster_id: usize,
+        partitioned_cluster_id: LocationKey,
         op_id: usize,
     },
 }
@@ -125,15 +131,15 @@ impl VisitMut for ClusterSelfIdReplace {
 }
 
 /// Converts input metadata to IDs, filtering by location if provided
-pub fn relevant_parents(
+pub fn relevant_inputs(
     input_metadatas: Vec<&HydroIrMetadata>,
-    location: Option<&LocationId>,
+    location: Option<&LocationKey>,
 ) -> Vec<usize> {
     input_metadatas
         .iter()
         .filter_map(|input_metadata| {
             if let Some(location) = location
-                && input_metadata.location_kind.root() != location
+                && input_metadata.location_id.root().key() != *location
             {
                 None
             } else {
@@ -143,43 +149,60 @@ pub fn relevant_parents(
         .collect()
 }
 
-pub fn parent_ids(
-    node: &HydroNode,
-    location: Option<&LocationId>,
-    cycle_source_to_sink_parent: &HashMap<usize, usize>,
-) -> Vec<usize> {
-    match node {
-        HydroNode::CycleSource { metadata, .. } => {
-            // For CycleSource, its parent is its CycleSink's parent. Note: assumes the CycleSink is on the same cluster
-            vec![*cycle_source_to_sink_parent.get(&metadata.op.id.unwrap()).unwrap()]
-        }
-        HydroNode::Tee { inner, .. } => {
-            vec![inner.0.borrow().op_metadata().id.unwrap()]
-        }
-        _ => relevant_parents(node.input_metadata(), location),
-    }
-}
-
-/// Creates a mapping from op_id to its parent op_ids, filtered by location if provided
-pub fn op_id_to_parents(
+/// Creates a mapping from op_id to its input op_ids, filtered by location if provided
+pub fn op_id_to_inputs(
     ir: &mut [HydroRoot],
-    location: Option<&LocationId>,
-    cycle_source_to_sink_parent: &HashMap<usize, usize>,
+    location: Option<&LocationKey>,
+    cycle_source_to_sink_input: &HashMap<usize, usize>,
 ) -> HashMap<usize, Vec<usize>> {
     let mapping = RefCell::new(HashMap::new());
 
     traverse_dfir(
         ir,
         |leaf, op_id| {
-            let relevant_parent_ids = relevant_parents(vec![leaf.input_metadata()], location);
-            mapping.borrow_mut().insert(*op_id, relevant_parent_ids);
+            let relevant_input_ids = relevant_inputs(vec![leaf.input_metadata()], location);
+            mapping.borrow_mut().insert(*op_id, relevant_input_ids);
         },
         |node, op_id| {
-            mapping.borrow_mut().insert(*op_id, parent_ids(node, location, cycle_source_to_sink_parent));
+            let input_ids = match node {
+                HydroNode::CycleSource { .. } => {
+                    // For CycleSource, its input is its CycleSink's input. Note: assumes the CycleSink is on the same cluster
+                    vec![*cycle_source_to_sink_input.get(op_id).unwrap()]
+                }
+                HydroNode::Tee { inner, .. } | HydroNode::Partition { inner, .. } => {
+                    vec![inner.0.borrow().op_metadata().id.unwrap()]
+                }
+                _ => relevant_inputs(node.input_metadata(), location),
+            };
+            mapping.borrow_mut().insert(*op_id, input_ids);
         },
     );
 
     mapping.take()
+}
+
+/// Creates a mapping from op_id to the other (if any) op_id that outputs to the same node.
+pub fn op_id_to_partner(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
+    let mut output = HashMap::new();
+
+    traverse_dfir(
+        ir,
+        |_, _| {},
+        |node, _op_id| {
+            let input_metadatas = node.input_metadata();
+            if input_metadatas.len() == 2 {
+                let dad_op_id = input_metadatas[0].op.id.unwrap();
+                let mom_op_id = input_metadatas[1].op.id.unwrap();
+                output.insert(dad_op_id, mom_op_id);
+                output.insert(mom_op_id, dad_op_id);
+            }
+            assert!(
+                input_metadatas.len() > 2,
+                "Logic needs to be updated to handle nodes with more than 2 inputs"
+            );
+        },
+    );
+    output
 }
 
 pub fn tee_to_inner_id(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
@@ -189,13 +212,54 @@ pub fn tee_to_inner_id(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
         ir,
         |_, _| {},
         |node, op_id| {
-            if let HydroNode::Tee { inner, .. } = node {
+            if let HydroNode::Tee { inner, .. } | HydroNode::Partition { inner, .. } = node {
                 mapping.insert(*op_id, inner.0.borrow().op_metadata().id.unwrap());
             }
         },
     );
 
     mapping
+}
+
+/// Check if the type is serializable. Currently a janky implementation that just looks for common unserializable types.
+/// Add to the list as new errors emerge.
+fn type_is_serializable(t: &DebugType) -> bool {
+    let type_name = t.to_token_stream().to_string();
+    let unserializable_types = [
+        "Rc",
+        "RefCell",
+        "Instant",
+        "Duration",
+        "SystemTime",
+        "HashMap",
+    ];
+    !unserializable_types
+        .iter()
+        .any(|unser| type_name.contains(unser))
+}
+
+/// Returns whether a node can be decoupled.
+///
+/// False if:
+/// 1. The node relies on knowing the initial value (Singleton, KeyedSingleton without BoundedValue)
+/// 2. The output type is not serializable
+pub fn can_decouple(output_type: &CollectionKind) -> bool {
+    !output_type.is_bounded()
+        && match output_type {
+            CollectionKind::Stream { element_type, .. }
+            | CollectionKind::Optional { element_type, .. } => type_is_serializable(element_type),
+            CollectionKind::KeyedSingleton {
+                bound: KeyedSingletonBoundKind::BoundedValue,
+                key_type,
+                value_type,
+            }
+            | CollectionKind::KeyedStream {
+                key_type,
+                value_type,
+                ..
+            } => type_is_serializable(key_type) && type_is_serializable(value_type),
+            CollectionKind::Singleton { .. } | CollectionKind::KeyedSingleton { .. } => false,
+        }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -205,15 +269,15 @@ pub enum NetworkType {
     SendRecv,
 }
 
-pub fn get_network_type(node: &HydroNode, location: usize) -> Option<NetworkType> {
+pub fn get_network_type(node: &HydroNode, location: &LocationKey) -> Option<NetworkType> {
     let mut is_to_us = false;
     let mut is_from_us = false;
 
     if let HydroNode::Network { input, .. } = node {
-        if input.metadata().location_kind.root().raw_id() == location {
+        if input.metadata().location_id.root().key() == *location {
             is_from_us = true;
         }
-        if node.metadata().location_kind.root().raw_id() == location {
+        if node.metadata().location_id.root().key() == *location {
             is_to_us = true;
         }
 
@@ -228,16 +292,6 @@ pub fn get_network_type(node: &HydroNode, location: usize) -> Option<NetworkType
         };
     }
     None
-}
-
-pub fn node_is_at_location(node: &HydroNode, location: usize) -> bool {
-    if let HydroNode::Network { .. } = node {
-        get_network_type(node, location).is_some()
-    }
-    else {
-        // If it's not a network, then its location should == the location
-        node.metadata().location_kind.root().raw_id() == location
-    }
 }
 
 fn get_this_crate() -> TokenStream {
@@ -257,15 +311,15 @@ pub fn serialize_bincode_with_type(is_demux: bool, t_type: &syn::Type) -> syn::E
 
     if is_demux {
         parse_quote! {
-            ::#root::runtime_support::stageleft::runtime_support::fn1_type_hint::<(#root::location::MemberId<_>, #t_type), _>(
+            #root::runtime_support::stageleft::runtime_support::fn1_type_hint::<(#root::location::MemberId<_>, #t_type), _>(
                 |(id, data)| {
-                    (id.raw_id, #root::runtime_support::bincode::serialize(&data).unwrap().into())
+                    (id.into_tagless(), #root::runtime_support::bincode::serialize(&data).unwrap().into())
                 }
             )
         }
     } else {
         parse_quote! {
-            ::#root::runtime_support::stageleft::runtime_support::fn1_type_hint::<#t_type, _>(
+            #root::runtime_support::stageleft::runtime_support::fn1_type_hint::<#t_type, _>(
                 |data| {
                     #root::runtime_support::bincode::serialize(&data).unwrap().into()
                 }
@@ -281,7 +335,7 @@ pub fn deserialize_bincode_with_type(tagged: Option<&syn::Type>, t_type: &syn::T
         parse_quote! {
             |res| {
                 let (id, b) = res.unwrap();
-                (#root::location::MemberId::<#c_type>::from_raw(id), #root::runtime_support::bincode::deserialize::<#t_type>(&b).unwrap())
+                (#root::location::MemberId::<#c_type>::from_tagless(id as #root::__staged::location::TaglessMemberId), #root::runtime_support::bincode::deserialize::<#t_type>(&b).unwrap())
             }
         }
     } else {
@@ -337,5 +391,51 @@ pub fn prepend_member_id_to_collection_kind(collection_kind: &CollectionKind) ->
             key_type: member_id_debug_type,
             value_type: collection_kind_to_debug_type(collection_kind),
         },
+    }
+}
+
+pub fn unbounded_stream(element_type: syn::Type) -> CollectionKind {
+    CollectionKind::Stream {
+        bound: BoundKind::Unbounded,
+        order: StreamOrder::NoOrder,
+        retry: StreamRetry::ExactlyOnce,
+        element_type: element_type.into(),
+    }
+}
+
+pub fn bounded_stream(element_type: syn::Type) -> CollectionKind {
+    CollectionKind::Stream {
+        bound: BoundKind::Bounded,
+        order: StreamOrder::NoOrder,
+        retry: StreamRetry::ExactlyOnce,
+        element_type: element_type.into(),
+    }
+}
+
+pub fn bounded_optional(element_type: syn::Type) -> CollectionKind {
+    CollectionKind::Optional {
+        bound: BoundKind::Bounded,
+        element_type: element_type.into(),
+    }
+}
+
+pub fn unbounded_optional(element_type: syn::Type) -> CollectionKind {
+    CollectionKind::Optional {
+        bound: BoundKind::Unbounded,
+        element_type: element_type.into(),
+    }
+}
+
+pub fn bounded_singleton(element_type: syn::Type) -> CollectionKind {
+    CollectionKind::Singleton {
+        bound: SingletonBoundKind::Bounded,
+        element_type: element_type.into(),
+    }
+}
+
+pub fn unbounded_singleton(element_type: syn::Type) -> CollectionKind {
+    CollectionKind::Singleton {
+        bound: SingletonBoundKind::Unbounded,
+        element_type: element_type.into(),
     }
 }
