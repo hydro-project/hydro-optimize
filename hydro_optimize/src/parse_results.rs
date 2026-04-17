@@ -14,6 +14,8 @@ use crate::deploy_and_analyze::MetricLogs;
 pub struct RunMetadata {
     pub throughputs: Vec<usize>,
     pub latencies: Vec<(f64, f64, f64, u64)>, // per-second: (p50, p99, p999, count)
+    pub counters: HashMap<usize, usize>,      // op_id -> cardinality count
+    pub perf: Vec<((usize, bool), f64)>,      // (op_id, is_recv) -> cpu fraction
     pub send_overhead: HashMap<LocationId, f64>,
     pub recv_overhead: HashMap<LocationId, f64>,
     pub unaccounted_perf: HashMap<LocationId, f64>, // % of perf samples not mapped to any operator
@@ -105,10 +107,10 @@ pub struct MemoryStats {
 /// Per-second aggregate I/O statistics from sar -b output
 #[derive(Debug, Default, Clone, Copy)]
 pub struct IOStats {
-    pub rtps: f64,       // read transfers per second
-    pub wtps: f64,       // write transfers per second
-    pub bread_per_sec: f64,  // blocks read per second
-    pub bwrtn_per_sec: f64,  // blocks written per second
+    pub rtps: f64,          // read transfers per second
+    pub wtps: f64,          // write transfers per second
+    pub bread_per_sec: f64, // blocks read per second
+    pub bwrtn_per_sec: f64, // blocks written per second
 }
 
 /// Combined per-second sar statistics
@@ -353,18 +355,16 @@ fn inject_perf_node(
     }
 }
 
-pub fn inject_perf(ir: &mut [HydroRoot], folded_data: Vec<u8>) -> f64 {
-    let (id_to_usage, unidentified_usage) = parse_perf(String::from_utf8(folded_data).unwrap());
+pub fn inject_perf(ir: &mut [HydroRoot], id_to_usage: &HashMap<(usize, bool), f64>) {
     traverse_dfir(
         ir,
         |root, next_stmt_id| {
-            inject_perf_root(root, &id_to_usage, next_stmt_id);
+            inject_perf_root(root, id_to_usage, next_stmt_id);
         },
         |node, next_stmt_id| {
-            inject_perf_node(node, &id_to_usage, next_stmt_id);
+            inject_perf_node(node, id_to_usage, next_stmt_id);
         },
     );
-    unidentified_usage
 }
 
 /// Returns (op_id, count)
@@ -470,12 +470,14 @@ async fn drain_receiver(receiver: &mut UnboundedReceiver<String>) -> Vec<String>
     lines
 }
 
-pub async fn analyze_perf(process: &impl DeployCrateWrapper, ir: &mut [HydroRoot]) -> f64 {
+pub async fn analyze_perf(process: &impl DeployCrateWrapper, ir: &mut [HydroRoot]) -> (HashMap<(usize, bool), f64>, f64) {
     let underlying = process.underlying();
     let perf_results = underlying.tracing_results().unwrap();
 
-    // Inject perf usages into metadata, return unidentified perf
-    inject_perf(ir, perf_results.folded_data.clone())
+    let folded_data = perf_results.folded_data.clone();
+    let (id_to_usage, unidentified_usage) = parse_perf(String::from_utf8(folded_data).unwrap());
+    inject_perf(ir, &id_to_usage);
+    (id_to_usage, unidentified_usage)
 }
 
 pub async fn analyze_cluster_results(
@@ -520,11 +522,11 @@ pub async fn analyze_cluster_results(
         ));
     }
 
-    for (id, name, _cluster) in nodes.get_all_clusters() {
+    for (id, name, cluster) in nodes.get_all_clusters() {
         let cluster_data = drained.get(&(id.clone(), name.to_string())).unwrap();
 
-        // Find the node with max CPU usage
-        let max_usage = cluster_data.iter().reduce(|max_data, data| {
+        // Find the node with max CPU usage (tracking index)
+        let max_idx_and_data = cluster_data.iter().enumerate().reduce(|(max_i, max_data), (i, data)| {
             let stat = measurement_second
                 .and_then(|s| data.0.get(s))
                 .or_else(|| data.0.last());
@@ -536,20 +538,23 @@ pub async fn analyze_cluster_results(
                     if s.cpu.all_stats.user + s.cpu.all_stats.system
                         > ms.cpu.all_stats.user + ms.cpu.all_stats.system =>
                 {
-                    data
+                    (i, data)
                 }
-                _ => max_data,
+                _ => (max_i, max_data),
             }
         });
 
-        if let Some((max_sar_stat, counters, _, _)) = max_usage {
-            // Parse perf
-            // let unidentified_perf = analyze_perf(cluster.members().get(*idx).unwrap(), ir).await;
+        if let Some((idx, (max_sar_stat, counters, _, _))) = max_idx_and_data {
             op_to_count.extend(counters.clone());
 
-            // run_metadata
-            //     .unaccounted_perf
-            //     .insert(id.clone(), unidentified_perf);
+            if let Some(member) = cluster.members().get(idx) {
+                let (perf_usage, unidentified_perf) = analyze_perf(member, ir).await;
+                run_metadata.perf.extend(perf_usage.into_iter().collect::<Vec<_>>());
+                run_metadata
+                    .unaccounted_perf
+                    .insert(id.clone(), unidentified_perf);
+            }
+
             run_metadata
                 .sar_stats
                 .insert(id.clone(), max_sar_stat.clone());
@@ -569,6 +574,7 @@ pub async fn analyze_cluster_results(
     }
 
     inject_count(ir, &op_to_count);
+    run_metadata.counters = op_to_count;
     run_metadata
 }
 

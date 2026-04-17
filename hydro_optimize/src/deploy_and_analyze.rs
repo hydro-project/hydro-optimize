@@ -16,12 +16,13 @@ use hydro_lang::location::LocationKey;
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::prelude::{Cluster, FlowBuilder, Process};
 use hydro_lang::telemetry::Sidecar;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::decouple_analysis::decouple_analysis;
 use crate::decoupler;
 use crate::deploy::{HostType, ReusableHosts};
-use crate::parse_results::{CPUStat, RunMetadata, SarStats, analyze_cluster_results};
+use crate::parse_results::{CPUStat, RunMetadata, SarStats, analyze_cluster_results, inject_count, inject_perf};
 use crate::repair::{cycle_source_to_sink_input, inject_id, remove_counter};
 
 pub(crate) const METRIC_INTERVAL_SECS: u64 = 1;
@@ -276,6 +277,42 @@ impl Optimizations {
     }
 }
 
+/// Profiling data collected during a benchmark run, serializable to disk.
+#[derive(Serialize, Deserialize)]
+pub struct ProfilingData {
+    pub counters: HashMap<usize, usize>,
+    pub bottleneck: LocationId,
+    /// Per-operator CPU usage fractions: (op_id, is_network_recv) → fraction of total samples.
+    #[serde(default)]
+    pub perf: Vec<((usize, bool), f64)>,
+}
+
+impl ProfilingData {
+    pub fn save(&self, path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).ok();
+        }
+        let json = serde_json::to_string_pretty(self).expect("failed to serialize ProfilingData");
+        match fs::write(path, json) {
+            Ok(()) => println!("Saved profiling data: {}", path.display()),
+            Err(e) => eprintln!("Failed to save profiling data to {}: {}", path.display(), e),
+        }
+    }
+
+    /// Loads from file and injects counters and perf data into the IR.
+    pub fn load_and_inject(path: &Path, ir: &mut [HydroRoot]) -> Self {
+        let json = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("Failed to load profiling data from {}: {}", path.display(), e));
+        let data: Self = serde_json::from_str(&json).expect("failed to deserialize ProfilingData");
+        inject_count(ir, &data.counters);
+        if !data.perf.is_empty() {
+            let id_to_usage: HashMap<(usize, bool), f64> = data.perf.iter().cloned().collect();
+            inject_perf(ir, &id_to_usage);
+        }
+        data
+    }
+}
+
 /// `stability_second`: The second in which the protocol is expected to be stable, and its performance can be used as the basis for optimization.
 #[allow(clippy::too_many_arguments)]
 pub async fn deploy_and_optimize<'a>(
@@ -407,37 +444,16 @@ pub async fn deploy_and_optimize<'a>(
             // Remove HydroNode::Counter (since we don't want to consider decoupling those)
             remove_counter(&mut ir);
 
-            // Create a mapping from each CycleSink to its corresponding CycleSource
-            let cycle_source_to_sink_input = cycle_source_to_sink_input(&mut ir);
-
-            if optimizations.decoupling {
-                let bottleneck = run_metadata.cpu_bottleneck(stability_second.unwrap());
-                // The bottleneck is either a process or cluster. Panic otherwise.
-                let (bottleneck_name, bottleneck_num_nodes) = processes
-                    .location_name(&bottleneck)
-                    .map(|name| (name, 1))
-                    .unwrap_or_else(|| clusters.location_name_and_num(&bottleneck).unwrap());
-
-                let decision = decouple_analysis(
-                    &mut ir,
-                    &bottleneck,
-                    0.01, // TODO: Deprecate use of send/recv overheads, since they are inaccurate anyway
-                    0.01,
-                    &cycle_source_to_sink_input,
-                );
-
-                // Apply decoupling — creates new clusters as needed
-                let new_clusters =
-                    decoupler::decouple(&mut ir, decision, &bottleneck, &mut post_rewrite_builder);
-                for cluster in new_clusters {
-                    clusters.named_clusters.push((
-                        cluster.id().key(),
-                        format!("{}-decouple-{}", bottleneck_name, iteration),
-                        bottleneck_num_nodes,
-                    ));
-                }
-                // TODO: Save decoupling decision to file
-            }
+            let bottleneck = run_metadata.cpu_bottleneck(stability_second.unwrap());
+            apply_optimizations(
+                &mut ir,
+                &bottleneck,
+                &optimizations,
+                &mut clusters,
+                &processes,
+                &mut post_rewrite_builder,
+                iteration,
+            );
         }
 
         post_rewrite_builder.replace_ir(ir);
@@ -445,6 +461,46 @@ pub async fn deploy_and_optimize<'a>(
     }
 
     run_metadata
+}
+
+/// Applies optimizations (decoupling) to the IR based on profiling data.
+/// If `profiling_file` is provided, loads counters and bottleneck from disk
+/// instead of using live data.
+pub fn apply_optimizations(
+    ir: &mut [HydroRoot],
+    bottleneck: &LocationId,
+    optimizations: &Optimizations,
+    clusters: &mut ReusableClusters,
+    processes: &ReusableProcesses,
+    post_rewrite_builder: &mut FlowBuilder<'_>,
+    iteration: usize,
+) {
+    let cycle_source_to_sink = cycle_source_to_sink_input(ir);
+
+    if optimizations.decoupling {
+        let (bottleneck_name, bottleneck_num_nodes) = processes
+            .location_name(bottleneck)
+            .map(|name| (name, 1))
+            .unwrap_or_else(|| clusters.location_name_and_num(bottleneck).unwrap());
+
+        let decision = decouple_analysis(
+            ir,
+            bottleneck,
+            0.01,
+            0.01,
+            &cycle_source_to_sink,
+        );
+
+        let new_clusters =
+            decoupler::decouple(ir, decision, bottleneck, post_rewrite_builder);
+        for cluster in new_clusters {
+            clusters.named_clusters.push((
+                cluster.id().key(),
+                format!("{}-decouple-{}", bottleneck_name, iteration),
+                bottleneck_num_nodes,
+            ));
+        }
+    }
 }
 
 /// Writes per-second metrics CSV for each location, combining sar stats with
@@ -577,14 +633,33 @@ async fn output_metrics(
         .sar_stats
         .iter()
         .for_each(|(location, sar_stats)| {
-            println!(
-                "{} CPU: {:.2}%",
-                location_id_to_cluster.get(location).unwrap(),
-                sar_stats
-                    .last()
-                    .map(|stats| stats.cpu.all_stats.user + stats.cpu.all_stats.system)
-                    .unwrap_or_default()
-            )
+            let name = location_id_to_cluster.get(location).unwrap();
+            if let Some(sar) = sar_stats.get(measurement_second) {
+                println!(
+                    "{} @{}s: CPU {:.2}% (user {:.2}%, sys {:.2}%, idle {:.2}%) | \
+                     Net rx {:.0} pkt/s {:.0} B/s, tx {:.0} pkt/s {:.0} B/s | \
+                     Mem {:.2}% ({:.0} KB used, {:.0} KB buf, {:.0} KB cached) | \
+                     IO r {:.2} w {:.2} tps, bread {:.2} bwrtn {:.2}/s",
+                    name,
+                    measurement_second + 1,
+                    sar.cpu.all_stats.user + sar.cpu.all_stats.system,
+                    sar.cpu.all_stats.user,
+                    sar.cpu.all_stats.system,
+                    sar.cpu.all_stats.idle,
+                    sar.network.rx_packets_per_sec,
+                    sar.network.rx_bytes_per_sec,
+                    sar.network.tx_packets_per_sec,
+                    sar.network.tx_bytes_per_sec,
+                    sar.memory.percent_mem_used,
+                    sar.memory.kb_mem_used,
+                    sar.memory.kb_buffers,
+                    sar.memory.kb_cached,
+                    sar.io.rtps,
+                    sar.io.wtps,
+                    sar.io.bread_per_sec,
+                    sar.io.bwrtn_per_sec,
+                );
+            }
         });
 
     if let Err(e) = write_metrics_csv(
@@ -597,6 +672,17 @@ async fn output_metrics(
     ) {
         eprintln!("Failed to write CSV: {}", e);
     }
+
+    let bottleneck = run_metadata.cpu_bottleneck(measurement_second);
+    ProfilingData {
+        counters: run_metadata.counters,
+        bottleneck,
+        perf: run_metadata.perf,
+    }
+    .save(&output_dir.join(format!(
+        "profiling_{}c_{}vc_r{}.json",
+        num_clients, num_clients_per_node, run
+    )));
 }
 
 pub struct BenchmarkArgs {
