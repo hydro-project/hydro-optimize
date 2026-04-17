@@ -7,7 +7,7 @@ use hydro_optimize::deploy_and_analyze::{
     Optimizations, ReusableClusters, ReusableProcesses, deploy_and_optimize,
 };
 use hydro_optimize_examples::print_parseable_bench_results;
-use hydro_test::cluster::two_pc_bench::{Aggregator, Client};
+use hydro_test::cluster::two_pc_bench;
 
 use stageleft::q;
 
@@ -70,6 +70,7 @@ async fn main() {
         print_parseable_bench_results,
     );
     let client_id = clients.id();
+    let client_aggregator_id = client_aggregator.id();
 
     deploy_and_optimize(
         &mut reusable_hosts,
@@ -83,8 +84,8 @@ async fn main() {
             .with_process(client_aggregator),
         Optimizations::default()
             .with_partitioning()
-            .excluding::<Client>()
-            .excluding::<Aggregator>(),
+            .excluding(client_id.clone())
+            .excluding(client_aggregator_id),
         &client_id,
         num_clients_per_node,
         Some(run_seconds),

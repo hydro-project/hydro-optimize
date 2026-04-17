@@ -8,7 +8,6 @@ use hydro_optimize::deploy_and_analyze::{
 };
 use hydro_std::bench_client::pretty_print_bench_results;
 use hydro_test::cluster::paxos::{CorePaxos, PaxosConfig};
-use hydro_test::cluster::paxos_bench::{Aggregator, Client};
 use stageleft::q;
 
 #[derive(Parser, Debug)]
@@ -82,6 +81,7 @@ async fn main() {
         pretty_print_bench_results, // Note: Throughput/latency numbers won't be accessible to deploy_and_optimize
     );
     let client_id = clients.id();
+    let client_aggregator_id = client_aggregator.id();
 
     // Deploy
     let mut reusable_hosts = ReusableHosts::new(&host_type);
@@ -101,8 +101,8 @@ async fn main() {
         ReusableProcesses::default().with_process(client_aggregator),
         Optimizations::default()
             .with_decoupling()
-            .excluding::<Client>()
-            .excluding::<Aggregator>()
+            .excluding(client_id.clone())
+            .excluding(client_aggregator_id)
             .with_iterations(num_times_to_optimize),
         &client_id,
         num_clients_per_node,

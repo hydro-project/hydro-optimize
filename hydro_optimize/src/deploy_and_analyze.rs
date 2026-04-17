@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
@@ -238,7 +238,7 @@ impl ReusableProcesses {
 pub struct Optimizations {
     decoupling: bool,
     partitioning: bool,
-    exclude: Vec<String>,
+    exclude: HashSet<LocationKey>,
     iterations: usize, // Must be at least 1
 }
 
@@ -247,7 +247,7 @@ impl Default for Optimizations {
         Self {
             decoupling: false,
             partitioning: false,
-            exclude: vec![],
+            exclude: HashSet::new(),
             iterations: 1,
         }
     }
@@ -264,8 +264,8 @@ impl Optimizations {
         self
     }
 
-    pub fn excluding<T>(mut self) -> Self {
-        self.exclude.push(std::any::type_name::<T>().to_string());
+    pub fn excluding(mut self, location: LocationId) -> Self {
+        self.exclude.insert(location.key());
         self
     }
 
@@ -315,6 +315,11 @@ pub async fn deploy_and_optimize<'a>(
     let counter_output_duration =
         syn::parse_quote!(std::time::Duration::from_secs(#METRIC_INTERVAL_SECS));
     let mut run_metadata = RunMetadata::default();
+    // Measure network (-n DEV) and CPU (-u) usage. -P ALL measures all CPUs on the machine
+    let sar_sidecar = ScriptSidecar {
+        script: "sar -n DEV -u -P ALL 1".to_string(),
+        prefix: SAR_USAGE_PREFIX.to_string(),
+    };
 
     for iteration in 0..optimizations.iterations {
         // Rewrite with counter tracking
@@ -345,6 +350,9 @@ pub async fn deploy_and_optimize<'a>(
                     *cluster_id,
                     reusable_hosts.get_cluster_hosts(deployment, name.clone(), *num_hosts, 0),
                 );
+                if !optimizations.exclude.contains(cluster_id) {
+                    deployable = deployable.with_sidecar_internal(*cluster_id, &sar_sidecar);
+                }
             }
         }
         for (process_id, name) in processes.named_processes.iter() {
@@ -352,18 +360,13 @@ pub async fn deploy_and_optimize<'a>(
                 *process_id,
                 reusable_hosts.get_no_perf_process_hosts(deployment, name.clone(), 0),
             );
+            if !optimizations.exclude.contains(process_id) {
+                deployable = deployable.with_sidecar_internal(*process_id, &sar_sidecar);
+            }
         }
 
-        // Measure network (-n DEV) and CPU (-u) usage. -P ALL measures all CPUs on the machine
-        let sar_sidecar = ScriptSidecar {
-            script: "sar -n DEV -u -P ALL 1".to_string(),
-            prefix: SAR_USAGE_PREFIX.to_string(),
-        };
-        let nodes = deployable
-            .with_sidecar_all(&sar_sidecar) // Measure network usage
-            .deploy(deployment);
+        let nodes = deployable.deploy(deployment);
         deployment.deploy().await.unwrap();
-
         let metrics = track_cluster_metrics(&nodes).await;
 
         // Wait for user to input a newline

@@ -49,6 +49,7 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
         (client_aggregator.id(), "client_aggregator".to_string()),
     ]);
     let client_id = clients.id();
+    let client_aggregator_id = client_aggregator.id();
 
     hydro_test::cluster::paxos_bench::paxos_bench(
         checkpoint_frequency,
@@ -79,7 +80,9 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
         .with_cluster(clients, num_clients)
         .with_cluster(replicas, f + 1);
     let processes = ReusableProcesses::default().with_process(client_aggregator);
-    let optimizations = Optimizations::default();
+    let optimizations = Optimizations::default()
+        .excluding(client_id.clone())
+        .excluding(client_aggregator_id);
 
     BenchmarkConfig {
         name: "Paxos".to_string(),
