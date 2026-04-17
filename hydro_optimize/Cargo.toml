@@ -31,6 +31,7 @@ quote = "1.0.35"
 
 [dev-dependencies]
 ctor.workspace = true
+futures = "0.3"
 hydro_build_utils.workspace = true
 hydro_lang = { workspace = true, features = ["viz"] }
 include_mdtests.workspace = true

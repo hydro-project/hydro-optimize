@@ -53,6 +53,7 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
         | HydroNode::FilterMap { metadata, .. }
         | HydroNode::Unique { metadata, .. }
         | HydroNode::Scan { metadata, .. }
+        | HydroNode::ScanAsyncBlocking { metadata, .. }
         | HydroNode::Fold { metadata, .. } // Output 1 value per tick
         | HydroNode::Reduce { metadata, .. } // Output 1 value per tick
         | HydroNode::FoldKeyed { metadata, .. }

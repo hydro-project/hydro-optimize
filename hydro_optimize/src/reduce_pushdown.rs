@@ -61,8 +61,8 @@ pub fn reduce_pushdown(ir: &mut [HydroRoot], decision: HashMap<usize, usize>) {
 
 #[cfg(test)]
 mod tests {
-    use hydro_build_utils::assert_debug_snapshot;
     use hydro_lang::{
+        compile::ir::{HydroNode, traverse_dfir},
         live_collections::stream::{ExactlyOnce, NoOrder, TotalOrder},
         location::Location,
         nondet::nondet,
@@ -76,9 +76,24 @@ mod tests {
         repair::{cycle_source_to_sink_input, inject_id, inject_location},
     };
 
-    #[test]
-    fn test_reduce_pushdown() {
+    fn count_reduces(ir: &mut [hydro_lang::compile::ir::HydroRoot]) -> usize {
+        let mut count = 0;
+        traverse_dfir(ir, |_, _| {}, |node, _| {
+            if matches!(node, HydroNode::Reduce { .. }) {
+                count += 1;
+            }
+        });
+        count
+    }
+
+    #[tokio::test]
+    async fn test_reduce_pushdown() {
+        use futures::StreamExt;
+        use hydro_deploy::Deployment;
+
         let mut builder = FlowBuilder::new();
+        let external = builder.external::<()>();
+        let gateway = builder.process::<()>();
         let cluster1 = builder.cluster::<()>();
         let cluster2 = builder.cluster::<()>();
 
@@ -87,27 +102,54 @@ mod tests {
             .broadcast(&cluster2, TCP.fail_stop().bincode(), nondet!(/** test */))
             .values()
             .weaken_ordering::<NoOrder>();
-        input
+        let output = input
             .clone()
             .merge_unordered(input)
             .max()
             .sample_eager(nondet!(/** test */))
             .assume_ordering::<TotalOrder>(nondet!(/** test */))
             .assume_retries::<ExactlyOnce>(nondet!(/** test */))
-            .for_each(q!(|max_val| {
-                println!("max value: {}", max_val);
-            }));
+            .send(&gateway, TCP.fail_stop().bincode())
+            .values()
+            .send_bincode_external(&external);
 
         let built = builder.optimize_with(|ir| {
             inject_id(ir);
             let cycle_data = cycle_source_to_sink_input(ir);
             inject_location(ir, &cycle_data);
+
+            let before = count_reduces(ir);
+
             let decision = reduce_pushdown_decision(ir, &cluster2.id());
+            assert!(!decision.is_empty(), "Expected non-empty pushdown decision");
             reduce_pushdown(ir, decision);
+
+            let after = count_reduces(ir);
+            assert!(
+                after > before,
+                "Expected more Reduce nodes after pushdown ({before} -> {after})"
+            );
         });
 
-        hydro_lang::compile::ir::dbg_dedup_tee(|| {
-            assert_debug_snapshot!(built.ir());
-        });
+        let mut deployment = Deployment::new();
+        let nodes = built
+            .with_process(&gateway, deployment.Localhost())
+            .with_cluster(&cluster1, vec![deployment.Localhost()])
+            .with_cluster(&cluster2, vec![deployment.Localhost()])
+            .with_external(&external, deployment.Localhost())
+            .deploy(&mut deployment);
+
+        deployment.deploy().await.unwrap();
+        let mut output = nodes.connect(output).await;
+        deployment.start().await.unwrap();
+
+        let val: i32 = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            output.next(),
+        )
+        .await
+        .expect("timeout waiting for output")
+        .expect("output channel closed");
+        assert_eq!(val, 5);
     }
 }

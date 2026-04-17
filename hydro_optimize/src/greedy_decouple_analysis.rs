@@ -16,7 +16,7 @@ use crate::{
 };
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
-struct UnitKey(u32);
+pub struct UnitKey(u32);
 
 impl UnifyKey for UnitKey {
     type Value = ();
