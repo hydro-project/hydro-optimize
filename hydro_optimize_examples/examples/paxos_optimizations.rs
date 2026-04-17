@@ -5,8 +5,9 @@ use hydro_lang::compile::ir::deep_clone;
 use hydro_lang::location::Location;
 use hydro_lang::prelude::FlowBuilder;
 use hydro_optimize::deploy_and_analyze::{
-    Optimizations, ProfilingData, ReusableClusters, ReusableProcesses, apply_optimizations,
+    Optimizations, ReusableClusters, ReusableProcesses, apply_optimizations,
 };
+use hydro_optimize::parse_results::RunMetadata;
 use hydro_optimize::repair::{inject_id, remove_counter};
 use hydro_test::cluster::paxos::{CorePaxos, PaxosConfig};
 use stageleft::q;
@@ -81,15 +82,13 @@ fn main() {
     });
 
     // Load profiling data and inject counters
-    let profiling = ProfilingData::load_and_inject(Path::new(&args.profiling), &mut ir);
-    println!("\n=== Bottleneck: {:?} ===", profiling.bottleneck);
+    let _profiling = RunMetadata::load_and_inject(Path::new(&args.profiling), &mut ir);
 
     // Apply optimizations
     let mut rewrite_builder = FlowBuilder::from_built(&built);
     rewrite_builder.replace_ir(deep_clone(&ir));
     apply_optimizations(
         &mut ir,
-        &profiling.bottleneck,
         &optimizations,
         &mut clusters.clone(),
         &processes,

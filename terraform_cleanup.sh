@@ -8,6 +8,10 @@ if [[ ! -d "$HYDRO_DIR" ]]; then
   exit 1
 fi
 
+# Remove perf leftover data
+rm -rf *.folded
+rm -rf *.perf.data
+
 pids=()
 dirs=()
 

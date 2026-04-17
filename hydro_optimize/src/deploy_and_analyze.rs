@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
@@ -16,13 +15,12 @@ use hydro_lang::location::LocationKey;
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::prelude::{Cluster, FlowBuilder, Process};
 use hydro_lang::telemetry::Sidecar;
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::decouple_analysis::decouple_analysis;
 use crate::decoupler;
 use crate::deploy::{HostType, ReusableHosts};
-use crate::parse_results::{CPUStat, RunMetadata, SarStats, analyze_cluster_results, inject_count, inject_perf};
+use crate::parse_results::{RunMetadata, analyze_cluster_results};
 use crate::repair::{cycle_source_to_sink_input, inject_id, remove_counter};
 
 pub(crate) const METRIC_INTERVAL_SECS: u64 = 1;
@@ -33,7 +31,12 @@ pub(crate) const LATENCY_PREFIX: &str = "HYDRO_OPTIMIZE_LAT:";
 pub(crate) const THROUGHPUT_PREFIX: &str = "HYDRO_OPTIMIZE_THR:";
 
 // Note: Ensure edits to the match arms are consistent with inject_count_node
-fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration: syn::Expr) {
+fn insert_counter_node(
+    node: &mut HydroNode,
+    next_stmt_id: &mut usize,
+    duration: syn::Expr,
+    exclude: &HashSet<LocationKey>,
+) {
     match node {
         HydroNode::Placeholder
         | HydroNode::Counter { .. } => {
@@ -65,6 +68,10 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
         | HydroNode::SingletonSource { metadata, .. }
         | HydroNode::Partition { metadata, .. }
          => {
+            if exclude.contains(&metadata.location_id.root().key()) {
+                return;
+            }
+
             let metadata = metadata.clone();
             let node_content = std::mem::replace(node, HydroNode::Placeholder);
 
@@ -100,12 +107,12 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
     }
 }
 
-fn insert_counter(ir: &mut [HydroRoot], duration: &syn::Expr) {
+fn insert_counter(ir: &mut [HydroRoot], duration: &syn::Expr, exclude: &HashSet<LocationKey>) {
     traverse_dfir(
         ir,
         |_, _| {},
         |node, next_stmt_id| {
-            insert_counter_node(node, next_stmt_id, duration.clone());
+            insert_counter_node(node, next_stmt_id, duration.clone(), exclude);
         },
     );
 }
@@ -239,7 +246,7 @@ impl ReusableProcesses {
 pub struct Optimizations {
     decoupling: bool,
     partitioning: bool,
-    exclude: HashSet<LocationKey>,
+    pub exclude: HashSet<LocationKey>,
     iterations: usize, // Must be at least 1
 }
 
@@ -274,42 +281,6 @@ impl Optimizations {
         assert!(iterations > 0);
         self.iterations = iterations;
         self
-    }
-}
-
-/// Profiling data collected during a benchmark run, serializable to disk.
-#[derive(Serialize, Deserialize)]
-pub struct ProfilingData {
-    pub counters: HashMap<usize, usize>,
-    pub bottleneck: LocationId,
-    /// Per-operator CPU usage fractions: (op_id, is_network_recv) → fraction of total samples.
-    #[serde(default)]
-    pub perf: Vec<((usize, bool), f64)>,
-}
-
-impl ProfilingData {
-    pub fn save(&self, path: &Path) {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).ok();
-        }
-        let json = serde_json::to_string_pretty(self).expect("failed to serialize ProfilingData");
-        match fs::write(path, json) {
-            Ok(()) => println!("Saved profiling data: {}", path.display()),
-            Err(e) => eprintln!("Failed to save profiling data to {}: {}", path.display(), e),
-        }
-    }
-
-    /// Loads from file and injects counters and perf data into the IR.
-    pub fn load_and_inject(path: &Path, ir: &mut [HydroRoot]) -> Self {
-        let json = fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("Failed to load profiling data from {}: {}", path.display(), e));
-        let data: Self = serde_json::from_str(&json).expect("failed to deserialize ProfilingData");
-        inject_count(ir, &data.counters);
-        if !data.perf.is_empty() {
-            let id_to_usage: HashMap<(usize, bool), f64> = data.perf.iter().cloned().collect();
-            inject_perf(ir, &id_to_usage);
-        }
-        data
     }
 }
 
@@ -363,7 +334,7 @@ pub async fn deploy_and_optimize<'a>(
         let mut post_rewrite_builder = FlowBuilder::from_built(&builder);
         let optimized = builder.optimize_with(|leaf| {
             inject_id(leaf);
-            insert_counter(leaf, &counter_output_duration);
+            insert_counter(leaf, &counter_output_duration, &optimizations.exclude);
         });
         let mut ir = deep_clone(optimized.ir());
 
@@ -440,14 +411,13 @@ pub async fn deploy_and_optimize<'a>(
         if analyze {
             // Parse results to get metrics
             run_metadata =
-                analyze_cluster_results(&nodes, &mut ir, metrics, stability_second).await;
+                analyze_cluster_results(&nodes, &mut ir, metrics, stability_second, &optimizations)
+                    .await;
             // Remove HydroNode::Counter (since we don't want to consider decoupling those)
             remove_counter(&mut ir);
 
-            let bottleneck = run_metadata.cpu_bottleneck(stability_second.unwrap());
             apply_optimizations(
                 &mut ir,
-                &bottleneck,
                 &optimizations,
                 &mut clusters,
                 &processes,
@@ -464,11 +434,8 @@ pub async fn deploy_and_optimize<'a>(
 }
 
 /// Applies optimizations (decoupling) to the IR based on profiling data.
-/// If `profiling_file` is provided, loads counters and bottleneck from disk
-/// instead of using live data.
 pub fn apply_optimizations(
     ir: &mut [HydroRoot],
-    bottleneck: &LocationId,
     optimizations: &Optimizations,
     clusters: &mut ReusableClusters,
     processes: &ReusableProcesses,
@@ -478,211 +445,30 @@ pub fn apply_optimizations(
     let cycle_source_to_sink = cycle_source_to_sink_input(ir);
 
     if optimizations.decoupling {
-        let (bottleneck_name, bottleneck_num_nodes) = processes
-            .location_name(bottleneck)
-            .map(|name| (name, 1))
-            .unwrap_or_else(|| clusters.location_name_and_num(bottleneck).unwrap());
-
-        let decision = decouple_analysis(
-            ir,
-            bottleneck,
-            0.01,
-            0.01,
-            &cycle_source_to_sink,
-        );
-
-        let new_clusters =
-            decoupler::decouple(ir, decision, bottleneck, post_rewrite_builder);
-        for cluster in new_clusters {
-            clusters.named_clusters.push((
-                cluster.id().key(),
-                format!("{}-decouple-{}", bottleneck_name, iteration),
-                bottleneck_num_nodes,
-            ));
-        }
+        // TODO: Re-enable and apply to all nodes in the program
+        // let (bottleneck_name, bottleneck_num_nodes) = processes
+        //     .location_name(bottleneck)
+        //     .map(|name| (name, 1))
+        //     .unwrap_or_else(|| clusters.location_name_and_num(bottleneck).unwrap());
+        //
+        // let decision = decouple_analysis(
+        //     ir,
+        //     bottleneck,
+        //     0.01,
+        //     0.01,
+        //     &cycle_source_to_sink,
+        // );
+        //
+        // let new_clusters =
+        //     decoupler::decouple(ir, decision, bottleneck, post_rewrite_builder);
+        // for cluster in new_clusters {
+        //     clusters.named_clusters.push((
+        //         cluster.id().key(),
+        //         format!("{}-decouple-{}", bottleneck_name, iteration),
+        //         bottleneck_num_nodes,
+        //     ));
+        // }
     }
-}
-
-/// Writes per-second metrics CSV for each location, combining sar stats with
-/// the shared throughput and latency time series.
-fn write_metrics_csv(
-    output_dir: &Path,
-    run_metadata: &RunMetadata,
-    location_id_to_cluster: &HashMap<LocationId, String>,
-    num_clients: usize,
-    num_clients_per_node: usize,
-    run: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    fs::create_dir_all(output_dir)?;
-
-    for (location, stats) in &run_metadata.sar_stats {
-        if stats.is_empty() {
-            continue;
-        }
-
-        let location_name = location_id_to_cluster.get(location).unwrap();
-        let filename = output_dir.join(format!(
-            "{}_{}c_{}vc_r{}.csv",
-            location_name, num_clients, num_clients_per_node, run
-        ));
-        let num_rows = stats
-            .len()
-            .max(run_metadata.throughputs.len())
-            .max(run_metadata.latencies.len());
-
-        let num_cores = stats
-            .iter()
-            .map(|s| s.cpu.core_stats.len())
-            .max()
-            .unwrap_or(0);
-
-        let mut file = File::create(&filename)?;
-        // Header
-        write!(file, "time_s,cpu_user,cpu_system,cpu_idle")?;
-        for c in 0..num_cores {
-            write!(file, ",core{}_user,core{}_system,core{}_idle", c, c, c)?;
-        }
-        writeln!(
-            file,
-            ",network_tx_packets_per_sec,network_rx_packets_per_sec,\
-             network_tx_bytes_per_sec,network_rx_bytes_per_sec,\
-             mem_kb_used,mem_percent_used,mem_kb_buffers,mem_kb_cached,\
-             io_rtps,io_wtps,io_bread_per_sec,io_bwrtn_per_sec,\
-             throughput_rps,latency_p50_ms,latency_p99_ms,latency_p999_ms,latency_samples",
-        )?;
-
-        let default_sar = SarStats::default();
-        for i in 0..num_rows {
-            let sar = stats.get(i).unwrap_or(&default_sar);
-            let thr = run_metadata.throughputs.get(i).copied().unwrap_or(0);
-            let (p50, p99, p999, count) =
-                run_metadata.latencies.get(i).copied().unwrap_or_default();
-            write!(
-                file,
-                "{},{:.2},{:.2},{:.2}",
-                i, sar.cpu.all_stats.user, sar.cpu.all_stats.system, sar.cpu.all_stats.idle,
-            )?;
-            let default_core = CPUStat::default();
-            for c in 0..num_cores {
-                let core = sar.cpu.core_stats.get(c).unwrap_or(&default_core);
-                write!(
-                    file,
-                    ",{:.2},{:.2},{:.2}",
-                    core.user, core.system, core.idle
-                )?;
-            }
-            writeln!(
-                file,
-                ",{:.2},{:.2},{:.2},{:.2},\
-                 {:.2},{:.2},{:.2},{:.2},\
-                 {:.2},{:.2},{:.2},{:.2},\
-                 {},{:.3},{:.3},{:.3},{}",
-                sar.network.tx_packets_per_sec,
-                sar.network.rx_packets_per_sec,
-                sar.network.tx_bytes_per_sec,
-                sar.network.rx_bytes_per_sec,
-                sar.memory.kb_mem_used,
-                sar.memory.percent_mem_used,
-                sar.memory.kb_buffers,
-                sar.memory.kb_cached,
-                sar.io.rtps,
-                sar.io.wtps,
-                sar.io.bread_per_sec,
-                sar.io.bwrtn_per_sec,
-                thr,
-                p50,
-                p99,
-                p999,
-                count,
-            )?;
-        }
-
-        println!("Generated CSV: {}", filename.display());
-    }
-
-    Ok(())
-}
-
-async fn output_metrics(
-    run_metadata: RunMetadata,
-    location_id_to_cluster: &HashMap<LocationId, String>,
-    output_dir: &Path,
-    num_clients: usize,
-    num_clients_per_node: usize,
-    measurement_second: usize,
-    run: usize,
-) {
-    if let Some(&throughput) = run_metadata.throughputs.get(measurement_second) {
-        println!(
-            "Throughput @{}s: {} requests/s",
-            measurement_second + 1,
-            throughput
-        );
-    }
-    if let Some(&(p50, p99, p999, samples)) = run_metadata.latencies.get(measurement_second) {
-        println!(
-            "Latency @{}s: p50: {:.3} | p99 {:.3} | p999 {:.3} ms ({} samples)",
-            measurement_second + 1,
-            p50,
-            p99,
-            p999,
-            samples
-        );
-    }
-    run_metadata
-        .sar_stats
-        .iter()
-        .for_each(|(location, sar_stats)| {
-            let name = location_id_to_cluster.get(location).unwrap();
-            if let Some(sar) = sar_stats.get(measurement_second) {
-                println!(
-                    "{} @{}s: CPU {:.2}% (user {:.2}%, sys {:.2}%, idle {:.2}%) | \
-                     Net rx {:.0} pkt/s {:.0} B/s, tx {:.0} pkt/s {:.0} B/s | \
-                     Mem {:.2}% ({:.0} KB used, {:.0} KB buf, {:.0} KB cached) | \
-                     IO r {:.2} w {:.2} tps, bread {:.2} bwrtn {:.2}/s",
-                    name,
-                    measurement_second + 1,
-                    sar.cpu.all_stats.user + sar.cpu.all_stats.system,
-                    sar.cpu.all_stats.user,
-                    sar.cpu.all_stats.system,
-                    sar.cpu.all_stats.idle,
-                    sar.network.rx_packets_per_sec,
-                    sar.network.rx_bytes_per_sec,
-                    sar.network.tx_packets_per_sec,
-                    sar.network.tx_bytes_per_sec,
-                    sar.memory.percent_mem_used,
-                    sar.memory.kb_mem_used,
-                    sar.memory.kb_buffers,
-                    sar.memory.kb_cached,
-                    sar.io.rtps,
-                    sar.io.wtps,
-                    sar.io.bread_per_sec,
-                    sar.io.bwrtn_per_sec,
-                );
-            }
-        });
-
-    if let Err(e) = write_metrics_csv(
-        output_dir,
-        &run_metadata,
-        location_id_to_cluster,
-        num_clients,
-        num_clients_per_node,
-        run,
-    ) {
-        eprintln!("Failed to write CSV: {}", e);
-    }
-
-    let bottleneck = run_metadata.cpu_bottleneck(measurement_second);
-    ProfilingData {
-        counters: run_metadata.counters,
-        bottleneck,
-        perf: run_metadata.perf,
-    }
-    .save(&output_dir.join(format!(
-        "profiling_{}c_{}vc_r{}.json",
-        num_clients, num_clients_per_node, run
-    )));
 }
 
 pub struct BenchmarkArgs {
@@ -769,29 +555,17 @@ pub async fn benchmark_protocol<'a>(
             )
             .await;
 
-            let run_throughput = run_metadata.throughputs
-                [START_MEASUREMENT_SECOND..=MEASUREMENT_SECOND]
-                .iter()
-                .sum::<usize>()
-                / (MEASUREMENT_SECOND - START_MEASUREMENT_SECOND + 1);
-            println!(
-                "clients={}, run={}, throughput@{}s={}",
-                num_virtual,
-                run,
-                MEASUREMENT_SECOND + 1,
-                run_throughput
-            );
-
-            output_metrics(
-                run_metadata,
+            let run_throughput =
+                run_metadata.avg_throughput(START_MEASUREMENT_SECOND, MEASUREMENT_SECOND);
+            run_metadata
+                .print_run_summary(&benchmark_config.location_id_to_cluster, MEASUREMENT_SECOND);
+            run_metadata.save_run_metadata(
                 &benchmark_config.location_id_to_cluster,
                 &output_dir,
                 PHYSICAL_CLIENTS,
                 num_virtual,
-                MEASUREMENT_SECOND,
                 run,
-            )
-            .await;
+            );
 
             if run_throughput == 0 {
                 zero_throughput_count += 1;
