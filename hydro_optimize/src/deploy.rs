@@ -173,14 +173,16 @@ impl ReusableHosts {
         cluster_name: String,
         num_hosts: usize,
         pin_to_core: usize,
+        perf: bool,
     ) -> Vec<TrybuildHost> {
         (0..num_hosts)
             .map(|i| {
-                self.get_no_perf_process_hosts(
-                    deployment,
-                    format!("{}{}", cluster_name, i),
-                    pin_to_core,
-                )
+                let name = format!("{}{}", cluster_name, i);
+                if perf {
+                    self.get_process_hosts(deployment, name, pin_to_core)
+                } else {
+                    self.get_no_perf_process_hosts(deployment, name, pin_to_core)
+                }
             })
             .collect()
     }

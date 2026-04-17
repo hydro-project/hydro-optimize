@@ -1,6 +1,5 @@
-use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::Write;
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
@@ -21,7 +20,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use crate::decouple_analysis::decouple_analysis;
 use crate::decoupler;
 use crate::deploy::{HostType, ReusableHosts};
-use crate::parse_results::{CPUStat, RunMetadata, SarStats, analyze_cluster_results};
+use crate::parse_results::{RunMetadata, analyze_cluster_results};
 use crate::repair::{cycle_source_to_sink_input, inject_id, remove_counter};
 
 pub(crate) const METRIC_INTERVAL_SECS: u64 = 1;
@@ -32,7 +31,12 @@ pub(crate) const LATENCY_PREFIX: &str = "HYDRO_OPTIMIZE_LAT:";
 pub(crate) const THROUGHPUT_PREFIX: &str = "HYDRO_OPTIMIZE_THR:";
 
 // Note: Ensure edits to the match arms are consistent with inject_count_node
-fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration: syn::Expr) {
+fn insert_counter_node(
+    node: &mut HydroNode,
+    next_stmt_id: &mut usize,
+    duration: syn::Expr,
+    exclude: &HashSet<LocationKey>,
+) {
     match node {
         HydroNode::Placeholder
         | HydroNode::Counter { .. } => {
@@ -64,6 +68,10 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
         | HydroNode::SingletonSource { metadata, .. }
         | HydroNode::Partition { metadata, .. }
          => {
+            if exclude.contains(&metadata.location_id.root().key()) {
+                return;
+            }
+
             let metadata = metadata.clone();
             let node_content = std::mem::replace(node, HydroNode::Placeholder);
 
@@ -99,12 +107,12 @@ fn insert_counter_node(node: &mut HydroNode, next_stmt_id: &mut usize, duration:
     }
 }
 
-fn insert_counter(ir: &mut [HydroRoot], duration: &syn::Expr) {
+fn insert_counter(ir: &mut [HydroRoot], duration: &syn::Expr, exclude: &HashSet<LocationKey>) {
     traverse_dfir(
         ir,
         |_, _| {},
         |node, next_stmt_id| {
-            insert_counter_node(node, next_stmt_id, duration.clone());
+            insert_counter_node(node, next_stmt_id, duration.clone(), exclude);
         },
     );
 }
@@ -238,7 +246,7 @@ impl ReusableProcesses {
 pub struct Optimizations {
     decoupling: bool,
     partitioning: bool,
-    exclude: Vec<String>,
+    pub exclude: HashSet<LocationKey>,
     iterations: usize, // Must be at least 1
 }
 
@@ -247,7 +255,7 @@ impl Default for Optimizations {
         Self {
             decoupling: false,
             partitioning: false,
-            exclude: vec![],
+            exclude: HashSet::new(),
             iterations: 1,
         }
     }
@@ -264,8 +272,8 @@ impl Optimizations {
         self
     }
 
-    pub fn excluding<T>(mut self) -> Self {
-        self.exclude.push(std::any::type_name::<T>().to_string());
+    pub fn excluding(mut self, location: LocationId) -> Self {
+        self.exclude.insert(location.key());
         self
     }
 
@@ -315,19 +323,25 @@ pub async fn deploy_and_optimize<'a>(
     let counter_output_duration =
         syn::parse_quote!(std::time::Duration::from_secs(#METRIC_INTERVAL_SECS));
     let mut run_metadata = RunMetadata::default();
+    // Measure network (-n DEV) and CPU (-u) usage. -P ALL measures all CPUs on the machine
+    let sar_sidecar = ScriptSidecar {
+        script: "sar -n DEV -u -P ALL -r -b 1".to_string(),
+        prefix: SAR_USAGE_PREFIX.to_string(),
+    };
 
     for iteration in 0..optimizations.iterations {
         // Rewrite with counter tracking
         let mut post_rewrite_builder = FlowBuilder::from_built(&builder);
         let optimized = builder.optimize_with(|leaf| {
             inject_id(leaf);
-            insert_counter(leaf, &counter_output_duration);
+            insert_counter(leaf, &counter_output_duration, &optimizations.exclude);
         });
         let mut ir = deep_clone(optimized.ir());
 
         // Insert all clusters & processes
         let mut deployable = optimized.into_deploy();
         for (cluster_id, name, num_hosts) in clusters.named_clusters.iter() {
+            let excluded = optimizations.exclude.contains(cluster_id);
             if *cluster_id == client_id.key() {
                 let mut client_hosts = vec![];
                 for i in 0..num_clients_per_node {
@@ -337,33 +351,41 @@ pub async fn deploy_and_optimize<'a>(
                         name.clone(),
                         *num_hosts,
                         pin_to_core,
+                        false,
                     ));
                 }
                 deployable = deployable.with_cluster_erased(*cluster_id, client_hosts.concat());
             } else {
                 deployable = deployable.with_cluster_erased(
                     *cluster_id,
-                    reusable_hosts.get_cluster_hosts(deployment, name.clone(), *num_hosts, 0),
+                    reusable_hosts.get_cluster_hosts(
+                        deployment,
+                        name.clone(),
+                        *num_hosts,
+                        0,
+                        !excluded,
+                    ),
                 );
+                if !excluded {
+                    deployable = deployable.with_sidecar_internal(*cluster_id, &sar_sidecar);
+                }
             }
         }
         for (process_id, name) in processes.named_processes.iter() {
-            deployable = deployable.with_process_erased(
-                *process_id,
-                reusable_hosts.get_no_perf_process_hosts(deployment, name.clone(), 0),
-            );
+            let excluded = optimizations.exclude.contains(process_id);
+            let host = if excluded {
+                reusable_hosts.get_no_perf_process_hosts(deployment, name.clone(), 0)
+            } else {
+                reusable_hosts.get_process_hosts(deployment, name.clone(), 0)
+            };
+            deployable = deployable.with_process_erased(*process_id, host);
+            if !excluded {
+                deployable = deployable.with_sidecar_internal(*process_id, &sar_sidecar);
+            }
         }
 
-        // Measure network (-n DEV) and CPU (-u) usage. -P ALL measures all CPUs on the machine
-        let sar_sidecar = ScriptSidecar {
-            script: "sar -n DEV -u -P ALL 1".to_string(),
-            prefix: SAR_USAGE_PREFIX.to_string(),
-        };
-        let nodes = deployable
-            .with_sidecar_all(&sar_sidecar) // Measure network usage
-            .deploy(deployment);
+        let nodes = deployable.deploy(deployment);
         deployment.deploy().await.unwrap();
-
         let metrics = track_cluster_metrics(&nodes).await;
 
         // Wait for user to input a newline
@@ -389,42 +411,19 @@ pub async fn deploy_and_optimize<'a>(
         if analyze {
             // Parse results to get metrics
             run_metadata =
-                analyze_cluster_results(&nodes, &mut ir, metrics, client_id, stability_second)
+                analyze_cluster_results(&nodes, &mut ir, metrics, stability_second, &optimizations)
                     .await;
             // Remove HydroNode::Counter (since we don't want to consider decoupling those)
             remove_counter(&mut ir);
 
-            // Create a mapping from each CycleSink to its corresponding CycleSource
-            let cycle_source_to_sink_input = cycle_source_to_sink_input(&mut ir);
-
-            if optimizations.decoupling {
-                let bottleneck = run_metadata.cpu_bottleneck(stability_second.unwrap());
-                // The bottleneck is either a process or cluster. Panic otherwise.
-                let (bottleneck_name, bottleneck_num_nodes) = processes
-                    .location_name(&bottleneck)
-                    .map(|name| (name, 1))
-                    .unwrap_or_else(|| clusters.location_name_and_num(&bottleneck).unwrap());
-
-                let decision = decouple_analysis(
-                    &mut ir,
-                    &bottleneck,
-                    0.01, // TODO: Deprecate use of send/recv overheads, since they are inaccurate anyway
-                    0.01,
-                    &cycle_source_to_sink_input,
-                );
-
-                // Apply decoupling — creates new clusters as needed
-                let new_clusters =
-                    decoupler::decouple(&mut ir, decision, &bottleneck, &mut post_rewrite_builder);
-                for cluster in new_clusters {
-                    clusters.named_clusters.push((
-                        cluster.id().key(),
-                        format!("{}-decouple-{}", bottleneck_name, iteration),
-                        bottleneck_num_nodes,
-                    ));
-                }
-                // TODO: Save decoupling decision to file
-            }
+            apply_optimizations(
+                &mut ir,
+                &optimizations,
+                &mut clusters,
+                &processes,
+                &mut post_rewrite_builder,
+                iteration,
+            );
         }
 
         post_rewrite_builder.replace_ir(ir);
@@ -434,142 +433,41 @@ pub async fn deploy_and_optimize<'a>(
     run_metadata
 }
 
-/// Writes per-second metrics CSV for each location, combining sar stats with
-/// the shared throughput and latency time series.
-fn write_metrics_csv(
-    output_dir: &Path,
-    run_metadata: &RunMetadata,
-    location_id_to_cluster: &HashMap<LocationId, String>,
-    num_clients: usize,
-    num_clients_per_node: usize,
-    run: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    fs::create_dir_all(output_dir)?;
-
-    for (location, stats) in &run_metadata.sar_stats {
-        if stats.is_empty() {
-            continue;
-        }
-
-        let location_name = location_id_to_cluster.get(location).unwrap();
-        let filename = output_dir.join(format!(
-            "{}_{}c_{}vc_r{}.csv",
-            location_name, num_clients, num_clients_per_node, run
-        ));
-        let num_rows = stats
-            .len()
-            .max(run_metadata.throughputs.len())
-            .max(run_metadata.latencies.len());
-
-        let num_cores = stats
-            .iter()
-            .map(|s| s.cpu.core_stats.len())
-            .max()
-            .unwrap_or(0);
-
-        let mut file = File::create(&filename)?;
-        // Header
-        write!(file, "time_s,cpu_user,cpu_system,cpu_idle")?;
-        for c in 0..num_cores {
-            write!(file, ",core{}_user,core{}_system,core{}_idle", c, c, c)?;
-        }
-        writeln!(
-            file,
-            ",network_tx_packets_per_sec,network_rx_packets_per_sec,\
-             network_tx_bytes_per_sec,network_rx_bytes_per_sec,\
-             throughput_rps,latency_p50_ms,latency_p99_ms,latency_p999_ms,latency_samples",
-        )?;
-
-        let default_sar = SarStats::default();
-        for i in 0..num_rows {
-            let sar = stats.get(i).unwrap_or(&default_sar);
-            let thr = run_metadata.throughputs.get(i).copied().unwrap_or(0);
-            let (p50, p99, p999, count) =
-                run_metadata.latencies.get(i).copied().unwrap_or_default();
-            write!(
-                file,
-                "{},{:.2},{:.2},{:.2}",
-                i, sar.cpu.all_stats.user, sar.cpu.all_stats.system, sar.cpu.all_stats.idle,
-            )?;
-            let default_core = CPUStat::default();
-            for c in 0..num_cores {
-                let core = sar.cpu.core_stats.get(c).unwrap_or(&default_core);
-                write!(
-                    file,
-                    ",{:.2},{:.2},{:.2}",
-                    core.user, core.system, core.idle
-                )?;
-            }
-            writeln!(
-                file,
-                ",{:.2},{:.2},{:.2},{:.2},{},{:.3},{:.3},{:.3},{}",
-                sar.network.tx_packets_per_sec,
-                sar.network.rx_packets_per_sec,
-                sar.network.tx_bytes_per_sec,
-                sar.network.rx_bytes_per_sec,
-                thr,
-                p50,
-                p99,
-                p999,
-                count,
-            )?;
-        }
-
-        println!("Generated CSV: {}", filename.display());
-    }
-
-    Ok(())
-}
-
-async fn output_metrics(
-    run_metadata: RunMetadata,
-    location_id_to_cluster: &HashMap<LocationId, String>,
-    output_dir: &Path,
-    num_clients: usize,
-    num_clients_per_node: usize,
-    measurement_second: usize,
-    run: usize,
+/// Applies optimizations (decoupling) to the IR based on profiling data.
+pub fn apply_optimizations(
+    ir: &mut [HydroRoot],
+    optimizations: &Optimizations,
+    clusters: &mut ReusableClusters,
+    processes: &ReusableProcesses,
+    post_rewrite_builder: &mut FlowBuilder<'_>,
+    iteration: usize,
 ) {
-    if let Some(&throughput) = run_metadata.throughputs.get(measurement_second) {
-        println!(
-            "Throughput @{}s: {} requests/s",
-            measurement_second + 1,
-            throughput
-        );
-    }
-    if let Some(&(p50, p99, p999, samples)) = run_metadata.latencies.get(measurement_second) {
-        println!(
-            "Latency @{}s: p50: {:.3} | p99 {:.3} | p999 {:.3} ms ({} samples)",
-            measurement_second + 1,
-            p50,
-            p99,
-            p999,
-            samples
-        );
-    }
-    run_metadata
-        .sar_stats
-        .iter()
-        .for_each(|(location, sar_stats)| {
-            println!(
-                "{} CPU: {:.2}%",
-                location_id_to_cluster.get(location).unwrap(),
-                sar_stats
-                    .last()
-                    .map(|stats| stats.cpu.all_stats.user + stats.cpu.all_stats.system)
-                    .unwrap_or_default()
-            )
-        });
+    let cycle_source_to_sink = cycle_source_to_sink_input(ir);
 
-    if let Err(e) = write_metrics_csv(
-        output_dir,
-        &run_metadata,
-        location_id_to_cluster,
-        num_clients,
-        num_clients_per_node,
-        run,
-    ) {
-        eprintln!("Failed to write CSV: {}", e);
+    if optimizations.decoupling {
+        // TODO: Re-enable and apply to all nodes in the program
+        // let (bottleneck_name, bottleneck_num_nodes) = processes
+        //     .location_name(bottleneck)
+        //     .map(|name| (name, 1))
+        //     .unwrap_or_else(|| clusters.location_name_and_num(bottleneck).unwrap());
+        //
+        // let decision = decouple_analysis(
+        //     ir,
+        //     bottleneck,
+        //     0.01,
+        //     0.01,
+        //     &cycle_source_to_sink,
+        // );
+        //
+        // let new_clusters =
+        //     decoupler::decouple(ir, decision, bottleneck, post_rewrite_builder);
+        // for cluster in new_clusters {
+        //     clusters.named_clusters.push((
+        //         cluster.id().key(),
+        //         format!("{}-decouple-{}", bottleneck_name, iteration),
+        //         bottleneck_num_nodes,
+        //     ));
+        // }
     }
 }
 
@@ -657,29 +555,17 @@ pub async fn benchmark_protocol<'a>(
             )
             .await;
 
-            let run_throughput = run_metadata.throughputs
-                [START_MEASUREMENT_SECOND..=MEASUREMENT_SECOND]
-                .iter()
-                .sum::<usize>()
-                / (MEASUREMENT_SECOND - START_MEASUREMENT_SECOND + 1);
-            println!(
-                "clients={}, run={}, throughput@{}s={}",
-                num_virtual,
-                run,
-                MEASUREMENT_SECOND + 1,
-                run_throughput
-            );
-
-            output_metrics(
-                run_metadata,
+            let run_throughput =
+                run_metadata.avg_throughput(START_MEASUREMENT_SECOND, MEASUREMENT_SECOND);
+            run_metadata
+                .print_run_summary(&benchmark_config.location_id_to_cluster, MEASUREMENT_SECOND);
+            run_metadata.save_run_metadata(
                 &benchmark_config.location_id_to_cluster,
                 &output_dir,
                 PHYSICAL_CLIENTS,
                 num_virtual,
-                MEASUREMENT_SECOND,
                 run,
-            )
-            .await;
+            );
 
             if run_throughput == 0 {
                 zero_throughput_count += 1;
