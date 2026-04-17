@@ -317,7 +317,7 @@ pub async fn deploy_and_optimize<'a>(
     let mut run_metadata = RunMetadata::default();
     // Measure network (-n DEV) and CPU (-u) usage. -P ALL measures all CPUs on the machine
     let sar_sidecar = ScriptSidecar {
-        script: "sar -n DEV -u -P ALL 1".to_string(),
+        script: "sar -n DEV -u -P ALL -r -b 1".to_string(),
         prefix: SAR_USAGE_PREFIX.to_string(),
     };
 
@@ -333,6 +333,7 @@ pub async fn deploy_and_optimize<'a>(
         // Insert all clusters & processes
         let mut deployable = optimized.into_deploy();
         for (cluster_id, name, num_hosts) in clusters.named_clusters.iter() {
+            let excluded = optimizations.exclude.contains(cluster_id);
             if *cluster_id == client_id.key() {
                 let mut client_hosts = vec![];
                 for i in 0..num_clients_per_node {
@@ -342,25 +343,35 @@ pub async fn deploy_and_optimize<'a>(
                         name.clone(),
                         *num_hosts,
                         pin_to_core,
+                        false,
                     ));
                 }
                 deployable = deployable.with_cluster_erased(*cluster_id, client_hosts.concat());
             } else {
                 deployable = deployable.with_cluster_erased(
                     *cluster_id,
-                    reusable_hosts.get_cluster_hosts(deployment, name.clone(), *num_hosts, 0),
+                    reusable_hosts.get_cluster_hosts(
+                        deployment,
+                        name.clone(),
+                        *num_hosts,
+                        0,
+                        !excluded,
+                    ),
                 );
-                if !optimizations.exclude.contains(cluster_id) {
+                if !excluded {
                     deployable = deployable.with_sidecar_internal(*cluster_id, &sar_sidecar);
                 }
             }
         }
         for (process_id, name) in processes.named_processes.iter() {
-            deployable = deployable.with_process_erased(
-                *process_id,
-                reusable_hosts.get_no_perf_process_hosts(deployment, name.clone(), 0),
-            );
-            if !optimizations.exclude.contains(process_id) {
+            let excluded = optimizations.exclude.contains(process_id);
+            let host = if excluded {
+                reusable_hosts.get_no_perf_process_hosts(deployment, name.clone(), 0)
+            } else {
+                reusable_hosts.get_process_hosts(deployment, name.clone(), 0)
+            };
+            deployable = deployable.with_process_erased(*process_id, host);
+            if !excluded {
                 deployable = deployable.with_sidecar_internal(*process_id, &sar_sidecar);
             }
         }
@@ -392,8 +403,7 @@ pub async fn deploy_and_optimize<'a>(
         if analyze {
             // Parse results to get metrics
             run_metadata =
-                analyze_cluster_results(&nodes, &mut ir, metrics, client_id, stability_second)
-                    .await;
+                analyze_cluster_results(&nodes, &mut ir, metrics, stability_second).await;
             // Remove HydroNode::Counter (since we don't want to consider decoupling those)
             remove_counter(&mut ir);
 
@@ -480,6 +490,8 @@ fn write_metrics_csv(
             file,
             ",network_tx_packets_per_sec,network_rx_packets_per_sec,\
              network_tx_bytes_per_sec,network_rx_bytes_per_sec,\
+             mem_kb_used,mem_percent_used,mem_kb_buffers,mem_kb_cached,\
+             io_rtps,io_wtps,io_bread_per_sec,io_bwrtn_per_sec,\
              throughput_rps,latency_p50_ms,latency_p99_ms,latency_p999_ms,latency_samples",
         )?;
 
@@ -505,11 +517,22 @@ fn write_metrics_csv(
             }
             writeln!(
                 file,
-                ",{:.2},{:.2},{:.2},{:.2},{},{:.3},{:.3},{:.3},{}",
+                ",{:.2},{:.2},{:.2},{:.2},\
+                 {:.2},{:.2},{:.2},{:.2},\
+                 {:.2},{:.2},{:.2},{:.2},\
+                 {},{:.3},{:.3},{:.3},{}",
                 sar.network.tx_packets_per_sec,
                 sar.network.rx_packets_per_sec,
                 sar.network.tx_bytes_per_sec,
                 sar.network.rx_bytes_per_sec,
+                sar.memory.kb_mem_used,
+                sar.memory.percent_mem_used,
+                sar.memory.kb_buffers,
+                sar.memory.kb_cached,
+                sar.io.rtps,
+                sar.io.wtps,
+                sar.io.bread_per_sec,
+                sar.io.bwrtn_per_sec,
                 thr,
                 p50,
                 p99,

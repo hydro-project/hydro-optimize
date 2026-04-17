@@ -93,11 +93,31 @@ pub struct NetworkStats {
     pub tx_bytes_per_sec: f64,
 }
 
+/// Per-second memory statistics from sar -r output
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MemoryStats {
+    pub kb_mem_used: f64,
+    pub percent_mem_used: f64,
+    pub kb_buffers: f64,
+    pub kb_cached: f64,
+}
+
+/// Per-second aggregate I/O statistics from sar -b output
+#[derive(Debug, Default, Clone, Copy)]
+pub struct IOStats {
+    pub rtps: f64,       // read transfers per second
+    pub wtps: f64,       // write transfers per second
+    pub bread_per_sec: f64,  // blocks read per second
+    pub bwrtn_per_sec: f64,  // blocks written per second
+}
+
 /// Combined per-second sar statistics
 #[derive(Debug, Default, Clone)]
 pub struct SarStats {
     pub cpu: CPUStats,
     pub network: NetworkStats,
+    pub memory: MemoryStats,
+    pub io: IOStats,
 }
 
 /// Parses a single CPU line from sar -u -P ALL output.
@@ -144,11 +164,52 @@ fn parse_network_line(line: &str) -> Option<NetworkStats> {
     })
 }
 
-/// Parses `sar -n DEV -u -P ALL` output lines and returns per-second SarStats.
+/// Parses a single memory line from sar -r output.
+/// Format: "HH:MM:SS AM/PM kbmemfree kbavail kbmemused %memused kbbuffers kbcached ..."
+fn parse_memory_line(line: &str) -> Option<MemoryStats> {
+    let re = Regex::new(
+        r"\d+:\d+:\d+\s+\w+\s+\d+\.?\d*\s+\d+\.?\d*\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)",
+    ).unwrap();
+    re.captures(line).and_then(|caps| {
+        // Skip header lines
+        if line.contains("kbmemfree") {
+            return None;
+        }
+        Some(MemoryStats {
+            kb_mem_used: caps[1].parse().ok()?,
+            percent_mem_used: caps[2].parse().ok()?,
+            kb_buffers: caps[3].parse().ok()?,
+            kb_cached: caps[4].parse().ok()?,
+        })
+    })
+}
+
+/// Parses a single I/O line from sar -b output.
+/// Format: "HH:MM:SS AM/PM tps rtps wtps bread/s bwrtn/s"
+fn parse_io_line(line: &str) -> Option<IOStats> {
+    let re = Regex::new(
+        r"\d+:\d+:\d+\s+\w+\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s*$",
+    ).unwrap();
+    re.captures(line).and_then(|caps| {
+        if line.contains("tps") {
+            return None;
+        }
+        Some(IOStats {
+            rtps: caps[2].parse().ok()?,
+            wtps: caps[3].parse().ok()?,
+            bread_per_sec: caps[4].parse().ok()?,
+            bwrtn_per_sec: caps[5].parse().ok()?,
+        })
+    })
+}
+
+/// Parses `sar -n DEV -u -P ALL -r -b` output lines and returns per-second SarStats.
 /// Groups per-core CPU stats with the aggregate "all" line.
 pub fn parse_sar_output(lines: Vec<String>) -> Vec<SarStats> {
     let mut cpu_usages: Vec<CPUStats> = vec![];
     let mut network_usages = vec![];
+    let mut memory_usages = vec![];
+    let mut io_usages = vec![];
 
     for line in &lines {
         if let Some((is_all, stat)) = parse_cpu_line(line) {
@@ -163,20 +224,31 @@ pub fn parse_sar_output(lines: Vec<String>) -> Vec<SarStats> {
             }
         } else if let Some(network) = parse_network_line(line) {
             network_usages.push(network);
+        } else if let Some(memory) = parse_memory_line(line) {
+            memory_usages.push(memory);
+        } else if let Some(io) = parse_io_line(line) {
+            io_usages.push(io);
         }
     }
 
+    let len = cpu_usages.len();
     assert!(
-        cpu_usages.len().abs_diff(network_usages.len()) <= 1,
+        len.abs_diff(network_usages.len()) <= 1,
         "sar output mismatch: {} cpu vs {} network entries",
-        cpu_usages.len(),
+        len,
         network_usages.len(),
     );
 
     cpu_usages
         .into_iter()
         .zip(network_usages)
-        .map(|(cpu, network)| SarStats { cpu, network })
+        .enumerate()
+        .map(|(i, (cpu, network))| SarStats {
+            cpu,
+            network,
+            memory: memory_usages.get(i).copied().unwrap_or_default(),
+            io: io_usages.get(i).copied().unwrap_or_default(),
+        })
         .collect()
 }
 
@@ -410,7 +482,6 @@ pub async fn analyze_cluster_results(
     nodes: &DeployResult<'_, HydroDeploy>,
     ir: &mut [HydroRoot],
     mut cluster_metrics: HashMap<(LocationId, String, usize), MetricLogs>,
-    client_id: &LocationId,
     measurement_second: Option<usize>,
 ) -> RunMetadata {
     let mut run_metadata = RunMetadata::default();
@@ -419,10 +490,6 @@ pub async fn analyze_cluster_results(
     // Drain all receivers and parse in parallel across all nodes
     let mut set = tokio::task::JoinSet::new();
     for ((location, name, idx), mut metrics) in cluster_metrics.drain() {
-        if location == *client_id && idx > 0 {
-            // Only analyze the client with index 0, since all clients should have similar perf. Saves time
-            continue;
-        }
         set.spawn(async move {
             println!("Analyzing cluster {:?}: {}", name, idx);
             let (sar_stats, op_to_count, throughputs, latencies) = tokio::join!(
