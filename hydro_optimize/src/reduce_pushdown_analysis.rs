@@ -197,6 +197,7 @@ fn reduce_pushdown_analysis_node(
         | HydroNode::Fold { .. }
         | HydroNode::FoldKeyed { .. }
         | HydroNode::Scan { .. }
+        | HydroNode::ScanAsyncBlocking { .. }
         | HydroNode::ReduceKeyed { .. } // NOTE: Type changes. On the other hand, ReduceKeyed should be push-downable? Unsupported for now.
         | HydroNode::ReduceKeyedWatermark { .. }
         | HydroNode::Filter { .. } // Removes elements, reduce will execute over too many elements

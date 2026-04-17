@@ -331,6 +331,7 @@ fn input_dependency_analysis_node(
         HydroNode::Reduce { .. }
         | HydroNode::Fold { .. }
         | HydroNode::Scan { .. }
+        | HydroNode::ScanAsyncBlocking { .. }
         | HydroNode::FlatMap { .. }
         | HydroNode::FlatMapStreamBlocking { .. }
         | HydroNode::Source { .. }
@@ -547,6 +548,7 @@ fn partitioning_constraint_analysis_node(
             HydroNode::Reduce { .. }
             | HydroNode::Fold { .. }
             | HydroNode::Scan { .. }
+            | HydroNode::ScanAsyncBlocking { .. }
             | HydroNode::Enumerate { .. }
             | HydroNode::CrossProduct { .. }
             | HydroNode::CrossSingleton { .. } => {} // Partitioning is impossible
