@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
@@ -17,10 +16,10 @@ use hydro_lang::prelude::{Cluster, FlowBuilder, Process};
 use hydro_lang::telemetry::Sidecar;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::decouple_analysis::decouple_analysis;
-use crate::decoupler;
 use crate::deploy::{HostType, ReusableHosts};
 use crate::parse_results::{RunMetadata, analyze_cluster_results};
+use crate::reduce_pushdown::reduce_pushdown;
+use crate::reduce_pushdown_analysis::reduce_pushdown_decision;
 use crate::repair::{cycle_source_to_sink_input, inject_id, remove_counter};
 
 pub(crate) const METRIC_INTERVAL_SECS: u64 = 1;
@@ -214,6 +213,7 @@ impl ReusableClusters {
         Self { named_clusters }
     }
 
+    #[expect(dead_code, reason = "used by commented-out decoupling optimization")]
     fn location_name_and_num(&self, location: &LocationId) -> Option<(String, usize)> {
         self.named_clusters
             .iter()
@@ -234,6 +234,7 @@ impl ReusableProcesses {
         self
     }
 
+    #[expect(dead_code, reason = "used by commented-out decoupling optimization")]
     fn location_name(&self, location: &LocationId) -> Option<String> {
         self.named_processes
             .iter()
@@ -323,18 +324,23 @@ pub async fn deploy_and_optimize<'a>(
     let counter_output_duration =
         syn::parse_quote!(std::time::Duration::from_secs(#METRIC_INTERVAL_SECS));
     let mut run_metadata = RunMetadata::default();
-    // Measure network (-n DEV) and CPU (-u) usage. -P ALL measures all CPUs on the machine
+    // Measure network (-n DEV), CPU (-u, -P ALL), memory (-r), and I/O (-b) every 1 second
     let sar_sidecar = ScriptSidecar {
         script: "sar -n DEV -u -P ALL -r -b 1".to_string(),
         prefix: SAR_USAGE_PREFIX.to_string(),
     };
 
     for iteration in 0..optimizations.iterations {
-        // Rewrite with counter tracking
         let mut post_rewrite_builder = FlowBuilder::from_built(&builder);
         let optimized = builder.optimize_with(|leaf| {
             inject_id(leaf);
-            insert_counter(leaf, &counter_output_duration, &optimizations.exclude);
+            // Always reduce pushdown first.
+            let reduce_decision = reduce_pushdown_decision(leaf);
+            reduce_pushdown(leaf, reduce_decision);
+            // Rewrite with counter tracking
+            if analyze {
+                insert_counter(leaf, &counter_output_duration, &optimizations.exclude);
+            }
         });
         let mut ir = deep_clone(optimized.ir());
 
@@ -410,9 +416,7 @@ pub async fn deploy_and_optimize<'a>(
 
         if analyze {
             // Parse results to get metrics
-            run_metadata =
-                analyze_cluster_results(&nodes, &mut ir, metrics, stability_second, &optimizations)
-                    .await;
+            run_metadata = analyze_cluster_results(&nodes, &mut ir, metrics, &optimizations).await;
             // Remove HydroNode::Counter (since we don't want to consider decoupling those)
             remove_counter(&mut ir);
 
@@ -437,12 +441,12 @@ pub async fn deploy_and_optimize<'a>(
 pub fn apply_optimizations(
     ir: &mut [HydroRoot],
     optimizations: &Optimizations,
-    clusters: &mut ReusableClusters,
-    processes: &ReusableProcesses,
-    post_rewrite_builder: &mut FlowBuilder<'_>,
-    iteration: usize,
+    _clusters: &mut ReusableClusters,
+    _processes: &ReusableProcesses,
+    _post_rewrite_builder: &mut FlowBuilder<'_>,
+    _iteration: usize,
 ) {
-    let cycle_source_to_sink = cycle_source_to_sink_input(ir);
+    let _cycle_source_to_sink = cycle_source_to_sink_input(ir);
 
     if optimizations.decoupling {
         // TODO: Re-enable and apply to all nodes in the program

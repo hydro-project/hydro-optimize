@@ -51,8 +51,8 @@ fn main() {
         clients.singleton(q!(1usize)),
         &client_aggregator,
         &replicas,
-        100,  // print_result_frequency / 10
-        1000, // print_result_frequency
+        100,    // print_result_frequency / 10
+        1000,   // print_result_frequency
         |_| {}, // no-op bench results printer
     );
 

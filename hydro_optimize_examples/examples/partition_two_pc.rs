@@ -7,6 +7,7 @@ use hydro_optimize::deploy_and_analyze::{
     Optimizations, ReusableClusters, ReusableProcesses, deploy_and_optimize,
 };
 use hydro_optimize_examples::print_parseable_bench_results;
+#[allow(unused_imports)]
 use hydro_test::cluster::two_pc_bench;
 
 use stageleft::q;

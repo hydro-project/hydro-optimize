@@ -36,16 +36,24 @@ mod test_init {
     }
 }
 
+#[allow(dead_code)]
 pub mod debug;
+#[allow(dead_code)]
 pub mod decouple_analysis;
+#[allow(dead_code)]
 pub mod decoupler;
 pub mod deploy;
 pub mod deploy_and_analyze;
+#[allow(dead_code)]
 pub mod greedy_decouple_analysis;
 pub mod parse_results;
+#[allow(dead_code)]
 pub mod partial_partitioner;
+#[allow(dead_code)]
 pub mod partition_node_analysis;
+#[allow(dead_code)]
 pub mod partition_syn_analysis;
+#[allow(dead_code)]
 pub mod partitioner;
 pub mod reduce_pushdown;
 pub mod reduce_pushdown_analysis;

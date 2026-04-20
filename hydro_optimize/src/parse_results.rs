@@ -290,7 +290,10 @@ impl CPUStats {
                 a.max(b)
             })
             .collect();
-        Self { all_stats: self.all_stats.max(other.all_stats), core_stats }
+        Self {
+            all_stats: self.all_stats.max(other.all_stats),
+            core_stats,
+        }
     }
 }
 
@@ -745,9 +748,7 @@ async fn drain_receiver(receiver: &mut UnboundedReceiver<String>) -> Vec<String>
     lines
 }
 
-pub async fn analyze_perf(
-    process: &impl DeployCrateWrapper,
-) -> (HashMap<(usize, bool), f64>, f64) {
+pub async fn analyze_perf(process: &impl DeployCrateWrapper) -> (HashMap<(usize, bool), f64>, f64) {
     let underlying = process.underlying();
     let perf_results = underlying.tracing_results().unwrap();
 
@@ -756,7 +757,10 @@ pub async fn analyze_perf(
 }
 
 /// Merges `src` into `dst`, keeping the max value for each key.
-fn merge_max<K: Eq + std::hash::Hash, V: PartialOrd + Copy>(dst: &mut HashMap<K, V>, src: HashMap<K, V>) {
+fn merge_max<K: Eq + std::hash::Hash, V: PartialOrd + Copy>(
+    dst: &mut HashMap<K, V>,
+    src: HashMap<K, V>,
+) {
     for (k, v) in src {
         dst.entry(k)
             .and_modify(|existing| {
@@ -783,7 +787,6 @@ pub async fn analyze_cluster_results(
     nodes: &DeployResult<'_, HydroDeploy>,
     ir: &mut [HydroRoot],
     mut cluster_metrics: HashMap<(LocationId, String, usize), MetricLogs>,
-    measurement_second: Option<usize>,
     optimizations: &Optimizations,
 ) -> RunMetadata {
     let mut run_metadata = RunMetadata::default();
@@ -847,7 +850,9 @@ pub async fn analyze_cluster_results(
             merge_max(&mut run_metadata.perf, perf_usage);
             max_unidentified = max_unidentified.max(unidentified_perf);
         }
-        run_metadata.unaccounted_perf.insert(id.clone(), max_unidentified);
+        run_metadata
+            .unaccounted_perf
+            .insert(id.clone(), max_unidentified);
 
         if !max_sar.is_empty() {
             run_metadata.sar_stats.insert(id.clone(), max_sar);
