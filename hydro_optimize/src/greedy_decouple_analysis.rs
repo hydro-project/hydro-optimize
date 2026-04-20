@@ -102,7 +102,7 @@ pub fn greedy_decouple_analysis(
 
     // Constrain tick
     let cycles = cycle_source_to_sink_input(ir);
-    let op_id_to_input = op_id_to_parents(ir, Some(&node_to_decouple.key()), &cycles);
+    let op_id_to_input = op_id_to_parents(ir, Some(node_to_decouple), &cycles);
     let mut tick_to_op_inputs = HashMap::new();
     for (tick_id, ops) in tick_to_ops {
         for op_id in ops {

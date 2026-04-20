@@ -453,9 +453,6 @@ fn op_loc(op_vars: &HashMap<usize, Variable>, solution: &HighsSolution) -> usize
     panic!("No location assigned to op");
 }
 
-/// Returns:
-/// - `new_networks`: map from (src_loc, dest_loc) to ops before which a Network should be inserted
-/// - `place_on_loc`: map from loc to set of op_ids that should be placed on that loc
 pub(crate) fn decouple_analysis(
     ir: &mut [HydroRoot],
     bottleneck: &LocationId,
@@ -512,81 +509,12 @@ pub(crate) fn decouple_analysis(
     }
 
     let solution = solve(&decoupling_metadata);
-    let DecoupleILPMetadata {
-        op_id_to_var,
-        network_ids,
-        ..
-    } = &mut *decoupling_metadata.borrow_mut();
 
-    let mut ops_on_loc: HashMap<usize, HashSet<usize>> =
-        HashMap::from_iter((0..num_locations).map(|loc_id| (loc_id, HashSet::new())));
-    let mut new_networks = HashMap::new(); // (src loc, dest loc): [op_id]
-    let mut place_on_loc = HashMap::new();
-
-    for (op_id, parents) in op_id_to_parents {
-        if let Some(op_vars) = op_id_to_var.get(&op_id) {
-            let op_location = op_loc(op_vars, &solution);
-            let parent_location = if let Some(parent) = parents.first()
-                && let Some(parent_vars) = op_id_to_var.get(parent)
-            {
-                Some(op_loc(parent_vars, &solution))
-            } else {
-                None
-            };
-
-            // Don't insert network if this is Source or already a Network
-            let network_type = network_ids.get(&op_id);
-
-            #[expect(clippy::collapsible_else_if, reason = "code symmetry")]
-            if network_type.is_none()
-                && let Some(parent_unwrapped) = parent_location
-            {
-                // Figure out if we should insert Network nodes
-                if parent_unwrapped != op_location {
-                    new_networks
-                        .entry((parent_unwrapped, op_location))
-                        .or_insert(HashSet::new())
-                        .insert(op_id);
-                }
-                // Record where the op is, based on its parent's location
-                ops_on_loc.get_mut(&parent_unwrapped).unwrap().insert(op_id);
-            } else {
-                // If this is a network node, or there's no parent (Source), then the op's location is its own location
-                ops_on_loc.get_mut(&op_location).unwrap().insert(op_id);
-                // If this is not a network node (Source), or it's a Network Recv/SendRecv node (with an unknown source), then place it on whatever node it is assigned to
-                if !network_type.is_some_and(|t| *t == NetworkType::Send) {
-                    place_on_loc
-                        .entry(op_location)
-                        .or_insert(HashSet::new())
-                        .insert(op_id);
-                }
-            }
-        }
+    let mut op_to_new_loc = DecoupleDecision::default();
+    for (op_id, vars) in decoupling_metadata.borrow().op_id_to_var.iter() {
+        let op_location = op_loc(vars, &solution);
+        op_to_new_loc.insert(*op_id, op_location);
     }
 
-    for (loc, ops) in ops_on_loc {
-        let mut sorted_ops = Vec::from_iter(ops);
-        sorted_ops.sort();
-        println!("Ops on location {}: {:?}", loc, sorted_ops);
-    }
-
-    for ((src_loc, dest_loc), ops) in &new_networks {
-        let mut sorted_ops = Vec::from_iter(ops);
-        sorted_ops.sort();
-        println!(
-            "{} outputting to {} after: {:?}",
-            src_loc, dest_loc, sorted_ops
-        );
-    }
-
-    for (loc, ops) in &place_on_loc {
-        let mut sorted_ops = Vec::from_iter(ops.iter());
-        sorted_ops.sort();
-        println!("Placing on location {}: {:?}", loc, sorted_ops);
-    }
-
-    DecoupleDecision {
-        new_networks,
-        place_on_loc,
-    }
+    op_to_new_loc
 }

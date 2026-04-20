@@ -29,11 +29,7 @@ use crate::rewrites::{
 ///
 /// Note: The location index is where the output of the node goes, not necessarily where the node is executed.
 /// Limitations: Sources can't be decoupled from their children.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct DecoupleDecision {
-    pub(crate) new_networks: HashMap<(usize, usize), HashSet<usize>>,
-    pub(crate) place_on_loc: HashMap<usize, HashSet<usize>>,
-}
+pub type DecoupleDecision = HashMap<usize, usize>;
 
 /// Adds networking after `node`.
 /// - `send_location`: the source of the network.
