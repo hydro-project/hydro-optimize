@@ -7,7 +7,7 @@ use syn::visit::Visit;
 
 use super::rewrites::{NetworkType, get_network_type};
 use crate::partition_syn_analysis::{AnalyzeClosure, StructOrTuple, StructOrTupleIndex};
-use crate::rewrites::op_id_to_inputs;
+use crate::rewrites::op_id_to_parents;
 
 /// Create a mapping from all input nodes to their parents (across locations)
 fn all_inputs_parents(
@@ -15,7 +15,7 @@ fn all_inputs_parents(
     inputs: &[usize],
     cycle_source_to_sink_input: &HashMap<usize, usize>,
 ) -> BTreeMap<usize, usize> {
-    op_id_to_inputs(ir, None, cycle_source_to_sink_input)
+    op_id_to_parents(ir, None, cycle_source_to_sink_input)
         .iter()
         .filter_map(|(op_id, parents)| {
             if inputs.contains(op_id) {
@@ -28,13 +28,13 @@ fn all_inputs_parents(
 }
 
 /// Find all input nodes of a location
-fn all_inputs(ir: &mut [HydroRoot], location: &LocationId) -> Vec<usize> {
+pub fn all_inputs(ir: &mut [HydroRoot], location: &LocationId) -> Vec<usize> {
     let mut inputs = vec![];
 
     traverse_dfir(
         ir,
         |_, _| {},
-        |node, next_stmt_id| match get_network_type(node, &location.root().key()) {
+        |node, next_stmt_id| match get_network_type(node, &location.root()) {
             Some(NetworkType::Recv) | Some(NetworkType::SendRecv) => {
                 inputs.push(*next_stmt_id);
             }
@@ -613,7 +613,7 @@ pub fn partitioning_analysis(
     Vec<BTreeMap<usize, StructOrTupleIndex>>,
     BTreeMap<usize, usize>,
 )> {
-    let op_id_to_parents = op_id_to_inputs(ir, Some(&location.key()), cycle_source_to_sink_input);
+    let op_id_to_parents = op_id_to_parents(ir, Some(&location), cycle_source_to_sink_input);
     let dependency_metadata = input_dependency_analysis(ir, location, op_id_to_parents);
     let mut possible_partitionings = BTreeMap::new();
 

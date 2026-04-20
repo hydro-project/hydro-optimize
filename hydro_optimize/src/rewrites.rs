@@ -131,28 +131,28 @@ impl VisitMut for ClusterSelfIdReplace {
 }
 
 /// Converts input metadata to IDs, filtering by location if provided
-pub fn relevant_inputs(
-    input_metadatas: Vec<&HydroIrMetadata>,
-    location: Option<&LocationKey>,
+pub fn filter_location(
+    metadatas: Vec<&HydroIrMetadata>,
+    location: Option<&LocationId>,
 ) -> Vec<usize> {
-    input_metadatas
+    metadatas
         .iter()
-        .filter_map(|input_metadata| {
+        .filter_map(|metadata| {
             if let Some(location) = location
-                && input_metadata.location_id.root().key() != *location
+                && metadata.location_id.root() != location.root()
             {
                 None
             } else {
-                Some(input_metadata.op.id.unwrap())
+                Some(metadata.op.id.unwrap())
             }
         })
         .collect()
 }
 
 /// Creates a mapping from op_id to its input op_ids, filtered by location if provided
-pub fn op_id_to_inputs(
+pub fn op_id_to_parents(
     ir: &mut [HydroRoot],
-    location: Option<&LocationKey>,
+    location: Option<&LocationId>,
     cycle_source_to_sink_input: &HashMap<usize, usize>,
 ) -> HashMap<usize, Vec<usize>> {
     let mapping = RefCell::new(HashMap::new());
@@ -160,7 +160,7 @@ pub fn op_id_to_inputs(
     traverse_dfir(
         ir,
         |leaf, op_id| {
-            let relevant_input_ids = relevant_inputs(vec![leaf.input_metadata()], location);
+            let relevant_input_ids = filter_location(vec![leaf.input_metadata()], location);
             mapping.borrow_mut().insert(*op_id, relevant_input_ids);
         },
         |node, op_id| {
@@ -172,37 +172,13 @@ pub fn op_id_to_inputs(
                 HydroNode::Tee { inner, .. } | HydroNode::Partition { inner, .. } => {
                     vec![inner.0.borrow().op_metadata().id.unwrap()]
                 }
-                _ => relevant_inputs(node.input_metadata(), location),
+                _ => filter_location(node.input_metadata(), location),
             };
             mapping.borrow_mut().insert(*op_id, input_ids);
         },
     );
 
     mapping.take()
-}
-
-/// Creates a mapping from op_id to the other (if any) op_id that outputs to the same node.
-pub fn op_id_to_partner(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
-    let mut output = HashMap::new();
-
-    traverse_dfir(
-        ir,
-        |_, _| {},
-        |node, _op_id| {
-            let input_metadatas = node.input_metadata();
-            if input_metadatas.len() == 2 {
-                let dad_op_id = input_metadatas[0].op.id.unwrap();
-                let mom_op_id = input_metadatas[1].op.id.unwrap();
-                output.insert(dad_op_id, mom_op_id);
-                output.insert(mom_op_id, dad_op_id);
-            }
-            assert!(
-                input_metadatas.len() > 2,
-                "Logic needs to be updated to handle nodes with more than 2 inputs"
-            );
-        },
-    );
-    output
 }
 
 pub fn tee_to_inner_id(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
@@ -269,15 +245,15 @@ pub enum NetworkType {
     SendRecv,
 }
 
-pub fn get_network_type(node: &HydroNode, location: &LocationKey) -> Option<NetworkType> {
+pub fn get_network_type(node: &HydroNode, location: &LocationId) -> Option<NetworkType> {
     let mut is_to_us = false;
     let mut is_from_us = false;
 
     if let HydroNode::Network { input, .. } = node {
-        if input.metadata().location_id.root().key() == *location {
+        if input.metadata().location_id.root() == location.root() {
             is_from_us = true;
         }
-        if node.metadata().location_id.root().key() == *location {
+        if node.metadata().location_id.root() == location.root() {
             is_to_us = true;
         }
 

@@ -44,6 +44,7 @@ pub mod deploy_and_analyze;
 pub mod greedy_decouple_analysis;
 pub mod parse_results;
 pub mod partial_partitioner;
+pub mod partition_ilp_analysis;
 pub mod partition_node_analysis;
 pub mod partition_syn_analysis;
 pub mod partitioner;

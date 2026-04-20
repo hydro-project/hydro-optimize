@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
@@ -11,7 +10,6 @@ use hydro_lang::compile::ir::{HydroNode, HydroRoot, deep_clone, traverse_dfir};
 use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::deploy::deploy_graph::DeployCrateWrapper;
 use hydro_lang::location::Location;
-use hydro_lang::location::LocationKey;
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::prelude::{Cluster, FlowBuilder, Process};
 use hydro_lang::telemetry::Sidecar;
@@ -35,7 +33,7 @@ fn insert_counter_node(
     node: &mut HydroNode,
     next_stmt_id: &mut usize,
     duration: syn::Expr,
-    exclude: &HashSet<LocationKey>,
+    exclude: &HashSet<LocationId>,
 ) {
     match node {
         HydroNode::Placeholder
@@ -68,7 +66,7 @@ fn insert_counter_node(
         | HydroNode::SingletonSource { metadata, .. }
         | HydroNode::Partition { metadata, .. }
          => {
-            if exclude.contains(&metadata.location_id.root().key()) {
+            if exclude.contains(metadata.location_id.root()) {
                 return;
             }
 
@@ -107,7 +105,7 @@ fn insert_counter_node(
     }
 }
 
-fn insert_counter(ir: &mut [HydroRoot], duration: &syn::Expr, exclude: &HashSet<LocationKey>) {
+fn insert_counter(ir: &mut [HydroRoot], duration: &syn::Expr, exclude: &HashSet<LocationId>) {
     traverse_dfir(
         ir,
         |_, _| {},
@@ -197,47 +195,47 @@ impl Sidecar for ScriptSidecar {
 
 #[derive(Default, Clone)]
 pub struct ReusableClusters {
-    named_clusters: Vec<(LocationKey, String, usize)>,
+    named_clusters: Vec<(LocationId, String, usize)>,
 }
 
 impl ReusableClusters {
     pub fn with_cluster<C>(mut self, cluster: Cluster<'_, C>, num_members: usize) -> Self {
         self.named_clusters.push((
-            cluster.id().key(),
+            cluster.id().clone(),
             std::any::type_name::<C>().to_string(),
             num_members,
         ));
         self
     }
 
-    pub fn from(named_clusters: Vec<(LocationKey, String, usize)>) -> Self {
+    pub fn from(named_clusters: Vec<(LocationId, String, usize)>) -> Self {
         Self { named_clusters }
     }
 
     fn location_name_and_num(&self, location: &LocationId) -> Option<(String, usize)> {
         self.named_clusters
             .iter()
-            .find(|(key, _, _)| location.key() == *key)
+            .find(|(id, _, _)| location.key() == id.key())
             .map(|(_, name, count)| (name.clone(), *count))
     }
 }
 
 #[derive(Default, Clone)]
 pub struct ReusableProcesses {
-    named_processes: Vec<(LocationKey, String)>,
+    named_processes: Vec<(LocationId, String)>,
 }
 
 impl ReusableProcesses {
     pub fn with_process<P>(mut self, process: Process<'_, P>) -> Self {
         self.named_processes
-            .push((process.id().key(), std::any::type_name::<P>().to_string()));
+            .push((process.id().clone(), std::any::type_name::<P>().to_string()));
         self
     }
 
     fn location_name(&self, location: &LocationId) -> Option<String> {
         self.named_processes
             .iter()
-            .find(|(key, _)| &location.key() == key)
+            .find(|(id, _)| location.key() == id.key())
             .map(|(_, name)| name.clone())
     }
 }
@@ -246,7 +244,7 @@ impl ReusableProcesses {
 pub struct Optimizations {
     decoupling: bool,
     partitioning: bool,
-    pub exclude: HashSet<LocationKey>,
+    pub exclude: HashSet<LocationId>,
     iterations: usize, // Must be at least 1
 }
 
@@ -273,7 +271,7 @@ impl Optimizations {
     }
 
     pub fn excluding(mut self, location: LocationId) -> Self {
-        self.exclude.insert(location.key());
+        self.exclude.insert(location);
         self
     }
 
@@ -342,7 +340,7 @@ pub async fn deploy_and_optimize<'a>(
         let mut deployable = optimized.into_deploy();
         for (cluster_id, name, num_hosts) in clusters.named_clusters.iter() {
             let excluded = optimizations.exclude.contains(cluster_id);
-            if *cluster_id == client_id.key() {
+            if cluster_id.key() == client_id.key() {
                 let mut client_hosts = vec![];
                 for i in 0..num_clients_per_node {
                     let pin_to_core = i % reusable_hosts.num_cores();
@@ -354,10 +352,11 @@ pub async fn deploy_and_optimize<'a>(
                         false,
                     ));
                 }
-                deployable = deployable.with_cluster_erased(*cluster_id, client_hosts.concat());
+                deployable =
+                    deployable.with_cluster_erased(cluster_id.key(), client_hosts.concat());
             } else {
                 deployable = deployable.with_cluster_erased(
-                    *cluster_id,
+                    cluster_id.key(),
                     reusable_hosts.get_cluster_hosts(
                         deployment,
                         name.clone(),
@@ -367,7 +366,7 @@ pub async fn deploy_and_optimize<'a>(
                     ),
                 );
                 if !excluded {
-                    deployable = deployable.with_sidecar_internal(*cluster_id, &sar_sidecar);
+                    deployable = deployable.with_sidecar_internal(cluster_id.key(), &sar_sidecar);
                 }
             }
         }
@@ -378,9 +377,9 @@ pub async fn deploy_and_optimize<'a>(
             } else {
                 reusable_hosts.get_process_hosts(deployment, name.clone(), 0)
             };
-            deployable = deployable.with_process_erased(*process_id, host);
+            deployable = deployable.with_process_erased(process_id.key(), host);
             if !excluded {
-                deployable = deployable.with_sidecar_internal(*process_id, &sar_sidecar);
+                deployable = deployable.with_sidecar_internal(process_id.key(), &sar_sidecar);
             }
         }
 
@@ -410,9 +409,7 @@ pub async fn deploy_and_optimize<'a>(
 
         if analyze {
             // Parse results to get metrics
-            run_metadata =
-                analyze_cluster_results(&nodes, &mut ir, metrics, stability_second, &optimizations)
-                    .await;
+            run_metadata = analyze_cluster_results(&nodes, &mut ir, metrics, &optimizations).await;
             // Remove HydroNode::Counter (since we don't want to consider decoupling those)
             remove_counter(&mut ir);
 
@@ -445,29 +442,33 @@ pub fn apply_optimizations(
     let cycle_source_to_sink = cycle_source_to_sink_input(ir);
 
     if optimizations.decoupling {
-        // TODO: Re-enable and apply to all nodes in the program
-        // let (bottleneck_name, bottleneck_num_nodes) = processes
-        //     .location_name(bottleneck)
-        //     .map(|name| (name, 1))
-        //     .unwrap_or_else(|| clusters.location_name_and_num(bottleneck).unwrap());
-        //
-        // let decision = decouple_analysis(
-        //     ir,
-        //     bottleneck,
-        //     0.01,
-        //     0.01,
-        //     &cycle_source_to_sink,
-        // );
-        //
-        // let new_clusters =
-        //     decoupler::decouple(ir, decision, bottleneck, post_rewrite_builder);
-        // for cluster in new_clusters {
-        //     clusters.named_clusters.push((
-        //         cluster.id().key(),
-        //         format!("{}-decouple-{}", bottleneck_name, iteration),
-        //         bottleneck_num_nodes,
-        //     ));
-        // }
+        // TODO: apply to all nodes in the program
+        let bottleneck = clusters.named_clusters.first().expect("No clusters found").0.clone();
+
+        let (bottleneck_name, bottleneck_num_nodes) = processes
+            .location_name(&bottleneck)
+            .map(|name| (name, 1))
+            .unwrap_or_else(|| clusters.location_name_and_num(&bottleneck).unwrap());
+
+        let decision = decouple_analysis(
+            ir,
+            &bottleneck,
+            0.01,
+            0.01,
+            2,
+            &cycle_source_to_sink,
+            optimizations.partitioning,
+        );
+
+        let new_clusters =
+            decoupler::decouple(ir, decision, &bottleneck, post_rewrite_builder);
+        for cluster in new_clusters {
+            clusters.named_clusters.push((
+                cluster.id().clone(),
+                format!("{}-decouple-{}", bottleneck_name, iteration),
+                bottleneck_num_nodes,
+            ));
+        }
     }
 }
 

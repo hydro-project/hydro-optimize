@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{BTreeSet, HashMap, HashSet, hash_map::Entry},
+    collections::{HashMap, HashSet, hash_map::Entry},
 };
 
 use good_lp::{Expression, Variable, constraint, variable};
@@ -14,7 +14,6 @@ use crate::{
     decouple_analysis::DecoupleILPMetadata,
     partition_node_analysis::all_inputs,
     partition_syn_analysis::{AnalyzeClosure, StructOrTuple, StructOrTupleIndex},
-    rewrites::{node_is_at_location, op_id_to_parents, parent_ids},
 };
 
 /// Add id to dependent_nodes if its parent_id is already in dependent_nodes
@@ -36,7 +35,7 @@ fn nodes_dependent_on_inputs(
     ir: &mut [HydroRoot],
     location: &LocationId,
     inputs: &Vec<usize>,
-    cycle_source_to_sink_parent: &HashMap<usize, usize>,
+    op_to_parents: &HashMap<usize, Vec<usize>>,
 ) -> HashSet<usize> {
     let dependent_nodes = RefCell::new(HashSet::from_iter(inputs.iter().cloned()));
     let mut num_dependent_nodes = inputs.len();
@@ -45,7 +44,7 @@ fn nodes_dependent_on_inputs(
         traverse_dfir(
             ir,
             |root, next_stmt_id| {
-                if root.input_metadata().location_kind.root() == location.root() {
+                if root.input_metadata().location_id.root() == location {
                     insert_dependent_node(
                         &dependent_nodes,
                         root.input_metadata().op.id,
@@ -54,9 +53,15 @@ fn nodes_dependent_on_inputs(
                 }
             },
             |node, next_stmt_id| {
-                if node_is_at_location(node, location.root().raw_id()) {
-                    for parent_id in parent_ids(node, Some(location), cycle_source_to_sink_parent) {
-                        insert_dependent_node(&dependent_nodes, Some(parent_id), *next_stmt_id);
+                if node.metadata().location_id.root() == location {
+                    if let Some(parents) = op_to_parents.get(next_stmt_id) {
+                        for parent_id in parents {
+                            insert_dependent_node(
+                                &dependent_nodes,
+                                Some(*parent_id),
+                                *next_stmt_id,
+                            );
+                        }
                     }
                 }
             },
@@ -90,12 +95,13 @@ fn output_to_parent_fields(node: &HydroNode) -> Vec<StructOrTuple> {
         | HydroNode::SingletonSource { .. }
         | HydroNode::CycleSource { .. }
         | HydroNode::Tee { .. }
-        | HydroNode::Persist { .. }
+        | HydroNode::Partition { .. }
         | HydroNode::YieldConcat { .. }
         | HydroNode::BeginAtomic { .. }
         | HydroNode::EndAtomic { .. }
         | HydroNode::Batch { .. }
         | HydroNode::ResolveFutures { .. }
+        | HydroNode::ResolveFuturesBlocking { .. }
         | HydroNode::ResolveFuturesOrdered { .. }
         | HydroNode::Filter { .. } // No changes to output
         | HydroNode::DeferTick { .. }
@@ -169,7 +175,9 @@ fn output_to_parent_fields(node: &HydroNode) -> Vec<StructOrTuple> {
         }
         // No mapping
         HydroNode::FlatMap { .. }
+        | HydroNode::FlatMapStreamBlocking { .. }
         | HydroNode::Scan { .. }
+        | HydroNode::ScanAsyncBlocking { .. }
         | HydroNode::Fold { .. }
         | HydroNode::Reduce { .. }
         => vec![StructOrTuple::default()],
@@ -277,9 +285,8 @@ fn create_canonical_fields_node(
 fn create_canonical_fields(
     ir: &mut [HydroRoot],
     location: &LocationId,
-    cycle_source_to_sink_parent: &HashMap<usize, usize>,
+    op_to_parents: &HashMap<usize, Vec<usize>>,
 ) -> HashMap<usize, Vec<StructOrTuple>> {
-    let op_to_parents = op_id_to_parents(ir, Some(location), cycle_source_to_sink_parent);
     let mut op_to_dependencies = HashMap::new();
 
     loop {
@@ -288,12 +295,12 @@ fn create_canonical_fields(
             ir,
             |_, _| {},
             |node, id| {
-                if node_is_at_location(node, location.root().raw_id()) {
+                if node.metadata().location_id.root() == location {
                     let mutated = create_canonical_fields_node(
                         Some(node),
                         *id,
                         *id,
-                        &op_to_parents,
+                        op_to_parents,
                         &mut op_to_dependencies,
                     );
                     fixpoint &= !mutated;
@@ -334,12 +341,13 @@ fn node_partitionability(node: &HydroNode) -> Partitionability {
         | HydroNode::SingletonSource { .. }
         | HydroNode::CycleSource { .. }
         | HydroNode::Tee { .. }
-        | HydroNode::Persist { .. }
+        | HydroNode::Partition { .. }
         | HydroNode::YieldConcat { .. }
         | HydroNode::BeginAtomic { .. }
         | HydroNode::EndAtomic { .. }
         | HydroNode::Batch { .. }
         | HydroNode::ResolveFutures { .. }
+        | HydroNode::ResolveFuturesBlocking { .. }
         | HydroNode::ResolveFuturesOrdered { .. }
         | HydroNode::Filter { .. }
         | HydroNode::DeferTick { .. }
@@ -350,6 +358,7 @@ fn node_partitionability(node: &HydroNode) -> Partitionability {
         | HydroNode::Map { .. }
         | HydroNode::FilterMap { .. }
         | HydroNode::FlatMap { .. }
+        | HydroNode::FlatMapStreamBlocking { .. }
         | HydroNode::Chain { .. }
         | HydroNode::ChainFirst { .. } => Partitionability::NoEffect,
         HydroNode::Join { .. }
@@ -364,6 +373,7 @@ fn node_partitionability(node: &HydroNode) -> Partitionability {
         | HydroNode::Enumerate { .. }
         | HydroNode::Sort { .. }
         | HydroNode::Scan { .. }
+        | HydroNode::ScanAsyncBlocking { .. }
         | HydroNode::Fold { .. }
         | HydroNode::Reduce { .. } => Partitionability::Unpartitionable,
     }
@@ -382,11 +392,13 @@ fn node_persists(node: &HydroNode) -> bool {
         | HydroNode::SingletonSource { .. }
         | HydroNode::CycleSource { .. }
         | HydroNode::Tee { .. }
+        | HydroNode::Partition { .. }
         | HydroNode::YieldConcat { .. }
         | HydroNode::BeginAtomic { .. }
         | HydroNode::EndAtomic { .. }
         | HydroNode::Batch { .. }
         | HydroNode::ResolveFutures { .. }
+        | HydroNode::ResolveFuturesBlocking { .. }
         | HydroNode::ResolveFuturesOrdered { .. }
         | HydroNode::Filter { .. }
         | HydroNode::Inspect { .. }
@@ -396,33 +408,31 @@ fn node_persists(node: &HydroNode) -> bool {
         | HydroNode::Map { .. }
         | HydroNode::FilterMap { .. }
         | HydroNode::FlatMap { .. }
+        | HydroNode::FlatMapStreamBlocking { .. }
         | HydroNode::Chain { .. }
         | HydroNode::ChainFirst { .. }
         | HydroNode::CrossSingleton { .. }
         | HydroNode::Sort { .. } => false,
-        // Maybe, depending on if it's 'static (either hidden parent is Persist)
+        // Maybe, depending on if it's 'static (either hidden parent is top_level)
         HydroNode::Join { left, right, .. } | HydroNode::CrossProduct { left, right, .. } => {
-            matches!(left.as_ref(), HydroNode::Persist { .. })
-                || matches!(right.as_ref(), HydroNode::Persist { .. })
-                || left.metadata().location_kind.is_top_level()
-                || right.metadata().location_kind.is_top_level()
+            left.metadata().location_id.is_top_level()
+                || right.metadata().location_id.is_top_level()
         }
-        // Maybe, depending on if it's 'static (neg parent is Persist)
+        // Maybe, depending on if it's 'static (neg parent is top_level)
         HydroNode::Difference { neg, .. } | HydroNode::AntiJoin { neg, .. } => {
-            matches!(neg.as_ref(), HydroNode::Persist { .. })
-                || neg.metadata().location_kind.is_top_level()
+            neg.metadata().location_id.is_top_level()
         }
+        // Maybe, depending on if it's 'static (input.metadata().location_id.is_top_level())
         HydroNode::FoldKeyed { input, .. }
         | HydroNode::ReduceKeyed { input, .. }
         | HydroNode::ReduceKeyedWatermark { input, .. }
         | HydroNode::Scan { input, .. }
+        | HydroNode::ScanAsyncBlocking { input, .. }
         | HydroNode::Fold { input, .. }
-        | HydroNode::Reduce { input, .. } => matches!(input.as_ref(), HydroNode::Persist { .. }),
-        // Maybe, depending on if it's 'static (input.metadata().location_kind.is_top_level())
-        HydroNode::Enumerate { input, .. } | HydroNode::Unique { input, .. } => {
-            input.metadata().location_kind.is_top_level()
-        }
-        HydroNode::Persist { .. } | HydroNode::DeferTick { .. } => true,
+        | HydroNode::Reduce { input, .. }
+        | HydroNode::Enumerate { input, .. }
+        | HydroNode::Unique { input, .. } => input.metadata().location_id.is_top_level(),
+        HydroNode::DeferTick { .. } => true,
     }
 }
 
@@ -667,10 +677,7 @@ fn partition_ilp_node_analysis(
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
     op_id_to_parents: &HashMap<usize, Vec<usize>>,
 ) {
-    if !node_is_at_location(
-        node,
-        decoupling_metadata.borrow().bottleneck.root().raw_id(),
-    ) {
+    if *node.metadata().location_id.root() != decoupling_metadata.borrow().bottleneck {
         return;
     }
 
@@ -772,7 +779,6 @@ fn zero_cost_if_partitionable(
 
 pub(crate) fn partition_ilp_analysis(
     ir: &mut [HydroRoot],
-    cycle_source_to_sink_parent: &HashMap<usize, usize>,
     op_id_to_parents: &HashMap<usize, Vec<usize>>,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
@@ -794,12 +800,12 @@ pub(crate) fn partition_ilp_analysis(
         ir,
         &decoupling_metadata.borrow().bottleneck,
         &inputs,
-        cycle_source_to_sink_parent,
+        op_id_to_parents,
     );
     let canonical_fields = create_canonical_fields(
         ir,
         &decoupling_metadata.borrow().bottleneck,
-        cycle_source_to_sink_parent,
+        op_id_to_parents,
     );
 
     traverse_dfir(

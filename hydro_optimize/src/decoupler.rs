@@ -13,6 +13,7 @@ use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::location::{Cluster, Location};
 use hydro_lang::networking::{NetworkingInfo, TcpFault};
 use proc_macro2::Span;
+use serde::{Deserialize, Serialize};
 use stageleft::quote_type;
 use syn::visit_mut::VisitMut;
 
@@ -20,7 +21,7 @@ use crate::debug::print_id;
 use crate::repair::{cycle_source_to_sink_input, inject_id, inject_location};
 use crate::rewrites::{
     ClusterSelfIdReplace, collection_kind_to_debug_type, deserialize_bincode_with_type,
-    op_id_to_inputs, prepend_member_id_to_collection_kind, serialize_bincode_with_type,
+    op_id_to_parents, prepend_member_id_to_collection_kind, serialize_bincode_with_type,
     tee_to_inner_id, unbounded_optional, unbounded_singleton, unbounded_stream,
 };
 
@@ -28,7 +29,11 @@ use crate::rewrites::{
 ///
 /// Note: The location index is where the output of the node goes, not necessarily where the node is executed.
 /// Limitations: Sources can't be decoupled from their children.
-pub type DecoupleDecision = HashMap<usize, usize>;
+#[derive(Clone, Serialize, Deserialize)]
+pub struct DecoupleDecision {
+    pub(crate) new_networks: HashMap<(usize, usize), HashSet<usize>>,
+    pub(crate) place_on_loc: HashMap<usize, HashSet<usize>>,
+}
 
 /// Adds networking after `node`.
 /// - `send_location`: the source of the network.
@@ -452,7 +457,7 @@ pub fn decouple<'a>(
 
     let cycles = cycle_source_to_sink_input(ir);
     let tee_to_inner_id_before_rewrites = tee_to_inner_id(ir);
-    let op_id_to_input_before_rewrites = op_id_to_inputs(ir, None, &cycles);
+    let op_id_to_input_before_rewrites = op_id_to_parents(ir, None, &cycles);
     let mut new_inners = HashMap::new();
     traverse_dfir(
         ir,

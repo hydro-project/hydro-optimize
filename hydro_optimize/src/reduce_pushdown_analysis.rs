@@ -8,7 +8,7 @@ use hydro_lang::{
     location::dynamic::LocationId,
 };
 
-use crate::{repair::cycle_source_to_sink_input, rewrites::op_id_to_inputs};
+use crate::{repair::cycle_source_to_sink_input, rewrites::op_id_to_parents};
 
 /// - `reduce_op_id`: The op_id of the `Reduce` that can pushed after this node
 /// - `distance_from_reduce`: Number of nodes between this node and the `Reduce`. If this node's child is Reduce, the distance is 0.
@@ -270,7 +270,7 @@ pub fn reduce_pushdown_decision(
     let metadata = reduce_pushdown_analysis(ir, node_to_analyze);
     let cycle_map = cycle_source_to_sink_input(ir);
     // Note: This accounts for cycles (parent of a CycleSource is its CycleSink's input)
-    let op_id_to_input = op_id_to_inputs(ir, Some(&node_to_analyze.key()), &cycle_map);
+    let op_id_to_input = op_id_to_parents(ir, Some(node_to_analyze), &cycle_map);
 
     let mut decisions = HashMap::new();
     // Pushing down furthest = pushing to nodes where we can't push to all of their parents.

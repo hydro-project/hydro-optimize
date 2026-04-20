@@ -2,7 +2,6 @@ use core::panic;
 use std::collections::HashMap;
 
 use hydro_lang::compile::ir::{HydroNode, HydroRoot, HydroSource, traverse_dfir};
-use hydro_lang::location::LocationKey;
 use hydro_lang::location::dynamic::LocationId;
 use serde::{Deserialize, Serialize};
 use syn::visit_mut::VisitMut;
@@ -18,8 +17,8 @@ use crate::rewrites::{
 pub struct Partitioner {
     pub nodes_before_partitioned_input: HashMap<usize, StructOrTupleIndex>, /* ID of node right before a Network -> what to partition on */
     pub num_partitions: usize,
-    pub location_id: LocationKey,
-    pub new_cluster_id: Option<LocationKey>, /* If we're partitioning a process, then a new cluster will be created and we'll need to substitute the old ID with this one */
+    pub location_id: LocationId,
+    pub new_cluster_id: Option<LocationId>, /* If we're partitioning a process, then a new cluster will be created and we'll need to substitute the old ID with this one */
 }
 
 pub fn quoted_struct_or_tuple_index(
@@ -119,7 +118,7 @@ fn replace_receiver_src_id(node: &mut HydroNode, partitioner: &Partitioner, op_i
     if let HydroNode::Network {
         input, metadata, ..
     } = node
-        && input.metadata().location_id.root().key() == *location_id
+        && input.metadata().location_id.root() == location_id.root()
     {
         println!(
             "Rewriting network on op {} so the sender's ID is mapped from the partition to the original sender",
@@ -202,8 +201,8 @@ fn replace_process_node_location(node: &mut HydroNode, partitioner: &Partitioner
     if let Some(new_id) = new_cluster_id {
         // Change any HydroNodes with a location field
         let location = &mut node.metadata_mut().location_id;
-        if location.root().key() == *location_id {
-            location.swap_root(LocationId::Cluster(*new_id));
+        if location.root() == location_id.root() {
+            location.swap_root(new_id.clone());
         }
     }
 }
@@ -234,7 +233,7 @@ fn remove_sender_id_from_receiver(node: &mut HydroNode, partitioner: &Partitione
 /// Broadcasting to the partitioned cluster should not actually send a message to every partition.
 fn replace_cluster_members_source(node: &mut HydroNode, partitioner: &Partitioner) {
     let num_partitions = partitioner.num_partitions;
-    let location_key = partitioner.location_id;
+    let location_key = partitioner.location_id.key();
 
     if let HydroNode::Source {
         source: HydroSource::ClusterMembers(target_loc, _),
@@ -273,7 +272,7 @@ fn partition_node(node: &mut HydroNode, partitioner: &Partitioner) {
     node.visit_debug_expr(|expr| {
         let mut visitor = ClusterSelfIdReplace::Partition {
             num_partitions: partitioner.num_partitions,
-            partitioned_cluster_id: partitioner.location_id,
+            partitioned_cluster_id: partitioner.location_id.key(),
             op_id,
         };
         visitor.visit_expr_mut(&mut expr.0);

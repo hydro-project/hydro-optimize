@@ -78,11 +78,15 @@ mod tests {
 
     fn count_reduces(ir: &mut [hydro_lang::compile::ir::HydroRoot]) -> usize {
         let mut count = 0;
-        traverse_dfir(ir, |_, _| {}, |node, _| {
-            if matches!(node, HydroNode::Reduce { .. }) {
-                count += 1;
-            }
-        });
+        traverse_dfir(
+            ir,
+            |_, _| {},
+            |node, _| {
+                if matches!(node, HydroNode::Reduce { .. }) {
+                    count += 1;
+                }
+            },
+        );
         count
     }
 
@@ -143,13 +147,10 @@ mod tests {
         let mut output = nodes.connect(output).await;
         deployment.start().await.unwrap();
 
-        let val: i32 = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            output.next(),
-        )
-        .await
-        .expect("timeout waiting for output")
-        .expect("output channel closed");
+        let val: i32 = tokio::time::timeout(std::time::Duration::from_secs(30), output.next())
+            .await
+            .expect("timeout waiting for output")
+            .expect("output channel closed");
         assert_eq!(val, 5);
     }
 }

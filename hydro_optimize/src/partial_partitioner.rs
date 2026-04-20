@@ -6,7 +6,6 @@ use hydro_lang::compile::builder::{CycleId, FlowBuilder};
 use hydro_lang::compile::ir::{
     CollectionKind, HydroIrOpMetadata, HydroNode, HydroRoot, SharedNode, traverse_dfir,
 };
-use hydro_lang::location::LocationKey;
 use hydro_lang::location::dynamic::LocationId;
 use serde::{Deserialize, Serialize};
 
@@ -30,8 +29,8 @@ pub struct PartialPartitioner {
     pub nodes_after_replicated_output: HashSet<usize>, /* ID of Network recv node for replicated output */
     pub nodes_for_garbage_collection: HashSet<usize>,  /* ID of Network */
     pub num_partitions: usize,
-    pub location_id: LocationKey,
-    pub new_cluster_id: Option<LocationKey>,
+    pub location_id: LocationId,
+    pub new_cluster_id: Option<LocationId>,
 }
 
 /// Shared state
@@ -268,7 +267,7 @@ fn build_coordinator(
 ) -> (HydroNode, CycleId) {
     let coord_tick = &state.coordinator_tick.clone();
     let coord_loc = &state.coordinator_location.clone();
-    let cluster_loc = &LocationId::Cluster(partitioner.location_id);
+    let cluster_loc = &partitioner.location_id;
     let num_partitions = partitioner.num_partitions;
 
     let usize_type: syn::Type = syn::parse_quote! { usize };
@@ -500,7 +499,7 @@ fn build_partition_state(
 ) {
     let p_tick = &state.partition_tick.clone();
     let coord_loc = &state.coordinator_location.clone();
-    let cluster_loc = &LocationId::Cluster(partitioner.location_id);
+    let cluster_loc = &partitioner.location_id;
     let usize_type: syn::Type = syn::parse_quote! { usize };
     let state_type: syn::Type = syn::parse_quote! { (bool, usize) };
 
@@ -625,7 +624,7 @@ fn handle_replicated_input(
     let node_metadata = original_node.metadata().clone();
     let element_type: syn::Type =
         (*collection_kind_to_debug_type(&node_metadata.collection_kind).0).clone();
-    let cluster_loc = &LocationId::Cluster(partitioner.location_id);
+    let cluster_loc = &partitioner.location_id;
     let coord_loc = &state.coordinator_location.clone();
     let coord_tick = &state.coordinator_tick.clone();
 
@@ -1182,7 +1181,7 @@ pub fn partial_partition(
     let coordinator_location = hydro_lang::location::Location::id(&coordinator_cluster);
     let clock_id = builder.next_clock_id();
     let coordinator_tick = LocationId::Tick(clock_id, Box::new(coordinator_location.clone()));
-    let cluster_location = LocationId::Cluster(partitioner.location_id);
+    let cluster_location = partitioner.location_id.clone();
     let partition_clock_id = builder.next_clock_id();
     let partition_tick = LocationId::Tick(partition_clock_id, Box::new(cluster_location));
     let c_prepare_ack_cycle = builder.next_cycle_id();
@@ -1303,7 +1302,7 @@ mod tests {
 
     fn apply_partial_partition<'a>(
         built: &'a hydro_lang::compile::built::BuiltFlow<'a>,
-        server_key: hydro_lang::location::LocationKey,
+        server_id: hydro_lang::location::dynamic::LocationId,
     ) -> FlowBuilder<'a> {
         let mut ir = deep_clone(built.ir());
         inject_id(&mut ir);
@@ -1314,7 +1313,7 @@ mod tests {
         traverse_dfir(
             &mut ir,
             |_, _| {},
-            |node, next_stmt_id| match get_network_type(node, &server_key) {
+            |node, next_stmt_id| match get_network_type(node, &server_id) {
                 Some(NetworkType::Recv) => {
                     if let HydroNode::Network { input, .. } = node
                         && let Some(send_id) = input.op_metadata().id
@@ -1351,7 +1350,7 @@ mod tests {
             nodes_after_replicated_output: HashSet::from([send_networks[0].1]),
             nodes_for_garbage_collection: HashSet::new(),
             num_partitions: 3,
-            location_id: server_key,
+            location_id: server_id,
             new_cluster_id: None,
         };
 
@@ -1380,7 +1379,7 @@ mod tests {
         let gateway = builder.process::<()>();
         let client = builder.cluster::<()>();
         let server = builder.cluster::<()>();
-        let server_key = hydro_lang::location::Location::id(&server).key();
+        let server_id = hydro_lang::location::Location::id(&server).clone();
 
         // External → gateway process → client cluster → server cluster
         let (state_send, state_gw) = gateway.source_external_bincode::<_, usize, _, _>(&external);
@@ -1434,7 +1433,7 @@ mod tests {
         let mut deployment = Deployment::new();
         let num_partitions = 3;
         let nodes = if apply_partition {
-            let new_builder = apply_partial_partition(&built, server_key);
+            let new_builder = apply_partial_partition(&built, server_id);
             new_builder
                 .with_process(&gateway, deployment.Localhost())
                 .with_cluster(&client, vec![deployment.Localhost()])
