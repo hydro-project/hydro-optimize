@@ -8,6 +8,10 @@ if [[ ! -d "$HYDRO_DIR" ]]; then
   exit 1
 fi
 
+# Remove perf leftover data
+rm -rf *.folded
+rm -rf *.perf.data
+
 pids=()
 dirs=()
 
@@ -29,6 +33,7 @@ failed=0
 for i in "${!pids[@]}"; do
   if wait "${pids[$i]}"; then
     echo "✓ ${dirs[$i]} — done"
+    rm -rf "${dirs[$i]}"
   else
     echo "✗ ${dirs[$i]} — failed"
     ((failed++))
