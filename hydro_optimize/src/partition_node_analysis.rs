@@ -165,6 +165,7 @@ fn input_dependency_analysis_node(
         | HydroNode::Tee { .. }
         | HydroNode::ResolveFutures { .. }
         | HydroNode::ResolveFuturesOrdered { .. }
+        | HydroNode::ResolveFuturesBlocking { .. }
         | HydroNode::DeferTick { .. }
         | HydroNode::Unique { .. }
         | HydroNode::Sort { .. }
@@ -330,7 +331,9 @@ fn input_dependency_analysis_node(
         HydroNode::Reduce { .. }
         | HydroNode::Fold { .. }
         | HydroNode::Scan { .. }
+        | HydroNode::ScanAsyncBlocking { .. }
         | HydroNode::FlatMap { .. }
+        | HydroNode::FlatMapStreamBlocking { .. }
         | HydroNode::Source { .. }
         | HydroNode::SingletonSource { .. } => {
             input_dependencies_entry.clear();
@@ -545,6 +548,7 @@ fn partitioning_constraint_analysis_node(
             HydroNode::Reduce { .. }
             | HydroNode::Fold { .. }
             | HydroNode::Scan { .. }
+            | HydroNode::ScanAsyncBlocking { .. }
             | HydroNode::Enumerate { .. }
             | HydroNode::CrossProduct { .. }
             | HydroNode::CrossSingleton { .. } => {} // Partitioning is impossible
@@ -556,8 +560,10 @@ fn partitioning_constraint_analysis_node(
             | HydroNode::ChainFirst { .. }
             | HydroNode::ResolveFutures { .. }
             | HydroNode::ResolveFuturesOrdered { .. }
+            | HydroNode::ResolveFuturesBlocking { .. }
             | HydroNode::Map { .. }
             | HydroNode::FlatMap { .. }
+            | HydroNode::FlatMapStreamBlocking { .. }
             | HydroNode::Filter { .. }
             | HydroNode::FilterMap { .. }
             | HydroNode::DeferTick { .. }

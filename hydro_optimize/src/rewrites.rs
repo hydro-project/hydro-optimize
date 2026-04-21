@@ -5,7 +5,8 @@ use hydro_lang::compile::builder::FlowBuilder;
 use hydro_lang::compile::built::BuiltFlow;
 use hydro_lang::compile::ir::{
     BoundKind, CollectionKind, DebugType, HydroIrMetadata, HydroNode, HydroRoot,
-    KeyedSingletonBoundKind, StreamOrder, StreamRetry, deep_clone, traverse_dfir,
+    KeyedSingletonBoundKind, SingletonBoundKind, StreamOrder, StreamRetry, deep_clone,
+    traverse_dfir,
 };
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::location::{Cluster, LocationKey};
@@ -390,5 +391,51 @@ pub fn prepend_member_id_to_collection_kind(collection_kind: &CollectionKind) ->
             key_type: member_id_debug_type,
             value_type: collection_kind_to_debug_type(collection_kind),
         },
+    }
+}
+
+pub fn unbounded_stream(element_type: syn::Type) -> CollectionKind {
+    CollectionKind::Stream {
+        bound: BoundKind::Unbounded,
+        order: StreamOrder::NoOrder,
+        retry: StreamRetry::ExactlyOnce,
+        element_type: element_type.into(),
+    }
+}
+
+pub fn bounded_stream(element_type: syn::Type) -> CollectionKind {
+    CollectionKind::Stream {
+        bound: BoundKind::Bounded,
+        order: StreamOrder::NoOrder,
+        retry: StreamRetry::ExactlyOnce,
+        element_type: element_type.into(),
+    }
+}
+
+pub fn bounded_optional(element_type: syn::Type) -> CollectionKind {
+    CollectionKind::Optional {
+        bound: BoundKind::Bounded,
+        element_type: element_type.into(),
+    }
+}
+
+pub fn unbounded_optional(element_type: syn::Type) -> CollectionKind {
+    CollectionKind::Optional {
+        bound: BoundKind::Unbounded,
+        element_type: element_type.into(),
+    }
+}
+
+pub fn bounded_singleton(element_type: syn::Type) -> CollectionKind {
+    CollectionKind::Singleton {
+        bound: SingletonBoundKind::Bounded,
+        element_type: element_type.into(),
+    }
+}
+
+pub fn unbounded_singleton(element_type: syn::Type) -> CollectionKind {
+    CollectionKind::Singleton {
+        bound: SingletonBoundKind::Unbounded,
+        element_type: element_type.into(),
     }
 }

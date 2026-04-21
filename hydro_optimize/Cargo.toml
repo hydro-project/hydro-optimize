@@ -19,6 +19,7 @@ hydro_std.workspace = true
 proc-macro2 = "1.0.95"
 regex.workspace = true
 serde.workspace = true
+serde_json = "1.0"
 stageleft.workspace = true
 syn = { version = "2.0.46", features = [
     "parsing",
@@ -31,6 +32,7 @@ quote = "1.0.35"
 
 [dev-dependencies]
 ctor.workspace = true
+futures = "0.3"
 hydro_build_utils.workspace = true
 hydro_lang = { workspace = true, features = ["viz"] }
 include_mdtests.workspace = true

@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::Path;
 
 use hydro_lang::compile::deploy::DeployResult;
 use hydro_lang::compile::ir::{HydroNode, HydroRoot, traverse_dfir};
@@ -6,59 +9,241 @@ use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::deploy::deploy_graph::DeployCrateWrapper;
 use hydro_lang::location::dynamic::LocationId;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::deploy_and_analyze::MetricLogs;
+use crate::deploy_and_analyze::{MetricLogs, Optimizations};
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct RunMetadata {
-    pub throughputs: Vec<usize>,
-    pub latencies: Vec<(f64, f64, f64, u64)>, // per-second: (p50, p99, p999, count)
-    pub send_overhead: HashMap<LocationId, f64>,
-    pub recv_overhead: HashMap<LocationId, f64>,
-    pub unaccounted_perf: HashMap<LocationId, f64>, // % of perf samples not mapped to any operator
-    pub sar_stats: HashMap<LocationId, Vec<SarStats>>,
+    #[serde(skip)]
+    throughputs: Vec<usize>,
+    #[serde(skip)]
+    latencies: Vec<(f64, f64, f64, u64)>, // per-second: (p50, p99, p999, count)
+    counters: HashMap<usize, usize>, // op_id -> cardinality count
+    #[serde(default, with = "perf_serde")]
+    perf: HashMap<(usize, bool), f64>, // (op_id, is_recv) -> cpu fraction
+    #[serde(skip)]
+    send_overhead: HashMap<LocationId, f64>,
+    #[serde(skip)]
+    recv_overhead: HashMap<LocationId, f64>,
+    #[serde(skip)]
+    unaccounted_perf: HashMap<LocationId, f64>, // % of perf samples not mapped to any operator
+    #[serde(skip)]
+    sar_stats: HashMap<LocationId, Vec<SarStats>>,
+}
+
+/// Serialize/deserialize perf HashMap as a Vec for JSON compatibility.
+mod perf_serde {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        map: &HashMap<(usize, bool), f64>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        let vec: Vec<_> = map.iter().map(|(k, v)| (*k, *v)).collect();
+        vec.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<HashMap<(usize, bool), f64>, D::Error> {
+        let vec: Vec<((usize, bool), f64)> = Vec::deserialize(d)?;
+        Ok(vec.into_iter().collect())
+    }
 }
 
 impl RunMetadata {
-    /// Returns the location of the bottlenecked node by comparing CPU usages at `measurement_sec`.
-    /// Panics if no sar_stats exist for the given `measurement_sec`
-    pub fn cpu_bottleneck(&self, measurement_sec: usize) -> LocationId {
-        let (loc, _stats) = self
-            .sar_stats
-            .iter()
-            .reduce(|(max_loc, max_stats), (curr_loc, curr_stats)| {
-                let max_cpu = &max_stats[measurement_sec].cpu.all_stats;
-                let curr_cpu = &curr_stats[measurement_sec].cpu.all_stats;
-                if max_cpu.system + max_cpu.user < curr_cpu.system + curr_cpu.user {
-                    (curr_loc, curr_stats)
-                } else {
-                    (max_loc, max_stats)
-                }
-            })
-            .unwrap();
-        loc.clone()
+    /// Average throughput over the given inclusive second range.
+    pub fn avg_throughput(&self, start: usize, end: usize) -> usize {
+        let slice = &self.throughputs[start..=end];
+        if slice.is_empty() {
+            0
+        } else {
+            slice.iter().sum::<usize>() / slice.len()
+        }
     }
 
-    /// Returns the location of the bottlenecked node by comparing network usage at `measurement_sec`.
-    /// Panics if no sar_stats exist for the given `measurement_sec`
-    pub fn network_bottlenck(&self, measurement_sec: usize) -> LocationId {
-        let (loc, _stats) = self
-            .sar_stats
-            .iter()
-            .reduce(|(max_loc, max_stats), (curr_loc, curr_stats)| {
-                let max_network = max_stats[measurement_sec].network;
-                let curr_network = curr_stats[measurement_sec].network;
-                if max_network.rx_bytes_per_sec + max_network.tx_bytes_per_sec
-                    < curr_network.rx_bytes_per_sec + curr_network.tx_bytes_per_sec
-                {
-                    (curr_loc, curr_stats)
-                } else {
-                    (max_loc, max_stats)
+    /// Prints a human-readable summary of metrics at the given measurement second.
+    pub fn print_run_summary(
+        &self,
+        location_id_to_cluster: &HashMap<LocationId, String>,
+        measurement_second: usize,
+    ) {
+        if let Some(&throughput) = self.throughputs.get(measurement_second) {
+            println!(
+                "Throughput @{}s: {} requests/s",
+                measurement_second + 1,
+                throughput
+            );
+        }
+        if let Some(&(p50, p99, p999, samples)) = self.latencies.get(measurement_second) {
+            println!(
+                "Latency @{}s: p50: {:.3} | p99 {:.3} | p999 {:.3} ms ({} samples)",
+                measurement_second + 1,
+                p50,
+                p99,
+                p999,
+                samples
+            );
+        }
+        for (location, sar_stats) in &self.sar_stats {
+            let name = location_id_to_cluster.get(location).unwrap();
+            if let Some(sar) = sar_stats.get(measurement_second) {
+                println!(
+                    "{} @{}s: CPU {:.2}% (user {:.2}%, sys {:.2}%, idle {:.2}%) | \
+                     Net rx {:.0} pkt/s {:.0} B/s, tx {:.0} pkt/s {:.0} B/s | \
+                     Mem {:.2}% ({:.0} KB used, {:.0} KB buf, {:.0} KB cached) | \
+                     IO r {:.2} w {:.2} tps, bread {:.2} bwrtn {:.2}/s",
+                    name,
+                    measurement_second + 1,
+                    sar.cpu.all_stats.user + sar.cpu.all_stats.system,
+                    sar.cpu.all_stats.user,
+                    sar.cpu.all_stats.system,
+                    sar.cpu.all_stats.idle,
+                    sar.network.rx_packets_per_sec,
+                    sar.network.rx_bytes_per_sec,
+                    sar.network.tx_packets_per_sec,
+                    sar.network.tx_bytes_per_sec,
+                    sar.memory.percent_mem_used,
+                    sar.memory.kb_mem_used,
+                    sar.memory.kb_buffers,
+                    sar.memory.kb_cached,
+                    sar.io.rtps,
+                    sar.io.wtps,
+                    sar.io.bread_per_sec,
+                    sar.io.bwrtn_per_sec,
+                );
+            }
+        }
+    }
+
+    /// Saves per-location CSVs and per-cluster profiling JSON files to `output_dir`.
+    pub fn save_run_metadata(
+        self,
+        location_id_to_cluster: &HashMap<LocationId, String>,
+        output_dir: &Path,
+        num_clients: usize,
+        num_clients_per_node: usize,
+        run: usize,
+    ) {
+        fs::create_dir_all(output_dir).ok();
+
+        // Write per-location CSV
+        for (location, stats) in &self.sar_stats {
+            if stats.is_empty() {
+                continue;
+            }
+            let location_name = location_id_to_cluster.get(location).unwrap();
+            let filename = output_dir.join(format!(
+                "{}_{}c_{}vc_r{}.csv",
+                location_name, num_clients, num_clients_per_node, run
+            ));
+            let num_rows = stats
+                .len()
+                .max(self.throughputs.len())
+                .max(self.latencies.len());
+            let num_cores = stats
+                .iter()
+                .map(|s| s.cpu.core_stats.len())
+                .max()
+                .unwrap_or(0);
+
+            let write_csv = || -> Result<(), Box<dyn std::error::Error>> {
+                let mut file = File::create(&filename)?;
+                write!(file, "time_s,cpu_user,cpu_system,cpu_idle")?;
+                for c in 0..num_cores {
+                    write!(file, ",core{}_user,core{}_system,core{}_idle", c, c, c)?;
                 }
-            })
-            .unwrap();
-        loc.clone()
+                writeln!(
+                    file,
+                    ",network_tx_packets_per_sec,network_rx_packets_per_sec,\
+                     network_tx_bytes_per_sec,network_rx_bytes_per_sec,\
+                     mem_kb_used,mem_percent_used,mem_kb_buffers,mem_kb_cached,\
+                     io_rtps,io_wtps,io_bread_per_sec,io_bwrtn_per_sec,\
+                     throughput_rps,latency_p50_ms,latency_p99_ms,latency_p999_ms,latency_samples",
+                )?;
+
+                let default_sar = SarStats::default();
+                for i in 0..num_rows {
+                    let sar = stats.get(i).unwrap_or(&default_sar);
+                    let thr = self.throughputs.get(i).copied().unwrap_or(0);
+                    let (p50, p99, p999, count) =
+                        self.latencies.get(i).copied().unwrap_or_default();
+                    write!(
+                        file,
+                        "{},{:.2},{:.2},{:.2}",
+                        i, sar.cpu.all_stats.user, sar.cpu.all_stats.system, sar.cpu.all_stats.idle,
+                    )?;
+                    let default_core = CPUStat::default();
+                    for c in 0..num_cores {
+                        let core = sar.cpu.core_stats.get(c).unwrap_or(&default_core);
+                        write!(
+                            file,
+                            ",{:.2},{:.2},{:.2}",
+                            core.user, core.system, core.idle
+                        )?;
+                    }
+                    writeln!(
+                        file,
+                        ",{:.2},{:.2},{:.2},{:.2},\
+                         {:.2},{:.2},{:.2},{:.2},\
+                         {:.2},{:.2},{:.2},{:.2},\
+                         {},{:.3},{:.3},{:.3},{}",
+                        sar.network.tx_packets_per_sec,
+                        sar.network.rx_packets_per_sec,
+                        sar.network.tx_bytes_per_sec,
+                        sar.network.rx_bytes_per_sec,
+                        sar.memory.kb_mem_used,
+                        sar.memory.percent_mem_used,
+                        sar.memory.kb_buffers,
+                        sar.memory.kb_cached,
+                        sar.io.rtps,
+                        sar.io.wtps,
+                        sar.io.bread_per_sec,
+                        sar.io.bwrtn_per_sec,
+                        thr,
+                        p50,
+                        p99,
+                        p999,
+                        count,
+                    )?;
+                }
+                Ok(())
+            };
+
+            match write_csv() {
+                Ok(()) => println!("Generated CSV: {}", filename.display()),
+                Err(e) => eprintln!("Failed to write CSV {}: {}", filename.display(), e),
+            }
+        }
+
+        // Save profiling JSON
+        let path = output_dir.join(format!(
+            "profiling_{}c_{}vc_r{}.json",
+            num_clients, num_clients_per_node, run
+        ));
+        let json = serde_json::to_string_pretty(&self).expect("failed to serialize profiling data");
+        match fs::write(&path, json) {
+            Ok(()) => println!("Saved profiling data: {}", path.display()),
+            Err(e) => eprintln!("Failed to save profiling data to {}: {}", path.display(), e),
+        }
+    }
+
+    /// Loads profiling data from file and injects counters and perf data into the IR.
+    pub fn load_and_inject(path: &Path, ir: &mut [HydroRoot]) -> Self {
+        let json = fs::read_to_string(path).unwrap_or_else(|e| {
+            panic!(
+                "Failed to load profiling data from {}: {}",
+                path.display(),
+                e
+            )
+        });
+        let data: Self = serde_json::from_str(&json).expect("failed to deserialize profiling data");
+        inject_count(ir, &data.counters);
+        inject_perf(ir, &data.perf);
+        data
     }
 }
 
@@ -78,10 +263,38 @@ pub struct CPUStat {
     pub system: f64,
     pub idle: f64,
 }
+
+impl CPUStat {
+    fn max(self, other: Self) -> Self {
+        Self {
+            user: self.user.max(other.user),
+            system: self.system.max(other.system),
+            idle: self.idle.max(other.idle),
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct CPUStats {
     pub core_stats: Vec<CPUStat>, // One for each core
     pub all_stats: CPUStat,
+}
+
+impl CPUStats {
+    fn max(self, other: Self) -> Self {
+        let len = self.core_stats.len().max(other.core_stats.len());
+        let core_stats = (0..len)
+            .map(|i| {
+                let a = self.core_stats.get(i).copied().unwrap_or_default();
+                let b = other.core_stats.get(i).copied().unwrap_or_default();
+                a.max(b)
+            })
+            .collect();
+        Self {
+            all_stats: self.all_stats.max(other.all_stats),
+            core_stats,
+        }
+    }
 }
 
 /// Per-second network statistics from sar -n DEV output (eth0 only)
@@ -93,18 +306,84 @@ pub struct NetworkStats {
     pub tx_bytes_per_sec: f64,
 }
 
+impl NetworkStats {
+    fn max(self, other: Self) -> Self {
+        Self {
+            rx_packets_per_sec: self.rx_packets_per_sec.max(other.rx_packets_per_sec),
+            tx_packets_per_sec: self.tx_packets_per_sec.max(other.tx_packets_per_sec),
+            rx_bytes_per_sec: self.rx_bytes_per_sec.max(other.rx_bytes_per_sec),
+            tx_bytes_per_sec: self.tx_bytes_per_sec.max(other.tx_bytes_per_sec),
+        }
+    }
+}
+
+/// Per-second memory statistics from sar -r output
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MemoryStats {
+    pub kb_mem_used: f64,
+    pub percent_mem_used: f64,
+    pub kb_buffers: f64,
+    pub kb_cached: f64,
+}
+
+impl MemoryStats {
+    fn max(self, other: Self) -> Self {
+        Self {
+            kb_mem_used: self.kb_mem_used.max(other.kb_mem_used),
+            percent_mem_used: self.percent_mem_used.max(other.percent_mem_used),
+            kb_buffers: self.kb_buffers.max(other.kb_buffers),
+            kb_cached: self.kb_cached.max(other.kb_cached),
+        }
+    }
+}
+
+/// Per-second aggregate I/O statistics from sar -b output
+#[derive(Debug, Default, Clone, Copy)]
+pub struct IOStats {
+    pub rtps: f64,          // read transfers per second
+    pub wtps: f64,          // write transfers per second
+    pub bread_per_sec: f64, // blocks read per second
+    pub bwrtn_per_sec: f64, // blocks written per second
+}
+
+impl IOStats {
+    fn max(self, other: Self) -> Self {
+        Self {
+            rtps: self.rtps.max(other.rtps),
+            wtps: self.wtps.max(other.wtps),
+            bread_per_sec: self.bread_per_sec.max(other.bread_per_sec),
+            bwrtn_per_sec: self.bwrtn_per_sec.max(other.bwrtn_per_sec),
+        }
+    }
+}
+
 /// Combined per-second sar statistics
 #[derive(Debug, Default, Clone)]
 pub struct SarStats {
     pub cpu: CPUStats,
     pub network: NetworkStats,
+    pub memory: MemoryStats,
+    pub io: IOStats,
+}
+
+impl SarStats {
+    fn max(self, other: Self) -> Self {
+        Self {
+            cpu: self.cpu.max(other.cpu),
+            network: self.network.max(other.network),
+            memory: self.memory.max(other.memory),
+            io: self.io.max(other.io),
+        }
+    }
 }
 
 /// Parses a single CPU line from sar -u -P ALL output.
 /// Returns (is_all, CPUStat) where is_all=true for the "all" aggregate line.
+/// Format: "HH:MM:SS CPU %user %nice %system %iowait %steal %idle"
 fn parse_cpu_line(line: &str) -> Option<(bool, CPUStat)> {
+    // Require "all" or a core number 0-999 (avoids matching memory lines with huge numbers)
     let cpu_regex = Regex::new(
-        r"\s(all|\d+)\s+(\d+\.?\d*)\s+\d+\.?\d*\s+(\d+\.?\d*)\s+\d+\.?\d*\s+\d+\.?\d*\s+(\d+\.?\d*)$",
+        r"\s(all|\d{1,3})\s+(\d+\.?\d*)\s+\d+\.?\d*\s+(\d+\.?\d*)\s+\d+\.?\d*\s+\d+\.?\d*\s+(\d+\.?\d*)$",
     )
     .unwrap();
 
@@ -118,16 +397,17 @@ fn parse_cpu_line(line: &str) -> Option<(bool, CPUStat)> {
 }
 
 /// Parses a single network line from sar -n DEV output (any non-loopback interface).
-/// Format: "HH:MM:SS AM/PM IFACE rxpck/s txpck/s rxkB/s txkB/s ..."
+/// Format: "HH:MM:SS IFACE rxpck/s txpck/s rxkB/s txkB/s [rxcmp/s txcmp/s rxmcst/s %ifutil]"
 /// Matches eth0, ens5, or any other interface name that isn't "lo".
 fn parse_network_line(line: &str) -> Option<NetworkStats> {
-    // Match any interface: captures interface name followed by numeric stats
+    // Require interface name to start with a letter (avoids matching bare numeric IO data lines)
     let iface_regex =
-        Regex::new(r"(\S+)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)").unwrap();
+        Regex::new(r"([a-zA-Z]\S*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)")
+            .unwrap();
 
     iface_regex.captures(line).and_then(|caps| {
         let iface = &caps[1];
-        // Skip loopback and header lines
+        // Skip loopback, docker, and header lines
         if iface == "lo" || iface == "docker0" || iface == "IFACE" {
             return None;
         }
@@ -144,11 +424,72 @@ fn parse_network_line(line: &str) -> Option<NetworkStats> {
     })
 }
 
-/// Parses `sar -n DEV -u -P ALL` output lines and returns per-second SarStats.
+/// Parses a single memory line from sar -r output.
+/// Format: "HH:MM:SS kbmemfree kbavail kbmemused %memused kbbuffers kbcached [kbcommit %commit kbactive kbinact kbdirty]"
+fn parse_memory_line(line: &str) -> Option<MemoryStats> {
+    // Require timestamp followed by two large integers (kbmemfree, kbavail) before the captured fields.
+    // The first field after timestamp must be a digit (not an interface name like "lo").
+    let re = Regex::new(r"\d+:\d+:\d+\s+(\d+)\s+\d+\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+)\s+(\d+)")
+        .unwrap();
+    re.captures(line).and_then(|caps| {
+        if line.contains("kbmemfree") {
+            return None;
+        }
+        // kbmemfree must be large (>10000) to distinguish from other numeric lines
+        let kbmemfree = caps[1].parse::<f64>().ok()?;
+        if kbmemfree < 10000.0 {
+            return None;
+        }
+        Some(MemoryStats {
+            kb_mem_used: caps[2].parse().ok()?,
+            percent_mem_used: caps[3].parse().ok()?,
+            kb_buffers: caps[4].parse().ok()?,
+            kb_cached: caps[5].parse().ok()?,
+        })
+    })
+}
+
+/// Parses a single I/O line from sar -b output.
+/// Format: "HH:MM:SS tps rtps wtps [dtps] bread/s bwrtn/s [bdscd/s]"
+/// Supports both 5-column (older) and 7-column (newer, with dtps/bdscd/s) formats.
+fn parse_io_line(line: &str) -> Option<IOStats> {
+    if line.contains("tps") {
+        return None;
+    }
+    // Try 7-column format first: tps rtps wtps dtps bread/s bwrtn/s bdscd/s
+    let re7 = Regex::new(
+        r"\d+:\d+:\d+\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+\d+\.?\d*\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+\d+\.?\d*\s*$",
+    ).unwrap();
+    if let Some(caps) = re7.captures(line) {
+        return Some(IOStats {
+            rtps: caps[2].parse().ok()?,
+            wtps: caps[3].parse().ok()?,
+            bread_per_sec: caps[4].parse().ok()?,
+            bwrtn_per_sec: caps[5].parse().ok()?,
+        });
+    }
+    // Fall back to 5-column format: tps rtps wtps bread/s bwrtn/s
+    let re5 = Regex::new(
+        r"\d+:\d+:\d+\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s*$",
+    )
+    .unwrap();
+    re5.captures(line).and_then(|caps| {
+        Some(IOStats {
+            rtps: caps[2].parse().ok()?,
+            wtps: caps[3].parse().ok()?,
+            bread_per_sec: caps[4].parse().ok()?,
+            bwrtn_per_sec: caps[5].parse().ok()?,
+        })
+    })
+}
+
+/// Parses `sar -n DEV -u -P ALL -r -b` output lines and returns per-second SarStats.
 /// Groups per-core CPU stats with the aggregate "all" line.
 pub fn parse_sar_output(lines: Vec<String>) -> Vec<SarStats> {
     let mut cpu_usages: Vec<CPUStats> = vec![];
     let mut network_usages = vec![];
+    let mut memory_usages = vec![];
+    let mut io_usages = vec![];
 
     for line in &lines {
         if let Some((is_all, stat)) = parse_cpu_line(line) {
@@ -163,20 +504,31 @@ pub fn parse_sar_output(lines: Vec<String>) -> Vec<SarStats> {
             }
         } else if let Some(network) = parse_network_line(line) {
             network_usages.push(network);
+        } else if let Some(memory) = parse_memory_line(line) {
+            memory_usages.push(memory);
+        } else if let Some(io) = parse_io_line(line) {
+            io_usages.push(io);
         }
     }
 
+    let len = cpu_usages.len();
     assert!(
-        cpu_usages.len().abs_diff(network_usages.len()) <= 1,
+        len.abs_diff(network_usages.len()) <= 1,
         "sar output mismatch: {} cpu vs {} network entries",
-        cpu_usages.len(),
+        len,
         network_usages.len(),
     );
 
     cpu_usages
         .into_iter()
         .zip(network_usages)
-        .map(|(cpu, network)| SarStats { cpu, network })
+        .enumerate()
+        .map(|(i, (cpu, network))| SarStats {
+            cpu,
+            network,
+            memory: memory_usages.get(i).copied().unwrap_or_default(),
+            io: io_usages.get(i).copied().unwrap_or_default(),
+        })
         .collect()
 }
 
@@ -281,18 +633,16 @@ fn inject_perf_node(
     }
 }
 
-pub fn inject_perf(ir: &mut [HydroRoot], folded_data: Vec<u8>) -> f64 {
-    let (id_to_usage, unidentified_usage) = parse_perf(String::from_utf8(folded_data).unwrap());
+pub fn inject_perf(ir: &mut [HydroRoot], id_to_usage: &HashMap<(usize, bool), f64>) {
     traverse_dfir(
         ir,
         |root, next_stmt_id| {
-            inject_perf_root(root, &id_to_usage, next_stmt_id);
+            inject_perf_root(root, id_to_usage, next_stmt_id);
         },
         |node, next_stmt_id| {
-            inject_perf_node(node, &id_to_usage, next_stmt_id);
+            inject_perf_node(node, id_to_usage, next_stmt_id);
         },
     );
-    unidentified_usage
 }
 
 /// Returns (op_id, count)
@@ -328,10 +678,12 @@ fn inject_count_node(
         | HydroNode::Difference { metadata, .. }
         | HydroNode::AntiJoin { metadata, .. }
         | HydroNode::FlatMap { metadata, .. }
+        | HydroNode::FlatMapStreamBlocking { metadata, .. }
         | HydroNode::Filter { metadata, .. }
         | HydroNode::FilterMap { metadata, .. }
         | HydroNode::Unique { metadata, .. }
         | HydroNode::Scan { metadata, .. }
+        | HydroNode::ScanAsyncBlocking { metadata, .. }
         | HydroNode::Fold { metadata, .. } // Output 1 value per tick
         | HydroNode::Reduce { metadata, .. } // Output 1 value per tick
         | HydroNode::FoldKeyed { metadata, .. }
@@ -366,6 +718,7 @@ fn inject_count_node(
         | HydroNode::YieldConcat { inner: input, metadata }
         | HydroNode::ResolveFutures { input, metadata }
         | HydroNode::ResolveFuturesOrdered { input, metadata }
+        | HydroNode::ResolveFuturesBlocking { input, metadata }
         => {
             metadata.cardinality = input.metadata().cardinality;
         }
@@ -395,20 +748,46 @@ async fn drain_receiver(receiver: &mut UnboundedReceiver<String>) -> Vec<String>
     lines
 }
 
-pub async fn analyze_perf(process: &impl DeployCrateWrapper, ir: &mut [HydroRoot]) -> f64 {
+pub async fn analyze_perf(process: &impl DeployCrateWrapper) -> (HashMap<(usize, bool), f64>, f64) {
     let underlying = process.underlying();
     let perf_results = underlying.tracing_results().unwrap();
 
-    // Inject perf usages into metadata, return unidentified perf
-    inject_perf(ir, perf_results.folded_data.clone())
+    let folded_data = perf_results.folded_data.clone();
+    parse_perf(String::from_utf8(folded_data).unwrap())
+}
+
+/// Merges `src` into `dst`, keeping the max value for each key.
+fn merge_max<K: Eq + std::hash::Hash, V: PartialOrd + Copy>(
+    dst: &mut HashMap<K, V>,
+    src: HashMap<K, V>,
+) {
+    for (k, v) in src {
+        dst.entry(k)
+            .and_modify(|existing| {
+                if v > *existing {
+                    *existing = v;
+                }
+            })
+            .or_insert(v);
+    }
+}
+
+/// Element-wise max merge of a time series, extending `dst` as needed.
+fn merge_max_vec<T: Clone>(dst: &mut Vec<T>, src: &[T], max_fn: fn(T, T) -> T) {
+    for (i, s) in src.iter().enumerate() {
+        if i >= dst.len() {
+            dst.push(s.clone());
+        } else {
+            dst[i] = max_fn(dst[i].clone(), s.clone());
+        }
+    }
 }
 
 pub async fn analyze_cluster_results(
     nodes: &DeployResult<'_, HydroDeploy>,
     ir: &mut [HydroRoot],
     mut cluster_metrics: HashMap<(LocationId, String, usize), MetricLogs>,
-    client_id: &LocationId,
-    measurement_second: Option<usize>,
+    optimizations: &Optimizations,
 ) -> RunMetadata {
     let mut run_metadata = RunMetadata::default();
     let mut op_to_count = HashMap::new();
@@ -416,10 +795,6 @@ pub async fn analyze_cluster_results(
     // Drain all receivers and parse in parallel across all nodes
     let mut set = tokio::task::JoinSet::new();
     for ((location, name, idx), mut metrics) in cluster_metrics.drain() {
-        if location == *client_id && idx > 0 {
-            // Only analyze the client with index 0, since all clients should have similar perf. Saves time
-            continue;
-        }
         set.spawn(async move {
             println!("Analyzing cluster {:?}: {}", name, idx);
             let (sar_stats, op_to_count, throughputs, latencies) = tokio::join!(
@@ -450,39 +825,37 @@ pub async fn analyze_cluster_results(
         ));
     }
 
-    for (id, name, _cluster) in nodes.get_all_clusters() {
+    for (id, name, cluster) in nodes.get_all_clusters() {
+        if optimizations.exclude.contains(&id.key()) {
+            continue;
+        }
+
         let cluster_data = drained.get(&(id.clone(), name.to_string())).unwrap();
 
-        // Find the node with max CPU usage
-        let max_usage = cluster_data.iter().reduce(|max_data, data| {
-            let stat = measurement_second
-                .and_then(|s| data.0.get(s))
-                .or_else(|| data.0.last());
-            let max_stat = measurement_second
-                .and_then(|s| max_data.0.get(s))
-                .or_else(|| max_data.0.last());
-            match (stat, max_stat) {
-                (Some(s), Some(ms))
-                    if s.cpu.all_stats.user + s.cpu.all_stats.system
-                        > ms.cpu.all_stats.user + ms.cpu.all_stats.system =>
-                {
-                    data
-                }
-                _ => max_data,
-            }
-        });
+        // Take max of each metric across all nodes in the cluster
+        let mut max_sar: Vec<SarStats> = vec![];
+        let mut max_counters: HashMap<usize, usize> = HashMap::new();
 
-        if let Some((max_sar_stat, counters, _, _)) = max_usage {
-            // Parse perf
-            // let unidentified_perf = analyze_perf(cluster.members().get(*idx).unwrap(), ir).await;
-            op_to_count.extend(counters.clone());
+        for (sar_stats, counters, _, _) in cluster_data {
+            merge_max_vec(&mut max_sar, sar_stats, SarStats::max);
+            merge_max(&mut max_counters, counters.clone());
+        }
 
-            // run_metadata
-            //     .unaccounted_perf
-            //     .insert(id.clone(), unidentified_perf);
-            run_metadata
-                .sar_stats
-                .insert(id.clone(), max_sar_stat.clone());
+        merge_max(&mut op_to_count, max_counters);
+
+        // Aggregate perf across all members
+        let mut max_unidentified = 0.0f64;
+        for member in cluster.members() {
+            let (perf_usage, unidentified_perf) = analyze_perf(&member).await;
+            merge_max(&mut run_metadata.perf, perf_usage);
+            max_unidentified = max_unidentified.max(unidentified_perf);
+        }
+        run_metadata
+            .unaccounted_perf
+            .insert(id.clone(), max_unidentified);
+
+        if !max_sar.is_empty() {
+            run_metadata.sar_stats.insert(id.clone(), max_sar);
         }
     }
 
@@ -499,6 +872,8 @@ pub async fn analyze_cluster_results(
     }
 
     inject_count(ir, &op_to_count);
+    inject_perf(ir, &run_metadata.perf);
+    run_metadata.counters = op_to_count;
     run_metadata
 }
 

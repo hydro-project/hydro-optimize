@@ -1206,7 +1206,6 @@ mod tests {
         c: Option<usize>,
     }
 
-    #[expect(dead_code, reason = "Not actually dead, used for testing below")]
     struct TestNestedStruct {
         struct_1: TestStruct,
         struct_2: TestStruct,

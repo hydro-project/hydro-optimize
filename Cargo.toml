@@ -8,16 +8,16 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-hydro_lang = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git" }
-hydro_std = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git" }
-hydro_test = { version = "0.0.0", git = "https://github.com/hydro-project/hydro.git" }
-dfir_lang = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git" }
-hydro_build_utils = { version = "0.0.1", git = "https://github.com/hydro-project/hydro.git", features = ["insta"] }
-hydro_deploy = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git", features = ["profile-folding"] }
-include_mdtests = { version = "0.0.0", git = "https://github.com/hydro-project/hydro.git" }
+hydro_lang = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git", rev = "e5099aaa" }
+hydro_std = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git", rev = "e5099aaa" }
+hydro_test = { version = "0.0.0", git = "https://github.com/hydro-project/hydro.git", rev = "e5099aaa" }
+dfir_lang = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git", rev = "e5099aaa" }
+hydro_build_utils = { version = "0.0.1", git = "https://github.com/hydro-project/hydro.git", rev = "e5099aaa", features = ["insta"] }
+hydro_deploy = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git", rev = "e5099aaa", features = ["profile-folding"] }
+include_mdtests = { version = "0.0.0", git = "https://github.com/hydro-project/hydro.git", rev = "e5099aaa" }
 serde = { version = "1.0.197", features = ["derive"] }
-stageleft = "0.13.2"
-stageleft_tool = "0.13.2"
+stageleft = "0.13.4"
+stageleft_tool = "0.13.4"
 tokio = { version = "1.29.0", features = ["full"] }
 ctor = "0.2"
 clap = { version = "4.4", features = ["derive"] }

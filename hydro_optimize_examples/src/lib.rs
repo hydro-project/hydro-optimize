@@ -1,7 +1,11 @@
 #[cfg(stageleft_runtime)]
 hydro_lang::setup!();
 
+<<<<<<< HEAD
 pub mod flink_queries;
+=======
+pub mod compare_and_swap;
+>>>>>>> main
 pub mod lock_server;
 pub mod network_calibrator;
 pub mod simple_kv_bench;
