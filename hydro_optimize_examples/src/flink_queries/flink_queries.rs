@@ -45,7 +45,9 @@ pub struct Bid {
 */
 
 pub fn q1<'a, PerformanceKey>(
+    _: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
     bid_stream: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
+    _: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
 ) -> KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>
 where
     PerformanceKey: Clone,
@@ -60,12 +62,14 @@ where
 }
 
 pub fn q2<'a, PerformanceKey>(
+    _: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
     bid_stream: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
-) -> KeyedStream<PerformanceKey, (i64, i64), Process<'a, Queries>, Unbounded, NoOrder> {
+    _: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
+) -> KeyedStream<PerformanceKey, Option<(i64, i64)>, Process<'a, Queries>, Unbounded, NoOrder> {
     /*
         Find bids with specific auction ids and show their bid price.
     */
-    bid_stream.filter_map(q!(|bid_obj| {
+    bid_stream.map(q!(|bid_obj| {
         if bid_obj.auction % 123 == 0 {
             Some((bid_obj.auction, bid_obj.price))
         } else {
@@ -74,12 +78,14 @@ pub fn q2<'a, PerformanceKey>(
     }))
 }
 
+// TODO: Condense into vec
 pub fn q3<'a, PerformanceKey>(
     auction_stream: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
+    _: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
     person_stream: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
 ) -> KeyedStream<
     PerformanceKey,
-    (String, String, String, i64),
+    Option<(String, String, String, i64)>,
     Process<'a, Queries>,
     Unbounded,
     NoOrder,
@@ -88,32 +94,40 @@ pub fn q3<'a, PerformanceKey>(
         Who is selling in OR, ID or CA in category 10, and for what auction ids?
         Illustrates an incremental join (using per-key state and timer) and filter.
     */
-    let cat10_auctions = auction_stream.entries().filter_map(q!(|(pk, a)| {
-        if a.category == 10 {
-            Some((a.seller, (a, pk)))
-        } else {
-            None
-        }
-    }));
-    let or_id_ca_persons = person_stream.entries().filter_map(q!(|(pk, p)| {
-        if p.state == "OR" || p.state == "CA" || p.state == "ID" {
-            Some((p.id, (p, pk)))
-        } else {
-            None
-        }
-    }));
 
-    or_id_ca_persons
-        .join(cat10_auctions)
+    let (cat10_auctions, filtered_out) = auction_stream
+        .entries()
+        .partition(q!(|(_, a)| a.category == 10));
+
+    let formatted_cat10s = cat10_auctions.map(q!(|(pk, a)| (a.seller, (a, pk))));
+    let cat10_filtered_out = filtered_out.map(q!(|(pk, _)| (pk, None))).into_keyed();
+
+    let (or_id_ca_persons, filtered_out) = person_stream
+        .entries()
+        .partition(q!(|(_, p)| ["OR", "CA", "ID"].contains(&p.state.as_str())));
+
+    let formatted_states = or_id_ca_persons.map(q!(|(pk, p)| (p.id, (p, pk))));
+    let state_filtered_out = filtered_out.map(q!(|(pk, _)| (pk, None))).into_keyed();
+    let joined = formatted_states
+        .join(formatted_cat10s)
         .map(q!(|p_a| {
             let (p_pk, a_pk) = p_a.1;
-            (p_pk.1, (p_pk.0.name, p_pk.0.city, p_pk.0.state, a_pk.0.id))
+            (
+                p_pk.1,
+                Some((p_pk.0.name, p_pk.0.city, p_pk.0.state, a_pk.0.id)),
+            )
         }))
-        .into_keyed()
+        .into_keyed();
+
+    joined
+        .merge_unordered(state_filtered_out)
+        .merge_unordered(cat10_filtered_out)
 }
 
 pub fn q11<'a, PerformanceKey: Ord + Clone>(
+    _: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
     bid_stream: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
+    _: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
 ) -> KeyedStream<PerformanceKey, (i64, i32, i64, i64), Process<'a, Queries>, Unbounded, NoOrder> {
     /*
         How many bids did a user make in each session they were active? Illustrates session windows.
@@ -167,10 +181,12 @@ pub fn q11<'a, PerformanceKey: Ord + Clone>(
 }
 
 pub fn q14<'a, PerformanceKey>(
+    _: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
     bid_stream: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
+    _: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
 ) -> KeyedStream<
     PerformanceKey,
-    (i64, i64, f64, String, i64, String, i64),
+    Option<(i64, i64, f64, String, i64, String, i64)>,
     Process<'a, Queries>,
     Unbounded,
     NoOrder,
@@ -179,7 +195,7 @@ pub fn q14<'a, PerformanceKey>(
         Convert bid timestamp into types and find bids with specific price.
         Illustrates duplicate expressions and usage of user-defined-functions.
     */
-    bid_stream.filter_map(q!(|bid| {
+    bid_stream.map(q!(|bid| {
         if bid.price as f64 * 0.908 > 1000000.0 && bid.price as f64 * 0.908 < 50000000.0 {
             let mut bid_time_type = "otherTime";
             let bid_hour = bid.date_time; // Using just seconds for testing
@@ -205,7 +221,9 @@ pub fn q14<'a, PerformanceKey>(
 }
 
 pub fn q17<'a, PerformanceKey>(
+    _: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
     bid_stream: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
+    _: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
 ) -> KeyedStream<
     PerformanceKey,
     (i64, i64, i64, i64, i64, i32, i64, i64, i64, i64),
@@ -274,7 +292,9 @@ pub fn q17<'a, PerformanceKey>(
 }
 
 pub fn q18<'a, PerformanceKey>(
+    _: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
     bid_stream: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
+    _: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
 ) -> KeyedStream<PerformanceKey, (i64, i64, i64, i64), Process<'a, Queries>, Unbounded, NoOrder> {
     /*
         What's a's last bid for bidder to auction?
@@ -320,7 +340,9 @@ pub fn q18<'a, PerformanceKey>(
 }
 
 pub fn q19<'a, PerformanceKey: Ord + Clone>(
+    _: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
     bid_stream: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
+    _: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
 ) -> KeyedStream<PerformanceKey, (usize, i64, i64), Process<'a, Queries>, Unbounded, NoOrder> {
     /*
         What's the top price 10 bids of an auction?
@@ -369,12 +391,14 @@ pub fn q19<'a, PerformanceKey: Ord + Clone>(
     sorted_price
 }
 
+// TODO: Condense into vec
 pub fn q20<'a, PerformanceKey>(
     auction_stream: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
     bid_stream: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
+    _: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
 ) -> KeyedStream<
     PerformanceKey,
-    (i64, i64, String, i64, i64, i64),
+    Option<(i64, i64, String, i64, i64, i64)>,
     Process<'a, Queries>,
     Unbounded,
     NoOrder,
@@ -383,38 +407,39 @@ pub fn q20<'a, PerformanceKey>(
         Get bids with the corresponding auction information where category is 10.
         Illustrates a filter join.
     */
-    let cat_10_auctions = auction_stream.entries().filter_map(q!(|(pk, a)| {
-        if a.category == 10 {
-            Some((a.id, (a, pk)))
-        } else {
-            None
-        }
-    }));
+    let (cat10_auctions, filtered_out) = auction_stream
+        .entries()
+        .partition(q!(|(_, a)| a.category == 10));
+
+    let formatted_cat10s = cat10_auctions.map(q!(|(pk, a)| (a.id, (a, pk))));
+    let cat10_filtered_out = filtered_out.map(q!(|(pk, _)| (pk, None))).into_keyed();
 
     let formatted_bids = bid_stream.entries().map(q!(|(pk, b)| (b.auction, (b, pk))));
-    let join = cat_10_auctions.join(formatted_bids);
+    let join = formatted_cat10s.join(formatted_bids);
     let select = join
         .map(q!(|elem| {
             let ((a, pk1), (b, _)) = elem.1;
             (
                 pk1,
-                (
+                Some((
                     b.auction,
                     b.date_time,
                     a.item_name,
                     a.date_time,
                     a.seller,
                     a.category,
-                ),
+                )),
             )
         }))
         .into_keyed();
 
-    select
+    select.merge_unordered(cat10_filtered_out)
 }
 
 pub fn q22<'a, PerformanceKey>(
+    _: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
     bid_stream: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
+    _: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
 ) -> KeyedStream<
     PerformanceKey,
     (i64, i64, i64, String, String, String, String),
@@ -440,6 +465,7 @@ pub fn q22<'a, PerformanceKey>(
     }))
 }
 
+// TODO: Condense into vec
 pub fn q23<'a, PerformanceKey>(
     auction_stream: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
     bid_stream: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
