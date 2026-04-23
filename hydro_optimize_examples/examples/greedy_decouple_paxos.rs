@@ -11,7 +11,7 @@ use hydro_optimize::deploy_and_analyze::{
 };
 use hydro_optimize::greedy_decouple_analysis::greedy_decouple_analysis;
 use hydro_optimize::repair::inject_id;
-use hydro_optimize::rewrites::{Rewrite, RewriteMetadata, replay};
+use hydro_optimize::rewrites::{Rewrite, replay};
 use hydro_optimize_examples::print_parseable_bench_results;
 use hydro_test::cluster::paxos::{CorePaxos, PaxosConfig};
 use stageleft::q;
@@ -81,16 +81,13 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
     });
     let mut ir = deep_clone(built.ir());
     let decision = greedy_decouple_analysis(&mut ir, &proposers.id());
-    let decouple = Rewrite::Decouple {
-        decision,
-        orig_location: proposers.id(),
+    let rewrite = Rewrite {
+        possible_rewrite: decision,
+        num_partitions: 0,
+        original_node: proposers.id(),
+        cluster_size: f + 1,
     };
-    let rewrite_metadata = RewriteMetadata {
-        node: proposers.id(),
-        num_nodes: f + 1,
-        rewrite: decouple,
-    };
-    let (new_proposer_nodes, new_builder) = replay(vec![rewrite_metadata], built);
+    let (new_proposer_nodes, new_builder) = replay(vec![rewrite], built);
     let new_proposer_ids_with_name_num = new_proposer_nodes
         .iter()
         .enumerate()
@@ -131,6 +128,7 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
         client_id,
         optimizations,
         location_id_to_cluster,
+        scenario_binary: None,
     }
 }
 

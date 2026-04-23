@@ -12,7 +12,8 @@ use hydro_lang::{
 
 use crate::rewrites::can_decouple;
 use crate::{
-    decoupler::DecoupleDecision, repair::cycle_source_to_sink_input, rewrites::op_id_to_parents,
+    decouple_analysis::PossibleRewrite, repair::cycle_source_to_sink_input,
+    rewrites::op_id_to_parents,
 };
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -72,13 +73,21 @@ fn assign_location_node(
 
     let key = key_to_loc.new_key(());
     op_to_key.insert(*op_id, key);
+
+    // Partition must share its inner's location because of how emit_core generates DFIR
+    if let HydroNode::Partition { inner, .. } = node {
+        let inner_id = inner.0.borrow().metadata().op.id.unwrap();
+        if let Some(&inner_key) = op_to_key.get(&inner_id) {
+            key_to_loc.union(key, inner_key);
+        }
+    }
 }
 
 /// Decouples as much as possible; only leaving ticked regions un-decoupled.
 pub fn greedy_decouple_analysis(
     ir: &mut [HydroRoot],
     node_to_decouple: &LocationId,
-) -> DecoupleDecision {
+) -> PossibleRewrite {
     let mut op_to_key = HashMap::new();
     let mut key_to_loc = UnificationTable::<InPlace<UnitKey>>::default();
     let mut tick_to_ops = HashMap::new();
@@ -155,10 +164,31 @@ pub fn greedy_decouple_analysis(
         }
     }
 
-    let mut decision = DecoupleDecision::default();
-    for (op_id, key) in op_to_key {
-        decision.insert(op_id, key_to_loc.find(key).0 as usize);
+    let mut op_to_loc = HashMap::new();
+    for (op_id, key) in &op_to_key {
+        op_to_loc.insert(*op_id, key_to_loc.find(*key).0 as usize);
     }
-    println!("Greedy decouple decision: {:#?}", decision);
-    decision
+
+    // Build PossibleRewrite: separate placement from network insertion
+    let cross_loc_parents = op_id_to_parents(ir, None, &cycles);
+    let mut result = PossibleRewrite::default();
+    for (&op_id, &loc) in &op_to_loc {
+        // If parents are at a different location, a network is needed.
+        // Both parents will be at the same location so checking one suffices.
+        if let Some(parents) = cross_loc_parents.get(&op_id)
+            && let Some(parent) = parents.first()
+            && let Some(&parent_loc) = op_to_loc.get(parent)
+            && parent_loc != loc
+        {
+            result.add_network(parent_loc, loc, op_id);
+        }
+    }
+    result.op_to_loc = op_to_loc;
+
+    println!(
+        "Greedy decouple result: {} placements, {} new network edges",
+        result.op_to_loc.len(),
+        result.op_to_network.len()
+    );
+    result
 }

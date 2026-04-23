@@ -1,8 +1,10 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
-use crate::decoupler::DecoupleDecision;
+use serde::{Deserialize, Serialize};
+
 use crate::partition_ilp_analysis::partition_ilp_analysis;
+use crate::partition_syn_analysis::StructOrTupleIndex;
 use crate::rewrites::op_id_to_parents;
 use good_lp::solvers::highs::HighsSolution;
 use good_lp::{
@@ -68,7 +70,7 @@ fn var_from_op_id(
             for loc in 0..num_locations {
                 let var = variables.add(variable().binary());
                 loc_to_var.insert(loc, var);
-                sum_expr = sum_expr + var;
+                sum_expr += var;
             }
             // Constrain sum to 1 (var is assigned to exactly 1 location)
             constraints.push(constraint!(sum_expr == 1));
@@ -97,7 +99,7 @@ fn add_equality_constr(
             let op_vars = var_from_op_id(*op, num_locations, op_id_to_var, variables, constraints);
             // For each locations, the vars between prev_op and op must be equal
             for (loc, prev_op_var) in &prev_op_vars {
-                let op_var = op_vars.get(&loc).unwrap();
+                let op_var = op_vars.get(loc).unwrap();
                 constraints.push(constraint!(*prev_op_var == *op_var));
             }
 
@@ -387,11 +389,28 @@ fn decouple_analysis_node(
         return;
     }
 
-    // Add decoupling overhead. For Tees of the same inner, even if multiple are decoupled, only penalize decoupling once
-    if let HydroNode::Tee {
+    if let HydroNode::Partition { inner, .. } = node {
+        // Partition must share its inner's location because of how emit_core generates DFIR
+        let inner_id = inner.0.borrow().metadata().op.id.unwrap();
+        let DecoupleILPMetadata {
+            variables,
+            constraints,
+            num_locations,
+            op_id_to_var,
+            ..
+        } = &mut *decoupling_metadata.borrow_mut();
+        add_equality_constr(
+            &[inner_id, *op_id],
+            *num_locations,
+            op_id_to_var,
+            variables,
+            constraints,
+        );
+    } else if let HydroNode::Tee {
         inner, metadata, ..
     } = node
     {
+        // Add decoupling overhead. For Tees of the same inner, even if multiple are decoupled, only penalize decoupling once
         add_tee_decoupling_overhead(
             inner.0.borrow().metadata().op.id.unwrap(),
             metadata,
@@ -453,6 +472,42 @@ fn op_loc(op_vars: &HashMap<usize, Variable>, solution: &HighsSolution) -> usize
     panic!("No location assigned to op");
 }
 
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct PossibleRewrite {
+    /// op_id → its new location (where its output streams to)
+    pub op_to_loc: HashMap<usize, usize>,
+    /// op_id → (src_loc, dst_loc). A new network should be inserted before this op
+    /// from src_loc to dst_loc. The network's location is dst_loc.
+    pub op_to_network: HashMap<usize, (usize, usize)>,
+    /// Location indices that can be arbitrarily partitioned because it does not persist.
+    pub stateless_partitionable: HashSet<usize>,
+    /// Location indices that are partitionable via a field
+    pub field_partitionable: HashSet<usize>,
+    pub partitionable: HashSet<usize>, // Union of stateless_partitionable and field_partitionable
+    /// For each op, what field it should be partitioned on
+    pub partition_field_choices: HashMap<usize, StructOrTupleIndex>,
+}
+
+impl PossibleRewrite {
+    /// All unique location indices referenced.
+    pub fn locations(&self) -> HashSet<usize> {
+        let mut locs: HashSet<usize> = self.op_to_loc.values().copied().collect();
+        for (s, d) in self.op_to_network.values() {
+            locs.insert(*s);
+            locs.insert(*d);
+        }
+        locs
+    }
+
+    pub fn num_locations(&self) -> usize {
+        self.locations().len()
+    }
+
+    pub fn add_network(&mut self, src: usize, dst: usize, op_id: usize) {
+        self.op_to_network.insert(op_id, (src, dst));
+    }
+}
+
 pub(crate) fn decouple_analysis(
     ir: &mut [HydroRoot],
     bottleneck: &LocationId,
@@ -461,7 +516,7 @@ pub(crate) fn decouple_analysis(
     num_locations: usize,
     cycle_source_to_sink_parent: &HashMap<usize, usize>,
     consider_partitioning: bool,
-) -> DecoupleDecision {
+) -> PossibleRewrite {
     if num_locations < 2 {
         panic!("Must decouple to at least 2 locations (original location, decoupled location)");
     }
@@ -504,17 +559,105 @@ pub(crate) fn decouple_analysis(
     }
 
     // Consider partitioning after all variables for decoupling have been created
-    if consider_partitioning {
-        partition_ilp_analysis(ir, &op_id_to_parents, &decoupling_metadata);
-    }
+    let partition_metadata = if consider_partitioning {
+        Some(partition_ilp_analysis(
+            ir,
+            &op_id_to_parents,
+            &decoupling_metadata,
+        ))
+    } else {
+        None
+    };
 
     let solution = solve(&decoupling_metadata);
 
-    let mut op_to_new_loc = DecoupleDecision::default();
-    for (op_id, vars) in decoupling_metadata.borrow().op_id_to_var.iter() {
-        let op_location = op_loc(vars, &solution);
-        op_to_new_loc.insert(*op_id, op_location);
+    // Build the DecoupleDecision by separating placement ops from network-insertion ops.
+    let DecoupleILPMetadata {
+        op_id_to_var,
+        network_ids,
+        ..
+    } = &*decoupling_metadata.borrow();
+
+    let mut result = PossibleRewrite::default();
+    for (&op_id, parents) in &op_id_to_parents {
+        let Some(op_vars) = op_id_to_var.get(&op_id) else {
+            continue;
+        };
+        let op_location = op_loc(op_vars, &solution);
+        let parent_location = parents
+            .first()
+            .and_then(|p| op_id_to_var.get(p))
+            .map(|pv| op_loc(pv, &solution));
+
+        let network_type = network_ids.get(&op_id);
+
+        if network_type.is_none()
+            && let Some(parent_loc) = parent_location
+        {
+            // Non-network op: if parent is at a different location, record a new network edge
+            if parent_loc != op_location {
+                result.add_network(parent_loc, op_location, op_id);
+            }
+        }
+
+        // Place sources, network recv/sendrecv, and non-network ops.
+        // Do NOT place network send-only nodes (they live on other clusters).
+        if !network_type.is_some_and(|t| *t == NetworkType::Send) {
+            result.op_to_loc.insert(op_id, op_location);
+        }
     }
 
-    op_to_new_loc
+    // Evaluate per-location partitionability
+    if let Some(pm) = partition_metadata {
+        for loc in 0..num_locations {
+            let num_relevant = solution
+                .eval(
+                    pm.num_relevant_operators
+                        .get(&loc)
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+                .round() as i64;
+            let num_partitionable = solution
+                .eval(
+                    pm.partitionable_operators
+                        .get(&loc)
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+                .round() as i64;
+            let num_persists = solution
+                .eval(
+                    pm.num_persist_operators
+                        .get(&loc)
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+                .round() as i64;
+            if num_persists == 0 {
+                result.stateless_partitionable.insert(loc);
+            } else if num_relevant == num_partitionable {
+                result.field_partitionable.insert(loc);
+            }
+        }
+
+        // Resolve per-op field choices from the ILP solution. For each op that has field
+        // variables, find which field the solver set to 1 (if any).
+        for (op_id, fields) in &pm.op_id_to_field_vars {
+            if let Some((name, _)) = fields
+                .iter()
+                .find(|(_, var)| solution.value(**var).round() == 1.0)
+            {
+                result.partition_field_choices.insert(*op_id, name.clone());
+            }
+        }
+    }
+
+    result.partitionable = result
+        .stateless_partitionable
+        .union(&result.field_partitionable)
+        .copied()
+        .collect();
+
+    result
 }

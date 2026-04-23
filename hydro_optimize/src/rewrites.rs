@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use hydro_lang::compile::builder::FlowBuilder;
 use hydro_lang::compile::built::BuiltFlow;
@@ -9,33 +9,25 @@ use hydro_lang::compile::ir::{
     traverse_dfir,
 };
 use hydro_lang::location::dynamic::LocationId;
-use hydro_lang::location::{Cluster, LocationKey};
+use hydro_lang::location::{Cluster, Location, LocationKey};
 use proc_macro2::{Span, TokenStream};
 use quote::{ToTokens, quote};
 use serde::{Deserialize, Serialize};
 use syn::parse_quote;
 use syn::visit_mut::{self, VisitMut};
 
-use crate::decoupler::{self, DecoupleDecision};
-use crate::partitioner::Partitioner;
+use crate::decouple_analysis::PossibleRewrite;
+use crate::decoupler;
 
 #[derive(Clone, Serialize, Deserialize)]
-pub enum Rewrite {
-    Decouple {
-        decision: DecoupleDecision,
-        orig_location: LocationId,
-    },
-    Partition(Partitioner),
+pub struct Rewrite {
+    pub possible_rewrite: PossibleRewrite,
+    pub num_partitions: usize,
+    pub original_node: LocationId,
+    pub cluster_size: usize,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-pub struct RewriteMetadata {
-    pub node: LocationId,
-    pub num_nodes: usize,
-    pub rewrite: Rewrite,
-}
-
-pub type Rewrites = Vec<RewriteMetadata>;
+pub type Rewrites = Vec<Rewrite>;
 
 /// Replays the rewrites in order.
 /// Returns Vec(Cluster, number of nodes) for each created cluster and a new FlowBuilder
@@ -48,23 +40,25 @@ pub fn replay<'a>(
     let mut ir = deep_clone(built.ir());
     let mut builder = FlowBuilder::from_built(&built);
 
-    // Apply decoupling/partitioning in order
-    for rewrite_metadata in rewrites {
-        match rewrite_metadata.rewrite {
-            Rewrite::Decouple {
-                decision,
-                orig_location,
-            } => {
-                let new_clusters =
-                    decoupler::decouple(&mut ir, decision, &orig_location, &mut builder);
-                for cluster in new_clusters {
-                    all_new_clusters.push((cluster, rewrite_metadata.num_nodes));
-                }
-            }
-            Rewrite::Partition(_partitioner) => {
-                panic!("Partitioning is not yet replayable");
+    for rewrite in rewrites {
+        let location_indices: HashSet<usize> =
+            rewrite.possible_rewrite.locations().into_iter().collect();
+        assert!(
+            !location_indices.is_empty() && location_indices.contains(&0),
+            "Rewrite must have at least the original location"
+        );
+        let mut locations_map = HashMap::new();
+        for idx in location_indices {
+            // idx 0 is the original cluster
+            if idx == 0 {
+                locations_map.insert(0, rewrite.original_node.clone());
+            } else {
+                let cluster = builder.cluster::<()>();
+                locations_map.insert(idx, cluster.id().clone());
+                all_new_clusters.push((cluster, rewrite.cluster_size));
             }
         }
+        decoupler::decouple(&mut ir, &rewrite, &locations_map);
     }
 
     builder.replace_ir(ir);
@@ -74,16 +68,10 @@ pub fn replay<'a>(
 
 /// Replace CLUSTER_SELF_ID with the ID of the original node the partition is assigned to
 #[derive(Copy, Clone)]
-pub enum ClusterSelfIdReplace {
-    Decouple {
-        orig_cluster_id: LocationKey,
-        decoupled_cluster_id: LocationKey,
-    },
-    Partition {
-        num_partitions: usize,
-        partitioned_cluster_id: LocationKey,
-        op_id: usize,
-    },
+pub struct ClusterSelfIdReplace {
+    pub orig_cluster_id: LocationKey,
+    pub new_cluster_id: LocationKey,
+    pub num_partitions: usize,
 }
 
 impl VisitMut for ClusterSelfIdReplace {
@@ -91,38 +79,24 @@ impl VisitMut for ClusterSelfIdReplace {
         if let syn::Expr::Path(path_expr) = expr {
             for segment in path_expr.path.segments.iter_mut() {
                 let ident = segment.ident.to_string();
-
-                match self {
-                    ClusterSelfIdReplace::Decouple {
-                        orig_cluster_id,
-                        decoupled_cluster_id,
-                    } => {
-                        let prefix = format!("__hydro_lang_cluster_self_id_{}", orig_cluster_id);
-                        if ident.starts_with(&prefix) {
-                            segment.ident = syn::Ident::new(
-                                &format!("__hydro_lang_cluster_self_id_{}", decoupled_cluster_id),
-                                segment.ident.span(),
-                            );
-                            println!("Decoupling: Replaced CLUSTER_SELF_ID");
-                            return;
-                        }
+                let prefix = format!("__hydro_lang_cluster_self_id_{}", self.orig_cluster_id);
+                if ident.starts_with(&prefix) {
+                    if self.orig_cluster_id != self.new_cluster_id {
+                        segment.ident = syn::Ident::new(
+                            &format!("__hydro_lang_cluster_self_id_{}", self.new_cluster_id),
+                            segment.ident.span(),
+                        );
+                        println!("Decoupling: Replaced CLUSTER_SELF_ID");
                     }
-                    ClusterSelfIdReplace::Partition {
-                        num_partitions,
-                        partitioned_cluster_id,
-                        op_id,
-                    } => {
-                        let prefix =
-                            format!("__hydro_lang_cluster_self_id_{}", partitioned_cluster_id);
-                        if ident.starts_with(&prefix) {
-                            let expr_content = std::mem::replace(expr, syn::Expr::PLACEHOLDER);
-                            *expr = syn::parse_quote!({
-                                #expr_content / #num_partitions as u32
-                            });
-                            println!("Partitioning: Replaced CLUSTER_SELF_ID for node {}", op_id);
-                            return;
-                        }
+                    if self.num_partitions > 0 {
+                        let num_partitions = self.num_partitions;
+                        let expr_content = std::mem::replace(expr, syn::Expr::PLACEHOLDER);
+                        *expr = syn::parse_quote!({
+                            #expr_content / #num_partitions as u32
+                        });
+                        println!("Partitioning: Replaced CLUSTER_SELF_ID");
                     }
+                    return;
                 }
             }
         }
@@ -243,6 +217,16 @@ pub enum NetworkType {
     Recv,
     Send,
     SendRecv,
+}
+
+/// Returns true if the node is at the given location, treating Networks as present
+/// at both their send and receive locations.
+pub fn node_at_location(node: &HydroNode, location: &LocationId) -> bool {
+    if let HydroNode::Network { .. } = node {
+        get_network_type(node, location).is_some()
+    } else {
+        node.metadata().location_id.root() == location.root()
+    }
 }
 
 pub fn get_network_type(node: &HydroNode, location: &LocationId) -> Option<NetworkType> {

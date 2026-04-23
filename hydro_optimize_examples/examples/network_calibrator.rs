@@ -68,6 +68,7 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
         client_id,
         optimizations,
         location_id_to_cluster,
+        scenario_binary: None,
     }
 }
 

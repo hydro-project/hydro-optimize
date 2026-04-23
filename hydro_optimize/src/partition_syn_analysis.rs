@@ -137,7 +137,7 @@ impl StructOrTuple {
 
     pub(crate) fn get_all_nested_dependencies(&self) -> BTreeSet<StructOrTupleIndex> {
         let mut all_dependencies = self.dependencies.clone();
-        for (_, child) in &self.fields {
+        for child in self.fields.values() {
             let child_dependencies = child.get_all_nested_dependencies();
             all_dependencies.extend(child_dependencies);
         }
@@ -360,7 +360,7 @@ impl StructOrTuple {
             if let Some(child2) = tuple2.get_dependencies(&vec![field.clone()]) {
                 // Recursively compute unions. If child2 is empty, then just keep child1
                 if let Some(new_child) = StructOrTuple::union(child1, &child2) {
-                    *child1 = Box::new(new_child);
+                    **child1 = new_child;
                 }
             }
         }
@@ -420,6 +420,24 @@ impl StructOrTuple {
         } else {
             Some(new_child)
         }
+    }
+
+    pub(crate) fn to_syn_expr(mut tuple: syn::Expr, indices: &StructOrTupleIndex) -> syn::Expr {
+        for index in indices {
+            let member = if let Ok(num_index) = index.parse::<usize>() {
+                syn::Member::Unnamed(syn::Index::from(num_index))
+            } else {
+                syn::Member::Named(syn::Ident::new(index, proc_macro2::Span::call_site()))
+            };
+            let dot_token = <syn::Token![.]>::default();
+            tuple = syn::Expr::Field(syn::ExprField {
+                attrs: vec![],
+                base: Box::new(tuple),
+                dot_token,
+                member,
+            });
+        }
+        tuple
     }
 }
 
@@ -630,12 +648,9 @@ impl Visit<'_> for StructOrTupleUseRhs {
     }
 
     fn visit_expr_unary(&mut self, unary: &syn::ExprUnary) {
-        match unary.op {
-            syn::UnOp::Deref(_) => {
-                // Allow deref
-                self.visit_expr(&unary.expr);
-            }
-            _ => {}
+        if let syn::UnOp::Deref(_) = unary.op {
+            // Allow deref
+            self.visit_expr(&unary.expr);
         }
     }
 

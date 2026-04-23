@@ -34,7 +34,7 @@ pub fn all_inputs(ir: &mut [HydroRoot], location: &LocationId) -> Vec<usize> {
     traverse_dfir(
         ir,
         |_, _| {},
-        |node, next_stmt_id| match get_network_type(node, &location.root()) {
+        |node, next_stmt_id| match get_network_type(node, location.root()) {
             Some(NetworkType::Recv) | Some(NetworkType::SendRecv) => {
                 inputs.push(*next_stmt_id);
             }
@@ -45,16 +45,16 @@ pub fn all_inputs(ir: &mut [HydroRoot], location: &LocationId) -> Vec<usize> {
     inputs
 }
 
-pub struct InputDependencyMetadata {
+struct InputDependencyMetadata {
     // Const fields
-    pub location: LocationId,
-    pub inputs: Vec<usize>,
-    pub op_id_to_parents: HashMap<usize, Vec<usize>>,
+    location: LocationId,
+    inputs: Vec<usize>,
+    op_id_to_parents: HashMap<usize, Vec<usize>>,
     // Variables
-    pub optimistic_phase: bool, /* If true, tuple intersection continues even if one side does not exist */
-    pub input_taint: BTreeMap<usize, BTreeSet<usize>>, /* op_id -> set of input op_ids that taint this node */
-    pub input_dependencies: BTreeMap<usize, BTreeMap<usize, StructOrTuple>>, /* op_id -> (input op_id -> index of input in output) */
-    pub syn_analysis: BTreeMap<usize, StructOrTuple>, /* Cached results for analyzing f for each operator */
+    optimistic_phase: bool, /* If true, tuple intersection continues even if one side does not exist */
+    input_taint: BTreeMap<usize, BTreeSet<usize>>, /* op_id -> set of input op_ids that taint this node */
+    input_dependencies: BTreeMap<usize, BTreeMap<usize, StructOrTuple>>, /* op_id -> (input op_id -> index of input in output) */
+    syn_analysis: BTreeMap<usize, StructOrTuple>, /* Cached results for analyzing f for each operator */
 }
 
 impl Hash for InputDependencyMetadata {
@@ -613,7 +613,7 @@ pub fn partitioning_analysis(
     Vec<BTreeMap<usize, StructOrTupleIndex>>,
     BTreeMap<usize, usize>,
 )> {
-    let op_id_to_parents = op_id_to_parents(ir, Some(&location), cycle_source_to_sink_input);
+    let op_id_to_parents = op_id_to_parents(ir, Some(location), cycle_source_to_sink_input);
     let dependency_metadata = input_dependency_analysis(ir, location, op_id_to_parents);
     let mut possible_partitionings = BTreeMap::new();
 

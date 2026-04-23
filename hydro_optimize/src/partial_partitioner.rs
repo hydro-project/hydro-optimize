@@ -11,11 +11,11 @@ use serde::{Deserialize, Serialize};
 
 use stageleft::quote_type;
 
-use crate::decoupler::add_network_raw;
+use crate::decouple_analysis::PossibleRewrite;
+use crate::decoupler::{add_network_raw, decouple};
 use crate::partition_syn_analysis::StructOrTupleIndex;
-use crate::partitioner::{Partitioner, partition};
 use crate::rewrites::{
-    bounded_optional, bounded_singleton, bounded_stream, collection_kind_to_debug_type,
+    Rewrite, bounded_optional, bounded_singleton, bounded_stream, collection_kind_to_debug_type,
     deserialize_bincode_with_type, prepend_member_id_to_collection_kind,
     serialize_bincode_with_type, unbounded_stream,
 };
@@ -29,8 +29,8 @@ pub struct PartialPartitioner {
     pub nodes_after_replicated_output: HashSet<usize>, /* ID of Network recv node for replicated output */
     pub nodes_for_garbage_collection: HashSet<usize>,  /* ID of Network */
     pub num_partitions: usize,
+    pub cluster_size: usize,
     pub location_id: LocationId,
-    pub new_cluster_id: Option<LocationId>,
 }
 
 /// Shared state
@@ -1159,6 +1159,25 @@ fn handle_replicated_output_recv(node: &mut HydroNode, num_partitions: usize) {
     };
 }
 
+/// Apply partitioning to `ir` by constructing a `Rewrite` for the decoupler
+fn apply_regular_partition(ir: &mut [HydroRoot], partitioner: &PartialPartitioner) {
+    // Set the partitioned cluster to idx 0
+    // `nodes_before_partitioned_input`.
+    let mut possible_rewrite = PossibleRewrite::default();
+    possible_rewrite.field_partitionable.insert(0);
+    possible_rewrite.partition_field_choices = partitioner.nodes_before_partitioned_input.clone();
+
+    let rewrite = Rewrite {
+        possible_rewrite,
+        num_partitions: partitioner.num_partitions,
+        original_node: partitioner.location_id.clone(),
+        cluster_size: partitioner.cluster_size,
+    };
+    let mut locations_map = HashMap::new();
+    locations_map.insert(0, partitioner.location_id.clone());
+    decouple(ir, &rewrite, &locations_map);
+}
+
 /// Limitations: Can only partition 1 cluster at a time.
 /// Assumes that the partitioned node only outputs to a cluster; if it outputs to a process, then the logic for nodes_before/after_replicated_output needs to account for different metadata types.
 pub fn partial_partition(
@@ -1167,13 +1186,7 @@ pub fn partial_partition(
     partitioner: PartialPartitioner,
 ) -> Option<PartialPartitionState> {
     if partitioner.nodes_to_replicate.is_empty() {
-        let regular_partitioner = Partitioner {
-            nodes_before_partitioned_input: partitioner.nodes_before_partitioned_input,
-            num_partitions: partitioner.num_partitions,
-            location_id: partitioner.location_id,
-            new_cluster_id: partitioner.new_cluster_id,
-        };
-        partition(ir, &regular_partitioner);
+        apply_regular_partition(ir, &partitioner);
         return None;
     }
 
@@ -1276,13 +1289,7 @@ pub fn partial_partition(
     ir.append(&mut state.new_cycle_sinks);
 
     // 5. Regular partitioning
-    let regular_partitioner = Partitioner {
-        nodes_before_partitioned_input: partitioner.nodes_before_partitioned_input,
-        num_partitions: partitioner.num_partitions,
-        location_id: partitioner.location_id,
-        new_cluster_id: partitioner.new_cluster_id,
-    };
-    partition(ir, &regular_partitioner);
+    apply_regular_partition(ir, &partitioner);
 
     Some(state)
 }
@@ -1350,8 +1357,8 @@ mod tests {
             nodes_after_replicated_output: HashSet::from([send_networks[0].1]),
             nodes_for_garbage_collection: HashSet::new(),
             num_partitions: 3,
+            cluster_size: 1,
             location_id: server_id,
-            new_cluster_id: None,
         };
 
         let mut new_builder = FlowBuilder::from_built(built);
