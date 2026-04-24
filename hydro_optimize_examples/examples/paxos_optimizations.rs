@@ -11,7 +11,7 @@ use hydro_optimize::deploy::{HostType, ReusableHosts};
 use hydro_optimize::deploy_and_analyze::{
     ApplyResult, BottleneckState, MEASUREMENT_SECOND, Optimizations, PHYSICAL_CLIENTS, RUN_SECONDS,
     ReusableClusters, ReusableProcesses, SCENARIO_FINISHED_PREFIX, START_MEASUREMENT_SECOND,
-    VIRTUAL_CLIENTS_MAX, apply_optimizations, deploy_and_optimize,
+    VIRTUAL_CLIENTS_MAX, apply_optimizations, deploy_and_analyze,
 };
 use hydro_optimize::parse_results::RunMetadata;
 use hydro_optimize::repair::{inject_id, remove_counter};
@@ -151,7 +151,7 @@ async fn main() {
     let mut ir = deep_clone(replayed_built.ir());
     inject_id(&mut ir);
     remove_counter(&mut ir);
-    let _profiling = RunMetadata::load_and_inject(Path::new(&args.profiling), &mut ir);
+    let _profiling = RunMetadata::load(Path::new(&args.profiling));
 
     // Find the bottleneck LocationId matching the name.
     let bottleneck = find_bottleneck(&args.bottleneck, &reusable_clusters, &processes)
@@ -207,7 +207,7 @@ async fn main() {
         .excluding(clients_id.clone())
         .excluding(client_aggregator_id);
 
-    let run_metadata = deploy_and_optimize(
+    let run_metadata = deploy_and_analyze(
         &mut reusable_hosts,
         &mut deployment,
         finalized,
@@ -218,7 +218,6 @@ async fn main() {
         std::cmp::max(1, VIRTUAL_CLIENTS_MAX / PHYSICAL_CLIENTS),
         Some(RUN_SECONDS),
         Some(MEASUREMENT_SECOND),
-        true,
     )
     .await;
 

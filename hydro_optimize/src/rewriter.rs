@@ -617,7 +617,7 @@ fn replace_cluster_self_id(
 }
 
 /// `locations_map`: Mapping from each location in the rewrites to a (potentially new) LocationId.
-pub fn decouple(
+pub fn apply_rewrite(
     ir: &mut [HydroRoot],
     rewrite: &Rewrite,
     locations_map: &HashMap<usize, LocationId>,

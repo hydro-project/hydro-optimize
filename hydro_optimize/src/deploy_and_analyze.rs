@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use chrono::Local;
@@ -13,25 +13,34 @@ use hydro_lang::location::Location;
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::prelude::{Cluster, FlowBuilder, Process};
 use hydro_lang::telemetry::Sidecar;
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::decouple_analysis::decouple_analysis;
-use crate::decoupler::decouple;
 use crate::deploy::{HostType, ReusableHosts};
 use crate::parse_results::{RunMetadata, analyze_cluster_results};
-use crate::repair::{cycle_source_to_sink_input, inject_id, remove_counter};
-use crate::rewrites::Rewrite;
+use crate::reduce_pushdown::reduce_pushdown;
+use crate::reduce_pushdown_analysis::reduce_pushdown_decision;
+use crate::repair::inject_id;
 
-/// Special line printed by a scenario subprocess after it finishes its measurement phase.
-pub const SCENARIO_FINISHED_PREFIX: &str = "HYDRO_OPTIMIZE_SCENARIO_FINISHED:";
-
-pub(crate) const METRIC_INTERVAL_SECS: u64 = 1;
+const METRIC_INTERVAL_SECS: u64 = 1;
 const COUNTER_PREFIX: &str = "_optimize_counter";
-pub(crate) const CPU_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_CPU:";
-pub(crate) const SAR_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_SAR:";
-pub(crate) const LATENCY_PREFIX: &str = "HYDRO_OPTIMIZE_LAT:";
-pub(crate) const THROUGHPUT_PREFIX: &str = "HYDRO_OPTIMIZE_THR:";
+const BYTE_SIZE_PREFIX: &str = "_optimize_byte_size";
+const CPU_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_CPU:";
+const SAR_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_SAR:";
+const LATENCY_PREFIX: &str = "HYDRO_OPTIMIZE_LAT:";
+const THROUGHPUT_PREFIX: &str = "HYDRO_OPTIMIZE_THR:";
+
+/// Applies reduce pushdown for all locations in the IR except excluded ones.
+fn apply_reduce_pushdown(ir: &mut [HydroRoot], exclude: &HashSet<LocationId>) {
+    let locations: HashSet<_> = ir
+        .iter()
+        .map(|root| root.input_metadata().location_id.root().clone())
+        .filter(|loc| !exclude.contains(loc))
+        .collect();
+    for loc in locations {
+        let decision = reduce_pushdown_decision(ir, &loc);
+        reduce_pushdown(ir, decision);
+    }
+}
 
 // Note: Ensure edits to the match arms are consistent with inject_count_node
 fn insert_counter_node(
@@ -75,11 +84,13 @@ fn insert_counter_node(
                 return;
             }
 
+            // Use the original op_id from inject_id, not the traversal counter
+            let original_id = metadata.op.id.unwrap();
             let metadata = metadata.clone();
             let node_content = std::mem::replace(node, HydroNode::Placeholder);
 
             let counter = HydroNode::Counter {
-                tag: next_stmt_id.to_string(),
+                tag: original_id.to_string(),
                 duration: duration.into(),
                 prefix: COUNTER_PREFIX.to_string(),
                 input: Box::new(node_content),
@@ -120,12 +131,66 @@ fn insert_counter(ir: &mut [HydroRoot], duration: &syn::Expr, exclude: &HashSet<
     );
 }
 
+/// Inserts an Inspect node that samples every Nth element's serialized byte size,
+/// printing it as `BYTE_SIZE_PREFIX(original_op_id): size`.
+/// `network_ops` contains original op_ids (before any insertions).
+/// Inserted at:
+/// - Ops where `network_ops` indicates a network boundary
+/// - After existing Network nodes
+fn insert_byte_size_inspect(
+    ir: &mut [HydroRoot],
+    network_ops: &HashSet<usize>,
+    sample_every_n: usize,
+) {
+    use crate::rewrites::collection_kind_to_debug_type;
+
+    traverse_dfir(
+        ir,
+        |_, _| {},
+        |node, op_id| {
+            // Use the original op_id from inject_id, not the traversal counter
+            let original_id = node.metadata().op.id.unwrap();
+            let is_network_boundary = network_ops.contains(&original_id);
+            let is_existing_network = matches!(node, HydroNode::Network { .. });
+            if !is_network_boundary && !is_existing_network {
+                return;
+            }
+
+            let metadata = node.metadata().clone();
+            let element_type: syn::Type =
+                (*collection_kind_to_debug_type(&metadata.collection_kind).0).clone();
+            let node_content = std::mem::replace(node, HydroNode::Placeholder);
+            let tag = original_id.to_string();
+            let prefix = BYTE_SIZE_PREFIX;
+
+            let f: syn::Expr = syn::parse_quote!({
+                let mut __byte_size_counter: usize = 0;
+                move |item: &#element_type| {
+                    __byte_size_counter += 1;
+                    if __byte_size_counter % #sample_every_n == 0 {
+                        let size = bincode::serialized_size(item).unwrap_or(0);
+                        println!("{}({}): {}", #prefix, #tag, size);
+                    }
+                }
+            });
+
+            *node = HydroNode::Inspect {
+                f: f.into(),
+                input: Box::new(node_content),
+                metadata,
+            };
+            *op_id += 1;
+        },
+    );
+}
+
 pub struct MetricLogs {
     pub throughputs: UnboundedReceiver<String>,
     pub latencies: UnboundedReceiver<String>,
     pub cpu: UnboundedReceiver<String>,
     pub sar: UnboundedReceiver<String>,
     pub counters: UnboundedReceiver<String>,
+    pub byte_sizes: UnboundedReceiver<String>,
 }
 
 async fn track_process_metrics(process: &impl DeployCrateWrapper) -> MetricLogs {
@@ -135,6 +200,7 @@ async fn track_process_metrics(process: &impl DeployCrateWrapper) -> MetricLogs 
         cpu: process.stdout_filter(CPU_USAGE_PREFIX),
         sar: process.stdout_filter(SAR_USAGE_PREFIX),
         counters: process.stdout_filter(COUNTER_PREFIX),
+        byte_sizes: process.stdout_filter(BYTE_SIZE_PREFIX),
     }
 }
 
@@ -229,7 +295,7 @@ impl ReusableClusters {
             .map(|(id, _, _)| id.clone())
     }
 
-    fn location_name_and_num(&self, location: &LocationId) -> Option<(String, usize)> {
+    pub fn location_name_and_num(&self, location: &LocationId) -> Option<(String, usize)> {
         self.named_clusters
             .iter()
             .find(|(id, _, _)| location.key() == id.key())
@@ -255,32 +321,18 @@ impl ReusableProcesses {
             .find(|(_, n)| n == name)
             .map(|(id, _)| id.clone())
     }
-
-    fn location_name(&self, location: &LocationId) -> Option<String> {
-        self.named_processes
-            .iter()
-            .find(|(id, _)| location.key() == id.key())
-            .map(|(_, name)| name.clone())
-    }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Optimizations {
     decoupling: bool,
     partitioning: bool,
+    no_counters: bool,
+    /// Insert size measuring nodes wherever decoupling is possible
+    size_analysis: bool,
+    /// Apply greedy decoupling, deploy decoupled system, gather per-operator SAR costs
+    blow_up_analysis: bool,
     pub exclude: HashSet<LocationId>,
-    iterations: usize, // Must be at least 1
-}
-
-impl Default for Optimizations {
-    fn default() -> Self {
-        Self {
-            decoupling: false,
-            partitioning: false,
-            exclude: HashSet::new(),
-            iterations: 1,
-        }
-    }
 }
 
 impl Optimizations {
@@ -294,80 +346,48 @@ impl Optimizations {
         self
     }
 
+    /// Do not insert counters. Used to establish highest-performance config
+    pub fn with_no_counters(mut self) -> Self {
+        self.no_counters = true;
+        self
+    }
+
+    /// Insert size measuring nodes wherever decoupling is possible
+    pub fn with_size_analysis(mut self) -> Self {
+        self.size_analysis = true;
+        self
+    }
+
+    /// Apply greedy decoupling, deploy decoupled system, gather per-operator SAR costs
+    pub fn with_blow_up_analysis(mut self) -> Self {
+        self.blow_up_analysis = true;
+        self
+    }
+
     pub fn excluding(mut self, location: LocationId) -> Self {
         self.exclude.insert(location);
         self
     }
-
-    pub fn with_iterations(mut self, iterations: usize) -> Self {
-        assert!(iterations > 0);
-        self.iterations = iterations;
-        self
-    }
-}
-
-/// Persistent per-bottleneck state that lets successive apply_optimizations calls
-/// remember which clusters have already been marked partitionable and how many
-/// partitions they should now use.
-#[derive(Default, Clone, Serialize, Deserialize)]
-pub struct BottleneckState {
-    /// Maps a bottleneck name to its current partition count (>= 2 once partitioned).
-    pub partitions: HashMap<String, usize>,
-}
-
-impl BottleneckState {
-    pub fn load(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(s) => serde_json::from_str(&s).expect("failed to deserialize BottleneckState"),
-            Err(_) => Self::default(),
-        }
-    }
-
-    pub fn save(&self, path: &Path) {
-        let json = serde_json::to_string_pretty(self).unwrap();
-        std::fs::write(path, json).expect("failed to write BottleneckState");
-    }
-}
-
-/// Result of `apply_optimizations` for a single bottleneck.
-pub enum ApplyResult {
-    /// A new decoupling rewrite was produced.
-    Decoupled(Rewrite),
-    /// The bottleneck is (re)partitioned to `num_partitions` total partitions.
-    Partitioned(Rewrite),
-    /// Neither decoupling nor partitioning is possible/useful. Caller should skip.
-    Skip,
 }
 
 /// `stability_second`: The second in which the protocol is expected to be stable, and its performance can be used as the basis for optimization.
 #[allow(clippy::too_many_arguments)]
-pub async fn deploy_and_optimize<'a>(
+pub async fn deploy_and_analyze<'a>(
     reusable_hosts: &mut ReusableHosts,
     deployment: &mut Deployment,
-    mut builder: BuiltFlow<'a>,
-    mut clusters: ReusableClusters,
-    processes: ReusableProcesses,
-    optimizations: Optimizations,
+    builder: BuiltFlow<'a>,
+    clusters: &ReusableClusters,
+    processes: &ReusableProcesses,
+    optimizations: &Optimizations,
     client_id: &LocationId,
     num_clients_per_node: usize,
     num_seconds: Option<usize>,
     stability_second: Option<usize>,
-    analyze: bool,
 ) -> RunMetadata {
-    assert!(
-        optimizations.iterations < 1 || num_seconds.is_some(),
-        "Cannot specify multiple iterations without bounding run time"
-    );
     if let Some(num_seconds) = num_seconds {
         assert!(
             stability_second.is_some_and(|stability_time| stability_time < num_seconds),
             "Invariant: stability_second < num_seconds"
-        );
-    }
-    if optimizations.decoupling || optimizations.partitioning {
-        assert!(
-            stability_second.is_some() && analyze,
-            "Must select stability_second and enable analysis with optimizations"
         );
     }
     assert!(
@@ -377,202 +397,217 @@ pub async fn deploy_and_optimize<'a>(
 
     let counter_output_duration =
         syn::parse_quote!(std::time::Duration::from_secs(#METRIC_INTERVAL_SECS));
-    let mut run_metadata = RunMetadata::default();
     // Measure network (-n DEV) and CPU (-u) usage. -P ALL measures all CPUs on the machine
     let sar_sidecar = ScriptSidecar {
         script: "sar -n DEV -u -P ALL -r -b 1".to_string(),
         prefix: SAR_USAGE_PREFIX.to_string(),
     };
 
-    for iteration in 0..optimizations.iterations {
-        // Rewrite with counter tracking
-        let mut post_rewrite_builder = FlowBuilder::from_built(&builder);
-        let optimized = builder.optimize_with(|leaf| {
+    // Rewrite with optional decoupled deployment (blow_up_analysis) or size inspection (size_analysis)
+    let mut extra_clusters: Vec<(LocationId, String, usize)> = vec![];
+    // Maps new LocationId → list of original op_ids assigned to that location
+    let mut location_to_original_ops: HashMap<LocationId, Vec<usize>> = HashMap::new();
+
+    let optimized = if optimizations.blow_up_analysis {
+        // 1. Run greedy analysis on original IR
+        let mut greedy_result = None;
+        let built = builder.optimize_with(|leaf| {
+            // Always reduce pushdown first
+            apply_reduce_pushdown(leaf, &optimizations.exclude);
             inject_id(leaf);
-            insert_counter(leaf, &counter_output_duration, &optimizations.exclude);
+            greedy_result = Some(
+                crate::greedy_decouple_analysis::greedy_decouple_analysis(
+                    leaf,
+                    &optimizations.exclude,
+                ),
+            );
         });
-        let mut ir = deep_clone(optimized.ir());
 
-        // Insert all clusters & processes
-        let mut deployable = optimized.into_deploy();
-        for (cluster_id, name, num_hosts) in clusters.named_clusters.iter() {
-            let excluded = optimizations.exclude.contains(cluster_id);
-            if cluster_id.key() == client_id.key() {
-                let mut client_hosts = vec![];
-                for i in 0..num_clients_per_node {
-                    let pin_to_core = i % reusable_hosts.num_cores();
-                    client_hosts.push(reusable_hosts.get_cluster_hosts(
-                        deployment,
-                        name.clone(),
-                        *num_hosts,
-                        pin_to_core,
-                        false,
-                    ));
+        let rewrite_result = greedy_result.unwrap();
+
+        // Phase 2: Create new clusters and apply the rewrite
+        let all_locs = rewrite_result.locations();
+        let mut builder = FlowBuilder::from_built(&built);
+        let mut ir = deep_clone(built.ir());
+
+        if all_locs.len() > 1 {
+            // Group ops by their assigned location index
+            let mut loc_idx_to_ops: HashMap<usize, Vec<usize>> = HashMap::new();
+            for (&op_id, &loc_idx) in &rewrite_result.op_to_loc {
+                loc_idx_to_ops.entry(loc_idx).or_default().push(op_id);
+            }
+
+            // Find the original location (first non-excluded cluster)
+            let original_loc = ir
+                .iter()
+                .map(|root| root.input_metadata().location_id.clone())
+                .find(|loc| !optimizations.exclude.contains(loc))
+                .expect("No non-excluded location found");
+            let cluster_size = clusters
+                .location_name_and_num(&original_loc)
+                .map(|(_, n)| n)
+                .unwrap_or(1);
+
+            let mut locations_map = HashMap::new();
+            locations_map.insert(0, original_loc.clone());
+
+            if let Some(ops) = loc_idx_to_ops.get(&0) {
+                location_to_original_ops
+                    .entry(original_loc.clone())
+                    .or_default()
+                    .extend(ops);
+            }
+
+            for loc_idx in all_locs {
+                if loc_idx == 0 {
+                    continue;
                 }
-                deployable =
-                    deployable.with_cluster_erased(cluster_id.key(), client_hosts.concat());
-            } else {
-                deployable = deployable.with_cluster_erased(
-                    cluster_id.key(),
-                    reusable_hosts.get_cluster_hosts(
-                        deployment,
-                        name.clone(),
-                        *num_hosts,
-                        0,
-                        !excluded,
-                    ),
-                );
-                if !excluded {
-                    deployable = deployable.with_sidecar_internal(cluster_id.key(), &sar_sidecar);
+                let cluster = builder.cluster::<()>();
+                let new_loc = cluster.id().clone();
+                locations_map.insert(loc_idx, new_loc.clone());
+
+                let loc_name = format!("decouple_{}", loc_idx);
+                extra_clusters.push((new_loc.clone(), loc_name, cluster_size));
+
+                if let Some(ops) = loc_idx_to_ops.get(&loc_idx) {
+                    location_to_original_ops
+                        .entry(new_loc)
+                        .or_default()
+                        .extend(ops);
                 }
             }
-        }
-        for (process_id, name) in processes.named_processes.iter() {
-            let excluded = optimizations.exclude.contains(process_id);
-            let host = if excluded {
-                reusable_hosts.get_no_perf_process_hosts(deployment, name.clone(), 0)
-            } else {
-                reusable_hosts.get_process_hosts(deployment, name.clone(), 0)
+
+            let rewrite = crate::rewrites::Rewrite {
+                possible_rewrite: rewrite_result,
+                num_partitions: 0,
+                original_node: original_loc,
+                cluster_size,
             };
-            deployable = deployable.with_process_erased(process_id.key(), host);
-            if !excluded {
-                deployable = deployable.with_sidecar_internal(process_id.key(), &sar_sidecar);
-            }
+            crate::rewriter::apply_rewrite(&mut ir, &rewrite, &locations_map);
         }
 
-        let nodes = deployable.deploy(deployment);
-        deployment.deploy().await.unwrap();
-        let metrics = track_cluster_metrics(&nodes).await;
-
-        // Wait for user to input a newline
-        deployment
-            .start_until(async {
-                if let Some(seconds) = num_seconds {
-                    // Wait for some number of seconds
-                    tokio::time::sleep(Duration::from_secs(seconds as u64)).await;
-                } else {
-                    // Wait for a new line
-                    eprintln!("Press enter to stop deployment and analyze results");
-                    let _ = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(
-                        tokio::io::stdin(),
-                    ))
-                    .next_line()
-                    .await
-                    .unwrap();
-                }
-            })
-            .await
-            .unwrap();
-
-        if analyze {
-            // Parse results to get metrics
-            run_metadata = analyze_cluster_results(&nodes, &mut ir, metrics, &optimizations).await;
-            // Remove HydroNode::Counter (since we don't want to consider decoupling those)
-            remove_counter(&mut ir);
-
-            if optimizations.decoupling {
-                // Preserve historical behavior: auto-optimize the first non-excluded cluster.
-                let bottleneck = clusters
-                    .named_clusters
-                    .iter()
-                    .map(|(id, _, _)| id)
-                    .find(|id| !optimizations.exclude.contains(id))
-                    .cloned()
-                    .expect("No bottleneck cluster available");
-                let mut state = BottleneckState::default();
-                apply_optimizations(
-                    &mut ir,
-                    &bottleneck,
-                    &mut clusters,
-                    &processes,
-                    &mut post_rewrite_builder,
-                    &mut state,
-                    iteration,
-                );
+        // Phase 3: Insert counters on the rewritten IR
+        builder.replace_ir(ir);
+        builder.finalize().optimize_with(|leaf| {
+            // Always reduce pushdown first
+            apply_reduce_pushdown(leaf, &optimizations.exclude);
+            inject_id(leaf);
+            if !optimizations.no_counters {
+                insert_counter(leaf, &counter_output_duration, &optimizations.exclude);
             }
-        }
+        })
+    } else if optimizations.size_analysis {
+        // Step 5: Insert byte-size inspects at network boundaries without applying decoupling
+        builder.optimize_with(|leaf| {
+            // Always reduce pushdown first
+            apply_reduce_pushdown(leaf, &optimizations.exclude);
+            inject_id(leaf);
+            let rewrite = crate::greedy_decouple_analysis::greedy_decouple_analysis(
+                leaf,
+                &optimizations.exclude,
+            );
+            let network_ops: HashSet<usize> =
+                rewrite.op_to_network.keys().copied().collect();
+            if !network_ops.is_empty() {
+                insert_byte_size_inspect(leaf, &network_ops, 100);
+            }
+            if !optimizations.no_counters {
+                insert_counter(leaf, &counter_output_duration, &optimizations.exclude);
+            }
+        })
+    } else {
+        builder.optimize_with(|leaf| {
+            // Always reduce pushdown first
+            apply_reduce_pushdown(leaf, &optimizations.exclude);
+            inject_id(leaf);
+            if !optimizations.no_counters {
+                insert_counter(leaf, &counter_output_duration, &optimizations.exclude);
+            }
+        })
+    };
 
-        post_rewrite_builder.replace_ir(ir);
-        builder = post_rewrite_builder.finalize();
+    // Insert all clusters & processes
+    let mut deployable = optimized.into_deploy();
+    for (cluster_id, name, num_hosts) in clusters.named_clusters.iter() {
+        let excluded = optimizations.exclude.contains(cluster_id);
+        if cluster_id.key() == client_id.key() {
+            let mut client_hosts = vec![];
+            for i in 0..num_clients_per_node {
+                let pin_to_core = i % reusable_hosts.num_cores();
+                client_hosts.push(reusable_hosts.get_cluster_hosts(
+                    deployment,
+                    name.clone(),
+                    *num_hosts,
+                    pin_to_core,
+                    false,
+                ));
+            }
+            deployable = deployable.with_cluster_erased(cluster_id.key(), client_hosts.concat());
+        } else {
+            deployable = deployable.with_cluster_erased(
+                cluster_id.key(),
+                reusable_hosts.get_cluster_hosts(
+                    deployment,
+                    name.clone(),
+                    *num_hosts,
+                    0,
+                    !excluded,
+                ),
+            );
+        }
+        if !excluded {
+            deployable = deployable.with_sidecar_internal(cluster_id.key(), &sar_sidecar);
+        }
+    }
+    // Deploy extra clusters created by greedy decouple analysis
+    for (cluster_id, name, num_hosts) in extra_clusters.iter() {
+        deployable = deployable.with_cluster_erased(
+            cluster_id.key(),
+            reusable_hosts.get_cluster_hosts(deployment, name.clone(), *num_hosts, 0, true),
+        );
+        deployable = deployable.with_sidecar_internal(cluster_id.key(), &sar_sidecar);
+    }
+    for (process_id, name) in processes.named_processes.iter() {
+        let excluded = optimizations.exclude.contains(process_id);
+        let host = if excluded {
+            reusable_hosts.get_no_perf_process_hosts(deployment, name.clone(), 0)
+        } else {
+            reusable_hosts.get_process_hosts(deployment, name.clone(), 0)
+        };
+        deployable = deployable.with_process_erased(process_id.key(), host);
+        if !excluded {
+            deployable = deployable.with_sidecar_internal(process_id.key(), &sar_sidecar);
+        }
     }
 
+    let nodes = deployable.deploy(deployment);
+    deployment.deploy().await.unwrap();
+    let metrics = track_cluster_metrics(&nodes).await;
+
+    // Wait for user to input a newline or timeout
+    deployment
+        .start_until(async {
+            if let Some(seconds) = num_seconds {
+                // Wait for some number of seconds
+                tokio::time::sleep(Duration::from_secs(seconds as u64)).await;
+            } else {
+                // Wait for a new line
+                eprintln!("Press enter to stop deployment and analyze results");
+                let _ = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(
+                    tokio::io::stdin(),
+                ))
+                .next_line()
+                .await
+                .unwrap();
+            }
+        })
+        .await
+        .unwrap();
+
+    // Parse results to get metrics
+    let mut run_metadata = analyze_cluster_results(&nodes, metrics, &optimizations).await;
+    run_metadata.location_to_original_ops = location_to_original_ops;
     run_metadata
-}
-
-/// Applies an optimization for the given `bottleneck` location.
-///
-/// Returns the rewrite that was produced (to be saved/replayed), or `Skip` if the scenario
-/// should not be explored further (no new decoupling AND the cluster is not partitionable).
-pub fn apply_optimizations(
-    ir: &mut [HydroRoot],
-    bottleneck: &LocationId,
-    clusters: &mut ReusableClusters,
-    processes: &ReusableProcesses,
-    post_rewrite_builder: &mut FlowBuilder<'_>,
-    state: &mut BottleneckState,
-    iteration: usize,
-) -> ApplyResult {
-    let cycle_source_to_sink = cycle_source_to_sink_input(ir);
-
-    let (bottleneck_name, bottleneck_num_nodes) = processes
-        .location_name(bottleneck)
-        .map(|name| (name, 1))
-        .unwrap_or_else(|| clusters.location_name_and_num(bottleneck).unwrap());
-
-    // Run decouple_analysis with partitioning considered. The result encodes both
-    // the decoupling placement and per-location partitionability + field choices.
-    let possible_rewrite =
-        decouple_analysis(ir, bottleneck, 0.01, 0.01, 2, &cycle_source_to_sink, true);
-
-    // Determine partition count: if already partitioned, double; otherwise use 2 if any
-    // location is partitionable; otherwise 0.
-    let any_partitionable = !possible_rewrite.stateless_partitionable.is_empty()
-        || !possible_rewrite.field_partitionable.is_empty();
-    let num_partitions = if let Some(count) = state.partitions.get(&bottleneck_name).copied() {
-        let new_count = count * 2;
-        state.partitions.insert(bottleneck_name.clone(), new_count);
-        new_count
-    } else if any_partitionable {
-        state.partitions.insert(bottleneck_name.clone(), 2);
-        2
-    } else {
-        0
-    };
-
-    let has_decoupling = possible_rewrite.num_locations() > 1;
-    if !has_decoupling && num_partitions == 0 {
-        return ApplyResult::Skip;
-    }
-
-    // Build locations_map: index 0 = bottleneck; create fresh clusters for other indices.
-    let mut locations_map = HashMap::new();
-    locations_map.insert(0, bottleneck.clone());
-    for loc_idx in possible_rewrite.locations() {
-        if loc_idx == 0 {
-            continue;
-        }
-        let cluster = post_rewrite_builder.cluster::<()>();
-        locations_map.insert(loc_idx, cluster.id().clone());
-        clusters.named_clusters.push((
-            cluster.id().clone(),
-            format!("{}-decouple-{}", bottleneck_name, iteration),
-            bottleneck_num_nodes,
-        ));
-    }
-
-    let rewrite = Rewrite {
-        possible_rewrite,
-        num_partitions,
-        original_node: bottleneck.clone(),
-        cluster_size: bottleneck_num_nodes,
-    };
-    decouple(ir, &rewrite, &locations_map);
-
-    if has_decoupling {
-        ApplyResult::Decoupled(rewrite)
-    } else {
-        ApplyResult::Partitioned(rewrite)
-    }
 }
 
 pub struct BenchmarkArgs {
@@ -588,11 +623,6 @@ pub struct BenchmarkConfig<'a> {
     pub client_id: LocationId,
     pub optimizations: Optimizations,
     pub location_id_to_cluster: HashMap<LocationId, String>,
-    /// Name of a cargo example (in `hydro_optimize_examples`) that can rerun this benchmark
-    /// after applying one new optimization for a specific bottleneck. When set, after the
-    /// normal benchmark sweep `benchmark_protocol` will iteratively launch scenarios (one
-    /// subprocess per non-excluded bottleneck) and converge on the highest-throughput config.
-    pub scenario_binary: Option<String>,
 }
 
 pub const START_MEASUREMENT_SECOND: usize = 30;
@@ -605,10 +635,9 @@ pub const NUM_RUNS_NO_THROUGHPUT: usize = 3;
 
 pub async fn benchmark_protocol<'a>(
     args: BenchmarkArgs,
+    start_virtual_clients: usize,
     num_runs: usize,
-    run_benchmark: fn(
-        usize, // PHYSICAL_CLIENTS
-    ) -> BenchmarkConfig<'a>,
+    run_benchmark: impl Fn(usize) -> BenchmarkConfig<'a>,
 ) {
     assert!(
         num_runs > 0,
@@ -626,17 +655,17 @@ pub async fn benchmark_protocol<'a>(
 
     let mut reusable_hosts = ReusableHosts::new(&host_type);
 
-    let benchmark_config = run_benchmark(PHYSICAL_CLIENTS);
-    let config_name = benchmark_config.name.clone();
-    let config_clusters = benchmark_config.clusters.clone();
-    let config_processes = benchmark_config.processes.clone();
-    let config_optimizations = benchmark_config.optimizations.clone();
-    let config_client_id = benchmark_config.client_id.clone();
-    let config_location_id_to_cluster = benchmark_config.location_id_to_cluster.clone();
-    let scenario_binary = benchmark_config.scenario_binary.clone();
-    let config_exclude = benchmark_config.optimizations.exclude.clone();
+    let BenchmarkConfig {
+        name: config_name,
+        builder,
+        clusters: config_clusters,
+        processes: config_processes,
+        optimizations: config_optimizations,
+        client_id: config_client_id,
+        location_id_to_cluster: config_location_id_to_cluster,
+    } = run_benchmark(PHYSICAL_CLIENTS);
     // Set up FlowBuilder for cloning
-    let built = benchmark_config.builder.finalize();
+    let built = builder.finalize();
     let ir = built.ir();
     let output_dir = Path::new("benchmark_results").join(format!(
         "{}_{}",
@@ -644,15 +673,11 @@ pub async fn benchmark_protocol<'a>(
         Local::now().format("%Y-%m-%d_%H-%M-%S")
     ));
 
-    let mut best_profiling: Option<PathBuf> = None;
-    let mut best_throughput: usize = 0;
-
-    for num_virtual in (1..=VIRTUAL_CLIENTS_MAX).step_by(VIRTUAL_CLIENTS_STEP) {
+    for num_virtual in (start_virtual_clients..=VIRTUAL_CLIENTS_MAX).step_by(VIRTUAL_CLIENTS_STEP) {
         let mut throughput_sum = 0;
         let mut successful_runs = 0;
         let mut zero_throughput_count = 0;
         let mut run = 0;
-        let mut aborted = false;
         while successful_runs < num_runs {
             println!(
                 "Running {} with {} clients (run {})",
@@ -661,18 +686,17 @@ pub async fn benchmark_protocol<'a>(
 
             let mut builder = FlowBuilder::from_built(&built);
             builder.replace_ir(deep_clone(ir));
-            let run_metadata = deploy_and_optimize(
+            let run_metadata = deploy_and_analyze(
                 &mut reusable_hosts,
                 &mut deployment,
                 builder.finalize(),
-                config_clusters.clone(),
-                config_processes.clone(),
-                config_optimizations.clone(),
+                &config_clusters,
+                &config_processes,
+                &config_optimizations,
                 &config_client_id,
                 std::cmp::max(1, num_virtual / PHYSICAL_CLIENTS), // clients per node
                 Some(RUN_SECONDS),
                 Some(MEASUREMENT_SECOND),
-                true,
             )
             .await;
 
@@ -698,8 +722,7 @@ pub async fn benchmark_protocol<'a>(
                         "Exceeded {} zero-throughput runs for this config. Terminating benchmark.",
                         NUM_RUNS_NO_THROUGHPUT
                     );
-                    aborted = true;
-                    break;
+                    return;
                 }
             } else {
                 throughput_sum += run_throughput;
@@ -708,252 +731,12 @@ pub async fn benchmark_protocol<'a>(
             run += 1;
         }
 
-        if successful_runs > 0 {
-            let current_throughput = throughput_sum / successful_runs;
-            println!(
-                "clients={}, avg_throughput={}",
-                num_virtual, current_throughput
-            );
-            if current_throughput > best_throughput {
-                best_throughput = current_throughput;
-                best_profiling = Some(output_dir.join(format!(
-                    "profiling_{}c_{}vc_r0.json",
-                    PHYSICAL_CLIENTS, num_virtual
-                )));
-            }
-        }
-
-        if aborted {
-            break;
-        }
-    }
-
-    // Post-sweep: iteratively try each non-excluded cluster/process as the bottleneck in parallel.
-    if let Some(binary) = scenario_binary
-        && let Some(profiling_path) = best_profiling
-    {
-        run_scenarios_loop(
-            &args,
-            &binary,
-            &output_dir,
-            &profiling_path,
-            &config_clusters,
-            &config_processes,
-            &config_exclude,
-            best_throughput,
-        )
-        .await;
-    }
-}
-
-/// Returns the list of bottleneck names from clusters + processes that are not excluded.
-pub fn non_excluded_bottlenecks(
-    clusters: &ReusableClusters,
-    processes: &ReusableProcesses,
-    exclude: &HashSet<LocationId>,
-) -> Vec<String> {
-    let mut names = vec![];
-    for (id, name, _) in &clusters.named_clusters {
-        if !exclude.contains(id) {
-            names.push(name.clone());
-        }
-    }
-    for (id, name) in &processes.named_processes {
-        if !exclude.contains(id) {
-            names.push(name.clone());
-        }
-    }
-    names
-}
-
-/// Spawns `scenario_binary` (a cargo example) as a subprocess for the given bottleneck.
-/// Pipes its stdout to `log_path` and concurrently scans for the finished marker and
-/// throughput line. Returns the final parsed throughput once the subprocess prints
-/// SCENARIO_FINISHED_PREFIX. The subprocess keeps running to completion (handling its own
-/// terraform teardown) in a detached background task; we just don't block on it.
-async fn run_one_scenario(
-    binary: &str,
-    args: &BenchmarkArgs,
-    bottleneck: &str,
-    rewrites_in: Option<&Path>,
-    state_in: Option<&Path>,
-    rewrites_out: &Path,
-    state_out: &Path,
-    profiling: &Path,
-    log_path: &Path,
-) -> Option<usize> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::process::Command;
-    use tokio::sync::oneshot;
-
-    let mut cmd = Command::new("cargo");
-    cmd.arg("run")
-        .arg("--release")
-        .arg("--example")
-        .arg(binary)
-        .arg("--")
-        .arg("--bottleneck")
-        .arg(bottleneck)
-        .arg("--profiling")
-        .arg(profiling)
-        .arg("--rewrites-out")
-        .arg(rewrites_out)
-        .arg("--state-out")
-        .arg(state_out);
-    if let Some(path) = rewrites_in {
-        cmd.arg("--rewrites-in").arg(path);
-    }
-    if let Some(path) = state_in {
-        cmd.arg("--state-in").arg(path);
-    }
-    if let Some(project) = &args.gcp {
-        cmd.arg("--gcp").arg(project);
-    } else if args.aws {
-        cmd.arg("--aws");
-    }
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    // Default tokio behavior is kill_on_drop = false, but be explicit: we want the child to
-    // keep running after this task finishes so it can finish terraform teardown.
-    cmd.kill_on_drop(false);
-
-    let mut child = cmd.spawn().expect("failed to spawn scenario subprocess");
-    let stdout = child.stdout.take().unwrap();
-    let log_file = tokio::fs::File::create(log_path)
-        .await
-        .expect("failed to create log file");
-
-    let (tx, rx) = oneshot::channel::<Option<usize>>();
-
-    // Continuously drain stdout to the log file (so the child's pipe never fills) and
-    // signal the parent via `tx` the first time we see the finished marker. The task keeps
-    // draining until EOF (child exit), then awaits the child to fully reap it.
-    tokio::spawn(async move {
-        let mut reader = BufReader::new(stdout).lines();
-        let mut log_file = log_file;
-        let mut tx = Some(tx);
-        let mut throughput: Option<usize> = None;
-        while let Ok(Some(line)) = reader.next_line().await {
-            let _ = log_file.write_all(line.as_bytes()).await;
-            let _ = log_file.write_all(b"\n").await;
-            if let Some(rest) = line.strip_prefix(SCENARIO_FINISHED_PREFIX) {
-                throughput = rest.trim().parse::<usize>().ok();
-                if let Some(sender) = tx.take() {
-                    let _ = sender.send(throughput);
-                }
-            }
-        }
-        // EOF: if we never saw the marker, still unblock the parent.
-        if let Some(sender) = tx.take() {
-            let _ = sender.send(throughput);
-        }
-        // Reap the child so it doesn't become a zombie.
-        let _ = child.wait().await;
-    });
-
-    rx.await.ok().flatten()
-}
-
-async fn run_scenarios_loop(
-    args: &BenchmarkArgs,
-    binary: &str,
-    output_dir: &Path,
-    initial_profiling: &Path,
-    clusters: &ReusableClusters,
-    processes: &ReusableProcesses,
-    exclude: &HashSet<LocationId>,
-    initial_throughput: usize,
-) {
-    let scenarios_dir = output_dir.join("scenarios");
-    std::fs::create_dir_all(&scenarios_dir).ok();
-
-    let mut current_profiling = initial_profiling.to_path_buf();
-    let mut current_rewrites: Option<PathBuf> = None;
-    let mut current_state: Option<PathBuf> = None;
-    let mut current_throughput = initial_throughput;
-    let mut iteration = 0usize;
-
-    loop {
-        let names = non_excluded_bottlenecks(clusters, processes, exclude);
-        if names.is_empty() {
-            println!("No non-excluded bottlenecks to explore; halting.");
-            break;
-        }
-
-        // Launch each scenario in parallel.
-        let mut handles = vec![];
-        for name in &names {
-            let out_rewrites =
-                scenarios_dir.join(format!("rewrites_iter{}_{}.json", iteration, name));
-            let out_state = scenarios_dir.join(format!("state_iter{}_{}.json", iteration, name));
-            let log_path = scenarios_dir.join(format!("log_iter{}_{}.txt", iteration, name));
-
-            let binary = binary.to_string();
-            let args_clone = BenchmarkArgs {
-                gcp: args.gcp.clone(),
-                aws: args.aws,
-            };
-            let bottleneck = name.clone();
-            let rewrites_in = current_rewrites.clone();
-            let state_in = current_state.clone();
-            let profiling = current_profiling.clone();
-            let out_rewrites_cl = out_rewrites.clone();
-            let out_state_cl = out_state.clone();
-            let handle = tokio::spawn(async move {
-                let thr = run_one_scenario(
-                    &binary,
-                    &args_clone,
-                    &bottleneck,
-                    rewrites_in.as_deref(),
-                    state_in.as_deref(),
-                    &out_rewrites_cl,
-                    &out_state_cl,
-                    &profiling,
-                    &log_path,
-                )
-                .await;
-                (bottleneck, thr, out_rewrites_cl, out_state_cl)
-            });
-            handles.push(handle);
-        }
-
-        let mut results = vec![];
-        for h in handles {
-            if let Ok(r) = h.await {
-                results.push(r);
-            }
-        }
-
-        // Pick highest-throughput scenario.
-        let best = results
-            .iter()
-            .filter_map(|(n, thr, rw, st)| thr.map(|t| (n.clone(), t, rw.clone(), st.clone())))
-            .max_by_key(|(_, t, _, _)| *t);
-
-        let Some((best_name, best_thr, best_rewrites, best_state)) = best else {
-            println!("All scenarios failed or were skipped; halting.");
-            break;
-        };
-
+        let current_throughput = throughput_sum / successful_runs;
         println!(
-            "Iteration {}: best bottleneck '{}' throughput {} (previous {})",
-            iteration, best_name, best_thr, current_throughput
+            "clients={}, avg_throughput={}",
+            num_virtual, current_throughput
         );
-
-        if best_thr <= current_throughput {
-            println!(
-                "No improvement. Halting. Best config: {}",
-                best_rewrites.display()
-            );
-            break;
-        }
-
-        current_throughput = best_thr;
-        current_rewrites = Some(best_rewrites);
-        current_state = Some(best_state);
-        // The subprocess also produced a new profiling file next to its rewrites.
-        current_profiling =
-            scenarios_dir.join(format!("profiling_iter{}_{}.json", iteration, best_name));
-        iteration += 1;
     }
 }
+
+

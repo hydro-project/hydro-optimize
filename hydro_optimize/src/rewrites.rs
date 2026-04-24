@@ -17,7 +17,7 @@ use syn::parse_quote;
 use syn::visit_mut::{self, VisitMut};
 
 use crate::decouple_analysis::PossibleRewrite;
-use crate::decoupler;
+use crate::rewriter;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Rewrite {
@@ -58,7 +58,7 @@ pub fn replay<'a>(
                 all_new_clusters.push((cluster, rewrite.cluster_size));
             }
         }
-        decoupler::decouple(&mut ir, &rewrite, &locations_map);
+        rewriter::apply_rewrite(&mut ir, &rewrite, &locations_map);
     }
 
     builder.replace_ir(ir);

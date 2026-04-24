@@ -8,13 +8,13 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-hydro_lang = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git", rev = "b6fc12e" }
-hydro_std = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git", rev = "b6fc12e" }
-hydro_test = { version = "0.0.0", git = "https://github.com/hydro-project/hydro.git", rev = "b6fc12e" }
-dfir_lang = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git", rev = "b6fc12e" }
-hydro_build_utils = { version = "0.0.1", git = "https://github.com/hydro-project/hydro.git", rev = "b6fc12e", features = ["insta"] }
-hydro_deploy = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git", rev = "b6fc12e", features = ["profile-folding"] }
-include_mdtests = { version = "0.0.0", git = "https://github.com/hydro-project/hydro.git", rev = "b6fc12e" }
+hydro_lang = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git", branch = "mingwei/fix-inline-tasks" }
+hydro_std = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git", branch = "mingwei/fix-inline-tasks" }
+hydro_test = { version = "0.0.0", git = "https://github.com/hydro-project/hydro.git", branch = "mingwei/fix-inline-tasks" }
+dfir_lang = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git", branch = "mingwei/fix-inline-tasks" }
+hydro_build_utils = { version = "0.0.1", git = "https://github.com/hydro-project/hydro.git", branch = "mingwei/fix-inline-tasks", features = ["insta"] }
+hydro_deploy = { version = "0.15.0", git = "https://github.com/hydro-project/hydro.git", branch = "mingwei/fix-inline-tasks", features = ["profile-folding"] }
+include_mdtests = { version = "0.0.0", git = "https://github.com/hydro-project/hydro.git", branch = "mingwei/fix-inline-tasks" }
 serde = { version = "1.0.197", features = ["derive"] }
 stageleft = "0.13.4"
 stageleft_tool = "0.13.4"

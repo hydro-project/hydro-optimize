@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use clap::{ArgAction, Parser};
 use hydro_lang::compile::ir::deep_clone;
@@ -80,7 +80,15 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
         inject_id(ir);
     });
     let mut ir = deep_clone(built.ir());
-    let decision = greedy_decouple_analysis(&mut ir, &proposers.id());
+    let decision = greedy_decouple_analysis(
+        &mut ir,
+        &HashSet::from([
+            acceptors.id(),
+            clients.id(),
+            client_aggregator.id(),
+            replicas.id(),
+        ]),
+    );
     let rewrite = Rewrite {
         possible_rewrite: decision,
         num_partitions: 0,
@@ -108,11 +116,7 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
     location_id_to_cluster.extend(new_proposer_ids_with_names);
     let client_id = clients.id();
 
-    let new_proposer_keys_with_name_num = new_proposer_ids_with_name_num
-        .into_iter()
-        .map(|(id, name, num)| (id.key(), name, num))
-        .collect();
-    let clusters = ReusableClusters::from(new_proposer_keys_with_name_num)
+    let clusters = ReusableClusters::from(new_proposer_ids_with_name_num)
         .with_cluster(proposers, f + 1)
         .with_cluster(acceptors, 2 * f + 1)
         .with_cluster(clients, num_clients)
@@ -135,12 +139,14 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+    let start_virtual_clients = 1;
     let num_runs = 3;
     benchmark_protocol(
         BenchmarkArgs {
             gcp: args.gcp,
             aws: args.aws,
         },
+        start_virtual_clients,
         num_runs,
         run_benchmark,
     )

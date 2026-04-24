@@ -7,7 +7,7 @@ use hydro_deploy::Deployment;
 use hydro_deploy::gcp::GcpNetwork;
 use hydro_lang::location::Location;
 use hydro_lang::viz::config::GraphConfig;
-use hydro_optimize::decoupler;
+use hydro_optimize::rewriter;
 use hydro_optimize::deploy::ReusableHosts;
 use hydro_optimize::deploy_and_analyze::deploy_and_analyze;
 use hydro_test::cluster::paxos_bench::{Aggregator, Client};
@@ -113,8 +113,8 @@ async fn main() {
         let mut decoupled_cluster = None;
         builder = rewritten_ir_builder.build_with(|builder| {
             let new_cluster = builder.cluster::<()>();
-            decoupler.decoupled_location = new_cluster.id().clone();
-            decoupler::decouple(&mut ir, &decoupler, &multi_run_metadata, i);
+            rewriter.decoupled_location = new_cluster.id().clone();
+            rewriter::apply_rewrite(&mut ir, &rewriter, &multi_run_metadata, i);
             decoupled_cluster = Some(new_cluster);
 
             ir
