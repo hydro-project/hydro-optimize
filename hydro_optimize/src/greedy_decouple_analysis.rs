@@ -184,7 +184,6 @@ pub fn greedy_decouple_analysis(
             .expect("Op's parent is not in the same location, must be network. But Network must be serializable and unbounded?");
         for input in inputs {
             let input_key = state.op_to_key.get(input).expect("Input should have a key");
-            state.key_to_loc.union(*op_key, *input_key);
         }
     }
 

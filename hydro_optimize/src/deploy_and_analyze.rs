@@ -16,6 +16,7 @@ use hydro_lang::telemetry::Sidecar;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::deploy::{HostType, ReusableHosts};
+use crate::greedy_decouple_analysis::greedy_decouple_analysis;
 use crate::parse_results::{RunMetadata, analyze_cluster_results};
 use crate::reduce_pushdown::reduce_pushdown;
 use crate::reduce_pushdown_analysis::reduce_pushdown_decision;
@@ -141,10 +142,7 @@ fn insert_counter(ir: &mut [HydroRoot], duration: &syn::Expr, exclude: &HashSet<
 /// Inserted at:
 /// - Ops where `network_ops` indicates a network boundary
 /// - After existing Network nodes
-fn insert_byte_size_inspect(
-    ir: &mut [HydroRoot],
-    network_ops: &HashSet<usize>,
-) {
+fn insert_byte_size_inspect(ir: &mut [HydroRoot], network_ops: &HashSet<usize>) {
     use crate::rewrites::collection_kind_to_debug_type;
 
     traverse_dfir(
@@ -421,10 +419,7 @@ pub async fn deploy_and_analyze<'a>(
     let optimized = if optimizations.blow_up_analysis {
         let mut greedy_results = None;
         let built = built.optimize_with(|leaf| {
-            greedy_results = Some(crate::greedy_decouple_analysis::greedy_decouple_analysis(
-                leaf,
-                &optimizations.exclude,
-            ));
+            greedy_results = Some(greedy_decouple_analysis(leaf, &optimizations.exclude));
         });
 
         let mut builder = FlowBuilder::from_built(&built);
@@ -510,20 +505,13 @@ pub async fn deploy_and_analyze<'a>(
                     name.clone(),
                     *num_hosts,
                     pin_to_core,
-                    false,
                 ));
             }
             deployable = deployable.with_cluster_erased(cluster_id.key(), client_hosts.concat());
         } else {
             deployable = deployable.with_cluster_erased(
                 cluster_id.key(),
-                reusable_hosts.get_cluster_hosts(
-                    deployment,
-                    name.clone(),
-                    *num_hosts,
-                    0,
-                    !excluded,
-                ),
+                reusable_hosts.get_cluster_hosts(deployment, name.clone(), *num_hosts, 0),
             );
         }
         if !excluded {
@@ -534,7 +522,7 @@ pub async fn deploy_and_analyze<'a>(
     for (cluster_id, name, num_hosts) in extra_clusters.iter() {
         deployable = deployable.with_cluster_erased(
             cluster_id.key(),
-            reusable_hosts.get_cluster_hosts(deployment, name.clone(), *num_hosts, 0, true),
+            reusable_hosts.get_cluster_hosts(deployment, name.clone(), *num_hosts, 0),
         );
         deployable = deployable.with_sidecar_internal(cluster_id.key(), &sar_sidecar);
     }
@@ -610,11 +598,6 @@ pub async fn benchmark_protocol<'a>(
     num_runs: usize,
     run_benchmark: impl Fn(usize) -> BenchmarkConfig<'a>,
 ) {
-    assert!(
-        num_runs > 0,
-        "Must run at least one iteration of the benchmark"
-    );
-
     let mut deployment = Deployment::new();
     let host_type: HostType = if let Some(project) = args.gcp.clone() {
         HostType::Gcp { project }
@@ -623,8 +606,29 @@ pub async fn benchmark_protocol<'a>(
     } else {
         HostType::Localhost
     };
-
     let mut reusable_hosts = ReusableHosts::new(&host_type);
+
+    benchmark_protocol_with_reusable_machines(
+        &mut reusable_hosts,
+        &mut deployment,
+        start_virtual_clients,
+        num_runs,
+        run_benchmark,
+    )
+    .await;
+}
+
+pub async fn benchmark_protocol_with_reusable_machines<'a>(
+    mut reusable_hosts: &mut ReusableHosts,
+    mut deployment: &mut Deployment,
+    start_virtual_clients: usize,
+    num_runs: usize,
+    run_benchmark: impl Fn(usize) -> BenchmarkConfig<'a>,
+) {
+    assert!(
+        num_runs > 0,
+        "Must run at least one iteration of the benchmark"
+    );
 
     let BenchmarkConfig {
         name: config_name,

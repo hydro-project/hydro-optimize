@@ -84,11 +84,6 @@ wait "$PID_COUNTERS" || echo "  WARNING: counter run failed"
 wait "$PID_BYTES" || echo "  WARNING: byte-size run failed"
 wait "$PID_BLOWUP" || echo "  WARNING: blow-up analysis run failed"
 
-echo "  Analysis runs complete."
-
-# ─── Step 4: Combine and optimize ───
-echo "=== Step 4: Combine Metrics & Find Optimal Configuration ==="
-
 # Find the profiling JSONs from each run's benchmark_results directory
 find_profiling_json() {
     # benchmark_paxos outputs to benchmark_results/Paxos_<timestamp>/profiling_*.json
