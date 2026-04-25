@@ -11,7 +11,7 @@ use hydro_lang::{
 };
 
 use crate::rewrites::{can_decouple, op_id_to_parents};
-use crate::{decouple_analysis::PossibleRewrite, repair::cycle_source_to_sink_parent};
+use crate::{decouple_analysis::Rewrite, repair::cycle_source_to_sink_parent};
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct UnitKey(u32);
@@ -110,11 +110,11 @@ impl GreedyDecoupleState {
 
 /// Decouples as much as possible; only leaving ticked regions un-decoupled.
 /// Applies to all locations except those in `excluded_locations`.
-/// Returns a PossibleRewrite per original LocationId that was split.
+/// Returns one `Rewrite` per original `LocationId` that was split.
 pub fn greedy_decouple_analysis(
     ir: &mut [HydroRoot],
     excluded_locations: &HashSet<LocationId>,
-) -> HashMap<LocationId, PossibleRewrite> {
+) -> Vec<Rewrite> {
     let mut state = GreedyDecoupleState::new(excluded_locations.clone());
 
     traverse_dfir(
@@ -184,6 +184,7 @@ pub fn greedy_decouple_analysis(
             .expect("Op's parent is not in the same location, must be network. But Network must be serializable and unbounded?");
         for input in inputs {
             let input_key = state.op_to_key.get(input).expect("Input should have a key");
+            state.key_to_loc.union(*op_key, *input_key);
         }
     }
 
@@ -195,9 +196,9 @@ pub fn greedy_decouple_analysis(
 
     let op_to_parents = op_id_to_parents(ir, None, &cycles);
 
-    // Build per-location PossibleRewrites with on-the-fly index remapping.
+    // Build per-location Rewrites with on-the-fly index remapping.
     // For each original location, remap new indices to 0, 1, 2, ... as we encounter them.
-    let mut results: HashMap<LocationId, PossibleRewrite> = HashMap::new();
+    let mut results: HashMap<LocationId, Rewrite> = HashMap::new();
     let mut remaps: HashMap<LocationId, HashMap<usize, usize>> = HashMap::new();
 
     for (&op_id, &loc_idx) in &op_to_loc_idx {
@@ -211,7 +212,7 @@ pub fn greedy_decouple_analysis(
         let remapped = *remap.entry(loc_idx).or_insert(next);
         results
             .entry(orig_loc.clone())
-            .or_default()
+            .or_insert_with(|| Rewrite::new(orig_loc.clone()))
             .op_to_loc
             .insert(op_id, remapped);
     }
@@ -247,5 +248,5 @@ pub fn greedy_decouple_analysis(
         );
     }
 
-    results
+    results.into_values().collect()
 }

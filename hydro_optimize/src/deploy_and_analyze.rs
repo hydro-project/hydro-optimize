@@ -15,7 +15,7 @@ use hydro_lang::prelude::{Cluster, FlowBuilder, Process};
 use hydro_lang::telemetry::Sidecar;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::decouple_analysis::PossibleRewrite;
+use crate::decouple_analysis::Rewrite;
 use crate::deploy::{HostType, ReusableHosts};
 use crate::greedy_decouple_analysis::greedy_decouple_analysis;
 use crate::parse_results::{RunMetadata, analyze_cluster_results};
@@ -23,7 +23,6 @@ use crate::reduce_pushdown::reduce_pushdown;
 use crate::reduce_pushdown_analysis::reduce_pushdown_decision;
 use crate::repair::inject_id;
 use crate::rewriter::apply_rewrite;
-use crate::rewrites::Rewrite;
 
 const METRIC_INTERVAL_SECS: u64 = 1;
 const BYTE_SIZE_SAMPLE_EVERY_N: usize = 10000; // Sample every 10000th element for byte size to avoid excessive overhead
@@ -322,8 +321,8 @@ pub enum OptimizationKind {
     BlowUpAnalysis,
     /// Insert size measuring nodes wherever decoupling is possible.
     SizeAnalysis,
-    /// Apply `PossibleRewrite`s loaded from files, in order.
-    LoadedRewrites(Vec<PossibleRewrite>),
+    /// Apply `Rewrite`s loaded from files, in order.
+    LoadedRewrites(Vec<Rewrite>),
 }
 
 #[derive(Clone, Default)]
@@ -373,20 +372,18 @@ impl Optimizations {
         self.exclude.contains(location)
     }
 
-    /// Loads a `PossibleRewrite` from `path` and queues it to be applied before deployment.
+    /// Loads a `Rewrite` from `path` and queues it to be applied before deployment.
     pub fn load_rewrite(mut self, path: &Path) -> Self {
         let s = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("failed to read rewrite file {}: {}", path.display(), e));
-        let rewrite: PossibleRewrite = serde_json::from_str(&s)
-            .unwrap_or_else(|e| panic!("failed to deserialize PossibleRewrite: {}", e));
+        let rewrite: Rewrite = serde_json::from_str(&s)
+            .unwrap_or_else(|e| panic!("failed to deserialize Rewrite: {}", e));
         match &mut self.kind {
             OptimizationKind::LoadedRewrites(v) => v.push(rewrite),
             OptimizationKind::None => {
                 self.kind = OptimizationKind::LoadedRewrites(vec![rewrite]);
             }
-            _ => panic!(
-                "load_rewrite is mutually exclusive with blow_up_analysis/size_analysis"
-            ),
+            _ => panic!("load_rewrite is mutually exclusive with blow_up_analysis/size_analysis"),
         }
         self
     }
@@ -517,39 +514,35 @@ pub const VIRTUAL_CLIENTS_MAX: usize = 50 * PHYSICAL_CLIENTS; // Based on manual
 pub const VIRTUAL_CLIENTS_STEP: usize = 50; // Can tweak to get finer-grained numbers
 pub const NUM_RUNS_NO_THROUGHPUT: usize = 3;
 
-// TODO: Review Kiro output from here down
-/// Applies a single `possible_rewrite` assigned to `orig_loc` on `ir`, creating any new
-/// clusters it requires on `builder`. Extends `clusters` with each new cluster and records
+/// Applies a single `rewrite`, creating any new clusters it requires on `builder`. Records
 /// which original op ids landed on which deployed location in `location_to_original_ops`.
 fn apply_single_rewrite<'a>(
-    ir: &mut Vec<HydroRoot>,
+    ir: &mut [HydroRoot],
     builder: &mut FlowBuilder<'a>,
     clusters: &mut ReusableClusters,
     location_to_original_ops: &mut HashMap<LocationId, Vec<usize>>,
-    orig_loc: LocationId,
-    possible_rewrite: PossibleRewrite,
+    rewrite: Rewrite,
     new_cluster_name: impl Fn(usize) -> String,
 ) {
-    let cluster_size = clusters
-        .location_name_and_num(&orig_loc)
-        .map(|(_, n)| n)
-        .unwrap_or(1); // Is process
-
     // Build locations_map: index 0 = original, index > 0 = new clusters.
     let mut locations_map = HashMap::new();
-    locations_map.insert(0, orig_loc.clone());
-    for loc_idx in possible_rewrite.locations() {
+    locations_map.insert(0, rewrite.original_location.clone());
+    for loc_idx in rewrite.locations() {
         if loc_idx == 0 {
             continue;
         }
         let cluster = builder.cluster::<()>();
         let new_loc = cluster.id().clone();
         locations_map.insert(loc_idx, new_loc.clone());
-        *clusters =
-            std::mem::take(clusters).with_named(new_loc, new_cluster_name(loc_idx), cluster_size);
+        // TODO: cluster_size should take into consideration number of partitions
+        *clusters = std::mem::take(clusters).with_named(
+            new_loc,
+            new_cluster_name(loc_idx),
+            rewrite.cluster_size,
+        );
     }
 
-    for (&op_id, &loc_idx) in &possible_rewrite.op_to_loc {
+    for (&op_id, &loc_idx) in &rewrite.op_to_loc {
         let deployed_loc = locations_map.get(&loc_idx).unwrap();
         location_to_original_ops
             .entry(deployed_loc.clone())
@@ -557,16 +550,7 @@ fn apply_single_rewrite<'a>(
             .push(op_id);
     }
 
-    apply_rewrite(
-        ir,
-        &Rewrite {
-            possible_rewrite,
-            num_partitions: 0,
-            original_node: orig_loc,
-            cluster_size,
-        },
-        &locations_map,
-    );
+    apply_rewrite(ir, &rewrite, &locations_map);
 }
 
 /// Applies every loaded rewrite (reduce pushdown + inject_id + apply_rewrite) in sequence.
@@ -575,7 +559,7 @@ fn apply_single_rewrite<'a>(
 fn apply_loaded_rewrites<'a>(
     built: BuiltFlow<'a>,
     mut clusters: ReusableClusters,
-    loaded_rewrites: &[PossibleRewrite],
+    loaded_rewrites: &[Rewrite],
     exclude: &HashSet<LocationId>,
 ) -> (
     BuiltFlow<'a>,
@@ -591,58 +575,24 @@ fn apply_loaded_rewrites<'a>(
     let mut builder = FlowBuilder::from_built(&built);
     let mut ir = deep_clone(built.ir());
 
-    for possible_rewrite in loaded_rewrites.iter().cloned() {
-        // reduce_pushdown + inject_id before each rewrite so op ids in the IR line up with
-        // the possible_rewrite's op_to_loc / op_to_network keys.
-        let decision = reduce_pushdown_decision(&mut ir, exclude);
-        reduce_pushdown(&mut ir, decision);
-        inject_id(&mut ir);
-
-        // Infer the original LocationId from any op referenced by the rewrite.
-        let (&any_op, _) = possible_rewrite
-            .op_to_loc
-            .iter()
-            .find(|&(_, &loc)| loc == 0)
-            .or_else(|| possible_rewrite.op_to_loc.iter().next())
-            .expect("loaded PossibleRewrite has no op_to_loc entries");
-        let orig_loc = find_op_location(&ir, any_op)
-            .expect("could not find loaded rewrite's original location in IR");
-
+    for (iter, rewrite) in loaded_rewrites.iter().cloned().enumerate() {
         apply_single_rewrite(
             &mut ir,
             &mut builder,
             &mut clusters,
             &mut location_to_original_ops,
-            orig_loc,
-            possible_rewrite,
-            |loc_idx| format!("loaded_rewrite_{}", loc_idx),
+            rewrite,
+            |loc_idx| format!("loaded_rewrite_{}_{}", iter, loc_idx),
         );
+
+        // reduce_pushdown + inject_id after each rewrite
+        let decision = reduce_pushdown_decision(&mut ir, exclude);
+        reduce_pushdown(&mut ir, decision);
+        inject_id(&mut ir);
     }
 
     builder.replace_ir(ir);
     (builder.finalize(), clusters, location_to_original_ops)
-}
-
-/// Returns the `LocationId` of the op with the given id, if any.
-fn find_op_location(ir: &[HydroRoot], target_op_id: usize) -> Option<LocationId> {
-    // traverse_dfir requires &mut but we only inspect; make a local mutable clone.
-    let mut ir_clone = deep_clone(ir);
-    let mut found = None;
-    traverse_dfir(
-        &mut ir_clone,
-        |_, _| {},
-        |node, _| {
-            if found.is_some() {
-                return;
-            }
-            if let Some(id) = node.metadata().op.id
-                && id == target_op_id
-            {
-                found = Some(node.metadata().location_id.clone());
-            }
-        },
-    );
-    found
 }
 
 /// Applies the greedy-decoupled rewrite (blow-up analysis). Returns the new IR, updated
@@ -665,15 +615,14 @@ fn apply_blow_up_analysis<'a>(
     let mut builder = FlowBuilder::from_built(&built);
     let mut ir = deep_clone(built.ir());
 
-    for (orig_loc, possible_rewrite) in greedy_results.unwrap() {
+    for (iter, rewrite) in greedy_results.unwrap().into_iter().enumerate() {
         apply_single_rewrite(
             &mut ir,
             &mut builder,
             &mut clusters,
             &mut location_to_original_ops,
-            orig_loc,
-            possible_rewrite,
-            |loc_idx| format!("decouple_{}", loc_idx),
+            rewrite,
+            |loc_idx| format!("decouple_{}_{}", iter, loc_idx),
         );
     }
 
@@ -727,20 +676,23 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
         reduce_pushdown(leaf, decision);
         inject_id(leaf);
     });
-    let exclude = &config_optimizations.exclude;
     let (built, clusters, location_to_original_ops) = match &config_optimizations.kind {
         OptimizationKind::None => (built, config_clusters, HashMap::new()),
-        OptimizationKind::LoadedRewrites(rewrites) => {
-            apply_loaded_rewrites(built, config_clusters, rewrites, exclude)
-        }
+        OptimizationKind::LoadedRewrites(rewrites) => apply_loaded_rewrites(
+            built,
+            config_clusters,
+            rewrites,
+            &config_optimizations.exclude,
+        ),
         OptimizationKind::BlowUpAnalysis => {
-            apply_blow_up_analysis(built, config_clusters, exclude)
+            apply_blow_up_analysis(built, config_clusters, &config_optimizations.exclude)
         }
         OptimizationKind::SizeAnalysis => {
             let built = built.optimize_with(|leaf| {
-                let per_loc_rewrites = greedy_decouple_analysis(leaf, exclude);
+                let per_loc_rewrites =
+                    greedy_decouple_analysis(leaf, &config_optimizations.exclude);
                 let network_ops: HashSet<usize> = per_loc_rewrites
-                    .values()
+                    .iter()
                     .flat_map(|r| r.op_to_network.keys().copied())
                     .collect();
                 if !network_ops.is_empty() {

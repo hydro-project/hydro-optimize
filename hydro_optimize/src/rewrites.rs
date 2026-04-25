@@ -9,19 +9,8 @@ use hydro_lang::location::LocationKey;
 use hydro_lang::location::dynamic::LocationId;
 use proc_macro2::{Span, TokenStream};
 use quote::{ToTokens, quote};
-use serde::{Deserialize, Serialize};
 use syn::parse_quote;
 use syn::visit_mut::{self, VisitMut};
-
-use crate::decouple_analysis::PossibleRewrite;
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Rewrite {
-    pub possible_rewrite: PossibleRewrite,
-    pub num_partitions: usize,
-    pub original_node: LocationId,
-    pub cluster_size: usize,
-}
 
 /// Replace CLUSTER_SELF_ID with the ID of the original node the partition is assigned to
 #[derive(Copy, Clone)]

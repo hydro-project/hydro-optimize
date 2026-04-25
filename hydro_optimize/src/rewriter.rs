@@ -11,10 +11,11 @@ use stageleft::quote_type;
 use syn::visit_mut::VisitMut;
 
 use crate::debug::print_id;
+use crate::decouple_analysis::Rewrite;
 use crate::partition_syn_analysis::{StructOrTuple, StructOrTupleIndex};
 use crate::repair::{cycle_source_to_sink_parent, inject_id, inject_location};
 use crate::rewrites::{
-    ClusterSelfIdReplace, Rewrite, collection_kind_to_debug_type, deserialize_bincode_with_type,
+    ClusterSelfIdReplace, collection_kind_to_debug_type, deserialize_bincode_with_type,
     prepend_member_id_to_collection_kind, serialize_bincode_with_type, tee_to_inner_id,
     unbounded_optional, unbounded_singleton, unbounded_stream,
 };
@@ -344,7 +345,7 @@ fn insert_network(
 ) {
     // Return if we don't need to insert anything
     let Some((sender_location_idx, receiver_location_idx)) =
-        rewrite.possible_rewrite.op_to_network.get(&op_id)
+        rewrite.op_to_network.get(&op_id)
     else {
         return;
     };
@@ -353,7 +354,6 @@ fn insert_network(
     let sender_location = locations_map.get(sender_location_idx).unwrap().clone();
     let receiver_location = locations_map.get(receiver_location_idx).unwrap();
     let sender_partitions = if rewrite
-        .possible_rewrite
         .partitionable
         .contains(sender_location_idx)
     {
@@ -362,7 +362,6 @@ fn insert_network(
         0
     };
     let receiver_partitions = if rewrite
-        .possible_rewrite
         .partitionable
         .contains(receiver_location_idx)
     {
@@ -371,7 +370,6 @@ fn insert_network(
         0
     };
     let partition_field = rewrite
-        .possible_rewrite
         .partition_field_choices
         .get(&op_id)
         .cloned();
@@ -445,30 +443,29 @@ fn repair_existing_network_for_partitioning(
         return;
     };
     let sender_op_id = input.op_metadata().id.unwrap();
-    let sender_location_idx = rewrite.possible_rewrite.op_to_loc.get(&sender_op_id);
+    let sender_location_idx = rewrite.op_to_loc.get(&sender_op_id);
     let sender_location = sender_location_idx
         .map(|idx| locations_map.get(idx).unwrap().clone())
         .unwrap_or_else(|| input.metadata().location_id.clone());
     let sender_partitions = if let Some(idx) = sender_location_idx
-        && rewrite.possible_rewrite.partitionable.contains(idx)
+        && rewrite.partitionable.contains(idx)
     {
         rewrite.num_partitions
     } else {
         0
     };
-    let receiver_location_idx = rewrite.possible_rewrite.op_to_loc.get(&op_id);
+    let receiver_location_idx = rewrite.op_to_loc.get(&op_id);
     let receiver_location = receiver_location_idx
         .map(|idx| locations_map.get(idx).unwrap().clone())
         .unwrap_or_else(|| metadata.location_id.clone());
     let receiver_partitions = if let Some(idx) = receiver_location_idx
-        && rewrite.possible_rewrite.partitionable.contains(idx)
+        && rewrite.partitionable.contains(idx)
     {
         rewrite.num_partitions
     } else {
         0
     };
     let partition_field = rewrite
-        .possible_rewrite
         .partition_field_choices
         .get(&op_id)
         .cloned();
@@ -518,7 +515,7 @@ fn decouple_node(
     repair_existing_network_for_partitioning(node, op_id, rewrite, locations_map);
 
     // Place on new location
-    if let Some(new_locatio_idx) = rewrite.possible_rewrite.op_to_loc.get(&op_id) {
+    if let Some(new_locatio_idx) = rewrite.op_to_loc.get(&op_id) {
         let new_location = locations_map.get(new_locatio_idx).unwrap();
         node.metadata_mut().location_id = new_location.clone();
     }
@@ -535,7 +532,6 @@ fn replace_cluster_self_id_node(
     let target_location = locations_map.get(&target_loc_idx).unwrap();
     // If the new location is partitioned, then we need to know how many partitions there are to divide
     let num_partitions = if rewrite
-        .possible_rewrite
         .partitionable
         .contains(&target_loc_idx)
     {
@@ -575,7 +571,7 @@ fn replace_cluster_self_id(
                 .input_metadata()
                 .op
                 .id
-                .and_then(|id| rewrite.possible_rewrite.op_to_loc.get(&id).copied())
+                .and_then(|id| rewrite.op_to_loc.get(&id).copied())
                 .unwrap_or(0);
             replace_cluster_self_id_node(
                 &mut |f| root.visit_debug_expr(f),
@@ -591,7 +587,6 @@ fn replace_cluster_self_id(
             };
 
             let target_loc_idx = rewrite
-                .possible_rewrite
                 .op_to_loc
                 .get(&op_id)
                 .copied()
@@ -605,7 +600,6 @@ fn replace_cluster_self_id(
             );
 
             if rewrite
-                .possible_rewrite
                 .partitionable
                 .contains(&target_loc_idx)
             {
@@ -622,8 +616,8 @@ pub fn apply_rewrite(
     rewrite: &Rewrite,
     locations_map: &HashMap<usize, LocationId>,
 ) {
-    if rewrite.possible_rewrite.op_to_loc.is_empty()
-        && rewrite.possible_rewrite.partitionable.is_empty()
+    if rewrite.op_to_loc.is_empty()
+        && rewrite.partitionable.is_empty()
     {
         // No rewriting to do
         println!("No decoupling or partitioning needed");

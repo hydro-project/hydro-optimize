@@ -482,8 +482,15 @@ pub struct DecouplePartitionConfig {
     pub consider_partitioning: bool,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct PossibleRewrite {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Rewrite {
+    /// The original `LocationId` that this rewrite is splitting (index 0 in the loc maps below).
+    pub original_location: LocationId,
+    /// Size of the original cluster; new clusters created by this rewrite inherit this size.
+    pub cluster_size: usize,
+    /// Number of partitions per partitionable location (0 = no partitioning).
+    /// TODO: This should be per-location
+    pub num_partitions: usize,
     /// op_id → its new location (where its output streams to)
     pub op_to_loc: HashMap<usize, usize>,
     /// op_id → (src_loc, dst_loc). A new network should be inserted before this op
@@ -498,7 +505,21 @@ pub struct PossibleRewrite {
     pub partition_field_choices: HashMap<usize, StructOrTupleIndex>,
 }
 
-impl PossibleRewrite {
+impl Rewrite {
+    pub fn new(original_location: LocationId) -> Self {
+        Self {
+            original_location,
+            cluster_size: 0,
+            num_partitions: 0,
+            op_to_loc: HashMap::new(),
+            op_to_network: HashMap::new(),
+            stateless_partitionable: HashSet::new(),
+            field_partitionable: HashSet::new(),
+            partitionable: HashSet::new(),
+            partition_field_choices: HashMap::new(),
+        }
+    }
+
     /// All unique location indices referenced.
     pub fn locations(&self) -> HashSet<usize> {
         let mut locs: HashSet<usize> = self.op_to_loc.values().copied().collect();
@@ -525,7 +546,7 @@ pub(crate) fn decouple_analysis(
     network_cost_table: NetworkCostTable,
     config: &DecouplePartitionConfig,
     cycle_source_to_sink_parent: &HashMap<usize, usize>,
-) -> PossibleRewrite {
+) -> Rewrite {
     let num_locations = config.num_locations;
     if num_locations < 2 {
         panic!("Must decouple to at least 2 locations (original location, decoupled location)");
@@ -588,7 +609,8 @@ pub(crate) fn decouple_analysis(
         ..
     } = &*decoupling_metadata.borrow();
 
-    let mut result = PossibleRewrite::default();
+    let mut result = Rewrite::new(bottleneck.clone());
+    result.num_partitions = config.num_partitions;
     for (&op_id, parents) in &op_id_to_parents {
         let Some(op_vars) = op_id_to_var.get(&op_id) else {
             continue;
@@ -672,11 +694,12 @@ pub(crate) fn decouple_analysis(
     result
 }
 
+// TODO: Review Kiro outputs starting here
 /// Result of a single configuration trial in the machine budget search.
 #[derive(Debug, Clone)]
 pub struct ConfigResult {
     pub config: DecouplePartitionConfig,
-    pub rewrite: PossibleRewrite,
+    pub rewrite: Rewrite,
     /// Maximum resource usage across all locations (the bottleneck cost).
     pub max_cost: f64,
 }

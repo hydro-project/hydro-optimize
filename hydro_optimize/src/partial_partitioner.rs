@@ -11,11 +11,11 @@ use serde::{Deserialize, Serialize};
 
 use stageleft::quote_type;
 
-use crate::decouple_analysis::PossibleRewrite;
+use crate::decouple_analysis::Rewrite;
 use crate::decoupler::{add_network_raw, decouple};
 use crate::partition_syn_analysis::StructOrTupleIndex;
 use crate::rewrites::{
-    Rewrite, bounded_optional, bounded_singleton, bounded_stream, collection_kind_to_debug_type,
+    bounded_optional, bounded_singleton, bounded_stream, collection_kind_to_debug_type,
     deserialize_bincode_with_type, prepend_member_id_to_collection_kind,
     serialize_bincode_with_type, unbounded_stream,
 };
@@ -1163,16 +1163,12 @@ fn handle_replicated_output_recv(node: &mut HydroNode, num_partitions: usize) {
 fn apply_regular_partition(ir: &mut [HydroRoot], partitioner: &PartialPartitioner) {
     // Set the partitioned cluster to idx 0
     // `nodes_before_partitioned_input`.
-    let mut possible_rewrite = PossibleRewrite::default();
-    possible_rewrite.field_partitionable.insert(0);
-    possible_rewrite.partition_field_choices = partitioner.nodes_before_partitioned_input.clone();
+    let mut rewrite = Rewrite::new(partitioner.location_id.clone());
+    rewrite.cluster_size = partitioner.cluster_size;
+    rewrite.num_partitions = partitioner.num_partitions;
+    rewrite.field_partitionable.insert(0);
+    rewrite.partition_field_choices = partitioner.nodes_before_partitioned_input.clone();
 
-    let rewrite = Rewrite {
-        possible_rewrite,
-        num_partitions: partitioner.num_partitions,
-        original_node: partitioner.location_id.clone(),
-        cluster_size: partitioner.cluster_size,
-    };
     let mut locations_map = HashMap::new();
     locations_map.insert(0, partitioner.location_id.clone());
     decouple(ir, &rewrite, &locations_map);
