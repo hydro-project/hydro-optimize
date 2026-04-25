@@ -312,18 +312,27 @@ impl ReusableProcesses {
     }
 }
 
+/// Mutually exclusive optimization strategies that rewrite the IR before deployment.
+#[derive(Clone, Default)]
+pub enum OptimizationKind {
+    /// No IR rewriting.
+    #[default]
+    None,
+    /// Apply greedy decoupling, deploy decoupled system, gather per-operator SAR costs.
+    BlowUpAnalysis,
+    /// Insert size measuring nodes wherever decoupling is possible.
+    SizeAnalysis,
+    /// Apply `PossibleRewrite`s loaded from files, in order.
+    LoadedRewrites(Vec<PossibleRewrite>),
+}
+
 #[derive(Clone, Default)]
 pub struct Optimizations {
     decoupling: bool,
     partitioning: bool,
     no_counters: bool,
-    /// Insert size measuring nodes wherever decoupling is possible
-    size_analysis: bool,
-    /// Apply greedy decoupling, deploy decoupled system, gather per-operator SAR costs
-    blow_up_analysis: bool,
+    kind: OptimizationKind,
     exclude: HashSet<LocationId>,
-    /// Rewrites loaded from file, applied in order before deployment.
-    loaded_rewrites: Vec<PossibleRewrite>,
 }
 
 impl Optimizations {
@@ -345,13 +354,13 @@ impl Optimizations {
 
     /// Insert size measuring nodes wherever decoupling is possible
     pub fn with_size_analysis(mut self) -> Self {
-        self.size_analysis = true;
+        self.set_kind(OptimizationKind::SizeAnalysis);
         self
     }
 
     /// Apply greedy decoupling, deploy decoupled system, gather per-operator SAR costs
     pub fn with_blow_up_analysis(mut self) -> Self {
-        self.blow_up_analysis = true;
+        self.set_kind(OptimizationKind::BlowUpAnalysis);
         self
     }
 
@@ -370,8 +379,24 @@ impl Optimizations {
             .unwrap_or_else(|e| panic!("failed to read rewrite file {}: {}", path.display(), e));
         let rewrite: PossibleRewrite = serde_json::from_str(&s)
             .unwrap_or_else(|e| panic!("failed to deserialize PossibleRewrite: {}", e));
-        self.loaded_rewrites.push(rewrite);
+        match &mut self.kind {
+            OptimizationKind::LoadedRewrites(v) => v.push(rewrite),
+            OptimizationKind::None => {
+                self.kind = OptimizationKind::LoadedRewrites(vec![rewrite]);
+            }
+            _ => panic!(
+                "load_rewrite is mutually exclusive with blow_up_analysis/size_analysis"
+            ),
+        }
         self
+    }
+
+    fn set_kind(&mut self, kind: OptimizationKind) {
+        assert!(
+            matches!(self.kind, OptimizationKind::None),
+            "blow_up_analysis, size_analysis, and loaded rewrites are mutually exclusive"
+        );
+        self.kind = kind;
     }
 }
 
@@ -550,7 +575,8 @@ fn apply_single_rewrite<'a>(
 fn apply_loaded_rewrites<'a>(
     built: BuiltFlow<'a>,
     mut clusters: ReusableClusters,
-    optimizations: &Optimizations,
+    loaded_rewrites: &[PossibleRewrite],
+    exclude: &HashSet<LocationId>,
 ) -> (
     BuiltFlow<'a>,
     ReusableClusters,
@@ -558,17 +584,17 @@ fn apply_loaded_rewrites<'a>(
 ) {
     let mut location_to_original_ops: HashMap<LocationId, Vec<usize>> = HashMap::new();
 
-    if optimizations.loaded_rewrites.is_empty() {
+    if loaded_rewrites.is_empty() {
         return (built, clusters, location_to_original_ops);
     }
 
     let mut builder = FlowBuilder::from_built(&built);
     let mut ir = deep_clone(built.ir());
 
-    for possible_rewrite in optimizations.loaded_rewrites.clone() {
+    for possible_rewrite in loaded_rewrites.iter().cloned() {
         // reduce_pushdown + inject_id before each rewrite so op ids in the IR line up with
         // the possible_rewrite's op_to_loc / op_to_network keys.
-        let decision = reduce_pushdown_decision(&mut ir, &optimizations.exclude);
+        let decision = reduce_pushdown_decision(&mut ir, exclude);
         reduce_pushdown(&mut ir, decision);
         inject_id(&mut ir);
 
@@ -624,7 +650,7 @@ fn find_op_location(ir: &[HydroRoot], target_op_id: usize) -> Option<LocationId>
 fn apply_blow_up_analysis<'a>(
     built: BuiltFlow<'a>,
     mut clusters: ReusableClusters,
-    optimizations: &Optimizations,
+    exclude: &HashSet<LocationId>,
 ) -> (
     BuiltFlow<'a>,
     ReusableClusters,
@@ -634,7 +660,7 @@ fn apply_blow_up_analysis<'a>(
 
     let mut greedy_results = None;
     let built = built.optimize_with(|leaf| {
-        greedy_results = Some(greedy_decouple_analysis(leaf, &optimizations.exclude));
+        greedy_results = Some(greedy_decouple_analysis(leaf, exclude));
     });
     let mut builder = FlowBuilder::from_built(&built);
     let mut ir = deep_clone(built.ir());
@@ -694,36 +720,35 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
         "Must run at least one iteration of the benchmark"
     );
 
-    // Apply any rewrites (loaded + blow-up + size analysis) first
+    // Apply the selected optimization strategy exactly once.
     // Baseline: reduce_pushdown + inject_id so downstream passes have stable op ids.
     let built = builder.finalize().optimize_with(|leaf| {
         let decision = reduce_pushdown_decision(leaf, &config_optimizations.exclude);
         reduce_pushdown(leaf, decision);
         inject_id(leaf);
     });
-    let (built, clusters, mut location_to_original_ops) =
-        apply_loaded_rewrites(built, config_clusters, &config_optimizations);
-    let (built, clusters, more_locs) = if config_optimizations.blow_up_analysis {
-        apply_blow_up_analysis(built, clusters, &config_optimizations)
-    } else {
-        (built, clusters, HashMap::new())
-    };
-    for (loc, ops) in more_locs {
-        location_to_original_ops.entry(loc).or_default().extend(ops);
-    }
-    let built = if config_optimizations.size_analysis {
-        built.optimize_with(|leaf| {
-            let per_loc_rewrites = greedy_decouple_analysis(leaf, &config_optimizations.exclude);
-            let network_ops: HashSet<usize> = per_loc_rewrites
-                .values()
-                .flat_map(|r| r.op_to_network.keys().copied())
-                .collect();
-            if !network_ops.is_empty() {
-                insert_byte_size_inspect(leaf, &network_ops);
-            }
-        })
-    } else {
-        built
+    let exclude = &config_optimizations.exclude;
+    let (built, clusters, location_to_original_ops) = match &config_optimizations.kind {
+        OptimizationKind::None => (built, config_clusters, HashMap::new()),
+        OptimizationKind::LoadedRewrites(rewrites) => {
+            apply_loaded_rewrites(built, config_clusters, rewrites, exclude)
+        }
+        OptimizationKind::BlowUpAnalysis => {
+            apply_blow_up_analysis(built, config_clusters, exclude)
+        }
+        OptimizationKind::SizeAnalysis => {
+            let built = built.optimize_with(|leaf| {
+                let per_loc_rewrites = greedy_decouple_analysis(leaf, exclude);
+                let network_ops: HashSet<usize> = per_loc_rewrites
+                    .values()
+                    .flat_map(|r| r.op_to_network.keys().copied())
+                    .collect();
+                if !network_ops.is_empty() {
+                    insert_byte_size_inspect(leaf, &network_ops);
+                }
+            });
+            (built, config_clusters, HashMap::new())
+        }
     };
 
     let ir = built.ir();
