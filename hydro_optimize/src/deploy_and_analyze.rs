@@ -415,12 +415,10 @@ pub async fn deploy_and_analyze<'a>(
             // Always reduce pushdown first
             apply_reduce_pushdown(leaf, &optimizations.exclude);
             inject_id(leaf);
-            greedy_result = Some(
-                crate::greedy_decouple_analysis::greedy_decouple_analysis(
-                    leaf,
-                    &optimizations.exclude,
-                ),
-            );
+            greedy_result = Some(crate::greedy_decouple_analysis::greedy_decouple_analysis(
+                leaf,
+                &optimizations.exclude,
+            ));
         });
 
         let rewrite_result = greedy_result.unwrap();
@@ -506,8 +504,7 @@ pub async fn deploy_and_analyze<'a>(
                 leaf,
                 &optimizations.exclude,
             );
-            let network_ops: HashSet<usize> =
-                rewrite.op_to_network.keys().copied().collect();
+            let network_ops: HashSet<usize> = rewrite.op_to_network.keys().copied().collect();
             if !network_ops.is_empty() {
                 insert_byte_size_inspect(leaf, &network_ops, 100);
             }
@@ -539,20 +536,13 @@ pub async fn deploy_and_analyze<'a>(
                     name.clone(),
                     *num_hosts,
                     pin_to_core,
-                    false,
                 ));
             }
             deployable = deployable.with_cluster_erased(cluster_id.key(), client_hosts.concat());
         } else {
             deployable = deployable.with_cluster_erased(
                 cluster_id.key(),
-                reusable_hosts.get_cluster_hosts(
-                    deployment,
-                    name.clone(),
-                    *num_hosts,
-                    0,
-                    !excluded,
-                ),
+                reusable_hosts.get_cluster_hosts(deployment, name.clone(), *num_hosts, 0),
             );
         }
         if !excluded {
@@ -563,7 +553,7 @@ pub async fn deploy_and_analyze<'a>(
     for (cluster_id, name, num_hosts) in extra_clusters.iter() {
         deployable = deployable.with_cluster_erased(
             cluster_id.key(),
-            reusable_hosts.get_cluster_hosts(deployment, name.clone(), *num_hosts, 0, true),
+            reusable_hosts.get_cluster_hosts(deployment, name.clone(), *num_hosts, 0),
         );
         deployable = deployable.with_sidecar_internal(cluster_id.key(), &sar_sidecar);
     }
@@ -605,7 +595,7 @@ pub async fn deploy_and_analyze<'a>(
         .unwrap();
 
     // Parse results to get metrics
-    let mut run_metadata = analyze_cluster_results(&nodes, metrics, &optimizations).await;
+    let mut run_metadata = analyze_cluster_results(&nodes, metrics, optimizations).await;
     run_metadata.location_to_original_ops = location_to_original_ops;
     run_metadata
 }
@@ -639,11 +629,6 @@ pub async fn benchmark_protocol<'a>(
     num_runs: usize,
     run_benchmark: impl Fn(usize) -> BenchmarkConfig<'a>,
 ) {
-    assert!(
-        num_runs > 0,
-        "Must run at least one iteration of the benchmark"
-    );
-
     let mut deployment = Deployment::new();
     let host_type: HostType = if let Some(project) = args.gcp.clone() {
         HostType::Gcp { project }
@@ -652,8 +637,29 @@ pub async fn benchmark_protocol<'a>(
     } else {
         HostType::Localhost
     };
-
     let mut reusable_hosts = ReusableHosts::new(&host_type);
+
+    benchmark_protocol_with_reusable_machines(
+        &mut reusable_hosts,
+        &mut deployment,
+        start_virtual_clients,
+        num_runs,
+        run_benchmark,
+    )
+    .await;
+}
+
+pub async fn benchmark_protocol_with_reusable_machines<'a>(
+    mut reusable_hosts: &mut ReusableHosts,
+    mut deployment: &mut Deployment,
+    start_virtual_clients: usize,
+    num_runs: usize,
+    run_benchmark: impl Fn(usize) -> BenchmarkConfig<'a>,
+) {
+    assert!(
+        num_runs > 0,
+        "Must run at least one iteration of the benchmark"
+    );
 
     let BenchmarkConfig {
         name: config_name,
@@ -738,5 +744,3 @@ pub async fn benchmark_protocol<'a>(
         );
     }
 }
-
-

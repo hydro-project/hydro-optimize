@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Network calibration: measures cost-per-byte at various message sizes.
-# Launches parallel benchmark runs with exponentially increasing message sizes (1B–4KB),
-# parses SAR network metrics and throughput, computes cost-per-byte, saves to JSON.
+# The network_calibrator example internally loops over exponentially increasing
+# message sizes (1B–4KB), reusing the same machines for consistency.
 #
 # Usage: ./scripts/calibrate_network.sh [--aws | --gcp PROJECT] [--output FILE]
 
@@ -33,36 +33,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-CALIBRATION_DIR="$(dirname "$OUTPUT_FILE")/calibration"
-mkdir -p "$CALIBRATION_DIR"
+mkdir -p "$(dirname "$OUTPUT_FILE")"
 
 echo "=== Network Calibration ==="
 
-# Launch calibration runs in parallel with exponentially increasing message sizes
-PIDS=()
-for size in 1 2 4 8 16 32 64 128 256 512 1024 2048 4096; do
-    echo "  Launching calibration with message_size=$size"
-    cargo run --example network_calibrator -- \
-        $CLOUD_ARGS --message-size "$size" \
-        > "$CALIBRATION_DIR/calibrate_${size}b.log" 2>&1 &
-    PIDS+=($!)
-done
+cargo run --example network_calibrator -- $CLOUD_ARGS > "$OUTPUT_FILE"run.txt
 
-# Wait for all calibration runs
-FAILED=0
-for pid in "${PIDS[@]}"; do
-    if ! wait "$pid"; then
-        echo "  WARNING: calibration process $pid failed"
-        FAILED=$((FAILED + 1))
-    fi
-done
-
-if [ "$FAILED" -gt 0 ]; then
-    echo "  $FAILED calibration runs failed. Check logs in $CALIBRATION_DIR"
-fi
-
-# Parse calibration results
+# Parse calibration results from benchmark_results/NetworkCalibration_*/ dirs
 echo "  Parsing calibration results..."
-python3 "$SCRIPT_DIR/parse_calibration.py" "$CALIBRATION_DIR" "$OUTPUT_FILE"
+python3 "$SCRIPT_DIR/parse_calibration.py" "$PROJECT_DIR/benchmark_results" "$OUTPUT_FILE"
 
 echo "=== Calibration complete ==="

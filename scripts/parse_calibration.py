@@ -4,11 +4,12 @@
 For each message size, reads the server CSV at MEASUREMENT_SECOND and computes
 how much CPU (%), memory (KB), and I/O (tps) is consumed per byte of network traffic.
 
-Usage: python3 parse_calibration.py <calibration_dir> <output_file>
+Usage: python3 parse_calibration.py <benchmark_results_dir> <output_file>
 
-Expects calibration_dir to contain subdirectories like:
-  Network_<timestamp>/server_10c_1vc_r0.csv
-One per message size, with the message size encoded in a calibrate_<size>b.log file.
+Expects benchmark_results_dir to contain directories like:
+  NetworkCalibration_1b_<timestamp>/server_10c_50vc_r0.csv
+  NetworkCalibration_2b_<timestamp>/server_10c_50vc_r0.csv
+  ...
 """
 
 import csv
@@ -23,36 +24,27 @@ MEASUREMENT_SECOND = 59
 
 def main():
     if len(sys.argv) != 3:
-        print(f"Usage: {sys.argv[0]} <calibration_dir> <output_file>", file=sys.stderr)
+        print(f"Usage: {sys.argv[0]} <benchmark_results_dir> <output_file>", file=sys.stderr)
         sys.exit(1)
 
-    calibration_dir = sys.argv[1]
+    results_dir = sys.argv[1]
     output_file = sys.argv[2]
     entries = []
 
-    for fname in sorted(os.listdir(calibration_dir)):
-        if not fname.startswith("calibrate_") or not fname.endswith(".log"):
+    for dirname in sorted(os.listdir(results_dir)):
+        m = re.match(r"NetworkCalibration_(\d+)b_", dirname)
+        if not m:
             continue
-        size = int(re.search(r"calibrate_(\d+)b", fname).group(1))
-
-        # Find the corresponding CSV for the server cluster
-        # The benchmark outputs CSVs in a subdirectory like Network_<timestamp>/
-        csv_dir = None
-        for d in os.listdir(calibration_dir):
-            candidate = os.path.join(calibration_dir, d)
-            if os.path.isdir(candidate) and d.startswith("Network"):
-                csv_dir = candidate
-                break
-
-        if csv_dir is None:
-            print(f"  WARNING: no benchmark output dir found for size={size}", file=sys.stderr)
+        size = int(m.group(1))
+        run_dir = os.path.join(results_dir, dirname)
+        if not os.path.isdir(run_dir):
             continue
 
         # Find server CSV
         server_csv = None
-        for f in os.listdir(csv_dir):
+        for f in os.listdir(run_dir):
             if f.startswith("server") and f.endswith(".csv"):
-                server_csv = os.path.join(csv_dir, f)
+                server_csv = os.path.join(run_dir, f)
                 break
 
         if server_csv is None:
