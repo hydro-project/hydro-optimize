@@ -1019,7 +1019,7 @@ dependencies = [
 [[package]]
 name = "copy_span"
 version = "0.1.0"
-source = "git+https://github.com/hydro-project/hydro.git?rev=b6fc12e#b6fc12e3a8b174f251a491fad12020da030e0dfe"
+source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1248,7 +1248,7 @@ dependencies = [
 [[package]]
 name = "dfir_lang"
 version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git?rev=b6fc12e#b6fc12e3a8b174f251a491fad12020da030e0dfe"
+source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
 dependencies = [
  "auto_impl",
  "documented",
@@ -1266,7 +1266,7 @@ dependencies = [
 [[package]]
 name = "dfir_pipes"
 version = "0.0.1"
-source = "git+https://github.com/hydro-project/hydro.git?rev=b6fc12e#b6fc12e3a8b174f251a491fad12020da030e0dfe"
+source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
 dependencies = [
  "futures-core",
  "futures-sink",
@@ -1282,7 +1282,7 @@ dependencies = [
 [[package]]
 name = "dfir_rs"
 version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git?rev=b6fc12e#b6fc12e3a8b174f251a491fad12020da030e0dfe"
+source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
 dependencies = [
  "bincode",
  "bytes",
@@ -1998,7 +1998,7 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 [[package]]
 name = "hydro_build_utils"
 version = "0.0.1"
-source = "git+https://github.com/hydro-project/hydro.git?rev=b6fc12e#b6fc12e3a8b174f251a491fad12020da030e0dfe"
+source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
 dependencies = [
  "insta",
  "rustc_version",
@@ -2007,7 +2007,7 @@ dependencies = [
 [[package]]
 name = "hydro_deploy"
 version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git?rev=b6fc12e#b6fc12e3a8b174f251a491fad12020da030e0dfe"
+source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
 dependencies = [
  "anyhow",
  "append-only-vec",
@@ -2043,7 +2043,7 @@ dependencies = [
 [[package]]
 name = "hydro_deploy_integration"
 version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git?rev=b6fc12e#b6fc12e3a8b174f251a491fad12020da030e0dfe"
+source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -2061,7 +2061,7 @@ dependencies = [
 [[package]]
 name = "hydro_lang"
 version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git?rev=b6fc12e#b6fc12e3a8b174f251a491fad12020da030e0dfe"
+source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
 dependencies = [
  "auto_impl",
  "backtrace",
@@ -2163,7 +2163,7 @@ dependencies = [
 [[package]]
 name = "hydro_std"
 version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git?rev=b6fc12e#b6fc12e3a8b174f251a491fad12020da030e0dfe"
+source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
 dependencies = [
  "hdrhistogram",
  "hydro_lang",
@@ -2175,7 +2175,7 @@ dependencies = [
 [[package]]
 name = "hydro_test"
 version = "0.0.0"
-source = "git+https://github.com/hydro-project/hydro.git?rev=b6fc12e#b6fc12e3a8b174f251a491fad12020da030e0dfe"
+source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
 dependencies = [
  "bytes",
  "colored",
@@ -2389,7 +2389,7 @@ dependencies = [
 [[package]]
 name = "include_mdtests"
 version = "0.0.0"
-source = "git+https://github.com/hydro-project/hydro.git?rev=b6fc12e#b6fc12e3a8b174f251a491fad12020da030e0dfe"
+source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
 dependencies = [
  "glob",
  "proc-macro2",
@@ -2576,7 +2576,7 @@ dependencies = [
 [[package]]
 name = "lattices"
 version = "0.6.2"
-source = "git+https://github.com/hydro-project/hydro.git?rev=b6fc12e#b6fc12e3a8b174f251a491fad12020da030e0dfe"
+source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
 dependencies = [
  "cc-traits",
  "fst",
@@ -2592,7 +2592,7 @@ dependencies = [
 [[package]]
 name = "lattices_macro"
 version = "0.5.11"
-source = "git+https://github.com/hydro-project/hydro.git?rev=b6fc12e#b6fc12e3a8b174f251a491fad12020da030e0dfe"
+source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
 dependencies = [
  "hydro_build_utils",
  "proc-macro-crate 3.5.0",
@@ -2618,9 +2618,9 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "libc"
-version = "0.2.185"
+version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52ff2c0fe9bc6cb6b14a0592c2ff4fa9ceb83eea9db979b0487cd054946a2b8f"
+checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libloading"
@@ -3967,9 +3967,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.38"
+version = "0.23.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69f9466fb2c14ea04357e91413efb882e2a6d4a406e625449bc0a5d360d53a21"
+checksum = "7c2c118cb077cca2822033836dfb1b975355dfb784b5e8da48f7b6c5db74e60e"
 dependencies = [
  "once_cell",
  "ring",
@@ -4276,7 +4276,7 @@ checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 [[package]]
 name = "sinktools"
 version = "0.0.1"
-source = "git+https://github.com/hydro-project/hydro.git?rev=b6fc12e#b6fc12e3a8b174f251a491fad12020da030e0dfe"
+source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
 dependencies = [
  "futures-util",
  "pin-project-lite",
@@ -5092,7 +5092,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 [[package]]
 name = "variadics"
 version = "0.0.10"
-source = "git+https://github.com/hydro-project/hydro.git?rev=b6fc12e#b6fc12e3a8b174f251a491fad12020da030e0dfe"
+source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
 dependencies = [
  "hashbrown 0.14.5",
  "hydro_build_utils",
@@ -5102,7 +5102,7 @@ dependencies = [
 [[package]]
 name = "variadics_macro"
 version = "0.6.2"
-source = "git+https://github.com/hydro-project/hydro.git?rev=b6fc12e#b6fc12e3a8b174f251a491fad12020da030e0dfe"
+source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
 dependencies = [
  "proc-macro-crate 3.5.0",
  "proc-macro2",

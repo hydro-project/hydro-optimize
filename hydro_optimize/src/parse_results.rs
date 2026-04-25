@@ -1,12 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 
 use hydro_lang::compile::deploy::DeployResult;
-use hydro_lang::compile::ir::{HydroNode, HydroRoot, traverse_dfir};
 use hydro_lang::deploy::HydroDeploy;
-use hydro_lang::deploy::deploy_graph::DeployCrateWrapper;
 use hydro_lang::location::dynamic::LocationId;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -14,47 +12,133 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::deploy_and_analyze::{MetricLogs, Optimizations};
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct RunMetadata {
-    #[serde(skip)]
-    throughputs: Vec<usize>,
-    #[serde(skip)]
-    latencies: Vec<(f64, f64, f64, u64)>, // per-second: (p50, p99, p999, count)
-    counters: HashMap<usize, usize>, // op_id -> cardinality count
-    #[serde(default, with = "perf_serde")]
-    perf: HashMap<(usize, bool), f64>, // (op_id, is_recv) -> cpu fraction
-    #[serde(skip)]
-    send_overhead: HashMap<LocationId, f64>,
-    #[serde(skip)]
-    recv_overhead: HashMap<LocationId, f64>,
-    #[serde(skip)]
-    unaccounted_perf: HashMap<LocationId, f64>, // % of perf samples not mapped to any operator
-    #[serde(skip)]
-    sar_stats: HashMap<LocationId, Vec<SarStats>>,
+    pub throughputs: Vec<usize>,
+    pub latencies: Vec<(f64, f64, f64, u64)>, // per-second: (p50, p99, p999, count)
+    pub counters: HashMap<usize, usize>,      // op_id -> cardinality count
+    pub byte_sizes: HashMap<usize, Vec<u64>>, // op_id -> sampled byte sizes
+    pub sar_stats: HashMap<LocationId, Vec<SarStats>>,
+    /// Maps each LocationId → original op_ids assigned to it (populated when size_analysis is used)
+    pub location_to_original_ops: HashMap<LocationId, Vec<usize>>,
 }
 
-/// Serialize/deserialize perf HashMap as a Vec for JSON compatibility.
-mod perf_serde {
-    use super::*;
-    use serde::{Deserializer, Serializer};
+// Purely use for serde on RunMetadata. All fields omitted are not serialized
+#[derive(Serialize, Deserialize)]
+struct SerdeRunMetadata {
+    counters: HashMap<usize, usize>,
+    #[serde(default)]
+    byte_sizes: HashMap<usize, Vec<u64>>,
+}
 
-    pub fn serialize<S: Serializer>(
-        map: &HashMap<(usize, bool), f64>,
-        s: S,
-    ) -> Result<S::Ok, S::Error> {
-        let vec: Vec<_> = map.iter().map(|(k, v)| (*k, *v)).collect();
-        vec.serialize(s)
+/// Only `counters` and `byte_sizes` are persisted; everything else is transient.
+impl Serialize for RunMetadata {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let serde = SerdeRunMetadata {
+            counters: self.counters.clone(),
+            byte_sizes: self.byte_sizes.clone(),
+        };
+        serde.serialize(serializer)
     }
+}
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        d: D,
-    ) -> Result<HashMap<(usize, bool), f64>, D::Error> {
-        let vec: Vec<((usize, bool), f64)> = Vec::deserialize(d)?;
-        Ok(vec.into_iter().collect())
+impl<'de> Deserialize<'de> for RunMetadata {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let serde = SerdeRunMetadata::deserialize(deserializer)?;
+        Ok(Self {
+            counters: serde.counters,
+            byte_sizes: serde.byte_sizes,
+            ..Default::default()
+        })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BottleneckMetric {
+    Cpu,
+    Network,
+    Memory,
+    IO,
+}
+
+pub struct ResourceLimits {
+    pub network_bytes_per_sec: f64,
+    pub io_tps: f64,
+    /// Resources that exceed this percentage will be considered bottlenecked
+    pub bottleneck_threshold: f64,
 }
 
 impl RunMetadata {
+    /// Returns all locations that are bottlenecked at the given measurement second,
+    /// along with which metric(s) each is bottlenecked on.
+    pub fn find_bottlenecks(
+        &self,
+        measurement_second: usize,
+        limits: &ResourceLimits,
+    ) -> Vec<(LocationId, HashSet<BottleneckMetric>)> {
+        let mut result = Vec::new();
+        for (location, stats) in &self.sar_stats {
+            let Some(sar) = stats.get(measurement_second) else {
+                continue;
+            };
+            let mut metrics = HashSet::new();
+
+            // If any core is overloaded, consider it CPU overloaded
+            let cpu_threshold = 100.0 * limits.bottleneck_threshold;
+            let max_core_used = sar
+                .cpu
+                .core_stats
+                .iter()
+                .map(|c| c.user + c.system)
+                .reduce(f64::max)
+                .unwrap_or(0.0);
+            println!(
+                "  {:?} CPU: max_core_used={:.1}% threshold={:.1}%",
+                location, max_core_used, cpu_threshold
+            );
+            if max_core_used >= cpu_threshold {
+                metrics.insert(BottleneckMetric::Cpu);
+            }
+
+            // If the sum of input + output bytes exceeds threshold
+            let net_threshold = limits.network_bytes_per_sec * limits.bottleneck_threshold;
+            let net_used = sar.network.rx_bytes_per_sec + sar.network.tx_bytes_per_sec;
+            println!(
+                "  {:?} Network: {:.0} B/s threshold={:.0} B/s",
+                location, net_used, net_threshold
+            );
+            if net_used >= net_threshold {
+                metrics.insert(BottleneckMetric::Network);
+            }
+
+            // If the percentage of memory used exceeds threshold
+            let mem_threshold = 100.0 * limits.bottleneck_threshold;
+            println!(
+                "  {:?} Memory: {:.1}% threshold={:.1}%",
+                location, sar.memory.percent_mem_used, mem_threshold
+            );
+            if sar.memory.percent_mem_used >= mem_threshold {
+                metrics.insert(BottleneckMetric::Memory);
+            }
+
+            // If the sum of read + write transfers per second exceeds threshold
+            let io_threshold = limits.io_tps * limits.bottleneck_threshold;
+            let io_used = sar.io.rtps + sar.io.wtps;
+            println!(
+                "  {:?} IO: {:.1} tps threshold={:.1} tps",
+                location, io_used, io_threshold
+            );
+            if io_used >= io_threshold {
+                metrics.insert(BottleneckMetric::IO);
+            }
+
+            if !metrics.is_empty() {
+                result.push((location.clone(), metrics));
+            }
+        }
+        result
+    }
+
     /// Average throughput over the given inclusive second range.
     pub fn avg_throughput(&self, start: usize, end: usize) -> usize {
         let slice = &self.throughputs[start..=end];
@@ -231,8 +315,8 @@ impl RunMetadata {
         }
     }
 
-    /// Loads profiling data from file and injects counters and perf data into the IR.
-    pub fn load_and_inject(path: &Path, ir: &mut [HydroRoot]) -> Self {
+    /// Loads profiling data from file.
+    pub fn load(path: &Path) -> Self {
         let json = fs::read_to_string(path).unwrap_or_else(|e| {
             panic!(
                 "Failed to load profiling data from {}: {}",
@@ -240,20 +324,8 @@ impl RunMetadata {
                 e
             )
         });
-        let data: Self = serde_json::from_str(&json).expect("failed to deserialize profiling data");
-        inject_count(ir, &data.counters);
-        inject_perf(ir, &data.perf);
-        data
+        serde_json::from_str(&json).expect("failed to deserialize profiling data")
     }
-}
-
-pub fn parse_cpu_usage(measurement: String) -> f64 {
-    let regex = Regex::new(r"Total (\d+\.\d+)%").unwrap();
-    regex
-        .captures_iter(&measurement)
-        .last()
-        .map(|cap| cap[1].parse::<f64>().unwrap())
-        .unwrap_or(0f64)
 }
 
 /// Per-second CPU statistics from sar -u output
@@ -567,84 +639,6 @@ pub fn parse_latency(lines: Vec<String>) -> Vec<(f64, f64, f64, u64)> {
         .collect()
 }
 
-/// Returns a map from (operator ID, is network receiver) to percentage of total samples, and the percentage of samples that are unaccounted
-fn parse_perf(file: String) -> (HashMap<(usize, bool), f64>, f64) {
-    let mut total_samples = 0f64;
-    let mut unidentified_samples = 0f64;
-    let mut samples_per_id = HashMap::new();
-    let operator_regex = Regex::new(r"op_\d+v\d+__(.*?)__(send)?(recv)?(\d+)").unwrap();
-
-    for line in file.lines() {
-        let n_samples_index = line.rfind(' ').unwrap() + 1;
-        let n_samples = &line[n_samples_index..].parse::<f64>().unwrap();
-
-        if let Some(cap) = operator_regex.captures_iter(line).last() {
-            let id = cap[4].parse::<usize>().unwrap();
-            let is_network_recv = cap
-                .get(3)
-                .is_some_and(|direction| direction.as_str() == "recv");
-
-            let dfir_operator_and_samples =
-                samples_per_id.entry((id, is_network_recv)).or_insert(0.0);
-            *dfir_operator_and_samples += n_samples;
-        } else {
-            unidentified_samples += n_samples;
-        }
-        total_samples += n_samples;
-    }
-
-    let percent_unidentified = unidentified_samples / total_samples;
-    println!(
-        "Out of {} samples, {} were unidentified, {}%",
-        total_samples,
-        unidentified_samples,
-        percent_unidentified * 100.0
-    );
-
-    samples_per_id
-        .iter_mut()
-        .for_each(|(_, samples)| *samples /= total_samples);
-    (samples_per_id, percent_unidentified)
-}
-
-fn inject_perf_root(
-    root: &mut HydroRoot,
-    id_to_usage: &HashMap<(usize, bool), f64>,
-    next_stmt_id: &mut usize,
-) {
-    if let Some(cpu_usage) = id_to_usage.get(&(*next_stmt_id, false)) {
-        root.op_metadata_mut().cpu_usage = Some(*cpu_usage);
-    }
-}
-
-fn inject_perf_node(
-    node: &mut HydroNode,
-    id_to_usage: &HashMap<(usize, bool), f64>,
-    next_stmt_id: &mut usize,
-) {
-    if let Some(cpu_usage) = id_to_usage.get(&(*next_stmt_id, false)) {
-        node.op_metadata_mut().cpu_usage = Some(*cpu_usage);
-    }
-    // If this is a Network node, separately get receiver CPU usage
-    if let HydroNode::Network { metadata, .. } = node
-        && let Some(cpu_usage) = id_to_usage.get(&(*next_stmt_id, true))
-    {
-        metadata.op.network_recv_cpu_usage = Some(*cpu_usage);
-    }
-}
-
-pub fn inject_perf(ir: &mut [HydroRoot], id_to_usage: &HashMap<(usize, bool), f64>) {
-    traverse_dfir(
-        ir,
-        |root, next_stmt_id| {
-            inject_perf_root(root, id_to_usage, next_stmt_id);
-        },
-        |node, next_stmt_id| {
-            inject_perf_node(node, id_to_usage, next_stmt_id);
-        },
-    );
-}
-
 /// Returns (op_id, count)
 pub fn parse_counter_usage(lines: Vec<String>) -> HashMap<usize, usize> {
     let regex = Regex::new(r"\((\d+)\): (\d+)").unwrap();
@@ -658,81 +652,186 @@ pub fn parse_counter_usage(lines: Vec<String>) -> HashMap<usize, usize> {
     op_to_count
 }
 
-// Note: Ensure edits to the match arms are consistent with insert_counter_node
-fn inject_count_node(
-    node: &mut HydroNode,
-    next_stmt_id: &mut usize,
-    op_to_count: &HashMap<usize, usize>,
-) {
-    match node {
-        HydroNode::Placeholder => {
-            std::panic!("Unexpected {:?} found in inject_count_node", node.print_root());
+/// Per-operator resource cost breakdown.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ResourceCost {
+    /// Fraction of CPU time attributed to this operator (0.0–1.0 per core).
+    pub cpu: f64,
+    /// I/O transfers per second attributed to this operator.
+    pub io: f64,
+    /// Memory KB attributed to this operator.
+    pub memory: f64,
+}
+
+/// Per-byte resource cost from network calibration.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct NetworkCostPerByte {
+    /// CPU % consumed per byte of network traffic
+    pub cpu_pct_per_byte: f64,
+    /// Memory KB consumed per byte of network traffic
+    pub memory_kb_per_byte: f64,
+    /// I/O transfers per second consumed per byte of network traffic
+    pub io_tps_per_byte: f64,
+}
+
+impl NetworkCostPerByte {
+    fn lerp(self, other: Self, t: f64) -> Self {
+        Self {
+            cpu_pct_per_byte: self.cpu_pct_per_byte
+                + t * (other.cpu_pct_per_byte - self.cpu_pct_per_byte),
+            memory_kb_per_byte: self.memory_kb_per_byte
+                + t * (other.memory_kb_per_byte - self.memory_kb_per_byte),
+            io_tps_per_byte: self.io_tps_per_byte
+                + t * (other.io_tps_per_byte - self.io_tps_per_byte),
         }
-        HydroNode::Source { metadata, .. }
-        | HydroNode::CycleSource { metadata, .. }
-        | HydroNode::Chain { metadata, .. } // Can technically be derived by summing parent cardinalities
-        | HydroNode::ChainFirst { metadata, .. } // Can technically be derived by taking parent cardinality + 1
-        | HydroNode::CrossSingleton { metadata, .. }
-        | HydroNode::CrossProduct { metadata, .. } // Can technically be derived by multiplying parent cardinalities
-        | HydroNode::Join { metadata, .. }
-        | HydroNode::Difference { metadata, .. }
-        | HydroNode::AntiJoin { metadata, .. }
-        | HydroNode::FlatMap { metadata, .. }
-        | HydroNode::FlatMapStreamBlocking { metadata, .. }
-        | HydroNode::Filter { metadata, .. }
-        | HydroNode::FilterMap { metadata, .. }
-        | HydroNode::Unique { metadata, .. }
-        | HydroNode::Scan { metadata, .. }
-        | HydroNode::ScanAsyncBlocking { metadata, .. }
-        | HydroNode::Fold { metadata, .. } // Output 1 value per tick
-        | HydroNode::Reduce { metadata, .. } // Output 1 value per tick
-        | HydroNode::FoldKeyed { metadata, .. }
-        | HydroNode::ReduceKeyed { metadata, .. }
-        | HydroNode::ReduceKeyedWatermark { metadata, .. }
-        | HydroNode::Network { metadata, .. }
-        | HydroNode::ExternalInput { metadata, .. }
-        | HydroNode::SingletonSource { metadata, .. }
-        | HydroNode::Partition { metadata, .. } => {
-            if let Some(count) = op_to_count.get(next_stmt_id) {
-                metadata.cardinality = Some(*count);
-            }
-            else {
-                // No counter found, set to 1 so division doesn't result in infinity
-                metadata.cardinality = Some(1);
-            }
-        }
-        HydroNode::Tee { inner, metadata, .. } => {
-            metadata.cardinality = inner.0.borrow().metadata().cardinality;
-        }
-        | HydroNode::Map { input, metadata, .. } // Equal to parent cardinality
-        | HydroNode::DeferTick { input, metadata, .. }
-        | HydroNode::Enumerate { input, metadata, .. }
-        | HydroNode::Inspect { input, metadata, .. }
-        | HydroNode::Sort { input, metadata, .. }
-        | HydroNode::Counter { input, metadata, .. }
-        | HydroNode::Cast { inner: input, metadata }
-        | HydroNode::ObserveNonDet { inner: input, metadata, .. }
-        | HydroNode::BeginAtomic { inner: input, metadata }
-        | HydroNode::EndAtomic { inner: input, metadata }
-        | HydroNode::Batch { inner: input, metadata }
-        | HydroNode::YieldConcat { inner: input, metadata }
-        | HydroNode::ResolveFutures { input, metadata }
-        | HydroNode::ResolveFuturesOrdered { input, metadata }
-        | HydroNode::ResolveFuturesBlocking { input, metadata }
-        => {
-            metadata.cardinality = input.metadata().cardinality;
+    }
+
+    /// Total resource cost for `count` messages of `bytes_each`.
+    pub fn total_cost(&self, count: usize, bytes_each: u64) -> ResourceCost {
+        let total_bytes = count as f64 * bytes_each as f64;
+        ResourceCost {
+            cpu: self.cpu_pct_per_byte * total_bytes,
+            memory: self.memory_kb_per_byte * total_bytes,
+            io: self.io_tps_per_byte * total_bytes,
         }
     }
 }
 
-pub fn inject_count(ir: &mut [HydroRoot], op_to_count: &HashMap<usize, usize>) {
-    traverse_dfir(
-        ir,
-        |_, _| {},
-        |node, next_stmt_id| {
-            inject_count_node(node, next_stmt_id, op_to_count);
-        },
-    );
+/// Lookup table mapping message size (bytes) → per-byte resource costs.
+/// Built from calibration runs at various message sizes. Interpolates linearly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkCostTable {
+    /// Sorted by message size.
+    entries: Vec<(u64, NetworkCostPerByte)>,
+}
+
+impl NetworkCostTable {
+    pub fn from_calibration(mut entries: Vec<(u64, NetworkCostPerByte)>) -> Self {
+        entries.sort_by_key(|(size, _)| *size);
+        assert!(
+            !entries.is_empty(),
+            "NetworkCostTable requires at least one calibration point"
+        );
+        Self { entries }
+    }
+
+    /// Returns the interpolated cost-per-byte for the given message size.
+    /// Clamps to the nearest endpoint if outside the calibrated range.
+    pub fn cost_per_byte(&self, message_size_bytes: u64) -> NetworkCostPerByte {
+        let n = self.entries.len();
+        if n == 1 || message_size_bytes <= self.entries[0].0 {
+            return self.entries[0].1;
+        }
+        if message_size_bytes >= self.entries[n - 1].0 {
+            return self.entries[n - 1].1;
+        }
+        let i = self
+            .entries
+            .partition_point(|(s, _)| *s <= message_size_bytes);
+        let (s0, c0) = self.entries[i - 1];
+        let (s1, c1) = self.entries[i];
+        let t = (message_size_bytes - s0) as f64 / (s1 - s0) as f64;
+        c0.lerp(c1, t)
+    }
+
+    /// Total resource cost for sending `count` messages of `message_size_bytes` each.
+    pub fn network_cost(&self, count: usize, message_size_bytes: u64) -> ResourceCost {
+        self.cost_per_byte(message_size_bytes)
+            .total_cost(count, message_size_bytes)
+    }
+}
+
+/// Combined per-operator metrics gathered from calibration, counters, and byte-size inspection.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct OperatorMetrics {
+    /// op_id → median output byte size per tuple
+    pub op_to_output_bytes: HashMap<usize, u64>,
+    /// op_id → cardinality (elements per measurement interval)
+    pub op_to_count: HashMap<usize, usize>,
+    /// op_id → resource cost
+    pub op_to_cost: HashMap<usize, ResourceCost>,
+}
+
+/// Parses byte-size measurement lines of the form `_optimize_byte_size(op_id): size`.
+pub fn parse_byte_sizes(lines: Vec<String>) -> HashMap<usize, Vec<u64>> {
+    let regex = Regex::new(r"\((\d+)\): (\d+)").unwrap();
+    let mut op_to_sizes: HashMap<usize, Vec<u64>> = HashMap::new();
+    for line in lines {
+        if let Some(cap) = regex.captures(&line) {
+            let op_id = cap[1].parse::<usize>().unwrap();
+            let size = cap[2].parse::<u64>().unwrap();
+            op_to_sizes.entry(op_id).or_default().push(size);
+        }
+    }
+    op_to_sizes
+}
+
+/// Computes median of a sorted slice.
+fn median(sorted: &mut Vec<u64>) -> u64 {
+    sorted.sort_unstable();
+    if sorted.is_empty() {
+        0
+    } else {
+        sorted[sorted.len() / 2]
+    }
+}
+
+impl OperatorMetrics {
+    /// Builds OperatorMetrics from raw measurements.
+    /// - `counters`: op_id → cardinality from counter measurements
+    /// - `byte_sizes`: op_id → sampled byte sizes from inspect measurements
+    /// - `sar_per_location`: per-location SAR stats at the measurement second
+    /// - `ops_per_location`: op_id → LocationId mapping (which ops run where)
+    /// - `network_cost_per_byte`: per-byte resource costs from calibration
+    pub fn from_measurements(
+        counters: HashMap<usize, usize>,
+        mut byte_sizes: HashMap<usize, Vec<u64>>,
+        sar_per_location: &HashMap<LocationId, SarStats>,
+        ops_per_location: &HashMap<LocationId, Vec<usize>>,
+        network_cost_per_byte: &NetworkCostPerByte,
+    ) -> Self {
+        let op_to_output_bytes: HashMap<usize, u64> = byte_sizes
+            .iter_mut()
+            .map(|(&op_id, sizes)| (op_id, median(sizes)))
+            .collect();
+
+        // Compute per-operator cost by dividing location cost evenly among its operators,
+        // then subtracting estimated network cost.
+        let mut op_to_cost = HashMap::new();
+        for (location, op_ids) in ops_per_location {
+            let Some(sar) = sar_per_location.get(location) else {
+                continue;
+            };
+            let n = op_ids.len().max(1) as f64;
+            let net_bytes = sar.network.rx_bytes_per_sec + sar.network.tx_bytes_per_sec;
+            let total_cpu = (sar.cpu.all_stats.user + sar.cpu.all_stats.system
+                - net_bytes * network_cost_per_byte.cpu_pct_per_byte)
+                .max(0.0);
+            let total_io = (sar.io.rtps + sar.io.wtps
+                - net_bytes * network_cost_per_byte.io_tps_per_byte)
+                .max(0.0);
+            let total_memory = (sar.memory.kb_mem_used
+                - net_bytes * network_cost_per_byte.memory_kb_per_byte)
+                .max(0.0);
+
+            for &op_id in op_ids {
+                op_to_cost.insert(
+                    op_id,
+                    ResourceCost {
+                        cpu: total_cpu / n,
+                        io: total_io / n,
+                        memory: total_memory / n,
+                    },
+                );
+            }
+        }
+
+        Self {
+            op_to_output_bytes,
+            op_to_count: counters,
+            op_to_cost,
+        }
+    }
 }
 
 /// Drains all currently available messages from a receiver into a Vec.
@@ -746,14 +845,6 @@ async fn drain_receiver(receiver: &mut UnboundedReceiver<String>) -> Vec<String>
         lines.push(line);
     }
     lines
-}
-
-pub async fn analyze_perf(process: &impl DeployCrateWrapper) -> (HashMap<(usize, bool), f64>, f64) {
-    let underlying = process.underlying();
-    let perf_results = underlying.tracing_results().unwrap();
-
-    let folded_data = perf_results.folded_data.clone();
-    parse_perf(String::from_utf8(folded_data).unwrap())
 }
 
 /// Merges `src` into `dst`, keeping the max value for each key.
@@ -785,7 +876,6 @@ fn merge_max_vec<T: Clone>(dst: &mut Vec<T>, src: &[T], max_fn: fn(T, T) -> T) {
 
 pub async fn analyze_cluster_results(
     nodes: &DeployResult<'_, HydroDeploy>,
-    ir: &mut [HydroRoot],
     mut cluster_metrics: HashMap<(LocationId, String, usize), MetricLogs>,
     optimizations: &Optimizations,
 ) -> RunMetadata {
@@ -797,11 +887,12 @@ pub async fn analyze_cluster_results(
     for ((location, name, idx), mut metrics) in cluster_metrics.drain() {
         set.spawn(async move {
             println!("Analyzing cluster {:?}: {}", name, idx);
-            let (sar_stats, op_to_count, throughputs, latencies) = tokio::join!(
+            let (sar_stats, op_to_count, throughputs, latencies, byte_sizes) = tokio::join!(
                 async { parse_sar_output(drain_receiver(&mut metrics.sar).await) },
                 async { parse_counter_usage(drain_receiver(&mut metrics.counters).await) },
                 async { parse_throughput(drain_receiver(&mut metrics.throughputs).await) },
                 async { parse_latency(drain_receiver(&mut metrics.latencies).await) },
+                async { parse_byte_sizes(drain_receiver(&mut metrics.byte_sizes).await) },
             );
             println!("Parsed stats from cluster {:?}: {}", name, idx);
             (
@@ -810,49 +901,49 @@ pub async fn analyze_cluster_results(
                 op_to_count,
                 throughputs,
                 latencies,
+                byte_sizes,
             )
         });
     }
 
+    // Join metric drain tasks
     let mut drained: HashMap<(LocationId, String), Vec<_>> = HashMap::new();
     while let Some(result) = set.join_next().await {
-        let ((id, name, _idx), sar_stats, op_to_count, throughputs, latencies) = result.unwrap();
+        let ((id, name, _idx), sar_stats, op_to_count, throughputs, latencies, byte_sizes) =
+            result.unwrap();
         drained.entry((id, name)).or_default().push((
             sar_stats,
             op_to_count,
             throughputs,
             latencies,
+            byte_sizes,
         ));
     }
 
-    for (id, name, cluster) in nodes.get_all_clusters() {
+    // Merge metrics across nodes in each cluster
+    for (id, name, _cluster) in nodes.get_all_clusters() {
         if optimizations.exclude.contains(&id) {
             continue;
         }
 
         let cluster_data = drained.get(&(id.clone(), name.to_string())).unwrap();
 
-        // Take max of each metric across all nodes in the cluster
         let mut max_sar: Vec<SarStats> = vec![];
         let mut max_counters: HashMap<usize, usize> = HashMap::new();
 
-        for (sar_stats, counters, _, _) in cluster_data {
+        for (sar_stats, counters, _, _, byte_sizes) in cluster_data {
             merge_max_vec(&mut max_sar, sar_stats, SarStats::max);
             merge_max(&mut max_counters, counters.clone());
+            for (op_id, sizes) in byte_sizes {
+                run_metadata
+                    .byte_sizes
+                    .entry(*op_id)
+                    .or_default()
+                    .extend(sizes);
+            }
         }
 
         merge_max(&mut op_to_count, max_counters);
-
-        // Aggregate perf across all members
-        let mut max_unidentified = 0.0f64;
-        for member in cluster.members() {
-            let (perf_usage, unidentified_perf) = analyze_perf(&member).await;
-            merge_max(&mut run_metadata.perf, perf_usage);
-            max_unidentified = max_unidentified.max(unidentified_perf);
-        }
-        run_metadata
-            .unaccounted_perf
-            .insert(id.clone(), max_unidentified);
 
         if !max_sar.is_empty() {
             run_metadata.sar_stats.insert(id.clone(), max_sar);
@@ -861,7 +952,7 @@ pub async fn analyze_cluster_results(
 
     // Collect throughput/latency from all processes (aggregator outputs these)
     for node_data in drained.into_values().flatten() {
-        let (_, _, throughputs, latencies) = node_data;
+        let (_, _, throughputs, latencies, _) = node_data;
         let has_throughput = !throughputs.is_empty();
         run_metadata.throughputs.extend(throughputs);
         run_metadata.latencies.extend(latencies);
@@ -871,71 +962,6 @@ pub async fn analyze_cluster_results(
         }
     }
 
-    inject_count(ir, &op_to_count);
-    inject_perf(ir, &run_metadata.perf);
     run_metadata.counters = op_to_count;
     run_metadata
-}
-
-pub async fn get_usage(usage_out: &mut UnboundedReceiver<String>) -> f64 {
-    let measurement = usage_out.recv().await.unwrap();
-    parse_cpu_usage(measurement)
-}
-
-// Track the max of each so we decouple conservatively
-pub fn analyze_send_recv_overheads(ir: &mut [HydroRoot], run_metadata: &mut RunMetadata) {
-    traverse_dfir(
-        ir,
-        |_, _| {},
-        |node, _| {
-            if let HydroNode::Network {
-                input, metadata, ..
-            } = node
-            {
-                let sender = input.metadata().location_id.root();
-                let receiver = metadata.location_id.root();
-
-                // Use cardinality from the network's input, not the network itself.
-                // Reason: Cardinality is measured at ONE recipient, but the sender may be sending to MANY machines.
-                if let Some(cpu_usage) = metadata.op.cpu_usage
-                    && let Some(cardinality) = input.metadata().cardinality
-                {
-                    let overhead = cpu_usage / cardinality as f64;
-                    run_metadata
-                        .send_overhead
-                        .entry(sender.clone())
-                        .and_modify(|max_send_overhead| {
-                            if overhead > *max_send_overhead {
-                                *max_send_overhead = overhead;
-                            }
-                        })
-                        .or_insert(overhead);
-                }
-
-                if let Some(cardinality) = metadata.cardinality
-                    && let Some(cpu_usage) = metadata.op.network_recv_cpu_usage
-                {
-                    let overhead = cpu_usage / cardinality as f64;
-
-                    run_metadata
-                        .recv_overhead
-                        .entry(receiver.clone())
-                        .and_modify(|max_recv_overhead| {
-                            if overhead > *max_recv_overhead {
-                                *max_recv_overhead = overhead;
-                            }
-                        })
-                        .or_insert(overhead);
-                }
-            }
-        },
-    );
-
-    // Print
-    for (location, overhead) in &run_metadata.send_overhead {
-        println!("Max send overhead at {:?}: {}", location, overhead);
-    }
-    for (location, overhead) in &run_metadata.recv_overhead {
-        println!("Max recv overhead at {:?}: {}", location, overhead);
-    }
 }

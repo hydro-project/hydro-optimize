@@ -4,7 +4,7 @@ use hydro_lang::location::Location;
 use hydro_lang::viz::config::GraphConfig;
 use hydro_optimize::deploy::{HostType, ReusableHosts};
 use hydro_optimize::deploy_and_analyze::{
-    Optimizations, ReusableClusters, ReusableProcesses, deploy_and_optimize,
+    Optimizations, ReusableClusters, ReusableProcesses, deploy_and_analyze,
 };
 use hydro_optimize_examples::print_parseable_bench_results;
 use hydro_test::cluster::two_pc_bench;
@@ -72,7 +72,7 @@ async fn main() {
     let client_id = clients.id();
     let client_aggregator_id = client_aggregator.id();
 
-    deploy_and_optimize(
+    deploy_and_analyze(
         &mut reusable_hosts,
         &mut deployment,
         builder.finalize(),
@@ -90,7 +90,6 @@ async fn main() {
         num_clients_per_node,
         Some(run_seconds),
         Some(measurement_second),
-        true,
     )
     .await;
 }
