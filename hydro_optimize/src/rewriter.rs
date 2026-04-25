@@ -12,7 +12,7 @@ use syn::visit_mut::VisitMut;
 
 use crate::debug::print_id;
 use crate::partition_syn_analysis::{StructOrTuple, StructOrTupleIndex};
-use crate::repair::{cycle_source_to_sink_input, inject_id, inject_location};
+use crate::repair::{cycle_source_to_sink_parent, inject_id, inject_location};
 use crate::rewrites::{
     ClusterSelfIdReplace, Rewrite, collection_kind_to_debug_type, deserialize_bincode_with_type,
     prepend_member_id_to_collection_kind, serialize_bincode_with_type, tee_to_inner_id,
@@ -656,7 +656,7 @@ pub fn apply_rewrite(
 
     // Fix locations since we changed some
     inject_id(ir);
-    let cycles = cycle_source_to_sink_input(ir);
+    let cycles = cycle_source_to_sink_parent(ir);
     inject_location(ir, &cycles);
     print_id(ir);
 }

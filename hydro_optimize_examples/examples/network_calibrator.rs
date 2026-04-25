@@ -50,8 +50,6 @@ async fn main() {
         benchmark_protocol_with_reusable_machines(
             &mut reusable_hosts,
             &mut deployment,
-            VIRTUAL_CLIENTS_MAX,
-            1,
             move |num_clients| {
                 let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
                 let server = builder.cluster();
@@ -93,6 +91,8 @@ async fn main() {
                     client_id,
                     optimizations,
                     location_id_to_cluster,
+                    start_virtual_clients: VIRTUAL_CLIENTS_MAX,
+                    num_runs: 1,
                 }
             },
         )

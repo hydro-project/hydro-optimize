@@ -205,7 +205,7 @@ impl RunMetadata {
 
     /// Saves per-location CSVs and per-cluster profiling JSON files to `output_dir`.
     pub fn save_run_metadata(
-        self,
+        &self,
         location_id_to_cluster: &HashMap<LocationId, String>,
         output_dir: &Path,
         num_clients: usize,
@@ -652,6 +652,7 @@ pub fn parse_counter_usage(lines: Vec<String>) -> HashMap<usize, usize> {
     op_to_count
 }
 
+// TODO: Review Kiro output from here down
 /// Per-operator resource cost breakdown.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ResourceCost {
@@ -922,7 +923,7 @@ pub async fn analyze_cluster_results(
 
     // Merge metrics across nodes in each cluster
     for (id, name, _cluster) in nodes.get_all_clusters() {
-        if optimizations.exclude.contains(&id) {
+        if optimizations.excludes(&id) {
             continue;
         }
 

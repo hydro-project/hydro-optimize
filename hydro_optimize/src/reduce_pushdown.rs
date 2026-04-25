@@ -73,7 +73,7 @@ mod tests {
     use crate::{
         reduce_pushdown::reduce_pushdown,
         reduce_pushdown_analysis::reduce_pushdown_decision,
-        repair::{cycle_source_to_sink_input, inject_id, inject_location},
+        repair::{cycle_source_to_sink_parent, inject_id, inject_location},
     };
 
     fn count_reduces(ir: &mut [hydro_lang::compile::ir::HydroRoot]) -> usize {
@@ -119,7 +119,7 @@ mod tests {
 
         let built = builder.optimize_with(|ir| {
             inject_id(ir);
-            let cycle_data = cycle_source_to_sink_input(ir);
+            let cycle_data = cycle_source_to_sink_parent(ir);
             inject_location(ir, &cycle_data);
 
             let before = count_reduces(ir);

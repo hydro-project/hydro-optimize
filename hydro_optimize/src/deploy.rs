@@ -2,9 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use hydro_deploy::gcp::GcpNetwork;
-use hydro_deploy::rust_crate::tracing_options::{
-    AL2_PERF_SETUP_COMMAND, DEBIAN_PERF_SETUP_COMMAND, TracingOptions,
-};
 use hydro_deploy::{AwsNetwork, Deployment, Host, HostTargetType, LinuxCompileType};
 use hydro_lang::deploy::TrybuildHost;
 
@@ -130,7 +127,7 @@ impl ReusableHosts {
         })
     }
 
-    pub fn get_no_perf_process_hosts(
+    pub fn get_process_host(
         &mut self,
         deployment: &mut Deployment,
         display_name: String,
@@ -139,31 +136,6 @@ impl ReusableHosts {
         let host = TrybuildHost::new(self.lazy_create_host(deployment, display_name.clone()))
             .pin_to_core(pin_to_core)
             .rustflags(self.get_rust_flags());
-        self.host_with_env(host)
-    }
-
-    pub fn get_process_hosts(
-        &mut self,
-        deployment: &mut Deployment,
-        display_name: String,
-        pin_to_core: usize,
-    ) -> TrybuildHost {
-        let setup_command = match &self.host_type {
-            InitializedHostType::Gcp { .. } => DEBIAN_PERF_SETUP_COMMAND,
-            InitializedHostType::Aws { .. } => AL2_PERF_SETUP_COMMAND,
-            InitializedHostType::Localhost => "", // Isn't run on localhost anyway
-        };
-        let host = TrybuildHost::new(self.lazy_create_host(deployment, display_name.clone()))
-            .pin_to_core(pin_to_core)
-            .rustflags(self.get_rust_flags())
-            .tracing(
-                TracingOptions::builder()
-                    .perf_raw_outfile(format!("{}.perf.data", display_name.clone()))
-                    .fold_outfile(format!("{}.data.folded", display_name))
-                    .frequency(128)
-                    .setup_command(setup_command)
-                    .build(),
-            );
         self.host_with_env(host)
     }
 
@@ -176,7 +148,7 @@ impl ReusableHosts {
     ) -> Vec<TrybuildHost> {
         (0..num_hosts)
             .map(|i| {
-                self.get_no_perf_process_hosts(
+                self.get_process_host(
                     deployment,
                     format!("{}{}", cluster_name, i),
                     pin_to_core,

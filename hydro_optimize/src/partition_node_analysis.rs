@@ -777,7 +777,7 @@ mod tests {
     use stageleft::q;
 
     use crate::partition_node_analysis::partitioning_analysis;
-    use crate::repair::{cycle_source_to_sink_input, inject_id, inject_location};
+    use crate::repair::{cycle_source_to_sink_parent, inject_id, inject_location};
 
     fn test_input_partitionable(
         builder: FlowBuilder<'_>,
@@ -788,7 +788,7 @@ mod tests {
         let built = builder
             .optimize_with(|ir| {
                 inject_id(ir);
-                cycle_data = cycle_source_to_sink_input(ir);
+                cycle_data = cycle_source_to_sink_parent(ir);
                 inject_location(ir, &cycle_data);
             })
             .into_deploy::<HydroDeploy>();

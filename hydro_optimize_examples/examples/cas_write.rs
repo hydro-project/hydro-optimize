@@ -67,22 +67,19 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
         client_id,
         optimizations,
         location_id_to_cluster,
-        scenario_binary: None,
+        start_virtual_clients: 1,
+        num_runs: 1,
     }
 }
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    let start_virtual_clients = 1;
-    let num_runs = 1;
     benchmark_protocol(
         BenchmarkArgs {
             gcp: args.gcp,
             aws: args.aws,
         },
-        start_virtual_clients,
-        num_runs,
         run_benchmark,
     )
     .await;

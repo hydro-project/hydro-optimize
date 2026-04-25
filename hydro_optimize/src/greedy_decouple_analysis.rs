@@ -11,7 +11,7 @@ use hydro_lang::{
 };
 
 use crate::rewrites::{can_decouple, op_id_to_parents};
-use crate::{decouple_analysis::PossibleRewrite, repair::cycle_source_to_sink_input};
+use crate::{decouple_analysis::PossibleRewrite, repair::cycle_source_to_sink_parent};
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct UnitKey(u32);
@@ -126,7 +126,7 @@ pub fn greedy_decouple_analysis(
     );
 
     // Constrain tick
-    let cycles = cycle_source_to_sink_input(ir);
+    let cycles = cycle_source_to_sink_parent(ir);
     let op_id_to_input = op_id_to_parents(ir, None, &cycles);
     let mut tick_to_op_inputs = HashMap::new();
     for (tick_id, ops) in state.tick_to_ops {

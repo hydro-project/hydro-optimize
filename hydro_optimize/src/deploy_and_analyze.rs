@@ -15,6 +15,7 @@ use hydro_lang::prelude::{Cluster, FlowBuilder, Process};
 use hydro_lang::telemetry::Sidecar;
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use crate::decouple_analysis::PossibleRewrite;
 use crate::deploy::{HostType, ReusableHosts};
 use crate::greedy_decouple_analysis::greedy_decouple_analysis;
 use crate::parse_results::{RunMetadata, analyze_cluster_results};
@@ -320,7 +321,9 @@ pub struct Optimizations {
     size_analysis: bool,
     /// Apply greedy decoupling, deploy decoupled system, gather per-operator SAR costs
     blow_up_analysis: bool,
-    pub exclude: HashSet<LocationId>,
+    exclude: HashSet<LocationId>,
+    /// Rewrites loaded from file, applied in order before deployment.
+    loaded_rewrites: Vec<PossibleRewrite>,
 }
 
 impl Optimizations {
@@ -356,11 +359,29 @@ impl Optimizations {
         self.exclude.insert(location);
         self
     }
+
+    pub fn excludes(&self, location: &LocationId) -> bool {
+        self.exclude.contains(location)
+    }
+
+    /// Loads a `PossibleRewrite` from `path` and queues it to be applied before deployment.
+    pub fn load_rewrite(mut self, path: &Path) -> Self {
+        let s = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("failed to read rewrite file {}: {}", path.display(), e));
+        let rewrite: PossibleRewrite = serde_json::from_str(&s)
+            .unwrap_or_else(|e| panic!("failed to deserialize PossibleRewrite: {}", e));
+        self.loaded_rewrites.push(rewrite);
+        self
+    }
 }
 
 /// `stability_second`: The second in which the protocol is expected to be stable, and its performance can be used as the basis for optimization.
+///
+/// Any rewriting of the IR (loaded rewrites, blow-up analysis, size analysis) is expected to
+/// have been performed by the caller already; this function only inserts counters, deploys,
+/// waits, and parses metrics.
 #[allow(clippy::too_many_arguments)]
-pub async fn deploy_and_analyze<'a>(
+async fn deploy_and_analyze<'a>(
     reusable_hosts: &mut ReusableHosts,
     deployment: &mut Deployment,
     builder: BuiltFlow<'a>,
@@ -370,117 +391,20 @@ pub async fn deploy_and_analyze<'a>(
     client_id: &LocationId,
     num_clients_per_node: usize,
     num_seconds: Option<usize>,
-    stability_second: Option<usize>,
 ) -> RunMetadata {
-    if let Some(num_seconds) = num_seconds {
-        assert!(
-            stability_second.is_some_and(|stability_time| stability_time < num_seconds),
-            "Invariant: stability_second < num_seconds"
-        );
-    }
     assert!(
         num_clients_per_node > 0,
         "Must have at least 1 client per node"
     );
 
-    let counter_output_duration =
-        syn::parse_quote!(std::time::Duration::from_secs(#METRIC_INTERVAL_SECS));
     // Measure network (-n DEV) and CPU (-u) usage. -P ALL measures all CPUs on the machine
     let sar_sidecar = ScriptSidecar {
         script: "sar -n DEV -u -P ALL -r -b 1".to_string(),
         prefix: SAR_USAGE_PREFIX.to_string(),
     };
 
-    // Rewrite with optional decoupled deployment (blow_up_analysis) or size inspection (size_analysis)
-    let mut extra_clusters: Vec<(LocationId, String, usize)> = vec![];
-    // Maps new LocationId → list of original op_ids assigned to that location
-    let mut location_to_original_ops: HashMap<LocationId, Vec<usize>> = HashMap::new();
-
-    // Always reduce pushdown and inject IDs first
-    let built = builder.optimize_with(|leaf| {
-        let decision = reduce_pushdown_decision(leaf, &optimizations.exclude);
-        reduce_pushdown(leaf, decision);
-        inject_id(leaf);
-    });
-
-    let optimized = if optimizations.blow_up_analysis {
-        let mut greedy_results = None;
-        let built = built.optimize_with(|leaf| {
-            greedy_results = Some(greedy_decouple_analysis(leaf, &optimizations.exclude));
-        });
-
-        let mut builder = FlowBuilder::from_built(&built);
-        let mut ir = deep_clone(built.ir());
-
-        for (orig_loc, possible_rewrite) in greedy_results.unwrap() {
-            let cluster_size = clusters
-                .location_name_and_num(&orig_loc)
-                .map(|(_, n)| n)
-                .unwrap_or(1); // Is process
-
-            // Build locations_map: index 0 = original, index > 0 = new clusters
-            let mut locations_map = HashMap::new();
-            locations_map.insert(0, orig_loc.clone());
-            for loc_idx in possible_rewrite.locations() {
-                if loc_idx == 0 {
-                    continue;
-                }
-                let cluster = builder.cluster::<()>();
-                let new_loc = cluster.id().clone();
-                locations_map.insert(loc_idx, new_loc.clone());
-                extra_clusters.push((new_loc, format!("decouple_{}", loc_idx), cluster_size));
-            }
-
-            // Record which original ops end up at which deployed location so we can reassociate metrics with the ops
-            for (&op_id, &loc_idx) in &possible_rewrite.op_to_loc {
-                let deployed_loc = locations_map.get(&loc_idx).unwrap();
-                location_to_original_ops
-                    .entry(deployed_loc.clone())
-                    .or_default()
-                    .push(op_id);
-            }
-
-            let rewrite = Rewrite {
-                possible_rewrite,
-                num_partitions: 0,
-                original_node: orig_loc,
-                cluster_size,
-            };
-            apply_rewrite(&mut ir, &rewrite, &locations_map);
-        }
-
-        builder.replace_ir(ir);
-        builder.finalize()
-    } else if optimizations.size_analysis {
-        // Insert byte-size inspects at network boundaries without applying decoupling
-        built.optimize_with(|leaf| {
-            let per_loc_rewrites = crate::greedy_decouple_analysis::greedy_decouple_analysis(
-                leaf,
-                &optimizations.exclude,
-            );
-            let network_ops: HashSet<usize> = per_loc_rewrites
-                .values()
-                .flat_map(|r| r.op_to_network.keys().copied())
-                .collect();
-            if !network_ops.is_empty() {
-                insert_byte_size_inspect(leaf, &network_ops);
-            }
-        })
-    } else {
-        built
-    };
-
-    // Insert counters
-    let optimized = if !optimizations.no_counters {
-        optimized.optimize_with(|leaf| {
-            insert_counter(leaf, &counter_output_duration, &optimizations.exclude);
-        })
-    } else {
-        optimized
-    };
-
     // Insert all clusters & processes
-    let mut deployable = optimized.into_deploy();
+    let mut deployable = builder.into_deploy();
     for (cluster_id, name, num_hosts) in clusters.named_clusters.iter() {
         let excluded = optimizations.exclude.contains(cluster_id);
         if cluster_id.key() == client_id.key() {
@@ -505,21 +429,9 @@ pub async fn deploy_and_analyze<'a>(
             deployable = deployable.with_sidecar_internal(cluster_id.key(), &sar_sidecar);
         }
     }
-    // Deploy extra clusters created by greedy decouple analysis
-    for (cluster_id, name, num_hosts) in extra_clusters.iter() {
-        deployable = deployable.with_cluster_erased(
-            cluster_id.key(),
-            reusable_hosts.get_cluster_hosts(deployment, name.clone(), *num_hosts, 0),
-        );
-        deployable = deployable.with_sidecar_internal(cluster_id.key(), &sar_sidecar);
-    }
     for (process_id, name) in processes.named_processes.iter() {
         let excluded = optimizations.exclude.contains(process_id);
-        let host = if excluded {
-            reusable_hosts.get_no_perf_process_hosts(deployment, name.clone(), 0)
-        } else {
-            reusable_hosts.get_process_hosts(deployment, name.clone(), 0)
-        };
+        let host = reusable_hosts.get_process_host(deployment, name.clone(), 0);
         deployable = deployable.with_process_erased(process_id.key(), host);
         if !excluded {
             deployable = deployable.with_sidecar_internal(process_id.key(), &sar_sidecar);
@@ -551,9 +463,7 @@ pub async fn deploy_and_analyze<'a>(
         .unwrap();
 
     // Parse results to get metrics
-    let mut run_metadata = analyze_cluster_results(&nodes, metrics, optimizations).await;
-    run_metadata.location_to_original_ops = location_to_original_ops;
-    run_metadata
+    analyze_cluster_results(&nodes, metrics, optimizations).await
 }
 
 pub struct BenchmarkArgs {
@@ -569,6 +479,9 @@ pub struct BenchmarkConfig<'a> {
     pub client_id: LocationId,
     pub optimizations: Optimizations,
     pub location_id_to_cluster: HashMap<LocationId, String>,
+    pub start_virtual_clients: usize,
+    /// Number of successful runs to collect per virtual-client count.
+    pub num_runs: usize,
 }
 
 pub const START_MEASUREMENT_SECOND: usize = 30;
@@ -579,12 +492,173 @@ pub const VIRTUAL_CLIENTS_MAX: usize = 50 * PHYSICAL_CLIENTS; // Based on manual
 pub const VIRTUAL_CLIENTS_STEP: usize = 50; // Can tweak to get finer-grained numbers
 pub const NUM_RUNS_NO_THROUGHPUT: usize = 3;
 
+// TODO: Review Kiro output from here down
+/// Applies a single `possible_rewrite` assigned to `orig_loc` on `ir`, creating any new
+/// clusters it requires on `builder`. Extends `clusters` with each new cluster and records
+/// which original op ids landed on which deployed location in `location_to_original_ops`.
+fn apply_single_rewrite<'a>(
+    ir: &mut Vec<HydroRoot>,
+    builder: &mut FlowBuilder<'a>,
+    clusters: &mut ReusableClusters,
+    location_to_original_ops: &mut HashMap<LocationId, Vec<usize>>,
+    orig_loc: LocationId,
+    possible_rewrite: PossibleRewrite,
+    new_cluster_name: impl Fn(usize) -> String,
+) {
+    let cluster_size = clusters
+        .location_name_and_num(&orig_loc)
+        .map(|(_, n)| n)
+        .unwrap_or(1); // Is process
+
+    // Build locations_map: index 0 = original, index > 0 = new clusters.
+    let mut locations_map = HashMap::new();
+    locations_map.insert(0, orig_loc.clone());
+    for loc_idx in possible_rewrite.locations() {
+        if loc_idx == 0 {
+            continue;
+        }
+        let cluster = builder.cluster::<()>();
+        let new_loc = cluster.id().clone();
+        locations_map.insert(loc_idx, new_loc.clone());
+        *clusters =
+            std::mem::take(clusters).with_named(new_loc, new_cluster_name(loc_idx), cluster_size);
+    }
+
+    for (&op_id, &loc_idx) in &possible_rewrite.op_to_loc {
+        let deployed_loc = locations_map.get(&loc_idx).unwrap();
+        location_to_original_ops
+            .entry(deployed_loc.clone())
+            .or_default()
+            .push(op_id);
+    }
+
+    apply_rewrite(
+        ir,
+        &Rewrite {
+            possible_rewrite,
+            num_partitions: 0,
+            original_node: orig_loc,
+            cluster_size,
+        },
+        &locations_map,
+    );
+}
+
+/// Applies every loaded rewrite (reduce pushdown + inject_id + apply_rewrite) in sequence.
+/// Returns the new `ReusableClusters` (containing any clusters created by the rewrites) and
+/// a map from each deployed `LocationId` back to the original op_ids that ended up there.
+fn apply_loaded_rewrites<'a>(
+    built: BuiltFlow<'a>,
+    mut clusters: ReusableClusters,
+    optimizations: &Optimizations,
+) -> (
+    BuiltFlow<'a>,
+    ReusableClusters,
+    HashMap<LocationId, Vec<usize>>,
+) {
+    let mut location_to_original_ops: HashMap<LocationId, Vec<usize>> = HashMap::new();
+
+    if optimizations.loaded_rewrites.is_empty() {
+        return (built, clusters, location_to_original_ops);
+    }
+
+    let mut builder = FlowBuilder::from_built(&built);
+    let mut ir = deep_clone(built.ir());
+
+    for possible_rewrite in optimizations.loaded_rewrites.clone() {
+        // reduce_pushdown + inject_id before each rewrite so op ids in the IR line up with
+        // the possible_rewrite's op_to_loc / op_to_network keys.
+        let decision = reduce_pushdown_decision(&mut ir, &optimizations.exclude);
+        reduce_pushdown(&mut ir, decision);
+        inject_id(&mut ir);
+
+        // Infer the original LocationId from any op referenced by the rewrite.
+        let (&any_op, _) = possible_rewrite
+            .op_to_loc
+            .iter()
+            .find(|&(_, &loc)| loc == 0)
+            .or_else(|| possible_rewrite.op_to_loc.iter().next())
+            .expect("loaded PossibleRewrite has no op_to_loc entries");
+        let orig_loc = find_op_location(&ir, any_op)
+            .expect("could not find loaded rewrite's original location in IR");
+
+        apply_single_rewrite(
+            &mut ir,
+            &mut builder,
+            &mut clusters,
+            &mut location_to_original_ops,
+            orig_loc,
+            possible_rewrite,
+            |loc_idx| format!("loaded_rewrite_{}", loc_idx),
+        );
+    }
+
+    builder.replace_ir(ir);
+    (builder.finalize(), clusters, location_to_original_ops)
+}
+
+/// Returns the `LocationId` of the op with the given id, if any.
+fn find_op_location(ir: &[HydroRoot], target_op_id: usize) -> Option<LocationId> {
+    // traverse_dfir requires &mut but we only inspect; make a local mutable clone.
+    let mut ir_clone = deep_clone(ir);
+    let mut found = None;
+    traverse_dfir(
+        &mut ir_clone,
+        |_, _| {},
+        |node, _| {
+            if found.is_some() {
+                return;
+            }
+            if let Some(id) = node.metadata().op.id
+                && id == target_op_id
+            {
+                found = Some(node.metadata().location_id.clone());
+            }
+        },
+    );
+    found
+}
+
+/// Applies the greedy-decoupled rewrite (blow-up analysis). Returns the new IR, updated
+/// clusters (with any newly created decouple clusters), and location → original op ids map.
+fn apply_blow_up_analysis<'a>(
+    built: BuiltFlow<'a>,
+    mut clusters: ReusableClusters,
+    optimizations: &Optimizations,
+) -> (
+    BuiltFlow<'a>,
+    ReusableClusters,
+    HashMap<LocationId, Vec<usize>>,
+) {
+    let mut location_to_original_ops: HashMap<LocationId, Vec<usize>> = HashMap::new();
+
+    let mut greedy_results = None;
+    let built = built.optimize_with(|leaf| {
+        greedy_results = Some(greedy_decouple_analysis(leaf, &optimizations.exclude));
+    });
+    let mut builder = FlowBuilder::from_built(&built);
+    let mut ir = deep_clone(built.ir());
+
+    for (orig_loc, possible_rewrite) in greedy_results.unwrap() {
+        apply_single_rewrite(
+            &mut ir,
+            &mut builder,
+            &mut clusters,
+            &mut location_to_original_ops,
+            orig_loc,
+            possible_rewrite,
+            |loc_idx| format!("decouple_{}", loc_idx),
+        );
+    }
+
+    builder.replace_ir(ir);
+    (builder.finalize(), clusters, location_to_original_ops)
+}
+
 pub async fn benchmark_protocol<'a>(
     args: BenchmarkArgs,
-    start_virtual_clients: usize,
-    num_runs: usize,
     run_benchmark: impl Fn(usize) -> BenchmarkConfig<'a>,
-) {
+) -> (Vec<HydroRoot>, RunMetadata) {
     let mut deployment = Deployment::new();
     let host_type: HostType = if let Some(project) = args.gcp.clone() {
         HostType::Gcp { project }
@@ -595,28 +669,15 @@ pub async fn benchmark_protocol<'a>(
     };
     let mut reusable_hosts = ReusableHosts::new(&host_type);
 
-    benchmark_protocol_with_reusable_machines(
-        &mut reusable_hosts,
-        &mut deployment,
-        start_virtual_clients,
-        num_runs,
-        run_benchmark,
-    )
-    .await;
+    benchmark_protocol_with_reusable_machines(&mut reusable_hosts, &mut deployment, run_benchmark)
+        .await
 }
 
 pub async fn benchmark_protocol_with_reusable_machines<'a>(
-    mut reusable_hosts: &mut ReusableHosts,
-    mut deployment: &mut Deployment,
-    start_virtual_clients: usize,
-    num_runs: usize,
+    reusable_hosts: &mut ReusableHosts,
+    deployment: &mut Deployment,
     run_benchmark: impl Fn(usize) -> BenchmarkConfig<'a>,
-) {
-    assert!(
-        num_runs > 0,
-        "Must run at least one iteration of the benchmark"
-    );
-
+) -> (Vec<HydroRoot>, RunMetadata) {
     let BenchmarkConfig {
         name: config_name,
         builder,
@@ -625,15 +686,54 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
         optimizations: config_optimizations,
         client_id: config_client_id,
         location_id_to_cluster: config_location_id_to_cluster,
+        start_virtual_clients,
+        num_runs,
     } = run_benchmark(PHYSICAL_CLIENTS);
-    // Set up FlowBuilder for cloning
-    let built = builder.finalize();
+    assert!(
+        num_runs > 0,
+        "Must run at least one iteration of the benchmark"
+    );
+
+    // Apply any rewrites (loaded + blow-up + size analysis) first
+    // Baseline: reduce_pushdown + inject_id so downstream passes have stable op ids.
+    let built = builder.finalize().optimize_with(|leaf| {
+        let decision = reduce_pushdown_decision(leaf, &config_optimizations.exclude);
+        reduce_pushdown(leaf, decision);
+        inject_id(leaf);
+    });
+    let (built, clusters, mut location_to_original_ops) =
+        apply_loaded_rewrites(built, config_clusters, &config_optimizations);
+    let (built, clusters, more_locs) = if config_optimizations.blow_up_analysis {
+        apply_blow_up_analysis(built, clusters, &config_optimizations)
+    } else {
+        (built, clusters, HashMap::new())
+    };
+    for (loc, ops) in more_locs {
+        location_to_original_ops.entry(loc).or_default().extend(ops);
+    }
+    let built = if config_optimizations.size_analysis {
+        built.optimize_with(|leaf| {
+            let per_loc_rewrites = greedy_decouple_analysis(leaf, &config_optimizations.exclude);
+            let network_ops: HashSet<usize> = per_loc_rewrites
+                .values()
+                .flat_map(|r| r.op_to_network.keys().copied())
+                .collect();
+            if !network_ops.is_empty() {
+                insert_byte_size_inspect(leaf, &network_ops);
+            }
+        })
+    } else {
+        built
+    };
+
     let ir = built.ir();
     let output_dir = Path::new("benchmark_results").join(format!(
         "{}_{}",
         config_name,
         Local::now().format("%Y-%m-%d_%H-%M-%S")
     ));
+
+    let mut final_run_metadata = RunMetadata::default();
 
     for num_virtual in (start_virtual_clients..=VIRTUAL_CLIENTS_MAX).step_by(VIRTUAL_CLIENTS_STEP) {
         let mut throughput_sum = 0;
@@ -648,19 +748,32 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
 
             let mut builder = FlowBuilder::from_built(&built);
             builder.replace_ir(deep_clone(ir));
-            let run_metadata = deploy_and_analyze(
-                &mut reusable_hosts,
-                &mut deployment,
-                builder.finalize(),
-                &config_clusters,
+            let finalized = if config_optimizations.no_counters {
+                builder.finalize()
+            } else {
+                let counter_output_duration: syn::Expr =
+                    syn::parse_quote!(std::time::Duration::from_secs(#METRIC_INTERVAL_SECS));
+                builder.finalize().optimize_with(|leaf| {
+                    insert_counter(
+                        leaf,
+                        &counter_output_duration,
+                        &config_optimizations.exclude,
+                    );
+                })
+            };
+            let mut run_metadata = deploy_and_analyze(
+                reusable_hosts,
+                deployment,
+                finalized,
+                &clusters,
                 &config_processes,
                 &config_optimizations,
                 &config_client_id,
                 std::cmp::max(1, num_virtual / PHYSICAL_CLIENTS), // clients per node
                 Some(RUN_SECONDS),
-                Some(MEASUREMENT_SECOND),
             )
             .await;
+            run_metadata.location_to_original_ops = location_to_original_ops.clone();
 
             let run_throughput =
                 run_metadata.avg_throughput(START_MEASUREMENT_SECOND, MEASUREMENT_SECOND);
@@ -684,13 +797,15 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
                         "Exceeded {} zero-throughput runs for this config. Terminating benchmark.",
                         NUM_RUNS_NO_THROUGHPUT
                     );
-                    return;
+                    final_run_metadata = run_metadata;
+                    return (deep_clone(ir), final_run_metadata);
                 }
             } else {
                 throughput_sum += run_throughput;
                 successful_runs += 1;
             }
             run += 1;
+            final_run_metadata = run_metadata;
         }
 
         let current_throughput = throughput_sum / successful_runs;
@@ -699,4 +814,6 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
             num_virtual, current_throughput
         );
     }
+
+    (deep_clone(ir), final_run_metadata)
 }

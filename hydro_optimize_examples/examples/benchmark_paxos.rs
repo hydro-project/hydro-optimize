@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use clap::{ArgAction, Parser};
 use hydro_lang::location::Location;
@@ -36,6 +37,11 @@ struct Args {
     /// Apply greedy decoupling, deploy decoupled system, gather per-operator SAR costs
     #[arg(long, action = ArgAction::SetTrue)]
     blow_up_analysis: bool,
+
+    /// Path(s) to JSON file(s) containing `PossibleRewrite`s to apply before deploying.
+    /// Rewrites are applied in the order given.
+    #[arg(long = "rewrite")]
+    rewrite: Vec<PathBuf>,
 }
 
 #[tokio::main]
@@ -44,14 +50,13 @@ async fn main() {
     let no_counters = args.no_counters;
     let size_analysis = args.size_analysis;
     let blow_up_analysis = args.blow_up_analysis;
+    let rewrite_paths = args.rewrite.clone();
 
-    benchmark_protocol(
+    let (_ir, _final_run_metadata) = benchmark_protocol(
         BenchmarkArgs {
             gcp: args.gcp,
             aws: args.aws,
         },
-        1,
-        1,
         move |num_clients| {
             let f = 1;
             let checkpoint_frequency = 1000;
@@ -118,6 +123,9 @@ async fn main() {
             if blow_up_analysis {
                 optimizations = optimizations.with_blow_up_analysis();
             }
+            for p in &rewrite_paths {
+                optimizations = optimizations.load_rewrite(Path::new(p));
+            }
 
             BenchmarkConfig {
                 name: "Paxos".to_string(),
@@ -127,6 +135,8 @@ async fn main() {
                 client_id,
                 optimizations,
                 location_id_to_cluster,
+                start_virtual_clients: 1,
+                num_runs: 1,
             }
         },
     )

@@ -1,15 +1,12 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use hydro_lang::compile::builder::FlowBuilder;
-use hydro_lang::compile::built::BuiltFlow;
 use hydro_lang::compile::ir::{
     BoundKind, CollectionKind, DebugType, HydroIrMetadata, HydroNode, HydroRoot,
-    KeyedSingletonBoundKind, SingletonBoundKind, StreamOrder, StreamRetry, deep_clone,
-    traverse_dfir,
+    KeyedSingletonBoundKind, SingletonBoundKind, StreamOrder, StreamRetry, traverse_dfir,
 };
+use hydro_lang::location::LocationKey;
 use hydro_lang::location::dynamic::LocationId;
-use hydro_lang::location::{Cluster, Location, LocationKey};
 use proc_macro2::{Span, TokenStream};
 use quote::{ToTokens, quote};
 use serde::{Deserialize, Serialize};
@@ -17,7 +14,6 @@ use syn::parse_quote;
 use syn::visit_mut::{self, VisitMut};
 
 use crate::decouple_analysis::PossibleRewrite;
-use crate::rewriter;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Rewrite {
@@ -25,45 +21,6 @@ pub struct Rewrite {
     pub num_partitions: usize,
     pub original_node: LocationId,
     pub cluster_size: usize,
-}
-
-pub type Rewrites = Vec<Rewrite>;
-
-/// Replays the rewrites in order.
-/// Returns Vec(Cluster, number of nodes) for each created cluster and a new FlowBuilder
-pub fn replay<'a>(
-    rewrites: Rewrites,
-    built: BuiltFlow<'a>,
-) -> (Vec<(Cluster<'a, ()>, usize)>, FlowBuilder<'a>) {
-    let mut all_new_clusters = vec![];
-
-    let mut ir = deep_clone(built.ir());
-    let mut builder = FlowBuilder::from_built(&built);
-
-    for rewrite in rewrites {
-        let location_indices: HashSet<usize> =
-            rewrite.possible_rewrite.locations().into_iter().collect();
-        assert!(
-            !location_indices.is_empty() && location_indices.contains(&0),
-            "Rewrite must have at least the original location"
-        );
-        let mut locations_map = HashMap::new();
-        for idx in location_indices {
-            // idx 0 is the original cluster
-            if idx == 0 {
-                locations_map.insert(0, rewrite.original_node.clone());
-            } else {
-                let cluster = builder.cluster::<()>();
-                locations_map.insert(idx, cluster.id().clone());
-                all_new_clusters.push((cluster, rewrite.cluster_size));
-            }
-        }
-        rewriter::apply_rewrite(&mut ir, &rewrite, &locations_map);
-    }
-
-    builder.replace_ir(ir);
-
-    (all_new_clusters, builder)
 }
 
 /// Replace CLUSTER_SELF_ID with the ID of the original node the partition is assigned to
