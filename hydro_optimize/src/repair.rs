@@ -55,7 +55,7 @@ fn link_cycles_node(node: &mut HydroNode, sources: &mut HashMap<CycleId, usize>)
 
 // Returns map from CycleSource id to the input IDs of the corresponding CycleSink's input
 // Assumes that metadtata.id is set for all nodes
-pub fn cycle_source_to_sink_input(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
+pub fn cycle_source_to_sink_parent(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
     let mut sources = HashMap::new();
     let mut sink_inputs = HashMap::new();
 

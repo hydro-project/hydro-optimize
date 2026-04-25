@@ -33,20 +33,6 @@ const SAR_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_SAR:";
 const LATENCY_PREFIX: &str = "HYDRO_OPTIMIZE_LAT:";
 const THROUGHPUT_PREFIX: &str = "HYDRO_OPTIMIZE_THR:";
 
-/// Applies reduce pushdown for all locations in the IR except excluded ones.
-fn apply_reduce_pushdown(ir: &mut [HydroRoot], exclude: &HashSet<LocationId>) {
-    // TODO: This way of getting locations is wrong, again
-    let locations: HashSet<_> = ir
-        .iter()
-        .map(|root| root.input_metadata().location_id.root().clone())
-        .filter(|loc| !exclude.contains(loc))
-        .collect();
-    for loc in locations {
-        let decision = reduce_pushdown_decision(ir, &loc);
-        reduce_pushdown(ir, decision);
-    }
-}
-
 // Note: Ensure edits to the match arms are consistent with inject_count_node
 fn insert_counter_node(
     node: &mut HydroNode,
@@ -412,7 +398,8 @@ pub async fn deploy_and_analyze<'a>(
 
     // Always reduce pushdown and inject IDs first
     let built = builder.optimize_with(|leaf| {
-        apply_reduce_pushdown(leaf, &optimizations.exclude);
+        let decision = reduce_pushdown_decision(leaf, &optimizations.exclude);
+        reduce_pushdown(leaf, decision);
         inject_id(leaf);
     });
 

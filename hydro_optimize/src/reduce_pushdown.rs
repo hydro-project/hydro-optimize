@@ -124,7 +124,7 @@ mod tests {
 
             let before = count_reduces(ir);
 
-            let decision = reduce_pushdown_decision(ir, &cluster2.id());
+            let decision = reduce_pushdown_decision(ir, &std::collections::HashSet::from([cluster1.id(), gateway.id()]));
             assert!(!decision.is_empty(), "Expected non-empty pushdown decision");
             reduce_pushdown(ir, decision);
 
