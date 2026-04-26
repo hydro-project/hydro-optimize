@@ -6,7 +6,7 @@ use hydro_lang::location::Location;
 use hydro_optimize::deploy::{HostType, ReusableHosts};
 use hydro_optimize::deploy_and_analyze::{
     BenchmarkConfig, Optimizations, ReusableClusters, ReusableProcesses,
-    benchmark_protocol_with_reusable_machines, VIRTUAL_CLIENTS_MAX,
+    benchmark_protocol_with_reusable_machines,
 };
 use hydro_optimize_examples::network_calibrator::network_calibrator;
 
@@ -90,7 +90,8 @@ async fn main() {
                     client_id,
                     optimizations,
                     location_id_to_cluster,
-                    start_virtual_clients: VIRTUAL_CLIENTS_MAX,
+                    start_virtual_clients: 1,
+                    virtual_clients_step: 10,
                     num_runs: 1,
                 }
             },
