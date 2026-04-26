@@ -513,6 +513,7 @@ pub const PHYSICAL_CLIENTS: usize = 10;
 pub const VIRTUAL_CLIENTS_MAX: usize = 50 * PHYSICAL_CLIENTS; // Based on manual testing, an 8-core m5.2xlarge's CPU saturates around 50 clients.
 pub const VIRTUAL_CLIENTS_STEP: usize = 50; // Can tweak to get finer-grained numbers
 pub const NUM_RUNS_NO_THROUGHPUT: usize = 3;
+pub const NO_IMPROVEMENT_LIMIT: usize = 3;
 
 /// Applies a single `rewrite`, creating any new clusters it requires on `builder`. Records
 /// which original op ids landed on which deployed location in `location_to_original_ops`.
@@ -711,6 +712,8 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
     ));
 
     let mut final_run_metadata = RunMetadata::default();
+    let mut best_throughput: usize = 0;
+    let mut no_improvement_count: usize = 0;
 
     for num_virtual in (start_virtual_clients..=VIRTUAL_CLIENTS_MAX).step_by(VIRTUAL_CLIENTS_STEP) {
         let mut throughput_sum = 0;
@@ -790,6 +793,21 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
             "clients={}, avg_throughput={}",
             num_virtual, current_throughput
         );
+
+        if current_throughput > best_throughput {
+            best_throughput = current_throughput;
+            no_improvement_count = 0;
+        } else {
+            no_improvement_count += 1;
+            println!(
+                "No throughput improvement ({}/{})",
+                no_improvement_count, NO_IMPROVEMENT_LIMIT
+            );
+            if no_improvement_count >= NO_IMPROVEMENT_LIMIT {
+                println!("Throughput plateaued for {} consecutive iterations. Terminating benchmark.", NO_IMPROVEMENT_LIMIT);
+                break;
+            }
+        }
     }
 
     (deep_clone(ir), final_run_metadata)
