@@ -5,7 +5,7 @@ use hydro_lang::location::Location;
 use hydro_lang::viz::config::GraphConfig;
 use hydro_optimize::deploy_and_analyze::{
     BenchmarkArgs, BenchmarkConfig, Optimizations, ReusableClusters, ReusableProcesses,
-    benchmark_protocol,
+    VIRTUAL_CLIENTS_STEP, benchmark_protocol,
 };
 use hydro_optimize_examples::compare_and_swap::cas_write_bench::cas_write_bench;
 
@@ -68,6 +68,7 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
         optimizations,
         location_id_to_cluster,
         start_virtual_clients: 1,
+        virtual_clients_step: VIRTUAL_CLIENTS_STEP,
         num_runs: 1,
     }
 }

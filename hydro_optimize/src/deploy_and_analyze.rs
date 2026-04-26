@@ -502,6 +502,7 @@ pub struct BenchmarkConfig<'a> {
     pub optimizations: Optimizations,
     pub location_id_to_cluster: HashMap<LocationId, String>,
     pub start_virtual_clients: usize,
+    pub virtual_clients_step: usize,
     /// Number of successful runs to collect per virtual-client count.
     pub num_runs: usize,
 }
@@ -587,9 +588,9 @@ fn apply_loaded_rewrites<'a>(
         );
 
         // reduce_pushdown + inject_id after each rewrite
+        inject_id(&mut ir);
         let decision = reduce_pushdown_decision(&mut ir, exclude);
         reduce_pushdown(&mut ir, decision);
-        inject_id(&mut ir);
     }
 
     builder.replace_ir(ir);
@@ -663,6 +664,7 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
         client_id: config_client_id,
         location_id_to_cluster: config_location_id_to_cluster,
         start_virtual_clients,
+        virtual_clients_step,
         num_runs,
     } = run_benchmark(PHYSICAL_CLIENTS);
     assert!(
@@ -673,9 +675,9 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
     // Apply the selected optimization strategy exactly once.
     // Baseline: reduce_pushdown + inject_id so downstream passes have stable op ids.
     let built = builder.finalize().optimize_with(|leaf| {
+        inject_id(leaf);
         let decision = reduce_pushdown_decision(leaf, &config_optimizations.exclude);
         reduce_pushdown(leaf, decision);
-        inject_id(leaf);
     });
     let (built, clusters, location_to_original_ops) = match &config_optimizations.kind {
         OptimizationKind::None => (built, config_clusters, HashMap::new()),
@@ -715,7 +717,7 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
     let mut best_throughput: usize = 0;
     let mut no_improvement_count: usize = 0;
 
-    for num_virtual in (start_virtual_clients..=VIRTUAL_CLIENTS_MAX).step_by(VIRTUAL_CLIENTS_STEP) {
+    for num_virtual in (start_virtual_clients..=VIRTUAL_CLIENTS_MAX).step_by(virtual_clients_step) {
         let mut throughput_sum = 0;
         let mut successful_runs = 0;
         let mut zero_throughput_count = 0;

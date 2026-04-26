@@ -5,7 +5,7 @@ use clap::{ArgAction, Parser};
 use hydro_lang::location::Location;
 use hydro_optimize::deploy_and_analyze::{
     BenchmarkArgs, BenchmarkConfig, Optimizations, ReusableClusters, ReusableProcesses,
-    benchmark_protocol,
+    VIRTUAL_CLIENTS_STEP, benchmark_protocol,
 };
 use hydro_optimize_examples::print_parseable_bench_results;
 use hydro_test::cluster::paxos::{CorePaxos, PaxosConfig};
@@ -136,6 +136,7 @@ async fn main() {
                 optimizations,
                 location_id_to_cluster,
                 start_virtual_clients: 1,
+                virtual_clients_step: VIRTUAL_CLIENTS_STEP,
                 num_runs: 1,
             }
         },
