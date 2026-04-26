@@ -10,47 +10,19 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::deploy_and_analyze::{MetricLogs, Optimizations};
+use crate::deploy_and_analyze::{
+    MEASUREMENT_SECOND, MetricLogs, Optimizations, START_MEASUREMENT_SECOND,
+};
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct RunMetadata {
     pub throughputs: Vec<usize>,
     pub latencies: Vec<(f64, f64, f64, u64)>, // per-second: (p50, p99, p999, count)
-    pub counters: HashMap<usize, usize>,      // op_id -> cardinality count
+    pub counters: HashMap<usize, Vec<usize>>, // op_id -> per-second rate time series
     pub byte_sizes: HashMap<usize, Vec<u64>>, // op_id -> sampled byte sizes
     pub sar_stats: HashMap<LocationId, Vec<SarStats>>,
     /// Maps each LocationId → original op_ids assigned to it (populated when size_analysis is used)
     pub location_to_original_ops: HashMap<LocationId, Vec<usize>>,
-}
-
-// Purely use for serde on RunMetadata. All fields omitted are not serialized
-#[derive(Serialize, Deserialize)]
-struct SerdeRunMetadata {
-    counters: HashMap<usize, usize>,
-    #[serde(default)]
-    byte_sizes: HashMap<usize, Vec<u64>>,
-}
-
-/// Only `counters` and `byte_sizes` are persisted; everything else is transient.
-impl Serialize for RunMetadata {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let serde = SerdeRunMetadata {
-            counters: self.counters.clone(),
-            byte_sizes: self.byte_sizes.clone(),
-        };
-        serde.serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for RunMetadata {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let serde = SerdeRunMetadata::deserialize(deserializer)?;
-        Ok(Self {
-            counters: serde.counters,
-            byte_sizes: serde.byte_sizes,
-            ..Default::default()
-        })
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -83,52 +55,39 @@ impl RunMetadata {
             };
             let mut metrics = HashSet::new();
 
-            // If any core is overloaded, consider it CPU overloaded
             let cpu_threshold = 100.0 * limits.bottleneck_threshold;
-            let max_core_used = sar
-                .cpu
-                .core_stats
-                .iter()
-                .map(|c| c.user + c.system)
-                .reduce(f64::max)
-                .unwrap_or(0.0);
             println!(
-                "  {:?} CPU: max_core_used={:.1}% threshold={:.1}%",
-                location, max_core_used, cpu_threshold
+                "  {:?} CPU: {:.1}% threshold={:.1}%",
+                location, sar.cpu, cpu_threshold
             );
-            if max_core_used >= cpu_threshold {
+            if sar.cpu >= cpu_threshold {
                 metrics.insert(BottleneckMetric::Cpu);
             }
 
-            // If the sum of input + output bytes exceeds threshold
             let net_threshold = limits.network_bytes_per_sec * limits.bottleneck_threshold;
-            let net_used = sar.network.rx_bytes_per_sec + sar.network.tx_bytes_per_sec;
             println!(
                 "  {:?} Network: {:.0} B/s threshold={:.0} B/s",
-                location, net_used, net_threshold
+                location, sar.network, net_threshold
             );
-            if net_used >= net_threshold {
+            if sar.network >= net_threshold {
                 metrics.insert(BottleneckMetric::Network);
             }
 
-            // If the percentage of memory used exceeds threshold
             let mem_threshold = 100.0 * limits.bottleneck_threshold;
             println!(
                 "  {:?} Memory: {:.1}% threshold={:.1}%",
-                location, sar.memory.percent_mem_used, mem_threshold
+                location, sar.memory, mem_threshold
             );
-            if sar.memory.percent_mem_used >= mem_threshold {
+            if sar.memory >= mem_threshold {
                 metrics.insert(BottleneckMetric::Memory);
             }
 
-            // If the sum of read + write transfers per second exceeds threshold
             let io_threshold = limits.io_tps * limits.bottleneck_threshold;
-            let io_used = sar.io.rtps + sar.io.wtps;
             println!(
                 "  {:?} IO: {:.1} tps threshold={:.1} tps",
-                location, io_used, io_threshold
+                location, sar.io, io_threshold
             );
-            if io_used >= io_threshold {
+            if sar.io >= io_threshold {
                 metrics.insert(BottleneckMetric::IO);
             }
 
@@ -139,14 +98,43 @@ impl RunMetadata {
         result
     }
 
-    /// Average throughput over the given inclusive second range.
-    pub fn avg_throughput(&self, start: usize, end: usize) -> usize {
-        let slice = &self.throughputs[start..=end];
-        if slice.is_empty() {
-            0
-        } else {
-            slice.iter().sum::<usize>() / slice.len()
-        }
+    /// Average throughput over the measurement window.
+    pub fn avg_throughput(&self) -> usize {
+        avg_over(&self.throughputs, |&v| v as f64) as usize
+    }
+
+    /// Average per-second counter rates over the measurement window for each op.
+    pub fn avg_counters(&self) -> HashMap<usize, usize> {
+        self.counters
+            .iter()
+            .map(|(&op_id, rates)| (op_id, avg_over(rates, |&v| v as f64) as usize))
+            .collect()
+    }
+
+    /// Median byte size for a single op.
+    pub fn median_byte_size(&self, op_id: usize) -> u64 {
+        self.byte_sizes
+            .get(&op_id)
+            .map(|sizes| median(&mut sizes.clone()))
+            .unwrap_or(0)
+    }
+
+    /// Average SAR stats over the measurement window for each location.
+    pub fn avg_sar_stats(&self) -> HashMap<LocationId, SarStats> {
+        self.sar_stats
+            .iter()
+            .map(|(loc, stats)| {
+                (
+                    loc.clone(),
+                    SarStats {
+                        cpu: avg_over(stats, |s| s.cpu),
+                        network: avg_over(stats, |s| s.network),
+                        memory: avg_over(stats, |s| s.memory),
+                        io: avg_over(stats, |s| s.io),
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Prints a human-readable summary of metrics at the given measurement second.
@@ -176,28 +164,13 @@ impl RunMetadata {
             let name = location_id_to_cluster.get(location).unwrap();
             if let Some(sar) = sar_stats.get(measurement_second) {
                 println!(
-                    "{} @{}s: CPU {:.2}% (user {:.2}%, sys {:.2}%, idle {:.2}%) | \
-                     Net rx {:.0} pkt/s {:.0} B/s, tx {:.0} pkt/s {:.0} B/s | \
-                     Mem {:.2}% ({:.0} KB used, {:.0} KB buf, {:.0} KB cached) | \
-                     IO r {:.2} w {:.2} tps, bread {:.2} bwrtn {:.2}/s",
+                    "{} @{}s: CPU {:.2}% | Net {:.0} B/s | Mem {:.2}% | IO {:.2} tps",
                     name,
                     measurement_second + 1,
-                    sar.cpu.all_stats.user + sar.cpu.all_stats.system,
-                    sar.cpu.all_stats.user,
-                    sar.cpu.all_stats.system,
-                    sar.cpu.all_stats.idle,
-                    sar.network.rx_packets_per_sec,
-                    sar.network.rx_bytes_per_sec,
-                    sar.network.tx_packets_per_sec,
-                    sar.network.tx_bytes_per_sec,
-                    sar.memory.percent_mem_used,
-                    sar.memory.kb_mem_used,
-                    sar.memory.kb_buffers,
-                    sar.memory.kb_cached,
-                    sar.io.rtps,
-                    sar.io.wtps,
-                    sar.io.bread_per_sec,
-                    sar.io.bwrtn_per_sec,
+                    sar.cpu,
+                    sar.network,
+                    sar.memory,
+                    sar.io,
                 );
             }
         }
@@ -228,24 +201,12 @@ impl RunMetadata {
                 .len()
                 .max(self.throughputs.len())
                 .max(self.latencies.len());
-            let num_cores = stats
-                .iter()
-                .map(|s| s.cpu.core_stats.len())
-                .max()
-                .unwrap_or(0);
 
             let write_csv = || -> Result<(), Box<dyn std::error::Error>> {
                 let mut file = File::create(&filename)?;
-                write!(file, "time_s,cpu_user,cpu_system,cpu_idle")?;
-                for c in 0..num_cores {
-                    write!(file, ",core{}_user,core{}_system,core{}_idle", c, c, c)?;
-                }
                 writeln!(
                     file,
-                    ",network_tx_packets_per_sec,network_rx_packets_per_sec,\
-                     network_tx_bytes_per_sec,network_rx_bytes_per_sec,\
-                     mem_kb_used,mem_percent_used,mem_kb_buffers,mem_kb_cached,\
-                     io_rtps,io_wtps,io_bread_per_sec,io_bwrtn_per_sec,\
+                    "time_s,cpu,network,memory,io,\
                      throughput_rps,latency_p50_ms,latency_p99_ms,latency_p999_ms,latency_samples",
                 )?;
 
@@ -255,43 +216,10 @@ impl RunMetadata {
                     let thr = self.throughputs.get(i).copied().unwrap_or(0);
                     let (p50, p99, p999, count) =
                         self.latencies.get(i).copied().unwrap_or_default();
-                    write!(
-                        file,
-                        "{},{:.2},{:.2},{:.2}",
-                        i, sar.cpu.all_stats.user, sar.cpu.all_stats.system, sar.cpu.all_stats.idle,
-                    )?;
-                    let default_core = CPUStat::default();
-                    for c in 0..num_cores {
-                        let core = sar.cpu.core_stats.get(c).unwrap_or(&default_core);
-                        write!(
-                            file,
-                            ",{:.2},{:.2},{:.2}",
-                            core.user, core.system, core.idle
-                        )?;
-                    }
                     writeln!(
                         file,
-                        ",{:.2},{:.2},{:.2},{:.2},\
-                         {:.2},{:.2},{:.2},{:.2},\
-                         {:.2},{:.2},{:.2},{:.2},\
-                         {},{:.3},{:.3},{:.3},{}",
-                        sar.network.tx_packets_per_sec,
-                        sar.network.rx_packets_per_sec,
-                        sar.network.tx_bytes_per_sec,
-                        sar.network.rx_bytes_per_sec,
-                        sar.memory.kb_mem_used,
-                        sar.memory.percent_mem_used,
-                        sar.memory.kb_buffers,
-                        sar.memory.kb_cached,
-                        sar.io.rtps,
-                        sar.io.wtps,
-                        sar.io.bread_per_sec,
-                        sar.io.bwrtn_per_sec,
-                        thr,
-                        p50,
-                        p99,
-                        p999,
-                        count,
+                        "{},{:.2},{:.2},{:.2},{:.2},{},{:.3},{:.3},{:.3},{}",
+                        i, sar.cpu, sar.network, sar.memory, sar.io, thr, p50, p99, p999, count,
                     )?;
                 }
                 Ok(())
@@ -302,140 +230,58 @@ impl RunMetadata {
                 Err(e) => eprintln!("Failed to write CSV {}: {}", filename.display(), e),
             }
         }
-
-        // Save profiling JSON
-        let path = output_dir.join(format!(
-            "profiling_{}c_{}vc_r{}.json",
-            num_clients, num_clients_per_node, run
-        ));
-        let json = serde_json::to_string_pretty(&self).expect("failed to serialize profiling data");
-        match fs::write(&path, json) {
-            Ok(()) => println!("Saved profiling data: {}", path.display()),
-            Err(e) => eprintln!("Failed to save profiling data to {}: {}", path.display(), e),
-        }
     }
 
-    /// Loads profiling data from file.
-    pub fn load(path: &Path) -> Self {
-        let json = fs::read_to_string(path).unwrap_or_else(|e| {
-            panic!(
-                "Failed to load profiling data from {}: {}",
-                path.display(),
-                e
-            )
-        });
-        serde_json::from_str(&json).expect("failed to deserialize profiling data")
-    }
-}
-
-/// Per-second CPU statistics from sar -u output
-#[derive(Debug, Default, Clone, Copy)]
-pub struct CPUStat {
-    pub user: f64,
-    pub system: f64,
-    pub idle: f64,
-}
-
-impl CPUStat {
-    fn max(self, other: Self) -> Self {
-        Self {
-            user: self.user.max(other.user),
-            system: self.system.max(other.system),
-            idle: self.idle.max(other.idle),
-        }
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct CPUStats {
-    pub core_stats: Vec<CPUStat>, // One for each core
-    pub all_stats: CPUStat,
-}
-
-impl CPUStats {
-    fn max(self, other: Self) -> Self {
-        let len = self.core_stats.len().max(other.core_stats.len());
-        let core_stats = (0..len)
-            .map(|i| {
-                let a = self.core_stats.get(i).copied().unwrap_or_default();
-                let b = other.core_stats.get(i).copied().unwrap_or_default();
-                a.max(b)
-            })
+    /// Saves median output byte size per decoupleable operator.
+    /// `decoupleable_ops` is the set of op_ids where decoupling could insert a network.
+    pub fn save_size_analysis(&self, output_dir: &Path, decoupleable_ops: &HashSet<usize>) {
+        let sizes: HashMap<usize, u64> = decoupleable_ops
+            .iter()
+            .map(|&op_id| (op_id, self.median_byte_size(op_id)))
             .collect();
-        Self {
-            all_stats: self.all_stats.max(other.all_stats),
-            core_stats,
+        save_json(output_dir, "size_analysis.json", &sizes);
+    }
+
+    /// Saves per-location blow-up stats: sar_stats, operator list, per-op counts.
+    pub fn save_blow_up_stats(&self, output_dir: &Path) {
+        let avg_counters = self.avg_counters();
+        let avg_sar = self.avg_sar_stats();
+
+        let mut location_stats: HashMap<String, BlowUpLocationStats> = HashMap::new();
+        for (loc, ops) in &self.location_to_original_ops {
+            if ops.is_empty() {
+                continue;
+            }
+            let sar = avg_sar.get(loc).cloned().unwrap_or_default();
+            let counts: HashMap<usize, usize> = ops
+                .iter()
+                .map(|&op| (op, avg_counters.get(&op).copied().unwrap_or(0)))
+                .collect();
+            location_stats.insert(
+                format!("{:?}", loc),
+                BlowUpLocationStats {
+                    sar_stats: sar,
+                    operators: ops.clone(),
+                    counts,
+                },
+            );
         }
+
+        save_json(output_dir, "blow_up_stats.json", &location_stats);
     }
 }
 
-/// Per-second network statistics from sar -n DEV output (eth0 only)
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NetworkStats {
-    pub rx_packets_per_sec: f64,
-    pub tx_packets_per_sec: f64,
-    pub rx_bytes_per_sec: f64,
-    pub tx_bytes_per_sec: f64,
-}
-
-impl NetworkStats {
-    fn max(self, other: Self) -> Self {
-        Self {
-            rx_packets_per_sec: self.rx_packets_per_sec.max(other.rx_packets_per_sec),
-            tx_packets_per_sec: self.tx_packets_per_sec.max(other.tx_packets_per_sec),
-            rx_bytes_per_sec: self.rx_bytes_per_sec.max(other.rx_bytes_per_sec),
-            tx_bytes_per_sec: self.tx_bytes_per_sec.max(other.tx_bytes_per_sec),
-        }
-    }
-}
-
-/// Per-second memory statistics from sar -r output
-#[derive(Debug, Default, Clone, Copy)]
-pub struct MemoryStats {
-    pub kb_mem_used: f64,
-    pub percent_mem_used: f64,
-    pub kb_buffers: f64,
-    pub kb_cached: f64,
-}
-
-impl MemoryStats {
-    fn max(self, other: Self) -> Self {
-        Self {
-            kb_mem_used: self.kb_mem_used.max(other.kb_mem_used),
-            percent_mem_used: self.percent_mem_used.max(other.percent_mem_used),
-            kb_buffers: self.kb_buffers.max(other.kb_buffers),
-            kb_cached: self.kb_cached.max(other.kb_cached),
-        }
-    }
-}
-
-/// Per-second aggregate I/O statistics from sar -b output
-#[derive(Debug, Default, Clone, Copy)]
-pub struct IOStats {
-    pub rtps: f64,          // read transfers per second
-    pub wtps: f64,          // write transfers per second
-    pub bread_per_sec: f64, // blocks read per second
-    pub bwrtn_per_sec: f64, // blocks written per second
-}
-
-impl IOStats {
-    fn max(self, other: Self) -> Self {
-        Self {
-            rtps: self.rtps.max(other.rtps),
-            wtps: self.wtps.max(other.wtps),
-            bread_per_sec: self.bread_per_sec.max(other.bread_per_sec),
-            bwrtn_per_sec: self.bwrtn_per_sec.max(other.bwrtn_per_sec),
-        }
-    }
-}
-
-/// Combined per-second sar statistics
-#[derive(Debug, Default, Clone)]
+/// Per-second SAR statistics
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 pub struct SarStats {
-    pub cpu: CPUStats,
-    pub network: NetworkStats,
-    pub memory: MemoryStats,
-    pub io: IOStats,
+    /// Max single-core CPU usage (user + system %)
+    pub cpu: f64,
+    /// Network in + out bytes/sec
+    pub network: f64,
+    /// Memory percent used
+    pub memory: f64,
+    /// IO rtps + wtps
+    pub io: f64,
 }
 
 impl SarStats {
@@ -447,161 +293,216 @@ impl SarStats {
             io: self.io.max(other.io),
         }
     }
-}
 
-/// Parses a single CPU line from sar -u -P ALL output.
-/// Returns (is_all, CPUStat) where is_all=true for the "all" aggregate line.
-/// Format: "HH:MM:SS CPU %user %nice %system %iowait %steal %idle"
-fn parse_cpu_line(line: &str) -> Option<(bool, CPUStat)> {
-    // Require "all" or a core number 0-999 (avoids matching memory lines with huge numbers)
-    let cpu_regex = Regex::new(
-        r"\s(all|\d{1,3})\s+(\d+\.?\d*)\s+\d+\.?\d*\s+(\d+\.?\d*)\s+\d+\.?\d*\s+\d+\.?\d*\s+(\d+\.?\d*)$",
-    )
-    .unwrap();
-
-    cpu_regex.captures(line).and_then(|caps| {
-        let is_all = &caps[1] == "all";
-        let user = caps[2].parse::<f64>().ok()?;
-        let system = caps[3].parse::<f64>().ok()?;
-        let idle = caps[4].parse::<f64>().ok()?;
-        Some((is_all, CPUStat { user, system, idle }))
-    })
-}
-
-/// Parses a single network line from sar -n DEV output (any non-loopback interface).
-/// Format: "HH:MM:SS IFACE rxpck/s txpck/s rxkB/s txkB/s [rxcmp/s txcmp/s rxmcst/s %ifutil]"
-/// Matches eth0, ens5, or any other interface name that isn't "lo".
-fn parse_network_line(line: &str) -> Option<NetworkStats> {
-    // Require interface name to start with a letter (avoids matching bare numeric IO data lines)
-    let iface_regex =
-        Regex::new(r"([a-zA-Z]\S*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)")
-            .unwrap();
-
-    iface_regex.captures(line).and_then(|caps| {
-        let iface = &caps[1];
-        // Skip loopback, docker, and header lines
-        if iface == "lo" || iface == "docker0" || iface == "IFACE" {
-            return None;
+    fn lerp(self, other: Self, t: f64) -> Self {
+        Self {
+            cpu: self.cpu + t * (other.cpu - self.cpu),
+            network: self.network + t * (other.network - self.network),
+            memory: self.memory + t * (other.memory - self.memory),
+            io: self.io + t * (other.io - self.io),
         }
-        let rx_pkt = caps[2].parse::<f64>().ok()?;
-        let tx_pkt = caps[3].parse::<f64>().ok()?;
-        let rx_kb = caps[4].parse::<f64>().ok()?;
-        let tx_kb = caps[5].parse::<f64>().ok()?;
-        Some(NetworkStats {
-            rx_packets_per_sec: rx_pkt,
-            tx_packets_per_sec: tx_pkt,
-            rx_bytes_per_sec: rx_kb * 1024.0,
-            tx_bytes_per_sec: tx_kb * 1024.0,
-        })
-    })
-}
-
-/// Parses a single memory line from sar -r output.
-/// Format: "HH:MM:SS kbmemfree kbavail kbmemused %memused kbbuffers kbcached [kbcommit %commit kbactive kbinact kbdirty]"
-fn parse_memory_line(line: &str) -> Option<MemoryStats> {
-    // Require timestamp followed by two large integers (kbmemfree, kbavail) before the captured fields.
-    // The first field after timestamp must be a digit (not an interface name like "lo").
-    let re = Regex::new(r"\d+:\d+:\d+\s+(\d+)\s+\d+\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+)\s+(\d+)")
-        .unwrap();
-    re.captures(line).and_then(|caps| {
-        if line.contains("kbmemfree") {
-            return None;
-        }
-        // kbmemfree must be large (>10000) to distinguish from other numeric lines
-        let kbmemfree = caps[1].parse::<f64>().ok()?;
-        if kbmemfree < 10000.0 {
-            return None;
-        }
-        Some(MemoryStats {
-            kb_mem_used: caps[2].parse().ok()?,
-            percent_mem_used: caps[3].parse().ok()?,
-            kb_buffers: caps[4].parse().ok()?,
-            kb_cached: caps[5].parse().ok()?,
-        })
-    })
-}
-
-/// Parses a single I/O line from sar -b output.
-/// Format: "HH:MM:SS tps rtps wtps [dtps] bread/s bwrtn/s [bdscd/s]"
-/// Supports both 5-column (older) and 7-column (newer, with dtps/bdscd/s) formats.
-fn parse_io_line(line: &str) -> Option<IOStats> {
-    if line.contains("tps") {
-        return None;
     }
-    // Try 7-column format first: tps rtps wtps dtps bread/s bwrtn/s bdscd/s
-    let re7 = Regex::new(
-        r"\d+:\d+:\d+\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+\d+\.?\d*\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+\d+\.?\d*\s*$",
-    ).unwrap();
-    if let Some(caps) = re7.captures(line) {
-        return Some(IOStats {
-            rtps: caps[2].parse().ok()?,
-            wtps: caps[3].parse().ok()?,
-            bread_per_sec: caps[4].parse().ok()?,
-            bwrtn_per_sec: caps[5].parse().ok()?,
-        });
+
+    /// Multiply each field by `s`.
+    pub fn scale(self, s: f64) -> Self {
+        Self {
+            cpu: self.cpu * s,
+            network: self.network * s,
+            memory: self.memory * s,
+            io: self.io * s,
+        }
     }
-    // Fall back to 5-column format: tps rtps wtps bread/s bwrtn/s
-    let re5 = Regex::new(
-        r"\d+:\d+:\d+\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s*$",
-    )
-    .unwrap();
-    re5.captures(line).and_then(|caps| {
-        Some(IOStats {
-            rtps: caps[2].parse().ok()?,
-            wtps: caps[3].parse().ok()?,
-            bread_per_sec: caps[4].parse().ok()?,
-            bwrtn_per_sec: caps[5].parse().ok()?,
+
+    /// Subtract `other`, clamping each field to 0.
+    pub fn sub_floor(self, other: Self) -> Self {
+        Self {
+            cpu: (self.cpu - other.cpu).max(0.0),
+            network: (self.network - other.network).max(0.0),
+            memory: (self.memory - other.memory).max(0.0),
+            io: (self.io - other.io).max(0.0),
+        }
+    }
+
+    pub fn add(&mut self, other: Self) {
+        self.cpu += other.cpu;
+        self.network += other.network;
+        self.memory += other.memory;
+        self.io += other.io;
+    }
+}
+
+/// Per-location blow-up analysis output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlowUpLocationStats {
+    pub sar_stats: SarStats,
+    pub operators: Vec<usize>,
+    pub counts: HashMap<usize, usize>,
+}
+
+/// Derives per-operator load for the ILP solver.
+///
+/// For each blown-up location, subtracts the network overhead introduced by blowing up
+/// (using greedy analysis to identify where networks were inserted), then assigns the
+/// full adjusted SarStats to the first operator of each location group.
+///
+/// Network costs are attributed to both sender and receiver locations. The byte size
+/// used is the parent's output size (since `op_to_network` inserts BEFORE the op).
+///
+/// Returns `op_id → SarStats` load assignment. Will not contain entries for operators that were not the first in their blown-up location group.
+pub fn derive_per_op_load(
+    blow_up_stats: &HashMap<LocationId, BlowUpLocationStats>,
+    op_output_sizes: &HashMap<usize, u64>,
+    op_counts: &HashMap<usize, usize>,
+    // op_id → (src_loc_idx, dst_loc_idx): greedy analysis would insert networks BEFORE this op
+    op_to_network: &HashMap<usize, (usize, usize)>,
+    // op_id → parent op_ids
+    op_to_parents: &HashMap<usize, Vec<usize>>,
+    calibration: &NetworkCostTable,
+    // op_id → location index from the greedy rewrite
+    op_to_loc: &HashMap<usize, usize>,
+) -> HashMap<usize, SarStats> {
+    // Build loc_idx → LocationId mapping from blow_up_stats
+    // (location_to_original_ops maps LocationId → ops, op_to_loc maps op → loc_idx;
+    //  we invert to get loc_idx → LocationId)
+    let mut loc_idx_to_location: HashMap<usize, LocationId> = HashMap::new();
+    for (loc, stats) in blow_up_stats {
+        for &op_id in &stats.operators {
+            if let Some(&loc_idx) = op_to_loc.get(&op_id) {
+                loc_idx_to_location
+                    .entry(loc_idx)
+                    .or_insert_with(|| loc.clone());
+            }
+        }
+    }
+
+    // For each network insertion, compute cost and attribute to both sender and receiver locations.
+    let mut loc_network_cost: HashMap<LocationId, SarStats> = HashMap::new();
+    for (&op_id, &(src_loc_idx, dst_loc_idx)) in op_to_network {
+        // The network sends the parent's output, so use parent's size and count.
+        // If there are multiple parents, each contributes a network.
+        let parents = op_to_parents.get(&op_id).cloned().unwrap();
+        for parent in parents {
+            let count = op_counts.get(&parent).copied().unwrap();
+            let size = op_output_sizes.get(&parent).copied().unwrap();
+            let cost = calibration.network_cost(count, size);
+
+            for loc_idx in [src_loc_idx, dst_loc_idx] {
+                if let Some(loc) = loc_idx_to_location.get(&loc_idx) {
+                    loc_network_cost.entry(loc.clone()).or_default().add(cost);
+                }
+            }
+        }
+    }
+
+    // Subtract network overhead from each location's SarStats
+    let loc_to_no_network_stats: HashMap<LocationId, SarStats> = blow_up_stats
+        .iter()
+        .map(|(loc, stats)| {
+            let net_cost = loc_network_cost.get(loc).copied().unwrap();
+            (loc.clone(), stats.sar_stats.sub_floor(net_cost))
         })
-    })
+        .collect();
+
+    // Assign load: first op of each location group gets the full adjusted SarStats
+    let mut per_op_load: HashMap<usize, SarStats> = HashMap::new();
+    for (loc, stats) in blow_up_stats {
+        let no_network_stats = loc_to_no_network_stats.get(loc).copied().unwrap();
+        let first_op = stats.operators.first().unwrap();
+        per_op_load.insert(*first_op, no_network_stats);
+    }
+
+    per_op_load
 }
 
 /// Parses `sar -n DEV -u -P ALL -r -b` output lines and returns per-second SarStats.
-/// Groups per-core CPU stats with the aggregate "all" line.
 pub fn parse_sar_output(lines: Vec<String>) -> Vec<SarStats> {
-    let mut cpu_usages: Vec<CPUStats> = vec![];
-    let mut network_usages = vec![];
-    let mut memory_usages = vec![];
-    let mut io_usages = vec![];
+    let cpu_regex = Regex::new(
+        r"\s(all|\d{1,3})\s+(\d+\.?\d*)\s+\d+\.?\d*\s+(\d+\.?\d*)\s+\d+\.?\d*\s+\d+\.?\d*\s+(\d+\.?\d*)$",
+    ).unwrap();
+    let iface_regex =
+        Regex::new(r"([a-zA-Z]\S*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)")
+            .unwrap();
+    let mem_regex =
+        Regex::new(r"\d+:\d+:\d+\s+(\d+)\s+\d+\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+)\s+(\d+)")
+            .unwrap();
+    let io_re7 = Regex::new(
+        r"\d+:\d+:\d+\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+\d+\.?\d*\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+\d+\.?\d*\s*$",
+    ).unwrap();
+    let io_re5 = Regex::new(
+        r"\d+:\d+:\d+\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s*$",
+    )
+    .unwrap();
+
+    let mut result: Vec<SarStats> = vec![];
 
     for line in &lines {
-        if let Some((is_all, stat)) = parse_cpu_line(line) {
-            // Assumes that "all" line comes before per-core lines
-            if is_all {
-                cpu_usages.push(CPUStats {
-                    all_stats: stat,
-                    core_stats: vec![],
-                });
-            } else if let Some(last) = cpu_usages.last_mut() {
-                last.core_stats.push(stat);
+        // CPU: "all" marks a new second, per-core lines update the max
+        if let Some(caps) = cpu_regex.captures(line) {
+            let is_all = &caps[1] == "all";
+            if let (Some(user), Some(system)) =
+                (caps[2].parse::<f64>().ok(), caps[3].parse::<f64>().ok())
+            {
+                let usage = user + system;
+                if is_all {
+                    result.push(SarStats {
+                        cpu: usage,
+                        ..Default::default()
+                    });
+                } else if let Some(last) = result.last_mut() {
+                    last.cpu = last.cpu.max(usage);
+                }
             }
-        } else if let Some(network) = parse_network_line(line) {
-            network_usages.push(network);
-        } else if let Some(memory) = parse_memory_line(line) {
-            memory_usages.push(memory);
-        } else if let Some(io) = parse_io_line(line) {
-            io_usages.push(io);
+            continue;
+        }
+
+        // Network
+        if let Some(caps) = iface_regex.captures(line) {
+            let iface = &caps[1];
+            if iface != "lo"
+                && iface != "docker0"
+                && iface != "IFACE"
+                && let (Some(rx_kb), Some(tx_kb)) =
+                    (caps[4].parse::<f64>().ok(), caps[5].parse::<f64>().ok())
+                && let Some(last) = result.last_mut()
+            {
+                last.network = (rx_kb + tx_kb) * 1024.0;
+            }
+            continue;
+        }
+
+        // Memory
+        if !line.contains("kbmemfree")
+            && let Some(caps) = mem_regex.captures(line)
+        {
+            if let Some(kbmemfree) = caps[1].parse::<f64>().ok()
+                && kbmemfree >= 10000.0
+                && let Some(pct) = caps[3].parse::<f64>().ok()
+                && let Some(last) = result.last_mut()
+            {
+                last.memory = pct;
+            }
+            continue;
+        }
+
+        // IO
+        if !line.contains("tps") {
+            let io_val = io_re7
+                .captures(line)
+                .and_then(|caps| Some(caps[2].parse::<f64>().ok()? + caps[3].parse::<f64>().ok()?))
+                .or_else(|| {
+                    io_re5.captures(line).and_then(|caps| {
+                        Some(caps[2].parse::<f64>().ok()? + caps[3].parse::<f64>().ok()?)
+                    })
+                });
+            if let Some(io) = io_val
+                && let Some(last) = result.last_mut()
+            {
+                last.io = io;
+            }
         }
     }
 
-    let len = cpu_usages.len();
-    assert!(
-        len.abs_diff(network_usages.len()) <= 1,
-        "sar output mismatch: {} cpu vs {} network entries",
-        len,
-        network_usages.len(),
-    );
-
-    cpu_usages
-        .into_iter()
-        .zip(network_usages)
-        .enumerate()
-        .map(|(i, (cpu, network))| SarStats {
-            cpu,
-            network,
-            memory: memory_usages.get(i).copied().unwrap_or_default(),
-            io: io_usages.get(i).copied().unwrap_or_default(),
-        })
-        .collect()
+    result
 }
 
 /// Parses throughput output from `print_parseable_bench_results`.
@@ -639,75 +540,40 @@ pub fn parse_latency(lines: Vec<String>) -> Vec<(f64, f64, f64, u64)> {
         .collect()
 }
 
-/// Returns (op_id, count)
-pub fn parse_counter_usage(lines: Vec<String>) -> HashMap<usize, usize> {
+/// Parses cumulative counter lines into per-second rates for each op.
+/// Returns op_id → Vec of per-second counts (delta between consecutive cumulative values).
+pub fn parse_counter_usage(lines: Vec<String>) -> HashMap<usize, Vec<usize>> {
     let regex = Regex::new(r"\((\d+)\): (\d+)").unwrap();
-    let mut op_to_count = HashMap::new();
+    let mut op_to_cumulative_count: HashMap<usize, Vec<usize>> = HashMap::new();
     for measurement in lines {
         let matches = regex.captures_iter(&measurement).last().unwrap();
         let op_id = matches[1].parse::<usize>().unwrap();
         let count = matches[2].parse::<usize>().unwrap();
-        op_to_count.insert(op_id, count);
+        op_to_cumulative_count.entry(op_id).or_default().push(count);
     }
-    op_to_count
-}
-
-// TODO: Review Kiro output from here down
-/// Per-operator resource cost breakdown.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct ResourceCost {
-    /// Fraction of CPU time attributed to this operator (0.0–1.0 per core).
-    pub cpu: f64,
-    /// I/O transfers per second attributed to this operator.
-    pub io: f64,
-    /// Memory KB attributed to this operator.
-    pub memory: f64,
-}
-
-/// Per-byte resource cost from network calibration.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-pub struct NetworkCostPerByte {
-    /// CPU % consumed per byte of network traffic
-    pub cpu_pct_per_byte: f64,
-    /// Memory KB consumed per byte of network traffic
-    pub memory_kb_per_byte: f64,
-    /// I/O transfers per second consumed per byte of network traffic
-    pub io_tps_per_byte: f64,
-}
-
-impl NetworkCostPerByte {
-    fn lerp(self, other: Self, t: f64) -> Self {
-        Self {
-            cpu_pct_per_byte: self.cpu_pct_per_byte
-                + t * (other.cpu_pct_per_byte - self.cpu_pct_per_byte),
-            memory_kb_per_byte: self.memory_kb_per_byte
-                + t * (other.memory_kb_per_byte - self.memory_kb_per_byte),
-            io_tps_per_byte: self.io_tps_per_byte
-                + t * (other.io_tps_per_byte - self.io_tps_per_byte),
+    // Convert cumulative to per-second deltas
+    let mut result = HashMap::new();
+    for (op_id, cumulative_count) in op_to_cumulative_count {
+        let mut rates = vec![];
+        for i in 1..cumulative_count.len() {
+            // Subtraction where min = 0
+            rates.push(cumulative_count[i].saturating_sub(cumulative_count[i - 1]));
         }
+        result.insert(op_id, rates);
     }
-
-    /// Total resource cost for `count` messages of `bytes_each`.
-    pub fn total_cost(&self, count: usize, bytes_each: u64) -> ResourceCost {
-        let total_bytes = count as f64 * bytes_each as f64;
-        ResourceCost {
-            cpu: self.cpu_pct_per_byte * total_bytes,
-            memory: self.memory_kb_per_byte * total_bytes,
-            io: self.io_tps_per_byte * total_bytes,
-        }
-    }
+    result
 }
 
-/// Lookup table mapping message size (bytes) → per-byte resource costs.
+/// Lookup table mapping message size (bytes) → per-message resource costs.
 /// Built from calibration runs at various message sizes. Interpolates linearly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkCostTable {
-    /// Sorted by message size.
-    entries: Vec<(u64, NetworkCostPerByte)>,
+    /// Sorted by message size. Each entry is (message_size, cost_per_message).
+    entries: Vec<(u64, SarStats)>,
 }
 
 impl NetworkCostTable {
-    pub fn from_calibration(mut entries: Vec<(u64, NetworkCostPerByte)>) -> Self {
+    pub fn from_calibration(mut entries: Vec<(u64, SarStats)>) -> Self {
         entries.sort_by_key(|(size, _)| *size);
         assert!(
             !entries.is_empty(),
@@ -716,9 +582,9 @@ impl NetworkCostTable {
         Self { entries }
     }
 
-    /// Returns the interpolated cost-per-byte for the given message size.
+    /// Returns the interpolated cost per message for the given message size.
     /// Clamps to the nearest endpoint if outside the calibrated range.
-    pub fn cost_per_byte(&self, message_size_bytes: u64) -> NetworkCostPerByte {
+    pub fn cost_per_message(&self, message_size_bytes: u64) -> SarStats {
         let n = self.entries.len();
         if n == 1 || message_size_bytes <= self.entries[0].0 {
             return self.entries[0].1;
@@ -736,21 +602,10 @@ impl NetworkCostTable {
     }
 
     /// Total resource cost for sending `count` messages of `message_size_bytes` each.
-    pub fn network_cost(&self, count: usize, message_size_bytes: u64) -> ResourceCost {
-        self.cost_per_byte(message_size_bytes)
-            .total_cost(count, message_size_bytes)
+    pub fn network_cost(&self, count: usize, message_size_bytes: u64) -> SarStats {
+        self.cost_per_message(message_size_bytes)
+            .scale(count as f64)
     }
-}
-
-/// Combined per-operator metrics gathered from calibration, counters, and byte-size inspection.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct OperatorMetrics {
-    /// op_id → median output byte size per tuple
-    pub op_to_output_bytes: HashMap<usize, u64>,
-    /// op_id → cardinality (elements per measurement interval)
-    pub op_to_count: HashMap<usize, usize>,
-    /// op_id → resource cost
-    pub op_to_cost: HashMap<usize, ResourceCost>,
 }
 
 /// Parses byte-size measurement lines of the form `_optimize_byte_size(op_id): size`.
@@ -768,70 +623,12 @@ pub fn parse_byte_sizes(lines: Vec<String>) -> HashMap<usize, Vec<u64>> {
 }
 
 /// Computes median of a sorted slice.
-fn median(sorted: &mut Vec<u64>) -> u64 {
+fn median(sorted: &mut [u64]) -> u64 {
     sorted.sort_unstable();
     if sorted.is_empty() {
         0
     } else {
         sorted[sorted.len() / 2]
-    }
-}
-
-impl OperatorMetrics {
-    /// Builds OperatorMetrics from raw measurements.
-    /// - `counters`: op_id → cardinality from counter measurements
-    /// - `byte_sizes`: op_id → sampled byte sizes from inspect measurements
-    /// - `sar_per_location`: per-location SAR stats at the measurement second
-    /// - `ops_per_location`: op_id → LocationId mapping (which ops run where)
-    /// - `network_cost_per_byte`: per-byte resource costs from calibration
-    pub fn from_measurements(
-        counters: HashMap<usize, usize>,
-        mut byte_sizes: HashMap<usize, Vec<u64>>,
-        sar_per_location: &HashMap<LocationId, SarStats>,
-        ops_per_location: &HashMap<LocationId, Vec<usize>>,
-        network_cost_per_byte: &NetworkCostPerByte,
-    ) -> Self {
-        let op_to_output_bytes: HashMap<usize, u64> = byte_sizes
-            .iter_mut()
-            .map(|(&op_id, sizes)| (op_id, median(sizes)))
-            .collect();
-
-        // Compute per-operator cost by dividing location cost evenly among its operators,
-        // then subtracting estimated network cost.
-        let mut op_to_cost = HashMap::new();
-        for (location, op_ids) in ops_per_location {
-            let Some(sar) = sar_per_location.get(location) else {
-                continue;
-            };
-            let n = op_ids.len().max(1) as f64;
-            let net_bytes = sar.network.rx_bytes_per_sec + sar.network.tx_bytes_per_sec;
-            let total_cpu = (sar.cpu.all_stats.user + sar.cpu.all_stats.system
-                - net_bytes * network_cost_per_byte.cpu_pct_per_byte)
-                .max(0.0);
-            let total_io = (sar.io.rtps + sar.io.wtps
-                - net_bytes * network_cost_per_byte.io_tps_per_byte)
-                .max(0.0);
-            let total_memory = (sar.memory.kb_mem_used
-                - net_bytes * network_cost_per_byte.memory_kb_per_byte)
-                .max(0.0);
-
-            for &op_id in op_ids {
-                op_to_cost.insert(
-                    op_id,
-                    ResourceCost {
-                        cpu: total_cpu / n,
-                        io: total_io / n,
-                        memory: total_memory / n,
-                    },
-                );
-            }
-        }
-
-        Self {
-            op_to_output_bytes,
-            op_to_count: counters,
-            op_to_cost,
-        }
     }
 }
 
@@ -848,20 +645,28 @@ async fn drain_receiver(receiver: &mut UnboundedReceiver<String>) -> Vec<String>
     lines
 }
 
-/// Merges `src` into `dst`, keeping the max value for each key.
-fn merge_max<K: Eq + std::hash::Hash, V: PartialOrd + Copy>(
-    dst: &mut HashMap<K, V>,
-    src: HashMap<K, V>,
-) {
-    for (k, v) in src {
-        dst.entry(k)
-            .and_modify(|existing| {
-                if v > *existing {
-                    *existing = v;
-                }
-            })
-            .or_insert(v);
+/// Serialize `value` as pretty JSON and write to `dir/filename`.
+fn save_json(dir: &Path, filename: &str, value: &impl Serialize) {
+    fs::create_dir_all(dir).ok();
+    let path = dir.join(filename);
+    let json = serde_json::to_string_pretty(value).expect("failed to serialize JSON");
+    match fs::write(&path, json) {
+        Ok(()) => println!("Saved {}", path.display()),
+        Err(e) => eprintln!("Failed to save {}: {}", path.display(), e),
     }
+}
+
+/// Average of `f(item)` over the measurement window
+fn avg_over<T>(slice: &[T], f: impl Fn(&T) -> f64) -> f64 {
+    assert!(
+        slice.len() > MEASUREMENT_SECOND,
+        "measurement window [{}, {}] out of range for slice of length {}",
+        START_MEASUREMENT_SECOND,
+        MEASUREMENT_SECOND,
+        slice.len()
+    );
+    let window = &slice[START_MEASUREMENT_SECOND..=MEASUREMENT_SECOND];
+    window.iter().map(&f).sum::<f64>() / window.len() as f64
 }
 
 /// Element-wise max merge of a time series, extending `dst` as needed.
@@ -881,7 +686,7 @@ pub async fn analyze_cluster_results(
     optimizations: &Optimizations,
 ) -> RunMetadata {
     let mut run_metadata = RunMetadata::default();
-    let mut op_to_count = HashMap::new();
+    let mut op_to_count: HashMap<usize, Vec<usize>> = HashMap::new();
 
     // Drain all receivers and parse in parallel across all nodes
     let mut set = tokio::task::JoinSet::new();
@@ -930,11 +735,14 @@ pub async fn analyze_cluster_results(
         let cluster_data = drained.get(&(id.clone(), name.to_string())).unwrap();
 
         let mut max_sar: Vec<SarStats> = vec![];
-        let mut max_counters: HashMap<usize, usize> = HashMap::new();
+        let mut max_counters: HashMap<usize, Vec<usize>> = HashMap::new();
 
         for (sar_stats, counters, _, _, byte_sizes) in cluster_data {
             merge_max_vec(&mut max_sar, sar_stats, SarStats::max);
-            merge_max(&mut max_counters, counters.clone());
+            for (op_id, rates) in counters {
+                let entry = max_counters.entry(*op_id).or_default();
+                merge_max_vec(entry, rates, usize::max);
+            }
             for (op_id, sizes) in byte_sizes {
                 run_metadata
                     .byte_sizes
@@ -944,7 +752,10 @@ pub async fn analyze_cluster_results(
             }
         }
 
-        merge_max(&mut op_to_count, max_counters);
+        for (op_id, rates) in max_counters {
+            let entry = op_to_count.entry(op_id).or_default();
+            merge_max_vec(entry, &rates, usize::max);
+        }
 
         if !max_sar.is_empty() {
             run_metadata.sar_stats.insert(id.clone(), max_sar);

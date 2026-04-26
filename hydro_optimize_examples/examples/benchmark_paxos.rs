@@ -28,7 +28,7 @@ struct Args {
 
     /// Disable counter instrumentation (for baseline runs)
     #[arg(long, action = ArgAction::SetTrue)]
-    no_counters: bool,
+    counters_only: bool,
 
     /// Insert byte-size inspection at network boundaries
     #[arg(long, action = ArgAction::SetTrue)]
@@ -47,7 +47,7 @@ struct Args {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    let no_counters = args.no_counters;
+    let counters_only = args.counters_only;
     let size_analysis = args.size_analysis;
     let blow_up_analysis = args.blow_up_analysis;
     let rewrite_paths = args.rewrite.clone();
@@ -114,8 +114,8 @@ async fn main() {
             let mut optimizations = Optimizations::default()
                 .excluding(client_id.clone())
                 .excluding(client_aggregator_id);
-            if no_counters {
-                optimizations = optimizations.with_no_counters();
+            if counters_only {
+                optimizations = optimizations.with_counters_only();
             }
             if size_analysis {
                 optimizations = optimizations.with_size_analysis();

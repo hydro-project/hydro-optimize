@@ -649,7 +649,7 @@ pub fn apply_rewrite(
     );
 
     // Fix locations since we changed some
-    inject_id(ir);
+    // NOTE: We do not re-inject IDs, because we need to know each op's original ID to associate it with their stats
     let cycles = cycle_source_to_sink_parent(ir);
     inject_location(ir, &cycles);
     print_id(ir);

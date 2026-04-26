@@ -9,7 +9,7 @@ use hydro_lang::compile::deploy::DeployResult;
 use hydro_lang::compile::ir::{HydroNode, HydroRoot, deep_clone, traverse_dfir};
 use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::deploy::deploy_graph::DeployCrateWrapper;
-use hydro_lang::location::Location;
+use hydro_lang::location::{Location, LocationKey, LocationType};
 use hydro_lang::location::dynamic::LocationId;
 use hydro_lang::prelude::{Cluster, FlowBuilder, Process};
 use hydro_lang::telemetry::Sidecar;
@@ -23,6 +23,7 @@ use crate::reduce_pushdown::reduce_pushdown;
 use crate::reduce_pushdown_analysis::reduce_pushdown_decision;
 use crate::repair::inject_id;
 use crate::rewriter::apply_rewrite;
+use crate::rewrites::collection_kind_to_debug_type;
 
 const METRIC_INTERVAL_SECS: u64 = 1;
 const BYTE_SIZE_SAMPLE_EVERY_N: usize = 10000; // Sample every 10000th element for byte size to avoid excessive overhead
@@ -112,14 +113,18 @@ fn insert_counter_node(
     }
 }
 
-fn insert_counter(ir: &mut [HydroRoot], duration: &syn::Expr, exclude: &HashSet<LocationId>) {
-    traverse_dfir(
-        ir,
-        |_, _| {},
-        |node, next_stmt_id| {
-            insert_counter_node(node, next_stmt_id, duration.clone(), exclude);
-        },
-    );
+fn insert_counters<'a>(built: BuiltFlow<'a>, exclude: &HashSet<LocationId>) -> BuiltFlow<'a> {
+    let counter_output_duration: syn::Expr =
+        syn::parse_quote!(std::time::Duration::from_secs(#METRIC_INTERVAL_SECS));
+    built.optimize_with(|leaf| {
+        traverse_dfir(
+            leaf,
+            |_, _| {},
+            |node, next_stmt_id| {
+                insert_counter_node(node, next_stmt_id, counter_output_duration.clone(), exclude);
+            },
+        );
+    })
 }
 
 /// Inserts an Inspect node that samples every Nth element's serialized byte size,
@@ -129,8 +134,6 @@ fn insert_counter(ir: &mut [HydroRoot], duration: &syn::Expr, exclude: &HashSet<
 /// - Ops where `network_ops` indicates a network boundary
 /// - After existing Network nodes
 fn insert_byte_size_inspect(ir: &mut [HydroRoot], network_ops: &HashSet<usize>) {
-    use crate::rewrites::collection_kind_to_debug_type;
-
     traverse_dfir(
         ir,
         |_, _| {},
@@ -218,8 +221,8 @@ impl Sidecar for ScriptSidecar {
     fn to_expr(
         &self,
         _flow_name: &str,
-        location_key: hydro_lang::location::LocationKey,
-        _location_type: hydro_lang::location::LocationType,
+        location_key: LocationKey,
+        _location_type: LocationType,
         _location_name: &str,
         _dfir_ident: &syn::Ident,
     ) -> syn::Expr {
@@ -314,10 +317,13 @@ impl ReusableProcesses {
 /// Mutually exclusive optimization strategies that rewrite the IR before deployment.
 #[derive(Clone, Default)]
 pub enum OptimizationKind {
-    /// No IR rewriting.
+    /// No IR rewriting, no counters.
     #[default]
     None,
+    /// No IR rewriting, but insert counters to measure per-op cardinality.
+    CountersOnly,
     /// Apply greedy decoupling, deploy decoupled system, gather per-operator SAR costs.
+    /// Always inserts counters.
     BlowUpAnalysis,
     /// Insert size measuring nodes wherever decoupling is possible.
     SizeAnalysis,
@@ -329,7 +335,6 @@ pub enum OptimizationKind {
 pub struct Optimizations {
     decoupling: bool,
     partitioning: bool,
-    no_counters: bool,
     kind: OptimizationKind,
     exclude: HashSet<LocationId>,
 }
@@ -345,9 +350,9 @@ impl Optimizations {
         self
     }
 
-    /// Do not insert counters. Used to establish highest-performance config
-    pub fn with_no_counters(mut self) -> Self {
-        self.no_counters = true;
+    /// Insert counters only (no IR rewriting).
+    pub fn with_counters_only(mut self) -> Self {
+        self.set_kind(OptimizationKind::CountersOnly);
         self
     }
 
@@ -561,7 +566,6 @@ fn apply_loaded_rewrites<'a>(
     built: BuiltFlow<'a>,
     mut clusters: ReusableClusters,
     loaded_rewrites: &[Rewrite],
-    exclude: &HashSet<LocationId>,
 ) -> (
     BuiltFlow<'a>,
     ReusableClusters,
@@ -585,11 +589,6 @@ fn apply_loaded_rewrites<'a>(
             rewrite,
             |loc_idx| format!("loaded_rewrite_{}_{}", iter, loc_idx),
         );
-
-        // reduce_pushdown + inject_id after each rewrite
-        let decision = reduce_pushdown_decision(&mut ir, exclude);
-        reduce_pushdown(&mut ir, decision);
-        inject_id(&mut ir);
     }
 
     builder.replace_ir(ir);
@@ -613,6 +612,7 @@ fn apply_blow_up_analysis<'a>(
     let built = built.optimize_with(|leaf| {
         greedy_results = Some(greedy_decouple_analysis(leaf, exclude));
     });
+    let built = insert_counters(built, exclude); // Insert counters before applying rewrites so we can measure original op cardinalities
     let mut builder = FlowBuilder::from_built(&built);
     let mut ir = deep_clone(built.ir());
 
@@ -671,20 +671,21 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
     );
 
     // Apply the selected optimization strategy exactly once.
-    // Baseline: reduce_pushdown + inject_id so downstream passes have stable op ids.
     let built = builder.finalize().optimize_with(|leaf| {
+        // Baseline: reduce_pushdown + inject_id so downstream passes have stable op ids.
         let decision = reduce_pushdown_decision(leaf, &config_optimizations.exclude);
         reduce_pushdown(leaf, decision);
         inject_id(leaf);
     });
     let (built, clusters, location_to_original_ops) = match &config_optimizations.kind {
         OptimizationKind::None => (built, config_clusters, HashMap::new()),
-        OptimizationKind::LoadedRewrites(rewrites) => apply_loaded_rewrites(
-            built,
-            config_clusters,
-            rewrites,
-            &config_optimizations.exclude,
-        ),
+        OptimizationKind::CountersOnly => {
+            let built = insert_counters(built, &config_optimizations.exclude);
+            (built, config_clusters, HashMap::new())
+        }
+        OptimizationKind::LoadedRewrites(rewrites) => {
+            apply_loaded_rewrites(built, config_clusters, rewrites)
+        }
         OptimizationKind::BlowUpAnalysis => {
             apply_blow_up_analysis(built, config_clusters, &config_optimizations.exclude)
         }
@@ -728,19 +729,7 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
 
             let mut builder = FlowBuilder::from_built(&built);
             builder.replace_ir(deep_clone(ir));
-            let finalized = if config_optimizations.no_counters {
-                builder.finalize()
-            } else {
-                let counter_output_duration: syn::Expr =
-                    syn::parse_quote!(std::time::Duration::from_secs(#METRIC_INTERVAL_SECS));
-                builder.finalize().optimize_with(|leaf| {
-                    insert_counter(
-                        leaf,
-                        &counter_output_duration,
-                        &config_optimizations.exclude,
-                    );
-                })
-            };
+            let finalized = builder.finalize();
             let mut run_metadata = deploy_and_analyze(
                 reusable_hosts,
                 deployment,
@@ -755,8 +744,7 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
             .await;
             run_metadata.location_to_original_ops = location_to_original_ops.clone();
 
-            let run_throughput =
-                run_metadata.avg_throughput(START_MEASUREMENT_SECOND, MEASUREMENT_SECOND);
+            let run_throughput = run_metadata.avg_throughput();
             run_metadata.print_run_summary(&config_location_id_to_cluster, MEASUREMENT_SECOND);
             run_metadata.save_run_metadata(
                 &config_location_id_to_cluster,
@@ -765,6 +753,10 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
                 num_virtual,
                 run,
             );
+
+            if matches!(config_optimizations.kind, OptimizationKind::BlowUpAnalysis) {
+                run_metadata.save_blow_up_stats(&output_dir);
+            }
 
             if run_throughput == 0 {
                 zero_throughput_count += 1;
@@ -804,7 +796,10 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
                 no_improvement_count, NO_IMPROVEMENT_LIMIT
             );
             if no_improvement_count >= NO_IMPROVEMENT_LIMIT {
-                println!("Throughput plateaued for {} consecutive iterations. Terminating benchmark.", NO_IMPROVEMENT_LIMIT);
+                println!(
+                    "Throughput plateaued for {} consecutive iterations. Terminating benchmark.",
+                    NO_IMPROVEMENT_LIMIT
+                );
                 break;
             }
         }

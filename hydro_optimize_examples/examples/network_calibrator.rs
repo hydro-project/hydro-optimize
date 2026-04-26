@@ -80,8 +80,7 @@ async fn main() {
                 let processes = ReusableProcesses::default().with_process(client_aggregator);
                 let optimizations = Optimizations::default()
                     .excluding(client_id.clone())
-                    .excluding(aggregator_id)
-                    .with_no_counters();
+                    .excluding(aggregator_id);
 
                 BenchmarkConfig {
                     name: format!("NetworkCalibration_{}b", size),
