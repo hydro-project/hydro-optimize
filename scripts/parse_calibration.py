@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """Parses network calibration results from benchmark CSVs and outputs a JSON cost-per-byte table.
 
-For each message size, reads the server CSV at MEASUREMENT_SECOND and computes
-how much CPU (%), memory (KB), and I/O (tps) is consumed per byte of network traffic.
+For each message size, reads the server CSV with the highest virtual client count
+at MEASUREMENT_SECOND and computes cost-per-byte for CPU, memory, and I/O.
 
 Usage: python3 parse_calibration.py <benchmark_results_dir> <output_file>
 
 Expects benchmark_results_dir to contain directories like:
-  NetworkCalibration_1b_<timestamp>/server_10c_50vc_r0.csv
-  NetworkCalibration_2b_<timestamp>/server_10c_50vc_r0.csv
+  NetworkCalibration_1b_<timestamp>/server_10c_81vc_r0.csv
+  NetworkCalibration_2b_<timestamp>/server_10c_81vc_r0.csv
   ...
+
+CSV columns: time_s,cpu,network,memory,io,throughput_rps,...
+  cpu      = max single-core CPU % (user + system)
+  network  = bytes/sec (in + out)
+  memory   = percent used
+  io       = rtps + wtps
 """
 
 import csv
@@ -40,12 +46,14 @@ def main():
         if not os.path.isdir(run_dir):
             continue
 
-        # Find server CSV
+        # Find server CSV with highest virtual client count
+        best_vc = -1
         server_csv = None
         for f in os.listdir(run_dir):
-            if f.startswith("server") and f.endswith(".csv"):
+            vm = re.match(r"server_\d+c_(\d+)vc_r\d+\.csv$", f)
+            if vm and int(vm.group(1)) > best_vc:
+                best_vc = int(vm.group(1))
                 server_csv = os.path.join(run_dir, f)
-                break
 
         if server_csv is None:
             print(f"  WARNING: no server CSV found for size={size}", file=sys.stderr)
@@ -61,30 +69,31 @@ def main():
 
         row = rows[MEASUREMENT_SECOND]
         throughput = float(row["throughput_rps"])
-        if throughput <= 0:
-            print(f"  WARNING: zero throughput for size={size}", file=sys.stderr)
+        network_bytes = float(row["network"])
+        if throughput <= 0 or network_bytes <= 0:
+            print(f"  WARNING: zero throughput/network for size={size}", file=sys.stderr)
             continue
 
-        bytes_per_sec = throughput * size
-        cpu_pct = float(row["cpu_user"]) + float(row["cpu_system"])
-        mem_kb = float(row["mem_kb_used"])
-        io_tps = float(row["io_rtps"]) + float(row["io_wtps"])
+        cpu_pct = float(row["cpu"])
+        memory_pct = float(row["memory"])
+        io_tps = float(row["io"])
 
         entry = {
             "message_size": size,
-            "cpu_pct_per_byte": cpu_pct / bytes_per_sec,
-            "memory_kb_per_byte": mem_kb / bytes_per_sec,
-            "io_tps_per_byte": io_tps / bytes_per_sec,
+            "cpu_pct_per_byte": cpu_pct / network_bytes,
+            "memory_pct_per_byte": memory_pct / network_bytes,
+            "io_tps_per_byte": io_tps / network_bytes,
         }
         entries.append(entry)
         print(
-            f"  size={size}: throughput={throughput:.0f}, "
-            f"cpu_per_byte={entry['cpu_pct_per_byte']:.8f}%, "
-            f"mem_per_byte={entry['memory_kb_per_byte']:.8f}KB, "
-            f"io_per_byte={entry['io_tps_per_byte']:.8f}tps"
+            f"  size={size}: throughput={throughput:.0f}, network={network_bytes:.0f}B/s, "
+            f"cpu_per_byte={entry['cpu_pct_per_byte']:.10f}%, "
+            f"mem_per_byte={entry['memory_pct_per_byte']:.10f}%, "
+            f"io_per_byte={entry['io_tps_per_byte']:.10f}tps"
         )
 
     entries.sort(key=lambda e: e["message_size"])
+    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
     with open(output_file, "w") as f:
         json.dump(entries, f, indent=2)
     print(f"  Saved calibration to {output_file} ({len(entries)} entries)")
