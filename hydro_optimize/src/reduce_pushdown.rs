@@ -1,16 +1,49 @@
 use std::collections::{HashMap, HashSet};
 
-use hydro_lang::compile::ir::{HydroNode, HydroRoot, traverse_dfir};
+use hydro_lang::compile::ir::{HydroIrMetadata, HydroNode, HydroRoot, traverse_dfir};
 
 use crate::repair::inject_id;
+use crate::rewrites::collection_kind_to_debug_type;
 
-fn add_reduce(node: &mut HydroNode, mut reduce: HydroNode) {
-    let HydroNode::Reduce { input, .. } = &mut reduce else {
-        panic!("reduce_pushdown expected a Reduce node");
-    };
-    let node_content = std::mem::replace(node, HydroNode::Placeholder);
-    **input = node_content;
-    *node = reduce;
+/// Builds a Scan that performs the reduce inline, only emitting when it receives input.
+/// Unlike a bare Reduce on an unbounded stream (which re-emits every tick),
+/// Scan only fires when there's actual input that tick.
+fn build_scan_reduce(
+    input_node: HydroNode,
+    reduce_f: syn::Expr,
+    reduce_metadata: HydroIrMetadata,
+) -> HydroNode {
+    let element_type: syn::Type =
+        (*collection_kind_to_debug_type(&reduce_metadata.collection_kind).0).clone();
+    let loc = reduce_metadata.location_id.clone();
+    let reduce_kind = reduce_metadata.collection_kind.clone();
+
+    // Scan state: Option<T>
+    // - None on first input: set to Some(input), emit Some(input)
+    // - Some(acc): apply reduce_f(&mut acc, input), emit Some(acc)
+    let scan_init: syn::Expr = syn::parse_quote!(|| None::<#element_type>);
+    let scan_acc: syn::Expr = syn::parse_quote!({
+        let reduce_fn = #reduce_f;
+        move |state: &mut Option<#element_type>, new_val: #element_type| -> Option<#element_type> {
+            match state {
+                None => {
+                    *state = Some(new_val.clone());
+                    Some(new_val)
+                }
+                Some(acc) => {
+                    reduce_fn(acc, new_val);
+                    Some(acc.clone())
+                }
+            }
+        }
+    });
+
+    HydroNode::Scan {
+        init: scan_init.into(),
+        acc: scan_acc.into(),
+        input: Box::new(input_node),
+        metadata: loc.clone().new_node_metadata(reduce_kind),
+    }
 }
 
 pub fn reduce_pushdown(ir: &mut [HydroRoot], decision: HashMap<usize, usize>) {
@@ -22,35 +55,35 @@ pub fn reduce_pushdown(ir: &mut [HydroRoot], decision: HashMap<usize, usize>) {
             .insert(op_id);
     }
 
-    // Create new Reduce nodes
-    let mut op_id_to_reduce = HashMap::new();
+    // Collect reduce function and metadata for each reduce to push down
+    let mut op_id_to_reduce_info: HashMap<usize, (syn::Expr, HydroIrMetadata)> = HashMap::new();
     traverse_dfir(
         ir,
         |_, _| {},
         |node, op_id| {
             if let Some(ops_to_insert) = reduce_to_insert_locations.get(op_id) {
                 let HydroNode::Reduce { f, metadata, .. } = node else {
-                    return;
+                    panic!(
+                        "Expected Reduce node for op_id {op_id}, but found {:?}",
+                        node
+                    );
                 };
+                let f_expr: syn::Expr = (**f).clone();
                 for reduce_id in ops_to_insert {
-                    let reduce_node = HydroNode::Reduce {
-                        f: f.clone(),
-                        input: Box::new(HydroNode::Placeholder), // Will be replaced
-                        metadata: metadata.clone(),
-                    };
-                    op_id_to_reduce.insert(*reduce_id, reduce_node);
+                    op_id_to_reduce_info.insert(*reduce_id, (f_expr.clone(), metadata.clone()));
                 }
             }
         },
     );
 
-    // Insert the Reduce nodes
+    // Insert Scan at each target location
     traverse_dfir(
         ir,
         |_, _| {},
         |node, op_id| {
-            if let Some(reduce_node) = op_id_to_reduce.remove(op_id) {
-                add_reduce(node, reduce_node);
+            if let Some((f, metadata)) = op_id_to_reduce_info.remove(op_id) {
+                let input = std::mem::replace(node, HydroNode::Placeholder);
+                *node = build_scan_reduce(input, f, metadata);
             }
         },
     );
@@ -61,6 +94,8 @@ pub fn reduce_pushdown(ir: &mut [HydroRoot], decision: HashMap<usize, usize>) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use hydro_lang::{
         compile::ir::{HydroNode, traverse_dfir},
         live_collections::stream::{ExactlyOnce, NoOrder, TotalOrder},
@@ -81,10 +116,11 @@ mod tests {
         traverse_dfir(
             ir,
             |_, _| {},
-            |node, _| {
-                if matches!(node, HydroNode::Reduce { .. }) {
+            |node, _| match node {
+                HydroNode::Scan { .. } | HydroNode::Reduce { .. } => {
                     count += 1;
                 }
+                _ => {}
             },
         );
         count
@@ -124,7 +160,7 @@ mod tests {
 
             let before = count_reduces(ir);
 
-            let decision = reduce_pushdown_decision(ir, &std::collections::HashSet::from([cluster1.id(), gateway.id()]));
+            let decision = reduce_pushdown_decision(ir, &HashSet::from([cluster1.id()]));
             assert!(!decision.is_empty(), "Expected non-empty pushdown decision");
             reduce_pushdown(ir, decision);
 
