@@ -127,11 +127,11 @@ pub fn greedy_decouple_analysis(
 
     // Constrain tick
     let cycles = cycle_source_to_sink_parent(ir);
-    let op_id_to_input = op_id_to_parents(ir, None, &cycles);
+    let op_id_to_parent = op_id_to_parents(ir, None, &cycles);
     let mut tick_to_op_inputs = HashMap::new();
     for (tick_id, ops) in state.tick_to_ops {
         for op_id in ops {
-            if let Some(inputs) = op_id_to_input.get(&op_id) {
+            if let Some(inputs) = op_id_to_parent.get(&op_id) {
                 tick_to_op_inputs
                     .entry(tick_id)
                     .or_insert_with(HashSet::new)
@@ -140,23 +140,20 @@ pub fn greedy_decouple_analysis(
         }
     }
     for (_tick_id, op_inputs) in tick_to_op_inputs {
-        // Pairwise union
-        let op_inputs_vec: Vec<usize> = op_inputs.into_iter().collect();
-        for i in 0..op_inputs_vec.len() - 1 {
-            let input1_key = state
-                .op_to_key
-                .get(&op_inputs_vec[i])
-                .expect("Input should have a key");
-            let input2_key = state
-                .op_to_key
-                .get(&op_inputs_vec[i + 1])
-                .expect("Input should have a key");
-            state.key_to_loc.union(*input1_key, *input2_key);
+        // Pairwise union, skipping inputs at excluded locations
+        let op_inputs_vec: Vec<usize> = op_inputs
+            .into_iter()
+            .filter(|op| state.op_to_key.contains_key(op))
+            .collect();
+        for i in 0..op_inputs_vec.len().saturating_sub(1) {
+            let input1_key = state.op_to_key[&op_inputs_vec[i]];
+            let input2_key = state.op_to_key[&op_inputs_vec[i + 1]];
+            state.key_to_loc.union(input1_key, input2_key);
         }
     }
 
-    // Constrain inputs
-    for (_op_id, inputs) in op_id_to_input.iter() {
+    // Constrain inputs (skip ops/inputs at excluded locations)
+    for (_op_id, inputs) in op_id_to_parent.iter() {
         assert!(
             inputs.len() <= 2,
             "Did not expect op with more than 2 inputs"
@@ -165,26 +162,26 @@ pub fn greedy_decouple_analysis(
             continue;
         }
 
-        let input1_key = state
-            .op_to_key
-            .get(&inputs[0])
-            .expect("Input should have a key");
-        let input2_key = state
-            .op_to_key
-            .get(&inputs[1])
-            .expect("Input should have a key");
-        state.key_to_loc.union(*input1_key, *input2_key);
+        if let (Some(&input1_key), Some(&input2_key)) = (
+            state.op_to_key.get(&inputs[0]),
+            state.op_to_key.get(&inputs[1]),
+        ) {
+            state.key_to_loc.union(input1_key, input2_key);
+        }
     }
 
     // Do not decouple constraints
     for op_id in state.do_not_decouple {
-        let op_key = state.op_to_key.get(&op_id).expect("Op should have a key");
-        let inputs = op_id_to_input
-            .get(&op_id)
-            .expect("Op's parent is not in the same location, must be network. But Network must be serializable and unbounded?");
+        let Some(&op_key) = state.op_to_key.get(&op_id) else {
+            continue;
+        };
+        let Some(inputs) = op_id_to_parent.get(&op_id) else {
+            continue;
+        };
         for input in inputs {
-            let input_key = state.op_to_key.get(input).expect("Input should have a key");
-            state.key_to_loc.union(*op_key, *input_key);
+            if let Some(&input_key) = state.op_to_key.get(input) {
+                state.key_to_loc.union(op_key, input_key);
+            }
         }
     }
 

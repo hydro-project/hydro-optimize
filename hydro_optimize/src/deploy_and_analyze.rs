@@ -155,13 +155,11 @@ fn insert_byte_size_inspect(ir: &mut [HydroRoot], network_ops: &HashSet<usize>) 
             let sample_every_n = BYTE_SIZE_SAMPLE_EVERY_N;
 
             let f: syn::Expr = syn::parse_quote!({
-                let mut __byte_size_counter: usize = 0;
                 move |item: &#element_type| {
-                    __byte_size_counter += 1;
-                    if __byte_size_counter % #sample_every_n == 0 {
-                        let size = bincode::serialized_size(item).unwrap_or(0);
-                        println!("{}({}): {}", #prefix, #tag, size);
-                    }
+                    let size = hydro_lang::runtime_support::bincode::serialize(item)
+                        .map(|v| v.len() as u64)
+                        .unwrap_or(0);
+                    println!("{}({}): {}", #prefix, #tag, size);
                 }
             });
 
@@ -679,6 +677,7 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
         let decision = reduce_pushdown_decision(leaf, &config_optimizations.exclude);
         reduce_pushdown(leaf, decision);
     });
+    let mut size_analysis_ops: HashSet<usize> = HashSet::new();
     let (built, clusters, location_to_original_ops) = match &config_optimizations.kind {
         OptimizationKind::None => (built, config_clusters, HashMap::new()),
         OptimizationKind::CountersOnly => {
@@ -692,6 +691,7 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
             apply_blow_up_analysis(built, config_clusters, &config_optimizations.exclude)
         }
         OptimizationKind::SizeAnalysis => {
+            let mut captured_ops = HashSet::new();
             let built = built.optimize_with(|leaf| {
                 let per_loc_rewrites =
                     greedy_decouple_analysis(leaf, &config_optimizations.exclude);
@@ -702,7 +702,9 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
                 if !network_ops.is_empty() {
                     insert_byte_size_inspect(leaf, &network_ops);
                 }
+                captured_ops = network_ops;
             });
+            size_analysis_ops = captured_ops;
             (built, config_clusters, HashMap::new())
         }
     };
@@ -760,6 +762,10 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
                 run_metadata.save_blow_up_stats(&output_dir);
             }
 
+            if !size_analysis_ops.is_empty() {
+                run_metadata.save_size_analysis(&output_dir, &size_analysis_ops);
+            }
+
             if run_throughput == 0 {
                 zero_throughput_count += 1;
                 println!(
@@ -804,6 +810,10 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
                 );
                 break;
             }
+        }
+
+        if matches!(config_optimizations.kind, OptimizationKind::SizeAnalysis) {
+            break;
         }
     }
 
