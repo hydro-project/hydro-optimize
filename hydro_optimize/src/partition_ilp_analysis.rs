@@ -5,7 +5,7 @@ use std::{
 
 use good_lp::{Expression, Variable, constraint, variable};
 use hydro_lang::{
-    compile::ir::{HydroNode, HydroRoot, traverse_dfir},
+    compile::ir::{CollectionKind, HydroNode, HydroRoot, StreamOrder, traverse_dfir},
     location::dynamic::LocationId,
 };
 use syn::visit::Visit;
@@ -79,7 +79,6 @@ fn nodes_dependent_on_inputs(
 /// Must contain an entry for each parent, even if there is no dependency.
 /// Contains 1 entry if there are no parents.
 /// A node that has 2 parents is only partitionable if it can be partitioned on a field with a dependency to a field in each parent, and both parents can also be partitioned on those fields.
-/// TODO: If the node is a KeyedStream with TotalOrder, we need to restrict partitioning to only the key fields.
 fn output_to_parent_fields(node: &HydroNode) -> Vec<StructOrTuple> {
     match node {
         HydroNode::Placeholder => {
@@ -425,12 +424,72 @@ fn node_persists(node: &HydroNode) -> bool {
     }
 }
 
+/// Whether a node's collection_kind requires TotalOrder.
+fn node_has_total_order(node: &HydroNode) -> bool {
+    matches!(
+        node.metadata().collection_kind,
+        CollectionKind::Stream {
+            order: StreamOrder::TotalOrder,
+            ..
+        } | CollectionKind::KeyedStream {
+            value_order: StreamOrder::TotalOrder,
+            // NOTE: This is unnecessarily conservative; we really just need to restrict partitioning to the key fields. Unfortunately that's somewhat hard to express, since this operator is not part of the set of operators considered during partitioning
+            ..
+        }
+    )
+}
+
+/// For a TotalOrder child node, add ILP constraints that prevent partitioning
+/// at any location where a parent sends to this child across a location boundary.
+fn add_total_order_edge_constraints(
+    child_id: usize,
+    op_id_to_parents: &HashMap<usize, Vec<usize>>,
+    decoupling_metadata: &RefCell<DecoupleILPMetadata>,
+    num_total_order_operators: &mut HashMap<usize, Expression>,
+) {
+    let parents = op_id_to_parents.get(&child_id).unwrap();
+    if parents.is_empty() {
+        return;
+    }
+
+    let DecoupleILPMetadata {
+        op_id_to_var,
+        variables,
+        constraints,
+        max_num_locations: num_locations,
+        ..
+    } = &mut *decoupling_metadata.borrow_mut();
+
+    for parent_id in parents {
+        let parent_vars = op_id_to_var.get(parent_id).unwrap();
+        let child_vars = op_id_to_var.get(&child_id).unwrap();
+
+        for loc in 0..*num_locations {
+            let parent_at_loc = *parent_vars.get(&loc).unwrap();
+            let child_at_loc = *child_vars.get(&loc).unwrap();
+
+            // e == 1 iff parent is at loc AND child is NOT at loc
+            let e = variables.add(variable().binary());
+            constraints.push(constraint!(e <= parent_at_loc));
+            constraints.push(constraint!(e <= 1 - child_at_loc));
+            constraints.push(constraint!(e >= parent_at_loc - child_at_loc));
+
+            num_total_order_operators.entry(loc).and_modify(|expr| {
+                let temp = std::mem::take(expr);
+                *expr = temp + e;
+            });
+        }
+    }
+}
+
 pub(crate) struct PartitionILPMetadata {
     pub(crate) op_id_to_field_vars: HashMap<usize, HashMap<StructOrTupleIndex, Variable>>, // op_id: field_name: variable
     op_id_to_partition_expr: HashMap<usize, Expression>, // op_id: 1 if the op is partitioned on any of its fields, 0 otherwise
     pub(crate) num_relevant_operators: HashMap<usize, Expression>, // location: number of relevant operators
     pub(crate) partitionable_operators: HashMap<usize, Expression>, // location: number of partitionable operators. Partitioning is possible at the location if partitionable_operators == num_relevant_operators
     pub(crate) num_persist_operators: HashMap<usize, Expression>, // location: number of nodes where node_persists() == true. If 0, then partitioning is always possible
+    pub(crate) num_total_order_operators: HashMap<usize, Expression>, // location: number of nodes where node_has_total_order() == true. If > 0, partitioning is impossible
+    pub(crate) can_partition: HashMap<usize, Variable>, // location: 1 iff location is partitionable ((all relevant partitionable OR no persist) AND no total-order)
 }
 
 /// Add the operator with `id` to the location_sum for each location
@@ -439,7 +498,7 @@ fn add_op_to_location_sum(
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
     location_sum: &mut HashMap<usize, Expression>,
 ) {
-    for loc in 0..decoupling_metadata.borrow().num_locations {
+    for loc in 0..decoupling_metadata.borrow().max_num_locations {
         let op_var = *decoupling_metadata
             .borrow()
             .op_id_to_var
@@ -684,6 +743,7 @@ fn partition_ilp_node_analysis(
         Partitionability::NoEffect => false,
         Partitionability::Conditional | Partitionability::Unpartitionable => true,
     };
+    // TODO: Known inaccuracy: if a node is not an IDB but flows into the positive edge of a negation (for example an anti-join), then it should also be relevant (and partitioned) to avoid producing too many outputs
     let is_relevant = idbs.contains(&op_id) && affect_partitionability;
     if is_relevant {
         add_op_to_location_sum(op_id, decoupling_metadata, num_relevant_operators);
@@ -692,6 +752,16 @@ fn partition_ilp_node_analysis(
     // Partitioning is possible if no node in the location persists
     if node_persists(node) {
         add_op_to_location_sum(op_id, decoupling_metadata, num_persist_operators);
+    }
+
+    // Partitioning is impossible if a TotalOrder child is at a different location
+    if !matches!(node, HydroNode::Network { .. }) && node_has_total_order(node) {
+        add_total_order_edge_constraints(
+            op_id,
+            op_id_to_parents,
+            decoupling_metadata,
+            &mut metadata.num_total_order_operators,
+        );
     }
 
     constrain_field_vars_to_parents(
@@ -704,71 +774,82 @@ fn partition_ilp_node_analysis(
     );
 }
 
-fn zero_cost_if_expr_sums_to_zero(
-    loc_to_expr: &HashMap<usize, Expression>,
+/// Derive `can_partition[loc]` from the accumulated per-location expressions.
+/// Partitionable iff (all relevant ops partitionable OR no persist) AND no total-order.
+fn calculate_partitionable(
+    metadata: &mut PartitionILPMetadata,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
-    max_num_ops: usize,
 ) {
+    let max_num_ops = decoupling_metadata.borrow().op_id_to_var.len();
+    let big_m = (max_num_ops + 1) as f64;
+    let num_locations = decoupling_metadata.borrow().max_num_locations;
     let DecoupleILPMetadata {
-        cpu_usages,
         variables,
         constraints,
         ..
     } = &mut *decoupling_metadata.borrow_mut();
 
-    for (loc, expr) in loc_to_expr {
-        cpu_usages.entry(*loc).and_modify(|cpu_usage| {
-            // If expr == 0, set cost to 0, otherwise, keep original cost
-            // Enforce with big-M constraints, where M = max_num_ops + 1:
-            //   expr <= M * zero_if_sums_to_zero
-            //   expr >= zero_if_sums_to_zero
-            let zero_if_sums_to_zero = variables.add(variable().binary());
-            constraints.push(constraint!(
-                expr.clone() <= (max_num_ops + 1) as f64 * zero_if_sums_to_zero
-            ));
-            constraints.push(constraint!(expr.clone() >= zero_if_sums_to_zero));
-
-            // Similar constraints for CPU, where M = 1.0 (100% CPU usage)
-            let prev_cpu_usage = std::mem::take(cpu_usage);
-            let cpu_usage_var = variables.add(variable().min(0));
-            constraints.push(constraint!(cpu_usage_var <= zero_if_sums_to_zero));
-            constraints.push(constraint!(
-                cpu_usage_var >= prev_cpu_usage - 1 + zero_if_sums_to_zero
-            ));
-
-            *cpu_usage = Expression::from(cpu_usage_var);
-        });
-    }
-}
-
-fn zero_cost_if_partitionable(
-    num_relevant_operators: &HashMap<usize, Expression>,
-    partitionable_operators: &HashMap<usize, Expression>,
-    decoupling_metadata: &RefCell<DecoupleILPMetadata>,
-    max_num_ops: usize,
-) {
-    let mut loc_to_difference = HashMap::new();
-    for (loc, num_relevant) in num_relevant_operators {
-        let num_partitionable = partitionable_operators.get(loc).unwrap();
-
-        let DecoupleILPMetadata {
-            variables,
-            constraints,
-            ..
-        } = &mut *decoupling_metadata.borrow_mut();
-
-        // Difference > 0 if num_relevant != num_partitionable
-        let difference_var = variables.add(variable());
+    for loc in 0..num_locations {
+        // all_partitionable: 1 iff num_relevant == partitionable
+        let diff = variables.add(variable().min(0));
+        let num_relevant = metadata
+            .num_relevant_operators
+            .get(&loc)
+            .cloned()
+            .unwrap_or_default();
+        let num_partitionable = metadata
+            .partitionable_operators
+            .get(&loc)
+            .cloned()
+            .unwrap_or_default();
         constraints.push(constraint!(
-            difference_var >= num_relevant.clone() - num_partitionable.clone()
+            diff >= num_relevant.clone() - num_partitionable.clone()
         ));
-        constraints.push(constraint!(
-            difference_var >= num_partitionable.clone() - num_relevant.clone()
-        ));
-        loc_to_difference.insert(*loc, Expression::from(difference_var));
-    }
+        constraints.push(constraint!(diff >= num_partitionable - num_relevant));
 
-    zero_cost_if_expr_sums_to_zero(&loc_to_difference, decoupling_metadata, max_num_ops);
+        let all_partitionable = variables.add(variable().binary());
+        constraints.push(constraint!(diff <= big_m * (1 - all_partitionable)));
+        constraints.push(constraint!(diff >= all_partitionable));
+
+        // no_persist: 1 iff num_persist == 0
+        let num_persist = metadata
+            .num_persist_operators
+            .get(&loc)
+            .cloned()
+            .unwrap_or_default();
+        let has_persist = variables.add(variable().binary());
+        constraints.push(constraint!(num_persist.clone() <= big_m * has_persist));
+        constraints.push(constraint!(num_persist >= has_persist));
+        let no_persist = variables.add(variable().binary());
+        constraints.push(constraint!(no_persist == 1 - has_persist));
+
+        // no_total_order: 1 iff num_total_order == 0
+        let num_total_order = metadata
+            .num_total_order_operators
+            .get(&loc)
+            .cloned()
+            .unwrap_or_default();
+        let has_total_order = variables.add(variable().binary());
+        constraints.push(constraint!(
+            num_total_order.clone() <= big_m * has_total_order
+        ));
+        constraints.push(constraint!(num_total_order >= has_total_order));
+
+        // or_cond = all_partitionable OR no_persist
+        let or_cond = variables.add(variable().binary());
+        constraints.push(constraint!(or_cond >= all_partitionable));
+        constraints.push(constraint!(or_cond >= no_persist));
+        constraints.push(constraint!(or_cond <= all_partitionable + no_persist));
+
+        // can_partition = or_cond AND no_total_order
+        let can_partition = variables.add(variable().binary());
+        constraints.push(constraint!(can_partition <= or_cond));
+        constraints.push(constraint!(can_partition <= 1 - has_total_order));
+        constraints.push(constraint!(
+            can_partition >= or_cond + (1 - has_total_order) - 1
+        ));
+        metadata.can_partition.insert(loc, can_partition);
+    }
 }
 
 pub(crate) fn partition_ilp_analysis(
@@ -778,7 +859,7 @@ pub(crate) fn partition_ilp_analysis(
 ) -> PartitionILPMetadata {
     // Make all cost expressions at all locations default to 0
     let location_to_zero_expr: HashMap<usize, Expression> =
-        (0..decoupling_metadata.borrow().num_locations)
+        (0..decoupling_metadata.borrow().max_num_locations)
             .map(|loc| (loc, Expression::from(0)))
             .collect();
     let mut metadata = PartitionILPMetadata {
@@ -786,7 +867,9 @@ pub(crate) fn partition_ilp_analysis(
         op_id_to_partition_expr: HashMap::new(),
         num_relevant_operators: location_to_zero_expr.clone(),
         partitionable_operators: location_to_zero_expr.clone(),
-        num_persist_operators: location_to_zero_expr,
+        num_persist_operators: location_to_zero_expr.clone(),
+        num_total_order_operators: location_to_zero_expr,
+        can_partition: HashMap::new(),
     };
 
     let inputs = all_inputs(ir, &decoupling_metadata.borrow().bottleneck);
@@ -818,21 +901,152 @@ pub(crate) fn partition_ilp_analysis(
         },
     );
 
-    let num_ops = decoupling_metadata.borrow().op_id_to_var.len();
-
-    // Set cost to 0 if all relevant operators are partitionable
-    zero_cost_if_partitionable(
-        &metadata.num_relevant_operators,
-        &metadata.partitionable_operators,
-        decoupling_metadata,
-        num_ops,
-    );
-    // Set cost to 0 if no nodes persist
-    zero_cost_if_expr_sums_to_zero(
-        &metadata.num_persist_operators,
-        decoupling_metadata,
-        num_ops,
-    );
+    calculate_partitionable(&mut metadata, decoupling_metadata);
 
     metadata
+}
+
+/// Apply resource-budget constraints: the total number of machines across all
+/// locations must equal `budget`. Each used location consumes at least 1
+/// machine; partitionable locations may consume more (each extra machine is an
+/// additional partition that divides CPU).
+///
+/// Returns `is_n_partitions[loc][n]` – per-location binary variables where
+/// `is_n_partitions[loc][n] = 1` iff location `loc` is assigned exactly `n`
+/// machines (partitions). The caller reads these from the solved ILP to
+/// populate `Rewrite::num_partitions`.
+///
+/// When `partition_metadata` is `None` (partitioning disabled), only the
+/// location-budget constraint is added and every used location gets exactly 1
+/// machine.
+pub(crate) fn apply_budget_constraints(
+    budget: usize,
+    partition_metadata: Option<&PartitionILPMetadata>,
+    decoupling_metadata: &RefCell<DecoupleILPMetadata>,
+) -> Vec<Vec<Variable>> {
+    let max_num_locations = decoupling_metadata.borrow().max_num_locations;
+
+    // --- loc_used[loc]: 1 iff any operator is assigned to location loc ---
+    let mut loc_used: Vec<Variable> = Vec::with_capacity(max_num_locations);
+    {
+        let DecoupleILPMetadata {
+            op_id_to_var,
+            variables,
+            constraints,
+            ..
+        } = &mut *decoupling_metadata.borrow_mut();
+
+        for loc in 0..max_num_locations {
+            let used = variables.add(variable().binary());
+            let mut sum_at_loc = Expression::default();
+            for op_vars in op_id_to_var.values() {
+                if let Some(&v) = op_vars.get(&loc) {
+                    constraints.push(constraint!(used >= v));
+                    sum_at_loc += v;
+                }
+            }
+            constraints.push(constraint!(used <= sum_at_loc));
+            loc_used.push(used);
+        }
+    }
+
+    // If partitioning is disabled, each used location gets exactly 1 machine.
+    // Budget constraint: sum(loc_used) <= budget.
+    let Some(pm) = partition_metadata else {
+        let num_unique_locs: Expression = loc_used.iter().copied().map(Expression::from).sum();
+        decoupling_metadata
+            .borrow_mut()
+            .constraints
+            .push(constraint!(num_unique_locs <= budget as f64));
+        // Return trivial is_n_partitions: each loc has [loc_used] (0 or 1 machine).
+        let is_n_partitions: Vec<Vec<Variable>> = (0..max_num_locations)
+            .map(|loc| vec![loc_used[loc]])
+            .collect();
+        return is_n_partitions;
+    };
+
+    // --- is_n_partitions[loc][n]: binary, 1 iff location loc uses exactly n machines ---
+    // n ranges from 0 (unused) to budget (all machines at one location).
+    let mut is_n_partitions: Vec<Vec<Variable>> = Vec::with_capacity(max_num_locations);
+
+    {
+        let DecoupleILPMetadata {
+            variables,
+            constraints,
+            ..
+        } = &mut *decoupling_metadata.borrow_mut();
+
+        // Build is_n_partitions per location
+        for loc in 0..max_num_locations {
+            let mut vars_for_loc = Vec::with_capacity(budget + 1);
+            let mut sum_vars = Expression::default();
+
+            for num_partitions in 0..=budget {
+                let has_n_partitions = variables.add(variable().binary());
+
+                // For a location, num_partitions=0 means that this location has nothing on it
+                // So it has 0 partitions if loc_used=0
+                if num_partitions == 0 {
+                    constraints.push(constraint!(has_n_partitions == 1 - loc_used[loc]));
+                } else {
+                    // If location is unused (0), then num_partitions = 0
+                    constraints.push(constraint!(has_n_partitions <= loc_used[loc]));
+                }
+                // num_partitions >= 2 requires partitionable
+                if num_partitions >= 2 {
+                    constraints.push(constraint!(has_n_partitions <= *pm.can_partition.get(&loc).unwrap()));
+                }
+
+                sum_vars += has_n_partitions;
+                vars_for_loc.push(has_n_partitions);
+            }
+
+            // Exactly one choice of num_partitions per location
+            constraints.push(constraint!(sum_vars == 1));
+            is_n_partitions.push(vars_for_loc);
+        }
+
+        // Budget: sum of machines across all locations = budget
+        let mut total_machines = Expression::default();
+        for loc in 0..max_num_locations {
+            for num_partitions in 0..=budget {
+                total_machines += Expression::from(is_n_partitions[loc][num_partitions]) * num_partitions as f64;
+            }
+        }
+        constraints.push(constraint!(total_machines <= budget as f64));
+    }
+
+    // --- CPU division constraints ---
+    // For each location, effective_cpu = cpu / num_partitions when
+    // is_n_partitions[loc][num_partitions]=1 and num_partitions>=1.
+    {
+        let DecoupleILPMetadata {
+            cpu_usages,
+            variables,
+            constraints,
+            ..
+        } = &mut *decoupling_metadata.borrow_mut();
+
+        // Big-M for CPU division linearization. Must exceed the maximum possible
+        // cpu_usage at any single location (op costs + decoupling overhead).
+        // A generous constant suffices; an overly large M only affects solver
+        // performance, not correctness.
+        let cpu_big_m = 5.0_f64;
+
+        for loc in 0..max_num_locations {
+            let cpu = cpu_usages.get(&loc).cloned().unwrap_or_default();
+            let effective_cpu = variables.add(variable().min(0));
+
+            for num_partitions in 1..=budget {
+                constraints.push(constraint!(
+                    effective_cpu >= cpu.clone() * (1.0 / num_partitions as f64)
+                        - cpu_big_m * (1 - is_n_partitions[loc][num_partitions])
+                ));
+            }
+
+            cpu_usages.insert(loc, Expression::from(effective_cpu));
+        }
+    }
+
+    is_n_partitions
 }

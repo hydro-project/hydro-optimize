@@ -353,22 +353,8 @@ fn insert_network(
     // Construct NetworkMetadata
     let sender_location = locations_map.get(sender_location_idx).unwrap().clone();
     let receiver_location = locations_map.get(receiver_location_idx).unwrap();
-    let sender_partitions = if rewrite
-        .partitionable
-        .contains(sender_location_idx)
-    {
-        rewrite.num_partitions
-    } else {
-        0
-    };
-    let receiver_partitions = if rewrite
-        .partitionable
-        .contains(receiver_location_idx)
-    {
-        rewrite.num_partitions
-    } else {
-        0
-    };
+    let sender_partitions = rewrite.num_partitions.get(sender_location_idx).copied().unwrap_or(0);
+    let receiver_partitions = rewrite.num_partitions.get(receiver_location_idx).copied().unwrap_or(0);
     let partition_field = rewrite
         .partition_field_choices
         .get(&op_id)
@@ -447,24 +433,16 @@ fn repair_existing_network_for_partitioning(
     let sender_location = sender_location_idx
         .map(|idx| locations_map.get(idx).unwrap().clone())
         .unwrap_or_else(|| input.metadata().location_id.clone());
-    let sender_partitions = if let Some(idx) = sender_location_idx
-        && rewrite.partitionable.contains(idx)
-    {
-        rewrite.num_partitions
-    } else {
-        0
-    };
+    let sender_partitions = sender_location_idx
+        .and_then(|idx| rewrite.num_partitions.get(idx).copied())
+        .unwrap_or(0);
     let receiver_location_idx = rewrite.op_to_loc.get(&op_id);
     let receiver_location = receiver_location_idx
         .map(|idx| locations_map.get(idx).unwrap().clone())
         .unwrap_or_else(|| metadata.location_id.clone());
-    let receiver_partitions = if let Some(idx) = receiver_location_idx
-        && rewrite.partitionable.contains(idx)
-    {
-        rewrite.num_partitions
-    } else {
-        0
-    };
+    let receiver_partitions = receiver_location_idx
+        .and_then(|idx| rewrite.num_partitions.get(idx).copied())
+        .unwrap_or(0);
     let partition_field = rewrite
         .partition_field_choices
         .get(&op_id)
@@ -531,14 +509,7 @@ fn replace_cluster_self_id_node(
 ) {
     let target_location = locations_map.get(&target_loc_idx).unwrap();
     // If the new location is partitioned, then we need to know how many partitions there are to divide
-    let num_partitions = if rewrite
-        .partitionable
-        .contains(&target_loc_idx)
-    {
-        rewrite.num_partitions
-    } else {
-        0
-    };
+    let num_partitions = rewrite.num_partitions.get(&target_loc_idx).copied().unwrap_or(0);
 
     let orig_key = orig_location.key();
     let new_key = target_location.key();
@@ -599,12 +570,9 @@ fn replace_cluster_self_id(
                 target_loc_idx,
             );
 
-            if rewrite
-                .partitionable
-                .contains(&target_loc_idx)
-            {
+            if let Some(&np) = rewrite.num_partitions.get(&target_loc_idx) {
                 let target_location = locations_map.get(&target_loc_idx).unwrap();
-                replace_cluster_members_source(node, target_location, rewrite.num_partitions);
+                replace_cluster_members_source(node, target_location, np);
             }
         },
     );

@@ -112,11 +112,10 @@ impl RunMetadata {
     }
 
     /// Median byte size for a single op.
-    pub fn median_byte_size(&self, op_id: usize) -> u64 {
+    pub fn median_byte_size(&self, op_id: usize) -> Option<u64> {
         self.byte_sizes
             .get(&op_id)
             .map(|sizes| median(&mut sizes.clone()))
-            .unwrap_or(0)
     }
 
     /// Average SAR stats over the measurement window for each location.
@@ -237,7 +236,7 @@ impl RunMetadata {
     pub fn save_size_analysis(&self, output_dir: &Path, decoupleable_ops: &HashSet<usize>) {
         let sizes: HashMap<usize, u64> = decoupleable_ops
             .iter()
-            .map(|&op_id| (op_id, self.median_byte_size(op_id)))
+            .filter_map(|&op_id| self.median_byte_size(op_id).map(|size| (op_id, size)))
             .collect();
         save_json(output_dir, "size_analysis.json", &sizes);
     }

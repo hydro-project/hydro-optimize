@@ -1165,7 +1165,7 @@ fn apply_regular_partition(ir: &mut [HydroRoot], partitioner: &PartialPartitione
     // `nodes_before_partitioned_input`.
     let mut rewrite = Rewrite::new(partitioner.location_id.clone());
     rewrite.cluster_size = partitioner.cluster_size;
-    rewrite.num_partitions = partitioner.num_partitions;
+    rewrite.num_partitions.insert(0, partitioner.num_partitions);
     rewrite.field_partitionable.insert(0);
     rewrite.partition_field_choices = partitioner.nodes_before_partitioned_input.clone();
 

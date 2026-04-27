@@ -133,6 +133,7 @@ fn insert_counters<'a>(built: BuiltFlow<'a>, exclude: &HashSet<LocationId>) -> B
 /// Inserted at:
 /// - Ops where `network_ops` indicates a network boundary
 /// - After existing Network nodes
+/// TODO: I'm not sure if this is inserting in the right place, since network_ops requires that a network be inserted BEFORE the operator but this checks the size of the recipient
 fn insert_byte_size_inspect(ir: &mut [HydroRoot], network_ops: &HashSet<usize>) {
     traverse_dfir(
         ir,
