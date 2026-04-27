@@ -26,7 +26,6 @@ use crate::rewriter::apply_rewrite;
 use crate::rewrites::collection_kind_to_debug_type;
 
 const METRIC_INTERVAL_SECS: u64 = 1;
-const BYTE_SIZE_SAMPLE_EVERY_N: usize = 10000; // Sample every 10000th element for byte size to avoid excessive overhead
 const COUNTER_PREFIX: &str = "_optimize_counter";
 const BYTE_SIZE_PREFIX: &str = "_optimize_byte_size";
 const CPU_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_CPU:";
@@ -131,7 +130,9 @@ fn insert_counters<'a>(built: BuiltFlow<'a>, exclude: &HashSet<LocationId>) -> B
 /// printing it as `BYTE_SIZE_PREFIX(original_op_id): size`.
 /// `network_ops` contains original op_ids (before any insertions).
 /// Inserted at:
-/// - Ops where `network_ops` indicates a network boundary
+/// - Ops where `network_ops` indicates a network boundary (the op executes at the sender
+///   location and its output would be sent over the network, so measuring here captures
+///   the serialized size that would cross the wire)
 /// - After existing Network nodes
 fn insert_byte_size_inspect(ir: &mut [HydroRoot], network_ops: &HashSet<usize>) {
     traverse_dfir(
@@ -152,7 +153,6 @@ fn insert_byte_size_inspect(ir: &mut [HydroRoot], network_ops: &HashSet<usize>) 
             let node_content = std::mem::replace(node, HydroNode::Placeholder);
             let tag = original_id.to_string();
             let prefix = BYTE_SIZE_PREFIX;
-            let sample_every_n = BYTE_SIZE_SAMPLE_EVERY_N;
 
             let f: syn::Expr = syn::parse_quote!({
                 move |item: &#element_type| {
