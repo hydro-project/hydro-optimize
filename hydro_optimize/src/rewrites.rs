@@ -3,7 +3,8 @@ use std::collections::HashMap;
 
 use hydro_lang::compile::ir::{
     BoundKind, CollectionKind, DebugType, HydroIrMetadata, HydroNode, HydroRoot,
-    KeyedSingletonBoundKind, SingletonBoundKind, StreamOrder, StreamRetry, traverse_dfir,
+    KeyedSingletonBoundKind, SingletonBoundKind, StreamOrder, StreamRetry, transform_bottom_up,
+    traverse_dfir,
 };
 use hydro_lang::location::LocationKey;
 use hydro_lang::location::dynamic::LocationId;
@@ -48,6 +49,37 @@ impl VisitMut for ClusterSelfIdReplace {
         }
         visit_mut::visit_expr_mut(self, expr);
     }
+}
+
+pub fn print_id(ir: &mut [HydroRoot]) {
+    let next_id = std::cell::Cell::new(0usize);
+    transform_bottom_up(
+        ir,
+        &mut |root| {
+            let id = next_id.get();
+            let input = root.input_metadata().op.id;
+            println!("{} Root {}, Inputs: {:?}", id, root.print_root(), input);
+            next_id.set(id + 1);
+        },
+        &mut |node| {
+            let id = next_id.get();
+            let metadata = node.metadata();
+            let inputs = node
+                .input_metadata()
+                .iter()
+                .map(|m| m.op.id)
+                .collect::<Vec<Option<usize>>>();
+            println!(
+                "{} Node {}, {:?}, Inputs: {:?}",
+                id,
+                node.print_root(),
+                metadata,
+                inputs,
+            );
+            next_id.set(id + 1);
+        },
+        false,
+    );
 }
 
 /// Converts input metadata to IDs, filtering by location if provided
@@ -132,6 +164,21 @@ fn type_is_serializable(t: &DebugType) -> bool {
     !unserializable_types
         .iter()
         .any(|unser| type_name.contains(unser))
+}
+
+/// Returns true for IR nodes that are syntactic sugar — they exist for type system
+/// or tick/atomic boundary purposes but don't represent real computation.
+/// These nodes should not be decoupled.
+pub fn is_syntactic_sugar(node: &HydroNode) -> bool {
+    matches!(
+        node,
+        HydroNode::Cast { .. }
+            | HydroNode::ObserveNonDet { .. }
+            | HydroNode::BeginAtomic { .. }
+            | HydroNode::EndAtomic { .. }
+            | HydroNode::Batch { .. }
+            | HydroNode::YieldConcat { .. }
+    )
 }
 
 /// Returns whether a node can be decoupled.

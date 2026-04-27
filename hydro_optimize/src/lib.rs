@@ -36,7 +36,6 @@ mod test_init {
     }
 }
 
-pub mod debug;
 pub mod decouple_analysis;
 pub mod rewriter;
 pub mod deploy;

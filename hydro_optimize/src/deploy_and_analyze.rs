@@ -21,9 +21,9 @@ use crate::greedy_decouple_analysis::greedy_decouple_analysis;
 use crate::parse_results::{RunMetadata, analyze_cluster_results};
 use crate::reduce_pushdown::reduce_pushdown;
 use crate::reduce_pushdown_analysis::reduce_pushdown_decision;
-use crate::repair::inject_id;
+use crate::repair::{cycle_source_to_sink_parent, inject_id};
 use crate::rewriter::apply_rewrite;
-use crate::rewrites::collection_kind_to_debug_type;
+use crate::rewrites::{collection_kind_to_debug_type, op_id_to_parents, tee_to_inner_id};
 
 const METRIC_INTERVAL_SECS: u64 = 1;
 const COUNTER_PREFIX: &str = "_optimize_counter";
@@ -33,7 +33,7 @@ const SAR_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_SAR:";
 const LATENCY_PREFIX: &str = "HYDRO_OPTIMIZE_LAT:";
 const THROUGHPUT_PREFIX: &str = "HYDRO_OPTIMIZE_THR:";
 
-// Note: Ensure edits to the match arms are consistent with inject_count_node
+// Note: Ensure edits to the match arms are consistent with infer_counter_from_parent
 fn insert_counter_node(
     node: &mut HydroNode,
     next_stmt_id: &mut usize,
@@ -76,7 +76,10 @@ fn insert_counter_node(
             }
 
             // Use the original op_id from inject_id, not the traversal counter
-            let original_id = metadata.op.id.unwrap();
+            let Some(original_id) = metadata.op.id else {
+                // If this node does not have an original id, it must have been added during the rewrite and we can ignore
+                return;
+            };
             let metadata = metadata.clone();
             let node_content = std::mem::replace(node, HydroNode::Placeholder);
 
@@ -124,6 +127,57 @@ fn insert_counters<'a>(built: BuiltFlow<'a>, exclude: &HashSet<LocationId>) -> B
             },
         );
     })
+}
+
+/// Returns true for node types whose cardinality equals their parent's and thus don't
+/// get their own counter in `insert_counter_node`. Must be kept in sync with the
+/// no-op match arm there.
+fn inherits_parent_cardinality(node: &HydroNode) -> bool {
+    matches!(
+        node,
+        HydroNode::Tee { .. }
+            | HydroNode::Map { .. }
+            | HydroNode::DeferTick { .. }
+            | HydroNode::Enumerate { .. }
+            | HydroNode::Inspect { .. }
+            | HydroNode::Sort { .. }
+            | HydroNode::Cast { .. }
+            | HydroNode::ObserveNonDet { .. }
+            | HydroNode::BeginAtomic { .. }
+            | HydroNode::EndAtomic { .. }
+            | HydroNode::Batch { .. }
+            | HydroNode::YieldConcat { .. }
+            | HydroNode::ResolveFutures { .. }
+            | HydroNode::ResolveFuturesOrdered { .. }
+            | HydroNode::ResolveFuturesBlocking { .. }
+    )
+}
+
+/// Fills in counters for ops that inherit their parent's cardinality.
+/// `op_id_to_parent` should be derived from the pre-rewrite IR so all parents have valid ids.
+pub fn inject_inferred_counters(
+    ir: &mut [HydroRoot],
+    op_id_to_parent: &HashMap<usize, Vec<usize>>,
+    counters: &mut HashMap<usize, usize>,
+) {
+    traverse_dfir(
+        ir,
+        |_, _| {},
+        |node, _| {
+            if !inherits_parent_cardinality(node) {
+                return;
+            }
+            let Some(original_id) = node.metadata().op.id else {
+                return;
+            };
+            if let Some(parents) = op_id_to_parent.get(&original_id)
+                && let Some(&parent_id) = parents.first()
+                && let Some(&count) = counters.get(&parent_id)
+            {
+                counters.insert(original_id, count);
+            }
+        },
+    );
 }
 
 /// Inserts an Inspect node that samples every Nth element's serialized byte size,
@@ -528,6 +582,7 @@ fn apply_single_rewrite<'a>(
     location_to_original_ops: &mut HashMap<LocationId, Vec<usize>>,
     rewrite: Rewrite,
     new_cluster_name: impl Fn(usize) -> String,
+    tee_to_inner: &HashMap<usize, usize>,
 ) {
     // Build locations_map: index 0 = original, index > 0 = new clusters.
     let mut locations_map = HashMap::new();
@@ -555,7 +610,7 @@ fn apply_single_rewrite<'a>(
             .push(op_id);
     }
 
-    apply_rewrite(ir, &rewrite, &locations_map);
+    apply_rewrite(ir, &rewrite, &locations_map, tee_to_inner);
 }
 
 /// Applies every loaded rewrite (reduce pushdown + inject_id + apply_rewrite) in sequence.
@@ -578,6 +633,7 @@ fn apply_loaded_rewrites<'a>(
 
     let mut builder = FlowBuilder::from_built(&built);
     let mut ir = deep_clone(built.ir());
+    let tee_to_inner = tee_to_inner_id(&mut ir);
 
     for (iter, rewrite) in loaded_rewrites.iter().cloned().enumerate() {
         apply_single_rewrite(
@@ -587,6 +643,7 @@ fn apply_loaded_rewrites<'a>(
             &mut location_to_original_ops,
             rewrite,
             |loc_idx| format!("loaded_rewrite_{}_{}", iter, loc_idx),
+            &tee_to_inner,
         );
     }
 
@@ -595,7 +652,8 @@ fn apply_loaded_rewrites<'a>(
 }
 
 /// Applies the greedy-decoupled rewrite (blow-up analysis). Returns the new IR, updated
-/// clusters (with any newly created decouple clusters), and location → original op ids map.
+/// clusters (with any newly created decouple clusters), location → original op ids map,
+/// and the pre-rewrite parent map (for inferring counters after deployment).
 fn apply_blow_up_analysis<'a>(
     built: BuiltFlow<'a>,
     mut clusters: ReusableClusters,
@@ -604,6 +662,7 @@ fn apply_blow_up_analysis<'a>(
     BuiltFlow<'a>,
     ReusableClusters,
     HashMap<LocationId, Vec<usize>>,
+    HashMap<usize, Vec<usize>>,
 ) {
     let mut location_to_original_ops: HashMap<LocationId, Vec<usize>> = HashMap::new();
 
@@ -611,9 +670,13 @@ fn apply_blow_up_analysis<'a>(
     let built = built.optimize_with(|leaf| {
         greedy_results = Some(greedy_decouple_analysis(leaf, exclude));
     });
-    let built = insert_counters(built, exclude); // Insert counters before applying rewrites so we can measure original op cardinalities
     let mut builder = FlowBuilder::from_built(&built);
     let mut ir = deep_clone(built.ir());
+
+    // Compute parent map and tee map before rewrites mutate the IR
+    let cycles = cycle_source_to_sink_parent(&mut ir);
+    let pre_rewrite_parents = op_id_to_parents(&mut ir, None, &cycles);
+    let tee_to_inner = tee_to_inner_id(&mut ir);
 
     for (iter, rewrite) in greedy_results.unwrap().into_iter().enumerate() {
         apply_single_rewrite(
@@ -623,11 +686,21 @@ fn apply_blow_up_analysis<'a>(
             &mut location_to_original_ops,
             rewrite,
             |loc_idx| format!("decouple_{}_{}", iter, loc_idx),
+            &tee_to_inner,
         );
     }
 
     builder.replace_ir(ir);
-    (builder.finalize(), clusters, location_to_original_ops)
+
+    // Insert counters after rewrites, otherwise rewrites won't work on an outdated graph
+    // Note that counters still reference each nodes' original op_id
+    let built = insert_counters(builder.finalize(), exclude);
+    (
+        built,
+        clusters,
+        location_to_original_ops,
+        pre_rewrite_parents,
+    )
 }
 
 pub async fn benchmark_protocol<'a>(
@@ -675,9 +748,12 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
         // Baseline: reduce_pushdown + inject_id so downstream passes have stable op ids.
         inject_id(leaf);
         let decision = reduce_pushdown_decision(leaf, &config_optimizations.exclude);
+        println!("CHECKPOINT: before reduce_pushdown");
         reduce_pushdown(leaf, decision);
+        println!("CHECKPOINT: after reduce_pushdown");
     });
     let mut size_analysis_ops: HashSet<usize> = HashSet::new();
+    let mut pre_rewrite_parents: Option<HashMap<usize, Vec<usize>>> = None;
     let (built, clusters, location_to_original_ops) = match &config_optimizations.kind {
         OptimizationKind::None => (built, config_clusters, HashMap::new()),
         OptimizationKind::CountersOnly => {
@@ -688,7 +764,10 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
             apply_loaded_rewrites(built, config_clusters, rewrites)
         }
         OptimizationKind::BlowUpAnalysis => {
-            apply_blow_up_analysis(built, config_clusters, &config_optimizations.exclude)
+            let (built, clusters, loc_ops, parents) =
+                apply_blow_up_analysis(built, config_clusters, &config_optimizations.exclude);
+            pre_rewrite_parents = Some(parents);
+            (built, clusters, loc_ops)
         }
         OptimizationKind::SizeAnalysis => {
             let mut captured_ops = HashSet::new();
@@ -759,7 +838,11 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
             );
 
             if matches!(config_optimizations.kind, OptimizationKind::BlowUpAnalysis) {
-                run_metadata.save_blow_up_stats(&output_dir);
+                run_metadata.save_blow_up_stats(
+                    &output_dir,
+                    &mut deep_clone(ir),
+                    pre_rewrite_parents.as_ref().unwrap(),
+                );
             }
 
             if !size_analysis_ops.is_empty() {

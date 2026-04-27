@@ -10,7 +10,7 @@ use hydro_lang::{
     location::dynamic::LocationId,
 };
 
-use crate::rewrites::{can_decouple, op_id_to_parents};
+use crate::rewrites::{can_decouple, is_syntactic_sugar, op_id_to_parents};
 use crate::{decouple_analysis::Rewrite, repair::cycle_source_to_sink_parent};
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -91,7 +91,9 @@ impl GreedyDecoupleState {
             self.tick_to_ops.entry(tick_id).or_default().insert(*op_id);
         }
 
-        if !can_decouple(&node.metadata().collection_kind) {
+        // All ticked ops must stay where the tick executes, even if their
+        // collection kind is unbounded (e.g. YieldConcat at the tick boundary).
+        if is_syntactic_sugar(node) || !can_decouple(&node.metadata().collection_kind) {
             self.do_not_decouple.insert(*op_id);
         }
 

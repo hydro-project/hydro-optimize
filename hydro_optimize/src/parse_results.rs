@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::Path;
 
 use hydro_lang::compile::deploy::DeployResult;
+use hydro_lang::compile::ir::HydroRoot;
 use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::location::dynamic::LocationId;
 use regex::Regex;
@@ -11,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::deploy_and_analyze::{
-    MEASUREMENT_SECOND, MetricLogs, Optimizations, START_MEASUREMENT_SECOND,
+    MEASUREMENT_SECOND, MetricLogs, Optimizations, START_MEASUREMENT_SECOND, inject_inferred_counters,
 };
 
 #[derive(Default, Clone)]
@@ -242,8 +243,14 @@ impl RunMetadata {
     }
 
     /// Saves per-location blow-up stats: sar_stats, operator list, per-op counts.
-    pub fn save_blow_up_stats(&self, output_dir: &Path) {
-        let avg_counters = self.avg_counters();
+    pub fn save_blow_up_stats(
+        &self,
+        output_dir: &Path,
+        ir: &mut [HydroRoot],
+        pre_rewrite_parents: &HashMap<usize, Vec<usize>>,
+    ) {
+        let mut avg_counters = self.avg_counters();
+        inject_inferred_counters(ir, pre_rewrite_parents, &mut avg_counters);
         let avg_sar = self.avg_sar_stats();
 
         let mut location_stats: HashMap<String, BlowUpLocationStats> = HashMap::new();

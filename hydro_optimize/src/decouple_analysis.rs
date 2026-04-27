@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::parse_results::{NetworkCostTable, RunMetadata, SarStats};
 use crate::partition_ilp_analysis::{apply_budget_constraints, partition_ilp_analysis};
 use crate::partition_syn_analysis::StructOrTupleIndex;
-use crate::rewrites::op_id_to_parents;
+use crate::rewrites::{is_syntactic_sugar, op_id_to_parents};
 use good_lp::solvers::highs::HighsSolution;
 use good_lp::{
     Constraint, Expression, ProblemVariables, Solution, SolverModel, Variable, constraint, highs,
@@ -416,6 +416,26 @@ fn decouple_analysis_node(
             variables,
             constraints,
         );
+    } else if is_syntactic_sugar(node) {
+        // Syntactic sugar nodes (Cast, Batch, YieldConcat, etc.) must stay with their parent
+        if let Some(parents) = op_id_to_parents.get(op_id)
+            && let Some(&parent_id) = parents.first()
+        {
+            let DecoupleILPMetadata {
+                variables,
+                constraints,
+                max_num_locations: num_locations,
+                op_id_to_var,
+                ..
+            } = &mut *decoupling_metadata.borrow_mut();
+            add_equality_constr(
+                &[parent_id, *op_id],
+                *num_locations,
+                op_id_to_var,
+                variables,
+                constraints,
+            );
+        }
     } else if let HydroNode::Tee {
         inner, metadata, ..
     } = node
