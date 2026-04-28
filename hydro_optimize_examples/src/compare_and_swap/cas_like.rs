@@ -43,14 +43,6 @@ impl<S: PartialOrd> PartialOrd for CASState<S> {
     }
 }
 
-impl<S: Ord> Ord for CASState<S> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.version
-            .cmp(&other.version)
-            .then_with(|| self.state.cmp(&other.state))
-    }
-}
-
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct UniqueRequestId {
     pub id: u64,
