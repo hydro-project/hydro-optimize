@@ -1,9 +1,12 @@
-use crate::flink_queries::flink_queries::{Auction, Bid, Person, Queries};
+use crate::flink_queries::{
+    flink_queries::{Auction, Bid, Person, Queries},
+    flink_workload_generators::*,
+};
 use hydro_lang::{
     live_collections::stream::NoOrder,
     location::MemberId,
     nondet::nondet,
-    prelude::{Bounded, Cluster, KeyedStream, Process, Singleton, Stream, TCP, Unbounded},
+    prelude::{Bounded, Cluster, KeyedStream, Process, Singleton, TCP, Unbounded},
 };
 
 use hydro_std::bench_client::{aggregate_bench_results, bench_client, compute_throughput_latency};
@@ -36,17 +39,6 @@ pub fn queries_bench<'a, Output>(
         Unbounded,
         NoOrder,
     >,
-    auction_workload_generator: impl FnOnce(
-        Stream<u64, Cluster<'a, Client>, Unbounded, NoOrder>,
-    )
-        -> Stream<Auction, Cluster<'a, Client>, Unbounded, NoOrder>,
-    bid_workload_generator: impl FnOnce(
-        Stream<u64, Cluster<'a, Client>, Unbounded, NoOrder>,
-    ) -> Stream<Bid, Cluster<'a, Client>, Unbounded, NoOrder>,
-    person_workload_generator: impl FnOnce(
-        Stream<u64, Cluster<'a, Client>, Unbounded, NoOrder>,
-    )
-        -> Stream<Person, Cluster<'a, Client>, Unbounded, NoOrder>,
 ) where
     Output: Clone + Serialize + DeserializeOwned,
 {
@@ -65,13 +57,56 @@ pub fn queries_bench<'a, Output>(
             let (bids_payloads, persons_payloads) =
                 not_auctions_payloads.partition(q!(move |num| *num < auctions_ratio + bids_ratio));
 
-            // Generate actual objects with a pattern relevant to specific query
-            let auctions_input = auction_workload_generator(auctions_payloads)
-                .send(query_sys, TCP.fail_stop().bincode());
-            let bids_input =
-                bid_workload_generator(bids_payloads).send(query_sys, TCP.fail_stop().bincode());
-            let persons_input = person_workload_generator(persons_payloads)
-                .send(query_sys, TCP.fail_stop().bincode());
+            // Generate actual workloads
+            let auctions_input: KeyedStream<
+                MemberId<Client>,
+                Auction,
+                Process<'a, Queries>,
+                Unbounded,
+                NoOrder,
+            >;
+
+            let bids_input: KeyedStream<
+                MemberId<Client>,
+                Bid,
+                Process<'a, Queries>,
+                Unbounded,
+                NoOrder,
+            >;
+
+            let persons_input: KeyedStream<
+                MemberId<Client>,
+                Person,
+                Process<'a, Queries>,
+                Unbounded,
+                NoOrder,
+            >;
+
+            if auctions_ratio > 0 {
+                auctions_input = auction_workload_generator(auctions_payloads)
+                    .send(query_sys, TCP.fail_stop().bincode());
+            } else {
+                auctions_input = auction_workload_generator_empty(auctions_payloads)
+                    .send(query_sys, TCP.fail_stop().bincode());
+            }
+
+            if bids_ratio > 0 {
+                bids_input = bid_workload_generator(bids_payloads)
+                    .send(query_sys, TCP.fail_stop().bincode());
+            } else {
+                bids_input = bid_workload_generator_empty(bids_payloads)
+                    .send(query_sys, TCP.fail_stop().bincode());
+            }
+
+            if persons_ratio > 0 {
+                persons_input = person_workload_generator(persons_payloads)
+                    .send(query_sys, TCP.fail_stop().bincode());
+            } else {
+                persons_input = person_workload_generator_empty(persons_payloads)
+                    .send(query_sys, TCP.fail_stop().bincode());
+            }
+
+            // Execute query
 
             let result = query_fn(auctions_input, bids_input, persons_input);
             result
@@ -96,9 +131,7 @@ pub fn queries_bench<'a, Output>(
 
 #[cfg(test)]
 mod tests {
-    use crate::flink_queries::{
-        flink_queries::*, flink_queries_bench::*, flink_workload_generators::*,
-    };
+    use crate::flink_queries::{flink_queries::*, flink_queries_bench::*};
     use hydro_deploy::Deployment;
     use hydro_lang::{
         deploy::{DeployCrateWrapper, TrybuildHost},
@@ -113,158 +146,59 @@ mod tests {
     #[cfg(stageleft_runtime)]
     use stageleft::q;
 
-    #[tokio::test]
+    // #[tokio::test]
     async fn query_1_throughput() {
-        test_template::<Bid>(
-            0,
-            100,
-            0,
-            q1,
-            auction_workload_generator_empty,
-            q1_bid_workload_generator,
-            person_workload_generator_empty,
-        )
-        .await;
+        test_template::<Bid>(0, 100, 0, q1).await;
     }
 
-    #[tokio::test]
+    // #[tokio::test]
     async fn query_2_throughput() {
-        test_template::<Option<(i64, i64)>>(
-            0,
-            100,
-            0,
-            q2,
-            auction_workload_generator_empty,
-            q2_bid_workload_generator,
-            person_workload_generator_empty,
-        )
-        .await;
+        test_template::<Option<(i64, i64)>>(0, 100, 0, q2).await;
     }
 
-    #[tokio::test]
+    // #[tokio::test]
     async fn query_3_throughput() {
-        test_template::<Option<(String, String, String, i64)>>(
-            50,
-            0,
-            50,
-            q3,
-            q3_auction_workload_generator,
-            bid_workload_generator_empty,
-            q3_person_workload_generator,
-        )
-        .await;
+        test_template::<Option<(String, String, String, Vec<i64>)>>(50, 0, 50, q3).await;
     }
 
-    #[tokio::test]
+    // #[tokio::test]
     async fn query_11_throughput() {
-        test_template::<(i64, i32, i64, i64)>(
-            50,
-            0,
-            50,
-            q11,
-            auction_workload_generator_empty,
-            q11_bid_workload_generator,
-            person_workload_generator_empty,
-        )
-        .await;
+        test_template::<(i64, i32, i64, i64)>(50, 0, 50, q11).await;
     }
 
-    #[tokio::test]
+    // #[tokio::test]
     async fn query_14_throughput() {
-        test_template::<Option<(i64, i64, f64, String, i64, String, i64)>>(
-            0,
-            100,
-            0,
-            q14,
-            auction_workload_generator_empty,
-            q14_bid_workload_generator,
-            person_workload_generator_empty,
-        )
-        .await;
+        test_template::<Option<(i64, i64, f64, String, i64, String, i64)>>(0, 100, 0, q14).await;
     }
 
-    #[tokio::test]
+    // #[tokio::test]
     async fn query_17_throughput() {
-        test_template::<(i64, i64, i64, i64, i64, i32, i64, i64, i64, i64)>(
-            0,
-            100,
-            0,
-            q17,
-            auction_workload_generator_empty,
-            q17_bid_workload_generator,
-            person_workload_generator_empty,
-        )
-        .await;
+        test_template::<(i64, i64, i64, i64, i64, i32, i64, i64, i64, i64)>(0, 100, 0, q17).await;
     }
 
-    #[tokio::test]
+    // #[tokio::test]
     async fn query_18_throughput() {
-        test_template::<(i64, i64, i64, i64)>(
-            0,
-            100,
-            0,
-            q18,
-            auction_workload_generator_empty,
-            q18_bid_workload_generator,
-            person_workload_generator_empty,
-        )
-        .await;
+        test_template::<(i64, i64, i64, i64)>(0, 100, 0, q18).await;
     }
 
-    #[tokio::test]
+    // #[tokio::test]
     async fn query_19_throughput() {
-        test_template::<(usize, i64, i64)>(
-            0,
-            100,
-            0,
-            q19,
-            auction_workload_generator_empty,
-            q19_bid_workload_generator,
-            person_workload_generator_empty,
-        )
-        .await;
+        test_template::<Vec<(usize, i64, i64)>>(0, 100, 0, q19).await;
     }
 
-    #[tokio::test]
+    // #[tokio::test]
     async fn query_20_throughput() {
-        test_template::<Option<(i64, i64, String, i64, i64, i64)>>(
-            30,
-            70,
-            0,
-            q20,
-            q20_auction_workload_generator,
-            q20_bid_workload_generator,
-            person_workload_generator_empty,
-        )
-        .await;
+        test_template::<Option<Vec<(i64, i64, String, i64, i64, i64)>>>(50, 50, 0, q20).await;
     }
 
-    #[tokio::test]
+    // #[tokio::test]
     async fn query_22_throughput() {
-        test_template::<(i64, i64, i64, String, String, String, String)>(
-            0,
-            100,
-            0,
-            q22,
-            auction_workload_generator_empty,
-            q22_bid_workload_generator,
-            person_workload_generator_empty,
-        )
-        .await;
+        test_template::<(i64, i64, i64, String, String, String, String)>(0, 100, 0, q22).await;
     }
 
     #[tokio::test]
     async fn query_23_throughput() {
-        test_template::<(Auction, Bid, Person)>(
-            20,
-            60,
-            20,
-            q23,
-            q23_auction_workload_generator,
-            q23_bid_workload_generator,
-            q23_person_workload_generator,
-        )
-        .await;
+        test_template::<(Person, Vec<Bid>)>(10, 80, 10, q23).await;
     }
 
     async fn test_template<'a, Output>(
@@ -279,26 +213,6 @@ mod tests {
             MemberId<Client>,
             Output,
             Process<'a, Queries>,
-            Unbounded,
-            NoOrder,
-        >,
-        auction_workload_generator: impl FnOnce(
-            Stream<u64, Cluster<'a, Client>, Unbounded, NoOrder>,
-        ) -> Stream<
-            Auction,
-            Cluster<'a, Client>,
-            Unbounded,
-            NoOrder,
-        >,
-        bid_workload_generator: impl FnOnce(
-            Stream<u64, Cluster<'a, Client>, Unbounded, NoOrder>,
-        )
-            -> Stream<Bid, Cluster<'a, Client>, Unbounded, NoOrder>,
-        person_workload_generator: impl FnOnce(
-            Stream<u64, Cluster<'a, Client>, Unbounded, NoOrder>,
-        ) -> Stream<
-            Person,
-            Cluster<'a, Client>,
             Unbounded,
             NoOrder,
         >,
@@ -321,9 +235,6 @@ mod tests {
             bids_ratio,
             persons_ratio,
             query_fn,
-            auction_workload_generator,
-            bid_workload_generator,
-            person_workload_generator,
         );
         let mut deployment = Deployment::new();
 

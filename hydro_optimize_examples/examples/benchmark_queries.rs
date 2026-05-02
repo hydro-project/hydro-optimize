@@ -1,13 +1,9 @@
-use hydro_lang::location::{Location, MemberId};
+use hydro_lang::location::Location;
 use hydro_optimize::deploy_and_analyze::{
     BenchmarkArgs, BenchmarkConfig, Optimizations, ReusableClusters, ReusableProcesses,
     benchmark_protocol,
 };
-use hydro_optimize_examples::flink_queries::{
-    flink_queries::{Bid, Queries, q1},
-    flink_queries_bench::{Client, queries_bench_single},
-    flink_workload_generators::bid_workload_generator,
-};
+use hydro_optimize_examples::flink_queries::{flink_queries::*, flink_queries_bench::*};
 use stageleft::q;
 use std::collections::HashMap;
 
@@ -25,16 +21,17 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
     ]);
     let client_id = clients.id();
 
-    // Output Type depends on which query you're running
-    queries_bench_single::<Bid, Bid>(
+    // Edit Output type and ratios depending on which query you're benching
+    queries_bench::<Bid>(
         &query_sys,
         &clients,
         clients.singleton(q!(1usize)),
         &client_aggregator,
         interval_millis,
-        // Replace query below
-        q1::<(MemberId<Client>, u32)>,
-        bid_workload_generator,
+        0,
+        100,
+        0,
+        q1,
     );
 
     let clusters = ReusableClusters::default().with_cluster(clients, num_clients);

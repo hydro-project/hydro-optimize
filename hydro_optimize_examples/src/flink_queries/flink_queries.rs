@@ -1,5 +1,6 @@
 use hydro_lang::{live_collections::stream::NoOrder, prelude::*};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 pub struct Queries;
 
@@ -78,14 +79,13 @@ pub fn q2<'a, PerformanceKey>(
     }))
 }
 
-// TODO: Condense into vec
-pub fn q3<'a, PerformanceKey>(
+pub fn q3<'a, PerformanceKey: Eq + std::hash::Hash>(
     auction_stream: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
     _: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
     person_stream: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
 ) -> KeyedStream<
     PerformanceKey,
-    Option<(String, String, String, i64)>,
+    Option<(String, String, String, Vec<i64>)>,
     Process<'a, Queries>,
     Unbounded,
     NoOrder,
@@ -94,7 +94,6 @@ pub fn q3<'a, PerformanceKey>(
         Who is selling in OR, ID or CA in category 10, and for what auction ids?
         Illustrates an incremental join (using per-key state and timer) and filter.
     */
-
     let (cat10_auctions, filtered_out) = auction_stream
         .entries()
         .partition(q!(|(_, a)| a.category == 10));
@@ -108,18 +107,52 @@ pub fn q3<'a, PerformanceKey>(
 
     let formatted_states = or_id_ca_persons.map(q!(|(pk, p)| (p.id, (p, pk))));
     let state_filtered_out = filtered_out.map(q!(|(pk, _)| (pk, None))).into_keyed();
+
     let joined = formatted_states
         .join(formatted_cat10s)
-        .map(q!(|p_a| {
-            let (p_pk, a_pk) = p_a.1;
-            (
-                p_pk.1,
-                Some((p_pk.0.name, p_pk.0.city, p_pk.0.state, a_pk.0.id)),
-            )
+        .map(q!(|(_id, ((p, p_pk), (a, a_pk)))| {
+            // Track PKs to know who to send result to later
+            let mut pks = std::iter::once(p_pk).collect::<HashSet<_>>();
+            pks.insert(a_pk);
+
+            (p.id, ((p.name, p.city, p.state), a.id, pks))
         }))
         .into_keyed();
 
-    joined
+    // Condense each Person -> Vec[Auction] and track PKs to later send results to
+    let aggregated = joined.fold(
+        q!(|| (None, Vec::new(), HashSet::new())),
+        q!(
+            |acc, (person_info, auction_id, pks)| {
+                if acc.0.is_none() {
+                    acc.0 = Some(person_info);
+                }
+
+                acc.1.push(auction_id);
+                acc.2.extend(pks);
+            },
+            commutative = manual_proof!(/** Order doesn't matter */)
+        ),
+    );
+
+    let tick = aggregated.location().tick();
+    // Prepare for re-keying on PK
+    let aggregated = aggregated.map(q!(|(p_opt, auctions, pks)| {
+        let (name, city, state) = p_opt.unwrap();
+        (pks, Some((name, city, state, auctions)))
+    }));
+
+    // Expand stored PKs who contributed an input and send them the result
+    let select = aggregated
+        .snapshot(&tick, nondet!(/** test */))
+        .entries()
+        .flat_map_unordered(q!(|(_, (pks, value))| {
+            pks.into_iter().map(move |pk| (pk, value.clone()))
+        }))
+        .into_keyed();
+
+    select
+        .all_ticks()
         .merge_unordered(state_filtered_out)
         .merge_unordered(cat10_filtered_out)
 }
@@ -198,7 +231,7 @@ pub fn q14<'a, PerformanceKey>(
     bid_stream.map(q!(|bid| {
         if bid.price as f64 * 0.908 > 1000000.0 && bid.price as f64 * 0.908 < 50000000.0 {
             let mut bid_time_type = "otherTime";
-            let bid_hour = bid.date_time; // Using just seconds for testing
+            let bid_hour = bid.date_time % 24;
             if bid_hour >= 8 && bid_hour <= 18 {
                 bid_time_type = "dayTime";
             } else if bid_hour <= 6 || bid_hour >= 20 {
@@ -220,7 +253,8 @@ pub fn q14<'a, PerformanceKey>(
     }))
 }
 
-pub fn q17<'a, PerformanceKey>(
+// no samples showing
+pub fn q17<'a, PerformanceKey: Clone>(
     _: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
     bid_stream: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
     _: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
@@ -244,54 +278,60 @@ pub fn q17<'a, PerformanceKey>(
             (bid.price, pk)
         )))
         .into_keyed();
-    let aggregation = grouped_auction_day.fold(
-        q!(|| (0, 0, 0, 0, i64::MAX, i64::MIN, 0, 0, None)),
-        q!(
-            |acc, (bid_price, pk)| {
-                acc.0 += 1;
-                acc.1 += if bid_price < 10000 { 1 } else { 0 };
-                acc.2 += if bid_price >= 10000 && bid_price < 1000000 {
-                    1
-                } else {
-                    0
-                };
-                acc.3 += if bid_price >= 1000000 { 1 } else { 0 };
-                acc.4 = if bid_price < acc.4 { bid_price } else { acc.4 };
-                acc.5 = if bid_price > acc.5 { bid_price } else { acc.5 };
-                acc.6 += bid_price;
-                acc.7 += bid_price;
-                acc.8 = Some(pk)
-            },
-            commutative = manual_proof!(/** comparison + counting is commutative **/)
-        ),
-    );
+    let aggregation = grouped_auction_day
+        .batch(&tick, nondet!(/** test **/))
+        .across_ticks(|stream| {
+            stream.fold(
+                q!(|| (0, 0, 0, 0, i64::MAX, i64::MIN, 0, 0, Vec::new())),
+                q!(
+                    |acc, (bid_price, pk)| {
+                        acc.0 += 1;
+                        acc.1 += if bid_price < 10000 { 1 } else { 0 };
+                        acc.2 += if bid_price >= 10000 && bid_price < 1000000 {
+                            1
+                        } else {
+                            0
+                        };
+                        acc.3 += if bid_price >= 1000000 { 1 } else { 0 };
+                        acc.4 = acc.4.min(bid_price);
+                        acc.5 = acc.5.max(bid_price);
+                        acc.6 += bid_price;
+                        acc.7 += bid_price;
+                        acc.8.push(pk.clone());
+                    },
+                    commutative = manual_proof!(/** ok */)
+                ),
+            )
+        });
 
     let select = aggregation.map_with_key(q!(|(key, data)| {
-        (
-            data.8.unwrap(),
-            (
-                key.0,
-                key.1,
-                data.0,
-                data.1,
-                data.2,
-                data.3,
-                data.4,
-                data.5,
-                data.6 / data.0,
-                data.7,
-            ),
-        )
+        let mut out = Vec::new();
+
+        for pk in data.8 {
+            out.push((
+                pk,
+                (
+                    key.0,
+                    key.1,
+                    data.0,
+                    data.1,
+                    data.2,
+                    data.3,
+                    data.4,
+                    data.5,
+                    if data.0 > 0 { data.6 / data.0 } else { 0 },
+                    data.7,
+                ),
+            ));
+        }
+        out
     }));
 
-    select
-        .snapshot(&tick, nondet!(/** Test **/))
-        .values()
-        .into_keyed()
-        .all_ticks()
+    select.values().flatten_ordered().into_keyed().all_ticks()
 }
 
-pub fn q18<'a, PerformanceKey>(
+// no samples showing
+pub fn q18<'a, PerformanceKey: Clone>(
     _: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
     bid_stream: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
     _: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
@@ -310,16 +350,19 @@ pub fn q18<'a, PerformanceKey>(
 
     // fold instead of reduce due to simulation testing limitations
     let last_bid_to_auctions = prepared_bids.fold(
-        q!(|| (None, (0, 0, 0, 0))),
+        q!(|| (Vec::new(), (0, 0, 0, 0))),
         q!(
-            |best, new| {
+            |state, new| {
+                let (pks, best) = state;
+                // track all contributing pks
+                pks.push(new.4.clone());
+
                 // Find last datetime
-                if new.2 > best.1.2 {
-                    best.1.0 = new.0;
-                    best.1.1 = new.1;
-                    best.1.2 = new.2;
-                    best.1.3 = new.3;
-                    best.0 = Some(new.4);
+                if new.2 > best.2 {
+                    best.0 = new.0;
+                    best.1 = new.1;
+                    best.2 = new.2;
+                    best.3 = new.3;
                 }
             },
             commutative = manual_proof!(/** max is commutative */)
@@ -329,21 +372,22 @@ pub fn q18<'a, PerformanceKey>(
     last_bid_to_auctions
         .snapshot(&tick, nondet!(/** test **/))
         .values()
-        .filter_map(q!(|elem| {
-            match elem.0 {
-                None => None,
-                Some(pk) => Some((pk, elem.1)),
+        .flat_map_unordered(q!(|(pks, best)| {
+            let mut out = vec![];
+            for pk in pks {
+                out.push((pk, best));
             }
+            out
         }))
         .into_keyed()
         .all_ticks()
 }
 
-pub fn q19<'a, PerformanceKey: Ord + Clone>(
+pub fn q19<'a, PerformanceKey: Ord + Clone + std::hash::Hash>(
     _: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
     bid_stream: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
     _: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
-) -> KeyedStream<PerformanceKey, (usize, i64, i64), Process<'a, Queries>, Unbounded, NoOrder> {
+) -> KeyedStream<PerformanceKey, Vec<(usize, i64, i64)>, Process<'a, Queries>, Unbounded, NoOrder> {
     /*
         What's the top price 10 bids of an auction?
         Illustrates a TOP-N query.
@@ -352,7 +396,7 @@ pub fn q19<'a, PerformanceKey: Ord + Clone>(
 
     let sorted_price = bid_stream
         .entries()
-        .map(q!(|(pk, bid)| (bid.auction, (bid.price, pk))))
+        .map(q!(|(pk, bid)| (bid.auction, (bid.price, pk.clone()))))
         .into_keyed()
         .batch(&tick, nondet!(/** test **/))
         .across_ticks(|stream| {
@@ -375,30 +419,42 @@ pub fn q19<'a, PerformanceKey: Ord + Clone>(
                     commutative = manual_proof!(/** top ten is commutative **/)
                 ),
             )
-        })
+        });
+
+    let per_pk = sorted_price
         .entries()
-        .all_ticks()
         .flat_map_unordered(q!(|(auction, top_ten)| {
-            let mut output = vec![];
-            for (i, elem) in top_ten.iter().enumerate() {
-                // make k-v pair
-                output.push((elem.1.clone(), (top_ten.len() - i - 1, auction, elem.0)));
+            let mut out = vec![];
+
+            for (i, (price, pk)) in top_ten.iter().enumerate() {
+                let rank = top_ten.len() - i - 1;
+                out.push((pk.clone(), (rank, auction, *price)));
             }
-            output
+
+            out
         }))
         .into_keyed();
 
-    sorted_price
+    let aggregated = per_pk.fold(
+        q!(|| Vec::new()),
+        q!(
+            |acc, val| {
+                acc.push(val);
+            },
+            commutative = manual_proof!(/** append */)
+        ),
+    );
+
+    aggregated.entries().into_keyed().all_ticks()
 }
 
-// TODO: Condense into vec
-pub fn q20<'a, PerformanceKey>(
+pub fn q20<'a, PerformanceKey: Eq + std::hash::Hash>(
     auction_stream: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
     bid_stream: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
     _: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
 ) -> KeyedStream<
     PerformanceKey,
-    Option<(i64, i64, String, i64, i64, i64)>,
+    Option<Vec<(i64, i64, String, i64, i64, i64)>>,
     Process<'a, Queries>,
     Unbounded,
     NoOrder,
@@ -407,6 +463,8 @@ pub fn q20<'a, PerformanceKey>(
         Get bids with the corresponding auction information where category is 10.
         Illustrates a filter join.
     */
+    let tick = bid_stream.location().tick();
+
     let (cat10_auctions, filtered_out) = auction_stream
         .entries()
         .partition(q!(|(_, a)| a.category == 10));
@@ -416,24 +474,67 @@ pub fn q20<'a, PerformanceKey>(
 
     let formatted_bids = bid_stream.entries().map(q!(|(pk, b)| (b.auction, (b, pk))));
     let join = formatted_cat10s.join(formatted_bids);
+
+    // Format the joined output to prepare for keying on b.auction
     let select = join
         .map(q!(|elem| {
             let ((a, pk1), (b, _)) = elem.1;
             (
-                pk1,
-                Some((
-                    b.auction,
-                    b.date_time,
-                    a.item_name,
-                    a.date_time,
-                    a.seller,
-                    a.category,
-                )),
+                b.auction,
+                (
+                    pk1,
+                    (
+                        b.auction,
+                        b.date_time,
+                        a.item_name,
+                        a.date_time,
+                        a.seller,
+                        a.category,
+                    ),
+                ),
             )
         }))
         .into_keyed();
 
-    select.merge_unordered(cat10_filtered_out)
+    // Condense join outputs into vec per auction to many bids
+    let agg = select
+        .batch(&tick, nondet!(/** test **/))
+        .across_ticks(|stream| {
+            stream.fold(
+                q!(|| Vec::new()),
+                q!(
+                    |acc, (pk, val)| {
+                        acc.push((pk, val));
+                    },
+                    commutative = manual_proof!(/** order doesn't matter */)
+                ),
+            )
+        })
+        // Remove auction key to prepare keying to (PK, v)
+        .entries()
+        .map(q!(|(_, vec)| vec))
+        .flatten_ordered()
+        .into_keyed();
+
+    // Condense outputs per PK
+    let result = agg
+        .across_ticks(|stream| {
+            stream.fold(
+                q!(|| Vec::new()),
+                q!(
+                    |acc, val| {
+                        acc.push(val);
+                    },
+                    commutative = manual_proof!(/** order doesn't matter  */)
+                ),
+            )
+        })
+        .entries()
+        .map(q!(|(pk, vec)| (pk, Some(vec))))
+        .into_keyed()
+        .all_ticks();
+
+    result.merge_unordered(cat10_filtered_out)
 }
 
 pub fn q22<'a, PerformanceKey>(
@@ -465,27 +566,75 @@ pub fn q22<'a, PerformanceKey>(
     }))
 }
 
-// TODO: Condense into vec
-pub fn q23<'a, PerformanceKey>(
+pub fn q23<'a, PerformanceKey: Eq + std::hash::Hash>(
     auction_stream: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
     bid_stream: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
     person_stream: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
-) -> KeyedStream<PerformanceKey, (Auction, Bid, Person), Process<'a, Queries>, Unbounded, NoOrder> {
+) -> KeyedStream<PerformanceKey, (Person, Vec<Bid>), Process<'a, Queries>, Unbounded, NoOrder> {
     /*
         Find all bids made by a person who has also listed an item for auction
         Illustrates a multi-way join.
     */
-    let prepared_persons = person_stream.entries().map(q!(|(pk, p)| (p.id, (p, pk))));
-    let prepared_bidders = bid_stream.entries().map(q!(|(pk, b)| (b.bidder, (b, pk))));
-    let prepared_auctions = auction_stream
-        .entries()
-        .map(q!(|(pk, a)| (a.seller, (a, pk))));
 
-    let joined_persons_bidders =
+    let prepared_persons = person_stream.entries().map(q!(|(pk, p)| (
+        p.id,
+        (p, std::iter::once(pk).collect::<HashSet<_>>())
+    )));
+    let prepared_bidders = bid_stream.entries().map(q!(|(pk, b)| (
+        b.bidder,
+        (b, std::iter::once(pk).collect::<HashSet<_>>())
+    )));
+    let prepared_auctions = auction_stream.entries().map(q!(|(pk, a)| (
+        a.seller,
+        std::iter::once(pk).collect::<HashSet<_>>()
+    )));
+
+    let persons_with_auctions =
         prepared_persons
-            .join(prepared_bidders)
-            .map(q!(|(_, ((p, pk), (b, _)))| (b.bidder, (p, b, pk))));
-    let join = joined_persons_bidders.join(prepared_auctions);
-    let select = join.map(q!(|(_, ((p, b, pk), (a, _)))| (pk, (a, b, p))));
-    select.into_keyed()
+            .join(prepared_auctions)
+            .map(q!(|(_, ((p, pk1), pk2))| {
+                let mut pk = pk1;
+                pk.extend(pk2);
+                (p.id, (p, pk))
+            }));
+
+    let join = persons_with_auctions
+        .join(prepared_bidders)
+        .map(q!(|(_, ((p, pk1), (b, pk2)))| {
+            let mut pk = pk1;
+            pk.extend(pk2);
+            (pk, (b, p))
+        }));
+
+    // Re-key by person to condense Person -> Vec[Bids]
+    let keyed = join
+        .map(q!(|(pk, (b, p))| { (p.id, (p, b, pk)) }))
+        .into_keyed();
+    let aggregated = keyed
+        .fold(
+            q!(|| (None, Vec::new(), HashSet::new())),
+            q!(
+                |acc, (p, b, pk)| {
+                    acc.0 = Some(p);
+                    acc.1.push(b);
+                    acc.2.extend(pk);
+                },
+                commutative = manual_proof!(/** Order doesn't matter */),
+            ),
+        )
+        // Remove Option formatting
+        .map(q!(|(p_opt, bids, pks)| { (pks, (p_opt.unwrap(), bids)) }));
+
+    let tick = aggregated.location().tick();
+    // Ensure each PK that contributed an input hears about its output
+    let select = aggregated
+        .snapshot(&tick, nondet!(/** Test */))
+        .entries()
+        .flat_map_unordered(q!(|(_, (pks, value))| {
+            pks.into_iter().map(move |pk| (pk, value.clone()))
+        }))
+        .into_keyed()
+        .all_ticks();
+
+    select
 }
