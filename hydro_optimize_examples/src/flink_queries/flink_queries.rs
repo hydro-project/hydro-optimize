@@ -1,6 +1,9 @@
-use hydro_lang::{live_collections::stream::NoOrder, prelude::*};
+use hydro_lang::{
+    live_collections::stream::{ExactlyOnce, NoOrder, TotalOrder},
+    prelude::*,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 pub struct Queries;
 
@@ -79,7 +82,7 @@ pub fn q2<'a, PerformanceKey>(
     }))
 }
 
-pub fn q3<'a, PerformanceKey: Eq + std::hash::Hash>(
+pub fn q3<'a, PerformanceKey: Eq + std::hash::Hash + Clone>(
     auction_stream: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
     _: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
     person_stream: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
@@ -98,22 +101,29 @@ pub fn q3<'a, PerformanceKey: Eq + std::hash::Hash>(
         .entries()
         .partition(q!(|(_, a)| a.category == 10));
 
-    let formatted_cat10s = cat10_auctions.map(q!(|(pk, a)| (a.seller, (a, pk))));
+    let formatted_cat10s = cat10_auctions
+        .clone()
+        .map(q!(|(pk, a)| (a.seller, (a, pk))));
     let cat10_filtered_out = filtered_out.map(q!(|(pk, _)| (pk, None))).into_keyed();
 
     let (or_id_ca_persons, filtered_out) = person_stream
         .entries()
         .partition(q!(|(_, p)| ["OR", "CA", "ID"].contains(&p.state.as_str())));
 
-    let formatted_states = or_id_ca_persons.map(q!(|(pk, p)| (p.id, (p, pk))));
+    let formatted_states = or_id_ca_persons.clone().map(q!(|(pk, p)| (p.id, (p, pk))));
     let state_filtered_out = filtered_out.map(q!(|(pk, _)| (pk, None))).into_keyed();
+
+    // Acks to ensure unmatched inputs that passed the filter receive an output so benchmark can see progress
+    let cat10_input_acks = cat10_auctions.map(q!(|(pk, _a)| (pk, None))).into_keyed();
+    let or_state_input_acks = or_id_ca_persons.map(q!(|(pk, _p)| (pk, None))).into_keyed();
 
     let joined = formatted_states
         .join(formatted_cat10s)
         .map(q!(|(_id, ((p, p_pk), (a, a_pk)))| {
             // Track PKs to know who to send result to later
-            let mut pks = std::iter::once(p_pk).collect::<HashSet<_>>();
+            let mut pks = HashSet::new();
             pks.insert(a_pk);
+            pks.insert(p_pk);
 
             (p.id, ((p.name, p.city, p.state), a.id, pks))
         }))
@@ -146,18 +156,27 @@ pub fn q3<'a, PerformanceKey: Eq + std::hash::Hash>(
     let select = aggregated
         .snapshot(&tick, nondet!(/** test */))
         .entries()
+        .all_ticks()
         .flat_map_unordered(q!(|(_, (pks, value))| {
             pks.into_iter().map(move |pk| (pk, value.clone()))
         }))
         .into_keyed();
 
-    select
-        .all_ticks()
-        .merge_unordered(state_filtered_out)
-        .merge_unordered(cat10_filtered_out)
+    // Combine outputs
+    let cat10_f = cat10_filtered_out.entries();
+    let state_f = state_filtered_out.entries();
+    let c10_ack = cat10_input_acks.entries();
+    let or_ack = or_state_input_acks.entries();
+    let sel = select.entries();
+
+    cat10_f
+        .merge_unordered(
+            state_f.merge_unordered(c10_ack.merge_unordered(or_ack.merge_unordered(sel))),
+        )
+        .into_keyed()
 }
 
-pub fn q11<'a, PerformanceKey: Ord + Clone>(
+pub fn q11<'a, PerformanceKey: Ord + Clone + Eq + std::hash::Hash>(
     _: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
     bid_stream: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
     _: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
@@ -168,49 +187,57 @@ pub fn q11<'a, PerformanceKey: Ord + Clone>(
         Emit the number of bids per session.
     */
     let tick = bid_stream.location().tick();
-    let bid_stream_reformat = bid_stream.entries();
 
-    bid_stream_reformat
-        .map(q!(|(pk, bid)| (bid.bidder, (bid.date_time, pk))))
+    bid_stream
+        .entries()
+        // Aggregate by bidder
+        .map(q!(|(pk, bid)| (bid.bidder, (bid.bidder, bid.date_time, pk))))
         .into_keyed()
-        .batch(&tick, nondet!(/** test */))
+        .batch(&tick, nondet!(/** Need to bound for sorting */))
+        // Sort by date_time to ensure sessions are grouped correctly
         .sort()
         .across_ticks(|s| {
-            s.fold(
-                q!(|| (None, vec![])),
-                q!(|state, (current_time, pk)| {
-                    let (current_session, completed) = state;
-
-                    match current_session {
-                        None => {
-                            *current_session = Some((current_time, current_time, 1, pk.clone()));
-                        }
-                        Some((start, last, count, pk_prev)) => {
-                            let gap = current_time - *last;
-
-                            if gap <= 10 {
-                                *last = current_time;
-                                *count += 1;
-                            } else {
-                                completed.push((*start, *last, *count, pk_prev.clone()));
-                                *current_session =
-                                    Some((current_time, current_time, 1, pk_prev.clone()));
+            s.assume_retries::<ExactlyOnce>(nondet!(/** one pass per element per key in batch */))
+                .assume_ordering::<TotalOrder>(nondet!(/** sorted batch */))
+                .generator(
+                    q!(|| None::<(i64, i64, i32)>),
+                    q!(|open, (bidder, current_time, pk)| {
+                        match open {
+                            // First session for the bidder
+                            None => {
+                                *open = Some((current_time, current_time, 1));
+                                hydro_lang::live_collections::keyed_stream::Generate::Yield((
+                                    pk.clone(),
+                                    (bidder, 1, current_time, current_time),
+                                ))
+                            }
+                            Some((start, last, count)) => {
+                                let gap = current_time - *last;
+                                // gap bound from https://github.com/nexmark/nexmark/blob/master/nexmark-flink/src/main/resources/queries/q11.sql#L23
+                                if gap <= 10 {
+                                    *last = current_time;
+                                    *count += 1;
+                                    hydro_lang::live_collections::keyed_stream::Generate::Yield((
+                                        pk.clone(),
+                                        (bidder, *count, *start, *last),
+                                    ))
+                                } else {
+                                    *open = Some((current_time, current_time, 1));
+                                    hydro_lang::live_collections::keyed_stream::Generate::Yield((
+                                        pk.clone(),
+                                        (bidder, 1, current_time, current_time),
+                                    ))
+                                }
                             }
                         }
-                    }
-                }),
-            )
+                    }),
+                )
+                .entries()
         })
-        .entries()
         .all_ticks()
-        .flat_map_unordered(q!(|(bidder, (_current, sessions))| {
-            let mut out = vec![];
-            for (start, end, count, pk) in sessions {
-                out.push((pk, (bidder, count, start, end)));
-            }
-            out
-        }))
+        .map(q!(|(_bidder, (pk, row))| (pk, row)))
         .into_keyed()
+        .weaken_ordering::<NoOrder>()
 }
 
 pub fn q14<'a, PerformanceKey>(
@@ -253,8 +280,7 @@ pub fn q14<'a, PerformanceKey>(
     }))
 }
 
-// no samples showing
-pub fn q17<'a, PerformanceKey: Clone>(
+pub fn q17<'a, PerformanceKey: Clone + Eq + std::hash::Hash>(
     _: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
     bid_stream: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
     _: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
@@ -269,69 +295,56 @@ pub fn q17<'a, PerformanceKey: Clone>(
         How many bids on an auction made a day and what is the price?
         Illustrates an unbounded group aggregation.
     */
-    let tick = bid_stream.location().tick();
-
     let grouped_auction_day = bid_stream
         .entries()
         .map(q!(|(pk, bid)| (
             (bid.auction, bid.date_time),
-            (bid.price, pk)
+            (bid.auction, bid.date_time, bid.price, pk)
         )))
         .into_keyed();
-    let aggregation = grouped_auction_day
-        .batch(&tick, nondet!(/** test **/))
-        .across_ticks(|stream| {
-            stream.fold(
-                q!(|| (0, 0, 0, 0, i64::MAX, i64::MIN, 0, 0, Vec::new())),
-                q!(
-                    |acc, (bid_price, pk)| {
-                        acc.0 += 1;
-                        acc.1 += if bid_price < 10000 { 1 } else { 0 };
-                        acc.2 += if bid_price >= 10000 && bid_price < 1000000 {
-                            1
-                        } else {
-                            0
-                        };
-                        acc.3 += if bid_price >= 1000000 { 1 } else { 0 };
-                        acc.4 = acc.4.min(bid_price);
-                        acc.5 = acc.5.max(bid_price);
-                        acc.6 += bid_price;
-                        acc.7 += bid_price;
-                        acc.8.push(pk.clone());
-                    },
-                    commutative = manual_proof!(/** ok */)
-                ),
-            )
-        });
 
-    let select = aggregation.map_with_key(q!(|(key, data)| {
-        let mut out = Vec::new();
+    grouped_auction_day
+        .assume_retries::<ExactlyOnce>(nondet!(/** one pass per element per key */))
+        .assume_ordering::<TotalOrder>(nondet!(/** result order not concerning */))
+        .generator(
+            q!(|| (0, 0, 0, 0, i64::MAX, i64::MIN, 0, 0, Vec::new())),
+            q!(|acc, (_auction, _date_time, bid_price, pk)| {
+                acc.0 += 1;
+                acc.1 += if bid_price < 10000 { 1 } else { 0 };
+                acc.2 += if bid_price >= 10000 && bid_price < 1000000 {
+                    1
+                } else {
+                    0
+                };
+                acc.3 += if bid_price >= 1000000 { 1 } else { 0 };
+                acc.4 = acc.4.min(bid_price);
+                acc.5 = acc.5.max(bid_price);
+                acc.6 += bid_price;
+                acc.7 += bid_price;
+                acc.8.push(pk.clone());
 
-        for pk in data.8 {
-            out.push((
-                pk,
-                (
-                    key.0,
-                    key.1,
-                    data.0,
-                    data.1,
-                    data.2,
-                    data.3,
-                    data.4,
-                    data.5,
-                    if data.0 > 0 { data.6 / data.0 } else { 0 },
-                    data.7,
-                ),
-            ));
-        }
-        out
-    }));
-
-    select.values().flatten_ordered().into_keyed().all_ticks()
+                let row = (
+                    _auction,
+                    _date_time,
+                    acc.0,
+                    acc.1,
+                    acc.2,
+                    acc.3 as i32,
+                    acc.4,
+                    acc.5,
+                    if acc.0 > 0 { acc.6 / acc.0 } else { 0 },
+                    acc.7,
+                );
+                hydro_lang::live_collections::keyed_stream::Generate::Yield((pk.clone(), row))
+            }),
+        )
+        .entries()
+        .map(q!(|(_key, (pk, row))| (pk, row)))
+        .into_keyed()
+        .weaken_ordering::<NoOrder>()
 }
 
-// no samples showing
-pub fn q18<'a, PerformanceKey: Clone>(
+pub fn q18<'a, PerformanceKey: Clone + Eq + std::hash::Hash>(
     _: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
     bid_stream: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
     _: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
@@ -339,48 +352,31 @@ pub fn q18<'a, PerformanceKey: Clone>(
     /*
         What's a's last bid for bidder to auction?
     */
-    let tick = bid_stream.location().tick();
     let prepared_bids = bid_stream
         .entries()
         .map(q!(|(pk, b)| (
             (b.bidder, b.auction),
             (b.auction, b.bidder, b.date_time, b.price, pk)
         )))
+        // Group by bidder and auction to later find the last bid
         .into_keyed();
 
-    // fold instead of reduce due to simulation testing limitations
-    let last_bid_to_auctions = prepared_bids.fold(
-        q!(|| (Vec::new(), (0, 0, 0, 0))),
-        q!(
-            |state, new| {
-                let (pks, best) = state;
-                // track all contributing pks
-                pks.push(new.4.clone());
-
-                // Find last datetime
+    prepared_bids
+        .assume_retries::<ExactlyOnce>(nondet!(/** one pass per element per key */))
+        .assume_ordering::<TotalOrder>(nondet!(/** need for ordering */))
+        .generator(
+            q!(|| (0, 0, 0, 0)),
+            q!(|best, new| {
                 if new.2 > best.2 {
-                    best.0 = new.0;
-                    best.1 = new.1;
-                    best.2 = new.2;
-                    best.3 = new.3;
+                    *best = (new.0, new.1, new.2, new.3);
                 }
-            },
-            commutative = manual_proof!(/** max is commutative */)
-        ),
-    );
-
-    last_bid_to_auctions
-        .snapshot(&tick, nondet!(/** test **/))
-        .values()
-        .flat_map_unordered(q!(|(pks, best)| {
-            let mut out = vec![];
-            for pk in pks {
-                out.push((pk, best));
-            }
-            out
-        }))
+                hydro_lang::live_collections::keyed_stream::Generate::Yield((new.4.clone(), *best))
+            }),
+        )
+        .entries()
+        .map(q!(|(_group, (pk, row))| (pk, row)))
         .into_keyed()
-        .all_ticks()
+        .weaken_ordering::<NoOrder>()
 }
 
 pub fn q19<'a, PerformanceKey: Ord + Clone + std::hash::Hash>(
@@ -421,6 +417,7 @@ pub fn q19<'a, PerformanceKey: Ord + Clone + std::hash::Hash>(
             )
         });
 
+    // Flatten the top ten bids per auction
     let per_pk = sorted_price
         .entries()
         .flat_map_unordered(q!(|(auction, top_ten)| {
@@ -448,7 +445,7 @@ pub fn q19<'a, PerformanceKey: Ord + Clone + std::hash::Hash>(
     aggregated.entries().into_keyed().all_ticks()
 }
 
-pub fn q20<'a, PerformanceKey: Eq + std::hash::Hash>(
+pub fn q20<'a, PerformanceKey: Eq + std::hash::Hash + Clone>(
     auction_stream: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
     bid_stream: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
     _: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
@@ -469,10 +466,23 @@ pub fn q20<'a, PerformanceKey: Eq + std::hash::Hash>(
         .entries()
         .partition(q!(|(_, a)| a.category == 10));
 
-    let formatted_cat10s = cat10_auctions.map(q!(|(pk, a)| (a.id, (a, pk))));
+    let formatted_cat10s = cat10_auctions
+        .clone()
+        .map(q!(|(pk, a)| (a.id, (a, pk))));
     let cat10_filtered_out = filtered_out.map(q!(|(pk, _)| (pk, None))).into_keyed();
 
-    let formatted_bids = bid_stream.entries().map(q!(|(pk, b)| (b.auction, (b, pk))));
+    // Acks so inputs get a reply even when category != 10 or join doesn't match
+    let cat10_input_acks = cat10_auctions
+        .map(q!(|(pk, _a)| (pk, Option::<Vec<(i64, i64, String, i64, i64, i64)>>::None)))
+        .into_keyed();
+
+    let bid_entries = bid_stream.entries();
+    let bid_input_acks = bid_entries
+        .clone()
+        .map(q!(|(pk, _b)| (pk, Option::<Vec<(i64, i64, String, i64, i64, i64)>>::None)))
+        .into_keyed();
+    
+    let formatted_bids = bid_entries.map(q!(|(pk, b)| (b.auction, (b, pk))));
     let join = formatted_cat10s.join(formatted_bids);
 
     // Format the joined output to prepare for keying on b.auction
@@ -534,7 +544,9 @@ pub fn q20<'a, PerformanceKey: Eq + std::hash::Hash>(
         .into_keyed()
         .all_ticks();
 
-    result.merge_unordered(cat10_filtered_out)
+    bid_input_acks.merge_unordered(
+        cat10_filtered_out.merge_unordered(cat10_input_acks.merge_unordered(result)),
+    )
 }
 
 pub fn q22<'a, PerformanceKey>(
@@ -566,7 +578,7 @@ pub fn q22<'a, PerformanceKey>(
     }))
 }
 
-pub fn q23<'a, PerformanceKey: Eq + std::hash::Hash>(
+pub fn q23<'a, PerformanceKey: Eq + std::hash::Hash + Ord + Clone>(
     auction_stream: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
     bid_stream: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
     person_stream: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
@@ -576,17 +588,18 @@ pub fn q23<'a, PerformanceKey: Eq + std::hash::Hash>(
         Illustrates a multi-way join.
     */
 
+    // Prepare for joins and track PKs to later send results to
     let prepared_persons = person_stream.entries().map(q!(|(pk, p)| (
         p.id,
-        (p, std::iter::once(pk).collect::<HashSet<_>>())
+        (p, std::iter::once(pk).collect::<BTreeSet<_>>())
     )));
     let prepared_bidders = bid_stream.entries().map(q!(|(pk, b)| (
         b.bidder,
-        (b, std::iter::once(pk).collect::<HashSet<_>>())
+        (b, std::iter::once(pk).collect::<BTreeSet<_>>())
     )));
     let prepared_auctions = auction_stream.entries().map(q!(|(pk, a)| (
         a.seller,
-        std::iter::once(pk).collect::<HashSet<_>>()
+        std::iter::once(pk).collect::<BTreeSet<_>>()
     )));
 
     let persons_with_auctions =
@@ -612,7 +625,7 @@ pub fn q23<'a, PerformanceKey: Eq + std::hash::Hash>(
         .into_keyed();
     let aggregated = keyed
         .fold(
-            q!(|| (None, Vec::new(), HashSet::new())),
+            q!(|| (None, Vec::new(), BTreeSet::new())),
             q!(
                 |acc, (p, b, pk)| {
                     acc.0 = Some(p);

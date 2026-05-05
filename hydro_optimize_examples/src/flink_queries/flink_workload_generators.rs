@@ -14,7 +14,7 @@ const FIRST_PERSON_ID: i64 = 1000;
 const FIRST_CATEGORY_ID: i64 = 10;
 
 // Used to restrain ID domain to ensure some joins succeed
-const NUM_PERSONS: i64 = 1000;
+const NUM_PERSONS: i64 = 500;
 const NUM_AUCTIONS: i64 = 1000;
 
 // Empty workload generators for queries who don't need its input
@@ -93,7 +93,7 @@ pub fn auction_workload_generator<'a, Client>(
                     reserve: initial + self::price_generator(),
                     date_time: *acc,
                     expires: *acc + rand::rng().random_range(0..100),
-                    seller: FIRST_PERSON_ID + (rand::rng().random_range(0..NUM_PERSONS)),
+                    seller: FIRST_PERSON_ID + *acc % NUM_PERSONS,
                     category: FIRST_CATEGORY_ID + rand::rng().random_range(0..NUM_CATEGORIES),
                     extra: self::string_generator(100, '_'),
                 })
@@ -112,10 +112,10 @@ pub fn bid_workload_generator<'a, Client>(
                 *acc += 1;
 
                 Some(Bid {
-                    auction: FIRST_AUCTION_ID + rand::rng().random_range(0..NUM_AUCTIONS),
-                    bidder: FIRST_PERSON_ID + rand::rng().random_range(0..NUM_PERSONS),
+                    auction: FIRST_AUCTION_ID + *acc % NUM_AUCTIONS,
+                    bidder: FIRST_PERSON_ID + *acc % NUM_PERSONS,
                     price: self::price_generator(),
-                    date_time: *acc,
+                    date_time: *acc + 7,
                     extra: self::string_generator(32, ' '),
                     channel: self::string_generator(7, ' '),
                     url: self::url_generator(),
@@ -140,28 +140,24 @@ pub fn person_workload_generator<'a, Client>(
         "Phoenix,Los Angeles,San Francisco,Boise,Portland,Bend,Redmond,Seattle,Kent,Cheyenne"
             .split(",")
             .collect();
-                if *acc < NUM_PERSONS {
-                    Some(Person {
-                        id: FIRST_PERSON_ID + *acc,
-                        name: format!(
-                            "{} {}",
-                            self::string_generator(7, '-'),
-                            self::string_generator(7, '-')
-                        ),
-                        email: format!(
-                            "{}@{}.com",
-                            self::string_generator(7, '_'),
-                            self::string_generator(5, '_')
-                        ),
-                        credit_card: self::cc_generator(),
-                        city: cities[rand::rng().random_range(0..cities.len())].to_string(),
-                        state: states[rand::rng().random_range(0..states.len())].to_string(),
-                        date_time: *acc,
-                        extra: self::string_generator(100, '_'),
-                    })
-                } else {
-                    None
-                }
+                Some(Person {
+                    id: FIRST_PERSON_ID + *acc % NUM_PERSONS,
+                    name: format!(
+                        "{} {}",
+                        self::string_generator(7, '-'),
+                        self::string_generator(7, '-')
+                    ),
+                    email: format!(
+                        "{}@{}.com",
+                        self::string_generator(7, '_'),
+                        self::string_generator(5, '_')
+                    ),
+                    credit_card: self::cc_generator(),
+                    city: cities[rand::rng().random_range(0..cities.len())].to_string(),
+                    state: states[rand::rng().random_range(0..states.len())].to_string(),
+                    date_time: *acc,
+                    extra: self::string_generator(100, '_'),
+                })
             }),
         )
         .into()
@@ -189,7 +185,7 @@ pub fn cc_generator() -> String {
     let v: Vec<u32> = (0..4)
         .map(|_| rand::rng().random_range(1000..=9999))
         .collect();
-    format!("{}-{}-{}-{}", v[0], v[1], v[2], v[4])
+    format!("{}-{}-{}-{}", v[0], v[1], v[2], v[3])
 }
 
 pub fn url_generator() -> String {

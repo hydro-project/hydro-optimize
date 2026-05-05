@@ -4,7 +4,7 @@ use crate::flink_queries::{
 };
 use hydro_lang::{
     live_collections::stream::NoOrder,
-    location::MemberId,
+    location::{Location, MemberId},
     nondet::nondet,
     prelude::{Bounded, Cluster, KeyedStream, Process, Singleton, TCP, Unbounded},
 };
@@ -146,59 +146,59 @@ mod tests {
     #[cfg(stageleft_runtime)]
     use stageleft::q;
 
-    // #[tokio::test]
+    #[tokio::test]
     async fn query_1_throughput() {
         test_template::<Bid>(0, 100, 0, q1).await;
     }
 
-    // #[tokio::test]
+    #[tokio::test]
     async fn query_2_throughput() {
         test_template::<Option<(i64, i64)>>(0, 100, 0, q2).await;
     }
 
-    // #[tokio::test]
+    #[tokio::test]
     async fn query_3_throughput() {
         test_template::<Option<(String, String, String, Vec<i64>)>>(50, 0, 50, q3).await;
     }
 
-    // #[tokio::test]
+    #[tokio::test]
     async fn query_11_throughput() {
-        test_template::<(i64, i32, i64, i64)>(50, 0, 50, q11).await;
+        test_template::<(i64, i32, i64, i64)>(0, 100, 0, q11).await;
     }
 
-    // #[tokio::test]
+    #[tokio::test]
     async fn query_14_throughput() {
         test_template::<Option<(i64, i64, f64, String, i64, String, i64)>>(0, 100, 0, q14).await;
     }
 
-    // #[tokio::test]
+    #[tokio::test]
     async fn query_17_throughput() {
         test_template::<(i64, i64, i64, i64, i64, i32, i64, i64, i64, i64)>(0, 100, 0, q17).await;
     }
 
-    // #[tokio::test]
+    #[tokio::test]
     async fn query_18_throughput() {
         test_template::<(i64, i64, i64, i64)>(0, 100, 0, q18).await;
     }
 
-    // #[tokio::test]
+    #[tokio::test]
     async fn query_19_throughput() {
         test_template::<Vec<(usize, i64, i64)>>(0, 100, 0, q19).await;
     }
 
-    // #[tokio::test]
+    #[tokio::test]
     async fn query_20_throughput() {
         test_template::<Option<Vec<(i64, i64, String, i64, i64, i64)>>>(50, 50, 0, q20).await;
     }
 
-    // #[tokio::test]
+    #[tokio::test]
     async fn query_22_throughput() {
         test_template::<(i64, i64, i64, String, String, String, String)>(0, 100, 0, q22).await;
     }
 
     #[tokio::test]
     async fn query_23_throughput() {
-        test_template::<(Person, Vec<Bid>)>(10, 80, 10, q23).await;
+        test_template::<(Person, Vec<Bid>)>(33, 34, 33, q23).await;
     }
 
     async fn test_template<'a, Output>(
