@@ -198,7 +198,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_23_throughput() {
-        test_template::<(Person, Vec<Bid>)>(33, 34, 33, q23).await;
+        test_template::<(Bid, Person)>(33, 34, 33, q23).await;
     }
 
     async fn test_template<'a, Output>(

@@ -3,7 +3,7 @@ use hydro_lang::{
     prelude::*,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 
 pub struct Queries;
 
@@ -191,7 +191,10 @@ pub fn q11<'a, PerformanceKey: Ord + Clone + Eq + std::hash::Hash>(
     bid_stream
         .entries()
         // Aggregate by bidder
-        .map(q!(|(pk, bid)| (bid.bidder, (bid.bidder, bid.date_time, pk))))
+        .map(q!(|(pk, bid)| (
+            bid.bidder,
+            (bid.bidder, bid.date_time, pk)
+        )))
         .into_keyed()
         .batch(&tick, nondet!(/** Need to bound for sorting */))
         // Sort by date_time to ensure sessions are grouped correctly
@@ -466,22 +469,26 @@ pub fn q20<'a, PerformanceKey: Eq + std::hash::Hash + Clone>(
         .entries()
         .partition(q!(|(_, a)| a.category == 10));
 
-    let formatted_cat10s = cat10_auctions
-        .clone()
-        .map(q!(|(pk, a)| (a.id, (a, pk))));
+    let formatted_cat10s = cat10_auctions.clone().map(q!(|(pk, a)| (a.id, (a, pk))));
     let cat10_filtered_out = filtered_out.map(q!(|(pk, _)| (pk, None))).into_keyed();
 
     // Acks so inputs get a reply even when category != 10 or join doesn't match
     let cat10_input_acks = cat10_auctions
-        .map(q!(|(pk, _a)| (pk, Option::<Vec<(i64, i64, String, i64, i64, i64)>>::None)))
+        .map(q!(|(pk, _a)| (
+            pk,
+            Option::<Vec<(i64, i64, String, i64, i64, i64)>>::None
+        )))
         .into_keyed();
 
     let bid_entries = bid_stream.entries();
     let bid_input_acks = bid_entries
         .clone()
-        .map(q!(|(pk, _b)| (pk, Option::<Vec<(i64, i64, String, i64, i64, i64)>>::None)))
+        .map(q!(|(pk, _b)| (
+            pk,
+            Option::<Vec<(i64, i64, String, i64, i64, i64)>>::None
+        )))
         .into_keyed();
-    
+
     let formatted_bids = bid_entries.map(q!(|(pk, b)| (b.auction, (b, pk))));
     let join = formatted_cat10s.join(formatted_bids);
 
@@ -582,72 +589,33 @@ pub fn q23<'a, PerformanceKey: Eq + std::hash::Hash + Ord + Clone>(
     auction_stream: KeyedStream<PerformanceKey, Auction, Process<'a, Queries>, Unbounded, NoOrder>,
     bid_stream: KeyedStream<PerformanceKey, Bid, Process<'a, Queries>, Unbounded, NoOrder>,
     person_stream: KeyedStream<PerformanceKey, Person, Process<'a, Queries>, Unbounded, NoOrder>,
-) -> KeyedStream<PerformanceKey, (Person, Vec<Bid>), Process<'a, Queries>, Unbounded, NoOrder> {
+) -> KeyedStream<PerformanceKey, (Bid, Person), Process<'a, Queries>, Unbounded, NoOrder> {
     /*
         Find all bids made by a person who has also listed an item for auction
         Illustrates a multi-way join.
     */
 
     // Prepare for joins and track PKs to later send results to
-    let prepared_persons = person_stream.entries().map(q!(|(pk, p)| (
-        p.id,
-        (p, std::iter::once(pk).collect::<BTreeSet<_>>())
-    )));
-    let prepared_bidders = bid_stream.entries().map(q!(|(pk, b)| (
-        b.bidder,
-        (b, std::iter::once(pk).collect::<BTreeSet<_>>())
-    )));
-    let prepared_auctions = auction_stream.entries().map(q!(|(pk, a)| (
-        a.seller,
-        std::iter::once(pk).collect::<BTreeSet<_>>()
-    )));
+    let prepared_persons = person_stream.entries().map(q!(|(pk, p)| (p.id, (p, pk))));
+
+    let prepared_bidders = bid_stream.entries().map(q!(|(pk, b)| (b.bidder, (b, pk))));
+
+    let prepared_auctions = auction_stream.entries().map(q!(|(pk, a)| (a.seller, pk)));
 
     let persons_with_auctions =
         prepared_persons
             .join(prepared_auctions)
-            .map(q!(|(_, ((p, pk1), pk2))| {
-                let mut pk = pk1;
-                pk.extend(pk2);
-                (p.id, (p, pk))
-            }));
+            .map(q!(|(_, ((p, pk1), pk2))| { (p.id, (p, pk1, pk2)) }));
 
     let join = persons_with_auctions
         .join(prepared_bidders)
-        .map(q!(|(_, ((p, pk1), (b, pk2)))| {
-            let mut pk = pk1;
-            pk.extend(pk2);
-            (pk, (b, p))
-        }));
-
-    // Re-key by person to condense Person -> Vec[Bids]
-    let keyed = join
-        .map(q!(|(pk, (b, p))| { (p.id, (p, b, pk)) }))
-        .into_keyed();
-    let aggregated = keyed
-        .fold(
-            q!(|| (None, Vec::new(), BTreeSet::new())),
-            q!(
-                |acc, (p, b, pk)| {
-                    acc.0 = Some(p);
-                    acc.1.push(b);
-                    acc.2.extend(pk);
-                },
-                commutative = manual_proof!(/** Order doesn't matter */),
-            ),
-        )
-        // Remove Option formatting
-        .map(q!(|(p_opt, bids, pks)| { (pks, (p_opt.unwrap(), bids)) }));
-
-    let tick = aggregated.location().tick();
-    // Ensure each PK that contributed an input hears about its output
-    let select = aggregated
-        .snapshot(&tick, nondet!(/** Test */))
-        .entries()
-        .flat_map_unordered(q!(|(_, (pks, value))| {
-            pks.into_iter().map(move |pk| (pk, value.clone()))
+        // Ensure each PK that contributed an input hears about its output
+        .flat_map_unordered(q!(|(_, ((person, pk1, pk2), (bid, pk3)))| {
+            [pk1, pk2, pk3]
+                .into_iter()
+                .map(move |pk| (pk, (bid.clone(), person.clone())))
         }))
-        .into_keyed()
-        .all_ticks();
+        .into_keyed();
 
-    select
+    join
 }
