@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::parse_results::{NetworkCostTable, RunMetadata, SarStats};
+use crate::parse_results::{NetworkCostTable, SarStats};
 use crate::partition_ilp_analysis::{apply_budget_constraints, partition_ilp_analysis};
 use crate::partition_syn_analysis::StructOrTupleIndex;
 use crate::rewrites::{is_syntactic_sugar, op_id_to_parents};
@@ -13,6 +13,7 @@ use good_lp::{
     variable, variables,
 };
 use hydro_lang::compile::builder::ClockId;
+
 use hydro_lang::compile::ir::{
     HydroIrMetadata, HydroIrOpMetadata, HydroNode, HydroRoot, traverse_dfir,
 };
@@ -38,7 +39,8 @@ use super::rewrites::{NetworkType, get_network_type};
 pub(crate) struct DecoupleILPMetadata {
     // Const fields
     pub(crate) bottleneck: LocationId,
-    pub(crate) run_metadata: RunMetadata,
+    pub(crate) op_counts: HashMap<usize, usize>,
+    pub(crate) op_sizes: HashMap<usize, u64>,
     pub(crate) network_cost_table: NetworkCostTable,
     pub(crate) per_op_load: HashMap<usize, SarStats>,
     pub(crate) max_num_locations: usize,
@@ -50,6 +52,26 @@ pub(crate) struct DecoupleILPMetadata {
     prev_op_parent_with_tick: HashMap<ClockId, usize>, // tick_id: last op_id with that tick_id
     tee_inner_to_decoupled_vars: HashMap<usize, HashMap<usize, (Variable, Variable)>>, /* inner_id: (loc: (send var, recv var)) */
     pub(crate) network_ids: HashMap<usize, NetworkType>,
+}
+
+/// All inputs needed by the ILP decoupling/partitioning solver.
+/// Contains pre-computed averages rather than time series.
+#[derive(Clone, Debug)]
+pub struct ILPAnalysisInputs {
+    /// Per-op cardinality (messages/sec, averaged over measurement window)
+    pub op_counts: HashMap<usize, usize>,
+    /// Per-op serialized message size in bytes (median)
+    pub op_sizes: HashMap<usize, u64>,
+    /// Network cost lookup table from calibration
+    pub network_cost_table: NetworkCostTable,
+    /// Per-op resource load (CPU from perf, memory/IO from blow-up)
+    pub per_op_load: HashMap<usize, SarStats>,
+    /// Maximum number of machines to try
+    pub max_machines: usize,
+    /// Whether to consider partitioning in the ILP
+    pub consider_partitioning: bool,
+    /// Number of replicas in the bottleneck cluster
+    pub cluster_size: usize,
 }
 
 // Penalty for decoupling regardless of cardinality (to prevent decoupling low cardinality operators)
@@ -249,13 +271,13 @@ fn add_decouple_vars(
 /// cannot be decoupled on its own).
 fn network_cost_for_decoupling_op(
     op_id: usize,
-    run_metadata: &RunMetadata,
+    op_counts: &HashMap<usize, usize>,
+    op_sizes: &HashMap<usize, u64>,
     network_cost_table: &NetworkCostTable,
 ) -> f64 {
-    // TODO: Need logic to inject count when loading RunMetadata from counters so the unwrap succeeds
-    let cardinality = run_metadata.avg_counters().get(&op_id).copied().unwrap();
-    match run_metadata.median_byte_size(op_id) {
-        Some(bytes) => network_cost_table.network_cost(cardinality, bytes).cpu,
+    let cardinality = op_counts.get(&op_id).copied().unwrap_or(0);
+    match op_sizes.get(&op_id) {
+        Some(&bytes) => network_cost_table.network_cost(cardinality, bytes).cpu,
         None => 0.0,
     }
 }
@@ -266,7 +288,8 @@ fn add_decoupling_overhead(
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
     let DecoupleILPMetadata {
-        run_metadata,
+        op_counts,
+        op_sizes,
         network_cost_table,
         variables,
         constraints,
@@ -278,7 +301,8 @@ fn add_decoupling_overhead(
 
     let metadata = node.metadata();
     let op_id = metadata.op.id.unwrap();
-    let net_cost = network_cost_for_decoupling_op(op_id, run_metadata, network_cost_table);
+    let net_cost = network_cost_for_decoupling_op(op_id, op_counts,
+        op_sizes, network_cost_table);
 
     if let Some(parents) = op_id_to_parents.get(&op_id) {
         // All parents must be assigned the same var (by constraints above), so it suffices to check one
@@ -311,7 +335,8 @@ fn add_tee_decoupling_overhead(
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
     let DecoupleILPMetadata {
-        run_metadata,
+        op_counts,
+        op_sizes,
         network_cost_table,
         variables,
         constraints,
@@ -323,7 +348,8 @@ fn add_tee_decoupling_overhead(
     } = &mut *decoupling_metadata.borrow_mut();
 
     let op_id = metadata.op.id.unwrap();
-    let net_cost = network_cost_for_decoupling_op(op_id, run_metadata, network_cost_table);
+    let net_cost = network_cost_for_decoupling_op(op_id, op_counts,
+        op_sizes, network_cost_table);
 
     println!("Tee {} has inner {}", op_id, inner_id);
 
@@ -459,7 +485,7 @@ fn decouple_analysis_node(
     add_tick_constraint(node.metadata(), op_id_to_parents, decoupling_metadata);
 }
 
-fn solve(decoupling_metadata: &RefCell<DecoupleILPMetadata>) -> HighsSolution {
+fn solve(decoupling_metadata: &RefCell<DecoupleILPMetadata>) -> (HighsSolution, f64) {
     let DecoupleILPMetadata {
         variables,
         constraints,
@@ -481,15 +507,14 @@ fn solve(decoupling_metadata: &RefCell<DecoupleILPMetadata>) -> HighsSolution {
     let problem = vars.minimise(highest_cpu);
     let solution = highs(problem).with_all(constrs).solve().unwrap();
 
+    let mut max_cost = 0.0f64;
     for (loc, cpu_usage) in cpu_usages {
-        println!(
-            "Projected CPU usage at location {}: {}",
-            loc,
-            solution.eval(cpu_usage.clone())
-        );
+        let cost = solution.eval(cpu_usage.clone());
+        println!("Projected CPU usage at location {}: {}", loc, cost);
+        max_cost = max_cost.max(cost);
     }
 
-    solution
+    (solution, max_cost)
 }
 
 fn op_loc(op_vars: &HashMap<usize, Variable>, solution: &HighsSolution) -> usize {
@@ -526,10 +551,10 @@ pub struct Rewrite {
 }
 
 impl Rewrite {
-    pub fn new(original_location: LocationId) -> Self {
+    pub fn new(original_location: LocationId, cluster_size: usize) -> Self {
         Self {
             original_location,
-            cluster_size: 0,
+            cluster_size,
             num_partitions: HashMap::new(),
             op_to_loc: HashMap::new(),
             op_to_network: HashMap::new(),
@@ -558,21 +583,29 @@ impl Rewrite {
 pub(crate) fn decouple_analysis(
     ir: &mut [HydroRoot],
     bottleneck: &LocationId,
-    run_metadata: RunMetadata,
-    network_cost_table: NetworkCostTable,
-    per_op_load: HashMap<usize, SarStats>,
+    inputs: ILPAnalysisInputs,
     max_num_locations: usize,
-    consider_partitioning: bool,
     cycle_source_to_sink_parent: &HashMap<usize, usize>,
-) -> Rewrite {
+) -> (Rewrite, f64) {
     assert!(
         max_num_locations >= 2,
         "Must decouple to at least 2 locations (original location, decoupled location)"
     );
 
+    let ILPAnalysisInputs {
+        op_counts,
+        op_sizes,
+        network_cost_table,
+        per_op_load,
+        consider_partitioning,
+        cluster_size,
+        ..
+    } = inputs;
+
     let decoupling_metadata = RefCell::new(DecoupleILPMetadata {
         bottleneck: bottleneck.clone(),
-        run_metadata,
+        op_counts,
+        op_sizes,
         network_cost_table,
         per_op_load,
         max_num_locations,
@@ -632,7 +665,7 @@ pub(crate) fn decouple_analysis(
         &decoupling_metadata,
     );
 
-    let solution = solve(&decoupling_metadata);
+    let (solution, max_cost) = solve(&decoupling_metadata);
 
     // Build the DecoupleDecision by separating placement ops from network-insertion ops.
     let DecoupleILPMetadata {
@@ -641,7 +674,7 @@ pub(crate) fn decouple_analysis(
         ..
     } = &*decoupling_metadata.borrow();
 
-    let mut result = Rewrite::new(bottleneck.clone());
+    let mut result = Rewrite::new(bottleneck.clone(), cluster_size);
 
     for (&op_id, parents) in &op_id_to_parents {
         let Some(op_vars) = op_id_to_var.get(&op_id) else {
@@ -698,6 +731,10 @@ pub(crate) fn decouple_analysis(
                         .unwrap_or_default(),
                 )
                 .round() as i64;
+            println!(
+                "  Location {}: num_relevant={}, num_partitionable={}, num_persists={}",
+                loc, num_relevant, num_partitionable, num_persists
+            );
             if num_persists == 0 {
                 result.stateless_partitionable.insert(loc);
             } else if num_relevant == num_partitionable {
@@ -733,7 +770,44 @@ pub(crate) fn decouple_analysis(
         }
     }
 
-    result
+    // Print per-location resource breakdown
+    {
+        let metadata = decoupling_metadata.borrow();
+        let mut loc_costs: HashMap<usize, SarStats> = HashMap::new();
+
+        // Sum per_op_load for each op at its assigned location
+        for (&op_id, load) in &metadata.per_op_load {
+            if let Some(op_vars) = metadata.op_id_to_var.get(&op_id) {
+                let loc = op_loc(op_vars, &solution);
+                loc_costs.entry(loc).or_default().add(*load);
+            }
+        }
+
+        // Add network costs for each new network boundary (op_to_network in result)
+        for (&op_id, &(src_loc, dst_loc)) in &result.op_to_network {
+            let count = metadata.op_counts.get(&op_id).copied().unwrap_or(0);
+            let size = metadata.op_sizes.get(&op_id).copied().unwrap_or(0);
+            if count > 0 && size > 0 {
+                let cost = metadata.network_cost_table.network_cost(count, size);
+                loc_costs.entry(src_loc).or_default().add(cost);
+                loc_costs.entry(dst_loc).or_default().add(cost);
+            }
+        }
+
+        println!("Per-location resource breakdown:");
+        for loc in 0..max_num_locations {
+            let cost = loc_costs.get(&loc).copied().unwrap_or_default();
+            let partitions = result.num_partitions.get(&loc).copied().unwrap_or(1);
+            if cost.cpu > 0.0 || cost.network > 0.0 {
+                println!(
+                    "  Location {}: cpu={:.1}% net={:.0} B/s (partitions={}, effective_cpu={:.1}%)",
+                    loc, cost.cpu, cost.network, partitions, cost.cpu / partitions as f64
+                );
+            }
+        }
+    }
+
+    (result, max_cost)
 }
 
 // TODO: Review Kiro outputs starting here
@@ -767,29 +841,23 @@ fn evaluate_max_cost(
 pub fn find_optimal_budget(
     ir: &mut [HydroRoot],
     bottleneck: &LocationId,
-    run_metadata: &RunMetadata,
-    network_cost_table: &NetworkCostTable,
-    per_op_load: &HashMap<usize, SarStats>,
+    inputs: &ILPAnalysisInputs,
     cycle_source_to_sink_parent: &HashMap<usize, usize>,
-    max_machines: usize,
 ) -> Vec<ConfigResult> {
     let mut results = Vec::new();
 
-    for budget in 2..=max_machines {
-        let rewrite = decouple_analysis(
+    for budget in 2..=inputs.max_machines {
+        let (rewrite, max_cost) = decouple_analysis(
             ir,
             bottleneck,
-            run_metadata.clone(),
-            network_cost_table.clone(),
-            per_op_load.clone(),
+            inputs.clone(),
             budget,
-            true,
             cycle_source_to_sink_parent,
         );
         results.push(ConfigResult {
             budget,
             rewrite,
-            max_cost: 0.0, // placeholder
+            max_cost,
         });
     }
 

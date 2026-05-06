@@ -52,31 +52,28 @@ impl VisitMut for ClusterSelfIdReplace {
 }
 
 pub fn print_id(ir: &mut [HydroRoot]) {
-    let next_id = std::cell::Cell::new(0usize);
     transform_bottom_up(
         ir,
         &mut |root| {
-            let id = next_id.get();
             let input = root.input_metadata().op.id;
-            println!("{} Root {}, Inputs: {:?}", id, root.print_root(), input);
-            next_id.set(id + 1);
+            let id = root.op_metadata().id;
+            println!("{:?} Root {}, Inputs: {:?}", id, root.print_root(), input);
         },
         &mut |node| {
-            let id = next_id.get();
             let metadata = node.metadata();
+            let id = metadata.op.id;
             let inputs = node
                 .input_metadata()
                 .iter()
                 .map(|m| m.op.id)
                 .collect::<Vec<Option<usize>>>();
             println!(
-                "{} Node {}, {:?}, Inputs: {:?}",
+                "{:?} Node {}, {:?}, Inputs: {:?}",
                 id,
                 node.print_root(),
                 metadata,
                 inputs,
             );
-            next_id.set(id + 1);
         },
         false,
     );

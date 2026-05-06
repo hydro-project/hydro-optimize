@@ -193,6 +193,7 @@ fn reduce_pushdown_analysis_node(
         | HydroNode::CrossSingleton { .. }
         | HydroNode::CrossProduct { .. }
         | HydroNode::Join { .. }
+        | HydroNode::JoinHalf { .. }
         | HydroNode::Enumerate { .. }
         | HydroNode::ResolveFutures { .. }
         | HydroNode::ResolveFuturesOrdered { .. }

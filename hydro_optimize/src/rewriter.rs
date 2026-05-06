@@ -12,8 +12,6 @@ use syn::visit_mut::VisitMut;
 
 use crate::decouple_analysis::Rewrite;
 use crate::partition_syn_analysis::{StructOrTuple, StructOrTupleIndex};
-use crate::repair::{cycle_source_to_sink_parent, inject_id, inject_location};
-use crate::rewrites::print_id;
 use crate::rewrites::{
     ClusterSelfIdReplace, collection_kind_to_debug_type, deserialize_bincode_with_type,
     prepend_member_id_to_collection_kind, serialize_bincode_with_type, unbounded_optional,
@@ -203,6 +201,7 @@ fn add_new_network(node: &mut HydroNode, network_metadata: NetworkMetadata) {
             &output_debug_type,
         ))
         .map(|e| e.into()),
+        batch_limit: None,
         input: Box::new(node_content),
         metadata: network_metadata
             .receiver_location
@@ -482,6 +481,20 @@ fn repair_existing_network_for_partitioning(
     }
 }
 
+/// Returns the location index where the node actually executes.
+/// For nodes with a network (except Tees), that's the parent's location (src_loc).
+/// For nodes without a network, their location will be the same as their parent's.
+/// Tees are special: It will end up on the receiving end due to how decoupling works, so it should be at the destination.
+fn execution_loc_of_op(op_id: usize, node: &HydroNode, rewrite: &Rewrite) -> Option<usize> {
+    if let Some(&(parent_loc_idx, _)) = rewrite.op_to_network.get(&op_id)
+        && !matches!(node, HydroNode::Tee { .. })
+    {
+        Some(parent_loc_idx)
+    } else {
+        rewrite.op_to_loc.get(&op_id).copied()
+    }
+}
+
 /// 1. Inserts network between original/decoupled operators
 /// 2. Repairs network to/from partitioned operators
 /// 3. Places decoupled nodes on their new location
@@ -501,20 +514,7 @@ fn decouple_node(
 
     repair_existing_network_for_partitioning(node, op_id, rewrite, locations_map);
 
-    // Set the node's location before inserting networks.
-    // op_to_network is inserted when the parent of op_id has a different destination than op_id.
-    // A network will be inserted after op_id (so it can send to its destination).
-    // op_id however will first flow into a Map (before networking),
-    // so it must have the location that its parent assigned.
-    // Tees are special: It will end up on the receiving end, so it should be at the desetination.
-    let target_loc_idx = if let Some(&(parent_loc_idx, _)) = rewrite.op_to_network.get(&op_id)
-        && !matches!(node, HydroNode::Tee { .. })
-    {
-        Some(parent_loc_idx)
-    } else {
-        rewrite.op_to_loc.get(&op_id).copied()
-    };
-    if let Some(loc_idx) = target_loc_idx {
+    if let Some(loc_idx) = execution_loc_of_op(op_id, node, rewrite) {
         let new_location = locations_map.get(&loc_idx).unwrap();
         node.metadata_mut()
             .location_id
@@ -593,7 +593,7 @@ fn replace_cluster_self_id(
                 return;
             };
 
-            let target_loc_idx = rewrite.op_to_loc.get(&op_id).copied().unwrap_or(0);
+            let target_loc_idx = execution_loc_of_op(op_id, node, rewrite).unwrap_or(0);
             replace_cluster_self_id_node(
                 &mut |f| node.visit_debug_expr(f),
                 rewrite,
@@ -640,11 +640,10 @@ pub fn apply_rewrite(
                 rewrite,
                 locations_map,
                 &mut new_inners,
-                &tee_to_inner_id_before_rewrites,
+                tee_to_inner_id_before_rewrites,
             );
         },
     );
 
     // NOTE: We do not re-inject IDs, because we need to know each op's original ID to associate it with their stats
-    print_id(ir);
 }

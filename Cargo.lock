@@ -69,7 +69,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
 dependencies = [
  "cfg-if",
- "const-random",
  "getrandom 0.3.4",
  "once_cell",
  "version_check",
@@ -224,9 +223,9 @@ dependencies = [
 
 [[package]]
 name = "async-compression"
-version = "0.4.41"
+version = "0.4.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0f9ee0f6e02ffd7ad5816e9464499fba7b3effd01123b515c41d1697c43dad1"
+checksum = "e79b3f8a79cccc2898f31920fc69f304859b3bd567490f75ebf51ae1c792a9ac"
 dependencies = [
  "compression-codecs",
  "compression-core",
@@ -479,9 +478,9 @@ dependencies = [
 
 [[package]]
 name = "blake3"
-version = "1.8.4"
+version = "1.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d2d5991425dfd0785aed03aedcf0b321d61975c9b5b3689c774a2610ae0b51e"
+checksum = "0aa83c34e62843d924f905e0f5c866eb1dd6545fc4d719e803d9ba6030371fce"
 dependencies = [
  "arrayref",
  "arrayvec",
@@ -769,9 +768,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.60"
+version = "1.2.61"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43c5703da9466b66a946814e1adf53ea2c90f10063b86290cc9eb67ce3478a20"
+checksum = "d16d90359e986641506914ba71350897565610e87ce0ad9e6f28569db3dd5c6d"
 dependencies = [
  "find-msvc-tools",
  "shlex",
@@ -926,9 +925,9 @@ dependencies = [
 
 [[package]]
 name = "compression-codecs"
-version = "0.4.37"
+version = "0.4.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb7b51a7d9c967fc26773061ba86150f19c50c0d65c887cb1fbe295fd16619b7"
+checksum = "ce2548391e9c1929c21bf6aa2680af86fe4c1b33e6cea9ac1cfeec0bd11218cf"
 dependencies = [
  "brotli",
  "compression-core",
@@ -938,9 +937,9 @@ dependencies = [
 
 [[package]]
 name = "compression-core"
-version = "0.4.31"
+version = "0.4.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75984efb6ed102a0d42db99afb6c1948f0380d1d91808d5529916e6c08b49d8d"
+checksum = "cc14f565cf027a105f7a44ccf9e5b424348421a1d8952a8fc9d499d313107789"
 
 [[package]]
 name = "concurrent-queue"
@@ -982,26 +981,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
-name = "const-random"
-version = "0.1.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87e00182fe74b066627d63b85fd550ac2998d4b0bd86bfed477a0ae4c7c71359"
-dependencies = [
- "const-random-macro",
-]
-
-[[package]]
-name = "const-random-macro"
-version = "0.1.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9d839f2a20b0aee515dc581a6172f2321f96cab76c1a38a4c584a194955390e"
-dependencies = [
- "getrandom 0.2.17",
- "once_cell",
- "tiny-keccak",
-]
-
-[[package]]
 name = "constant_time_eq"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1018,8 +997,8 @@ dependencies = [
 
 [[package]]
 name = "copy_span"
-version = "0.1.0"
-source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
+version = "0.1.1"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#c3f8f49ea3448677eb4b5726512adcba71017707"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1080,9 +1059,9 @@ dependencies = [
 
 [[package]]
 name = "crc-catalog"
-version = "2.4.0"
+version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19d374276b40fb8bbdee95aef7c7fa6b5316ec764510eb64b8dd0e2ed0d7e7f5"
+checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
 name = "crc32fast"
@@ -1107,12 +1086,6 @@ name = "crossbeam-utils"
 version = "0.8.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
-
-[[package]]
-name = "crunchy"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "crypto-bigint"
@@ -1200,10 +1173,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "data-encoding"
-version = "2.10.0"
+name = "dashmap"
+version = "6.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
+checksum = "5041cc499144891f3790297212f32a74fb938e5136a14943f338ef9e0ae276cf"
+dependencies = [
+ "cfg-if",
+ "crossbeam-utils",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+]
+
+[[package]]
+name = "data-encoding"
+version = "2.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "debugid"
@@ -1247,8 +1234,8 @@ dependencies = [
 
 [[package]]
 name = "dfir_lang"
-version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
+version = "0.16.0"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#c3f8f49ea3448677eb4b5726512adcba71017707"
 dependencies = [
  "auto_impl",
  "documented",
@@ -1266,7 +1253,7 @@ dependencies = [
 [[package]]
 name = "dfir_pipes"
 version = "0.0.1"
-source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#c3f8f49ea3448677eb4b5726512adcba71017707"
 dependencies = [
  "futures-core",
  "futures-sink",
@@ -1281,8 +1268,8 @@ dependencies = [
 
 [[package]]
 name = "dfir_rs"
-version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
+version = "0.16.0"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#c3f8f49ea3448677eb4b5726512adcba71017707"
 dependencies = [
  "bincode",
  "bytes",
@@ -1589,18 +1576,6 @@ dependencies = [
  "crc32fast",
  "miniz_oxide",
  "zlib-rs",
-]
-
-[[package]]
-name = "flurry"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf5efcf77a4da27927d3ab0509dec5b0954bb3bc59da5a1de9e52642ebd4cdf9"
-dependencies = [
- "ahash",
- "num_cpus",
- "parking_lot",
- "seize",
 ]
 
 [[package]]
@@ -1911,9 +1886,9 @@ checksum = "6fe2267d4ed49bc07b63801559be28c718ea06c4738b7a03c94df7386d2cde46"
 
 [[package]]
 name = "highs"
-version = "2.0.0"
+version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9f739d4b9d063219b2dfa00705d8f2127fcead4d053867a5557c953dc3a4b99"
+checksum = "a5ef3d7c6bd21aaa82a1a3530a5529ba82c9a398b24d626c62de532afeb94ecd"
 dependencies = [
  "highs-sys",
  "log",
@@ -1997,8 +1972,8 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
 name = "hydro_build_utils"
-version = "0.0.1"
-source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
+version = "0.1.0"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#c3f8f49ea3448677eb4b5726512adcba71017707"
 dependencies = [
  "insta",
  "rustc_version",
@@ -2006,8 +1981,8 @@ dependencies = [
 
 [[package]]
 name = "hydro_deploy"
-version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
+version = "0.16.0"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#c3f8f49ea3448677eb4b5726512adcba71017707"
 dependencies = [
  "anyhow",
  "append-only-vec",
@@ -2042,8 +2017,8 @@ dependencies = [
 
 [[package]]
 name = "hydro_deploy_integration"
-version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
+version = "0.16.0"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#c3f8f49ea3448677eb4b5726512adcba71017707"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -2060,8 +2035,8 @@ dependencies = [
 
 [[package]]
 name = "hydro_lang"
-version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
+version = "0.16.0"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#c3f8f49ea3448677eb4b5726512adcba71017707"
 dependencies = [
  "auto_impl",
  "backtrace",
@@ -2162,8 +2137,8 @@ dependencies = [
 
 [[package]]
 name = "hydro_std"
-version = "0.15.0"
-source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
+version = "0.16.0"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#c3f8f49ea3448677eb4b5726512adcba71017707"
 dependencies = [
  "hdrhistogram",
  "hydro_lang",
@@ -2175,7 +2150,7 @@ dependencies = [
 [[package]]
 name = "hydro_test"
 version = "0.0.0"
-source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#c3f8f49ea3448677eb4b5726512adcba71017707"
 dependencies = [
  "bytes",
  "colored",
@@ -2378,9 +2353,9 @@ dependencies = [
 
 [[package]]
 name = "idna_adapter"
-version = "1.2.1"
+version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3acae9609540aa318d1bc588455225fb2085b9ed0c4f6bd0d9d5bcd86f1a0344"
+checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
@@ -2389,7 +2364,7 @@ dependencies = [
 [[package]]
 name = "include_mdtests"
 version = "0.0.0"
-source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#c3f8f49ea3448677eb4b5726512adcba71017707"
 dependencies = [
  "glob",
  "proc-macro2",
@@ -2563,9 +2538,9 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "js-sys"
-version = "0.3.95"
+version = "0.3.97"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2964e92d1d9dc3364cae4d718d93f227e3abb088e747d92e0395bfdedf1c12ca"
+checksum = "a1840c94c045fbcf8ba2812c95db44499f7c64910a912551aaaa541decebcacf"
 dependencies = [
  "cfg-if",
  "futures-util",
@@ -2575,8 +2550,8 @@ dependencies = [
 
 [[package]]
 name = "lattices"
-version = "0.6.2"
-source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
+version = "0.7.0"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#c3f8f49ea3448677eb4b5726512adcba71017707"
 dependencies = [
  "cc-traits",
  "fst",
@@ -2591,8 +2566,8 @@ dependencies = [
 
 [[package]]
 name = "lattices_macro"
-version = "0.5.11"
-source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
+version = "0.6.0"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#c3f8f49ea3448677eb4b5726512adcba71017707"
 dependencies = [
  "hydro_build_utils",
  "proc-macro-crate 3.5.0",
@@ -2936,16 +2911,6 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
  "libm",
-]
-
-[[package]]
-name = "num_cpus"
-version = "1.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
-dependencies = [
- "hermit-abi",
- "libc",
 ]
 
 [[package]]
@@ -3898,16 +3863,17 @@ dependencies = [
 
 [[package]]
 name = "russh-sftp"
-version = "2.1.1"
+version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bb94393cafad0530145b8f626d8687f1ee1dedb93d7ba7740d6ae81868b13b5"
+checksum = "09daa0ebcf53fb18d7b16167586a68b5bf2cfa3eaad49e661a19302552a2b879"
 dependencies = [
  "bitflags",
  "bytes",
  "chrono",
- "flurry",
+ "dashmap",
  "log",
  "serde",
+ "serde_bytes",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -3967,9 +3933,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.39"
+version = "0.23.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c2c118cb077cca2822033836dfb1b975355dfb784b5e8da48f7b6c5db74e60e"
+checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
  "once_cell",
  "ring",
@@ -3981,9 +3947,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-pki-types"
-version = "1.14.0"
+version = "1.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be040f8b0a225e40375822a563fa9524378b9d63112f53e19ffff34df5d33fdd"
+checksum = "30a7197ae7eb376e574fe940d068c30fe0462554a3ddbe4eca7838e049c937a9"
 dependencies = [
  "web-time",
  "zeroize",
@@ -4119,12 +4085,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "seize"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "689224d06523904ebcc9b482c6a3f4f7fb396096645c4cd10c0d2ff7371a34d3"
-
-[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4142,6 +4102,16 @@ checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
  "serde_derive",
+]
+
+[[package]]
+name = "serde_bytes"
+version = "0.11.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5d440709e79d88e51ac01c4b72fc6cb7314017bb7da9eeff678aa94c10e3ea8"
+dependencies = [
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -4275,8 +4245,8 @@ checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
 name = "sinktools"
-version = "0.0.1"
-source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
+version = "0.1.0"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#c3f8f49ea3448677eb4b5726512adcba71017707"
 dependencies = [
  "futures-util",
  "pin-project-lite",
@@ -4287,9 +4257,9 @@ dependencies = [
 
 [[package]]
 name = "siphasher"
-version = "1.0.2"
+version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
+checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "slab"
@@ -4386,11 +4356,12 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stageleft"
-version = "0.13.4"
+version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb893f5c6f2338e230c75c88d8ea4e13c659e88ef13e48a4063241b64afb2fbd"
+checksum = "e2c4e51b7913fbb07d1a575e23618fff6ac4cfd8705865e95e0984b884511ec9"
 dependencies = [
  "ctor 0.4.3",
+ "parking_lot",
  "proc-macro-crate 3.5.0",
  "proc-macro2",
  "quote",
@@ -4400,9 +4371,9 @@ dependencies = [
 
 [[package]]
 name = "stageleft_macro"
-version = "0.13.4"
+version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ddfbff9cf1258ec2ef523083ac502e65b77eb0fe41ffc4e465ca60e283957e8"
+checksum = "5f66d0c988d22a7cc51495e8d8a6f46ba5352d1424437b244716bb71c5160a07"
 dependencies = [
  "proc-macro-crate 3.5.0",
  "proc-macro2",
@@ -4413,9 +4384,9 @@ dependencies = [
 
 [[package]]
 name = "stageleft_tool"
-version = "0.13.4"
+version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab8487474c598c9fb663898ed0443205b2f9e576aa1d0bc9558ee4cb914885eb"
+checksum = "ba88edb18395d26627c6480435a08a30a84056b16ec5e920775716f5f4d92375"
 dependencies = [
  "prettyplease",
  "proc-macro-crate 3.5.0",
@@ -4548,6 +4519,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "591ef38edfb78ca4771ee32cf494cb8771944bee237a9b91fc9c1424ac4b777b"
 
 [[package]]
+name = "tcp_bench"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "futures",
+ "libc",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4638,15 +4621,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7694e1cfe791f8d31026952abf09c69ca6f6fa4e1a1229e18988f06a04a12dca"
 
 [[package]]
-name = "tiny-keccak"
-version = "2.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c9d3793400a45f954c52e73d068316d76b6f4e36977e3fcebb13a2721e80237"
-dependencies = [
- "crunchy",
-]
-
-[[package]]
 name = "tinystr"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4673,9 +4647,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.52.1"
+version = "1.52.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b67dee974fe86fd92cc45b7a95fdd2f99a36a6d7b0d431a231178d3d670bbcc6"
+checksum = "110a78583f19d5cdb2c5ccf321d1290344e71313c6c37d43520d386027d18386"
 dependencies = [
  "bytes",
  "libc",
@@ -5091,8 +5065,8 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "variadics"
-version = "0.0.10"
-source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
+version = "0.1.0"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#c3f8f49ea3448677eb4b5726512adcba71017707"
 dependencies = [
  "hashbrown 0.14.5",
  "hydro_build_utils",
@@ -5101,8 +5075,8 @@ dependencies = [
 
 [[package]]
 name = "variadics_macro"
-version = "0.6.2"
-source = "git+https://github.com/hydro-project/hydro.git?branch=mingwei%2Ffix-inline-tasks#d2e3e568df9e2d945229cdd0cb17e841893b24d7"
+version = "0.7.0"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#c3f8f49ea3448677eb4b5726512adcba71017707"
 dependencies = [
  "proc-macro-crate 3.5.0",
  "proc-macro2",
@@ -5152,9 +5126,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen"
-version = "0.2.118"
+version = "0.2.120"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bf938a0bacb0469e83c1e148908bd7d5a6010354cf4fb73279b7447422e3a89"
+checksum = "df52b6d9b87e0c74c9edfa1eb2d9bf85e5d63515474513aa50fa181b3c4f5db1"
 dependencies = [
  "cfg-if",
  "once_cell",
@@ -5165,9 +5139,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-futures"
-version = "0.4.68"
+version = "0.4.70"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f371d383f2fb139252e0bfac3b81b265689bf45b6874af544ffa4c975ac1ebf8"
+checksum = "af934872acec734c2d80e6617bbb5ff4f12b052dd8e6332b0817bce889516084"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
@@ -5175,9 +5149,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro"
-version = "0.2.118"
+version = "0.2.120"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eeff24f84126c0ec2db7a449f0c2ec963c6a49efe0698c4242929da037ca28ed"
+checksum = "78b1041f495fb322e64aca85f5756b2172e35cd459376e67f2a6c9dffcedb103"
 dependencies = [
  "quote",
  "wasm-bindgen-macro-support",
@@ -5185,9 +5159,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro-support"
-version = "0.2.118"
+version = "0.2.120"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d08065faf983b2b80a79fd87d8254c409281cf7de75fc4b773019824196c904"
+checksum = "9dcd0ff20416988a18ac686d4d4d0f6aae9ebf08a389ff5d29012b05af2a1b41"
 dependencies = [
  "bumpalo",
  "proc-macro2",
@@ -5198,9 +5172,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-shared"
-version = "0.2.118"
+version = "0.2.120"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fd04d9e306f1907bd13c6361b5c6bfc7b3b3c095ed3f8a9246390f8dbdee129"
+checksum = "49757b3c82ebf16c57d69365a142940b384176c24df52a087fb748e2085359ea"
 dependencies = [
  "unicode-ident",
 ]
@@ -5254,9 +5228,9 @@ dependencies = [
 
 [[package]]
 name = "web-sys"
-version = "0.3.95"
+version = "0.3.97"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f2dfbb17949fa2088e5d39408c48368947b86f7834484e87b73de55bc14d97d"
+checksum = "2eadbac71025cd7b0834f20d1fe8472e8495821b4e9801eb0a60bd1f19827602"
 dependencies = [
  "js-sys",
  "wasm-bindgen",

@@ -1,12 +1,14 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use chrono::Local;
 use hydro_deploy::Deployment;
 use hydro_lang::compile::built::BuiltFlow;
 use hydro_lang::compile::deploy::DeployResult;
-use hydro_lang::compile::ir::{HydroNode, HydroRoot, deep_clone, traverse_dfir};
+use hydro_lang::compile::ir::{
+    HydroNode, HydroRoot, deep_clone, transform_bottom_up, traverse_dfir,
+};
 use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::deploy::deploy_graph::DeployCrateWrapper;
 use hydro_lang::location::dynamic::LocationId;
@@ -15,10 +17,13 @@ use hydro_lang::prelude::{Cluster, FlowBuilder, Process};
 use hydro_lang::telemetry::Sidecar;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::decouple_analysis::Rewrite;
+use crate::decouple_analysis::{ILPAnalysisInputs, Rewrite, find_optimal_budget};
 use crate::deploy::{HostType, ReusableHosts};
 use crate::greedy_decouple_analysis::greedy_decouple_analysis;
-use crate::parse_results::{RunMetadata, analyze_cluster_results};
+use crate::parse_results::{
+    BlowUpLocationStats, IlpInputs, RunMetadata, SarStats, analyze_cluster_results,
+    load_ilp_inputs, per_op_load_from_perf,
+};
 use crate::reduce_pushdown::reduce_pushdown;
 use crate::reduce_pushdown_analysis::reduce_pushdown_decision;
 use crate::repair::{cycle_source_to_sink_parent, inject_id};
@@ -26,6 +31,8 @@ use crate::rewriter::apply_rewrite;
 use crate::rewrites::{collection_kind_to_debug_type, op_id_to_parents, tee_to_inner_id};
 
 const METRIC_INTERVAL_SECS: u64 = 1;
+const BATCH_PULL_LIMIT: usize = 32;
+const CALIBRATION_DIR: &str = "benchmark_results";
 const COUNTER_PREFIX: &str = "_optimize_counter";
 const BYTE_SIZE_PREFIX: &str = "_optimize_byte_size";
 const CPU_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_CPU:";
@@ -52,6 +59,7 @@ fn insert_counter_node(
         | HydroNode::CrossSingleton { metadata, .. }
         | HydroNode::CrossProduct { metadata, .. } // Can technically be derived by multiplying parent cardinalities
         | HydroNode::Join { metadata, .. }
+        | HydroNode::JoinHalf { metadata, .. }
         | HydroNode::Difference { metadata, .. }
         | HydroNode::AntiJoin { metadata, .. }
         | HydroNode::FlatMap { metadata, .. }
@@ -379,8 +387,33 @@ pub enum OptimizationKind {
     BlowUpAnalysis,
     /// Insert size measuring nodes wherever decoupling is possible.
     SizeAnalysis,
+    /// Deploy with `perf record` on non-excluded locations for flamegraph profiling.
+    PerfOnly,
+    /// Run ILP to find optimal decoupling, save Rewrite to file, then exit without deploying.
+    BottleneckElimination(BottleneckEliminationConfig),
     /// Apply `Rewrite`s loaded from files, in order.
     LoadedRewrites(Vec<Rewrite>),
+}
+
+/// Configuration for the ILP-based bottleneck elimination pass.
+#[derive(Clone)]
+pub struct BottleneckEliminationConfig {
+    /// Benchmark name (e.g. "Paxos") — used to find latest blow_up, size, and counters dirs.
+    pub name: String,
+}
+
+impl OptimizationKind {
+    fn label(&self) -> &'static str {
+        match self {
+            OptimizationKind::None => "none",
+            OptimizationKind::CountersOnly => "counters",
+            OptimizationKind::BlowUpAnalysis => "blow_up",
+            OptimizationKind::SizeAnalysis => "size",
+            OptimizationKind::PerfOnly => "perf",
+            OptimizationKind::BottleneckElimination(_) => "ilp",
+            OptimizationKind::LoadedRewrites(_) => "loaded",
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -420,13 +453,21 @@ impl Optimizations {
         self
     }
 
-    pub fn excluding(mut self, location: LocationId) -> Self {
-        self.exclude.insert(location);
+    /// Deploy with `perf record` on non-excluded locations for flamegraph profiling.
+    pub fn with_perf_only(mut self) -> Self {
+        self.set_kind(OptimizationKind::PerfOnly);
         self
     }
 
-    pub fn excludes(&self, location: &LocationId) -> bool {
-        self.exclude.contains(location)
+    /// Run ILP-based bottleneck elimination (offline, no deployment).
+    pub fn with_bottleneck_elimination(mut self, config: BottleneckEliminationConfig) -> Self {
+        self.set_kind(OptimizationKind::BottleneckElimination(config));
+        self
+    }
+
+    pub fn excluding(mut self, location: LocationId) -> Self {
+        self.exclude.insert(location);
+        self
     }
 
     /// Loads a `Rewrite` from `path` and queues it to be applied before deployment.
@@ -467,55 +508,39 @@ async fn deploy_and_analyze<'a>(
     clusters: &ReusableClusters,
     processes: &ReusableProcesses,
     optimizations: &Optimizations,
-    client_id: &LocationId,
-    num_clients_per_node: usize,
     num_seconds: Option<usize>,
 ) -> RunMetadata {
-    assert!(
-        num_clients_per_node > 0,
-        "Must have at least 1 client per node"
-    );
-
     // Measure network (-n DEV) and CPU (-u) usage. -P ALL measures all CPUs on the machine
     let sar_sidecar = ScriptSidecar {
         script: "sar -n DEV -u -P ALL -r -b 1".to_string(),
         prefix: SAR_USAGE_PREFIX.to_string(),
     };
 
+    let use_perf = matches!(optimizations.kind, OptimizationKind::PerfOnly);
+
     // Insert all clusters & processes
     let mut deployable = builder.into_deploy();
     for (cluster_id, name, num_hosts) in clusters.named_clusters.iter() {
         let excluded = optimizations.exclude.contains(cluster_id);
-        if cluster_id.key() == client_id.key() {
-            let mut client_hosts = vec![];
-            for i in 0..num_clients_per_node {
-                let pin_to_core = i % reusable_hosts.num_cores();
-                client_hosts.push(reusable_hosts.get_cluster_hosts(
-                    deployment,
-                    name.clone(),
-                    *num_hosts,
-                    pin_to_core,
-                ));
-            }
-            deployable = deployable.with_cluster_erased(cluster_id.key(), client_hosts.concat());
+        let batch_limit = if excluded {
+            None
         } else {
-            deployable = deployable.with_cluster_erased(
-                cluster_id.key(),
-                reusable_hosts.get_cluster_hosts(deployment, name.clone(), *num_hosts, 0),
-            );
-        }
-        if !excluded {
-            deployable = deployable.with_sidecar_internal(cluster_id.key(), &sar_sidecar);
-        }
+            Some(BATCH_PULL_LIMIT)
+        };
+        let hosts = reusable_hosts.get_cluster_hosts(deployment, name.clone(), *num_hosts, 0, use_perf && !excluded);
+        deployable = deployable.with_cluster_erased(cluster_id.key(), hosts, batch_limit);
     }
     for (process_id, name) in processes.named_processes.iter() {
         let excluded = optimizations.exclude.contains(process_id);
-        let host = reusable_hosts.get_process_host(deployment, name.clone(), 0);
-        deployable = deployable.with_process_erased(process_id.key(), host);
-        if !excluded {
-            deployable = deployable.with_sidecar_internal(process_id.key(), &sar_sidecar);
-        }
+        let batch_limit = if excluded {
+            None
+        } else {
+            Some(BATCH_PULL_LIMIT)
+        };
+        let host = reusable_hosts.get_process_host(deployment, name.clone(), 0, use_perf && !excluded);
+        deployable = deployable.with_process_erased(process_id.key(), host, batch_limit);
     }
+    deployable = deployable.with_sidecar_all(&sar_sidecar);
 
     let nodes = deployable.deploy(deployment);
     deployment.deploy().await.unwrap();
@@ -542,7 +567,7 @@ async fn deploy_and_analyze<'a>(
         .unwrap();
 
     // Parse results to get metrics
-    analyze_cluster_results(&nodes, metrics, optimizations).await
+    analyze_cluster_results(&nodes, metrics).await
 }
 
 pub struct BenchmarkArgs {
@@ -555,7 +580,6 @@ pub struct BenchmarkConfig<'a> {
     pub builder: FlowBuilder<'a>,
     pub clusters: ReusableClusters,
     pub processes: ReusableProcesses,
-    pub client_id: LocationId,
     pub optimizations: Optimizations,
     pub location_id_to_cluster: HashMap<LocationId, String>,
     pub start_virtual_clients: usize,
@@ -570,6 +594,7 @@ pub const RUN_SECONDS: usize = 90;
 pub const PHYSICAL_CLIENTS: usize = 10;
 pub const VIRTUAL_CLIENTS_MAX: usize = 50 * PHYSICAL_CLIENTS; // Based on manual testing, an 8-core m5.2xlarge's CPU saturates around 50 clients.
 pub const VIRTUAL_CLIENTS_STEP: usize = 50; // Can tweak to get finer-grained numbers
+pub const NUM_VIRTUAL_CLIENTS_ENV: &str = "NUM_VIRTUAL_CLIENTS";
 pub const NUM_RUNS_NO_THROUGHPUT: usize = 3;
 pub const NO_IMPROVEMENT_LIMIT: usize = 3;
 
@@ -580,8 +605,8 @@ fn apply_single_rewrite<'a>(
     builder: &mut FlowBuilder<'a>,
     clusters: &mut ReusableClusters,
     location_to_original_ops: &mut HashMap<LocationId, Vec<usize>>,
+    location_id_to_cluster: &mut HashMap<LocationId, String>,
     rewrite: Rewrite,
-    new_cluster_name: impl Fn(usize) -> String,
     tee_to_inner: &HashMap<usize, usize>,
 ) {
     // Build locations_map: index 0 = original, index > 0 = new clusters.
@@ -593,13 +618,11 @@ fn apply_single_rewrite<'a>(
         }
         let cluster = builder.cluster::<()>();
         let new_loc = cluster.id().clone();
+        let name = format!("{:?}", new_loc);
         locations_map.insert(loc_idx, new_loc.clone());
+        location_id_to_cluster.insert(new_loc.clone(), name.clone());
         // TODO: cluster_size should take into consideration number of partitions
-        *clusters = std::mem::take(clusters).with_named(
-            new_loc,
-            new_cluster_name(loc_idx),
-            rewrite.cluster_size,
-        );
+        *clusters = std::mem::take(clusters).with_named(new_loc, name, rewrite.cluster_size);
     }
 
     for (&op_id, &loc_idx) in &rewrite.op_to_loc {
@@ -614,41 +637,38 @@ fn apply_single_rewrite<'a>(
 }
 
 /// Applies every loaded rewrite (reduce pushdown + inject_id + apply_rewrite) in sequence.
-/// Returns the new `ReusableClusters` (containing any clusters created by the rewrites) and
-/// a map from each deployed `LocationId` back to the original op_ids that ended up there.
+/// Returns the built flow and a map from each deployed `LocationId` back to the original op_ids.
 fn apply_loaded_rewrites<'a>(
     built: BuiltFlow<'a>,
-    mut clusters: ReusableClusters,
+    clusters: &mut ReusableClusters,
     loaded_rewrites: &[Rewrite],
-) -> (
-    BuiltFlow<'a>,
-    ReusableClusters,
-    HashMap<LocationId, Vec<usize>>,
-) {
+) -> (BuiltFlow<'a>, HashMap<LocationId, Vec<usize>>) {
     let mut location_to_original_ops: HashMap<LocationId, Vec<usize>> = HashMap::new();
 
     if loaded_rewrites.is_empty() {
-        return (built, clusters, location_to_original_ops);
+        return (built, location_to_original_ops);
     }
 
     let mut builder = FlowBuilder::from_built(&built);
     let mut ir = deep_clone(built.ir());
     let tee_to_inner = tee_to_inner_id(&mut ir);
 
-    for (iter, rewrite) in loaded_rewrites.iter().cloned().enumerate() {
+    let mut dummy_loc_map = HashMap::new();
+
+    for rewrite in loaded_rewrites.iter().cloned() {
         apply_single_rewrite(
             &mut ir,
             &mut builder,
-            &mut clusters,
+            clusters,
             &mut location_to_original_ops,
+            &mut dummy_loc_map,
             rewrite,
-            |loc_idx| format!("loaded_rewrite_{}_{}", iter, loc_idx),
             &tee_to_inner,
         );
     }
 
     builder.replace_ir(ir);
-    (builder.finalize(), clusters, location_to_original_ops)
+    (builder.finalize(), location_to_original_ops)
 }
 
 /// Applies the greedy-decoupled rewrite (blow-up analysis). Returns the new IR, updated
@@ -656,11 +676,11 @@ fn apply_loaded_rewrites<'a>(
 /// and the pre-rewrite parent map (for inferring counters after deployment).
 fn apply_blow_up_analysis<'a>(
     built: BuiltFlow<'a>,
-    mut clusters: ReusableClusters,
+    clusters: &mut ReusableClusters,
     exclude: &HashSet<LocationId>,
+    location_id_to_cluster: &mut HashMap<LocationId, String>,
 ) -> (
     BuiltFlow<'a>,
-    ReusableClusters,
     HashMap<LocationId, Vec<usize>>,
     HashMap<usize, Vec<usize>>,
 ) {
@@ -668,7 +688,7 @@ fn apply_blow_up_analysis<'a>(
 
     let mut greedy_results = None;
     let built = built.optimize_with(|leaf| {
-        greedy_results = Some(greedy_decouple_analysis(leaf, exclude));
+        greedy_results = Some(greedy_decouple_analysis(leaf, exclude, clusters));
     });
     let mut builder = FlowBuilder::from_built(&built);
     let mut ir = deep_clone(built.ir());
@@ -678,14 +698,14 @@ fn apply_blow_up_analysis<'a>(
     let pre_rewrite_parents = op_id_to_parents(&mut ir, None, &cycles);
     let tee_to_inner = tee_to_inner_id(&mut ir);
 
-    for (iter, rewrite) in greedy_results.unwrap().into_iter().enumerate() {
+    for rewrite in greedy_results.unwrap() {
         apply_single_rewrite(
             &mut ir,
             &mut builder,
-            &mut clusters,
+            clusters,
             &mut location_to_original_ops,
+            location_id_to_cluster,
             rewrite,
-            |loc_idx| format!("decouple_{}_{}", iter, loc_idx),
             &tee_to_inner,
         );
     }
@@ -695,12 +715,139 @@ fn apply_blow_up_analysis<'a>(
     // Insert counters after rewrites, otherwise rewrites won't work on an outdated graph
     // Note that counters still reference each nodes' original op_id
     let built = insert_counters(builder.finalize(), exclude);
-    (
-        built,
-        clusters,
-        location_to_original_ops,
-        pre_rewrite_parents,
-    )
+    (built, location_to_original_ops, pre_rewrite_parents)
+}
+
+/// Runs the ILP-based bottleneck elimination offline (no deployment).
+/// Loads blow-up stats, size analysis, and calibration data, then solves for optimal decoupling.
+fn run_bottleneck_elimination<'a>(
+    built: BuiltFlow<'a>,
+    clusters: &ReusableClusters,
+    exclude: &HashSet<LocationId>,
+    config: &BottleneckEliminationConfig,
+) -> Vec<crate::decouple_analysis::ConfigResult> {
+    let IlpInputs { blow_up_stats: blow_up_raw, op_output_sizes, op_counts, perf: perf_raw, network_cost_table } =
+        load_ilp_inputs(Path::new(CALIBRATION_DIR), &config.name);
+
+    // Find the bottleneck: the blow-up location with highest CPU
+    // TODO: Account for all resources, not just CPU
+    let (bottleneck_key, bottleneck_stats) = blow_up_raw
+        .iter()
+        .max_by(|(_, a), (_, b)| a.sar_stats.cpu.partial_cmp(&b.sar_stats.cpu).unwrap())
+        .expect("Empty blow-up stats");
+    println!(
+        "Bottleneck: {} (cpu={:.1}%)",
+        bottleneck_key, bottleneck_stats.sar_stats.cpu
+    );
+
+    // Find the bottleneck's original LocationId by looking up one of its operators in the IR
+    // TODO: Clean up after here
+    let bottleneck_op = *bottleneck_stats.operators.first().unwrap();
+    let mut bottleneck: Option<LocationId> = None;
+    let built = built.optimize_with(|leaf| {
+        traverse_dfir(leaf, |_, _| {}, |node, id| {
+            if node.metadata().op.id == Some(bottleneck_op) {
+                bottleneck = Some(node.metadata().location_id.root().clone());
+            }
+        });
+    });
+    let bottleneck = bottleneck.expect("Bottleneck op not found in IR");
+    println!("Bottleneck LocationId: {:?}", bottleneck);
+
+    // Identify network ops: any op that appears with is_recv=true in perf is a Network recv.
+    // Also find Network send ops by scanning the IR for HydroNode::Network at the bottleneck.
+    let perf_key = format!("{:?}", bottleneck);
+    let bottleneck_perf = perf_raw
+        .get(&perf_key)
+        .unwrap_or_else(|| panic!("No perf data for bottleneck (key: {})", perf_key));
+
+    let mut network_op_ids: HashSet<usize> = bottleneck_perf
+        .iter()
+        .filter(|((_, is_recv), _)| *is_recv)
+        .map(|((op_id, _), _)| *op_id)
+        .collect();
+    // Also add send-side Network ops (perf records them without is_recv)
+    traverse_dfir(
+        &mut deep_clone(built.ir()),
+        |_, _| {},
+        |node, _| {
+            if matches!(node, HydroNode::Network { .. }) {
+                if let Some(op_id) = node.metadata().op.id {
+                    network_op_ids.insert(op_id);
+                }
+            }
+        },
+    );
+
+    let mut per_op_load = per_op_load_from_perf(
+        bottleneck_perf,
+        &op_counts,
+        &op_output_sizes,
+        &network_op_ids,
+        &network_cost_table,
+    );
+    // TODO: Clean up up to here
+
+    // Add memory and IO costs from blow-up stats (assign to first op of each blown-up location)
+    for stats in blow_up_raw.values() {
+        if let Some(&first_op) = stats.operators.first() {
+            let entry = per_op_load.entry(first_op).or_default();
+            entry.memory += stats.sar_stats.memory;
+            entry.io += stats.sar_stats.io;
+        }
+    }
+
+    // 9. Get cluster size for the bottleneck
+    let cluster_size = clusters
+        .location_name_and_num(&bottleneck)
+        .map(|(_, n)| n)
+        .unwrap_or(1);
+
+    // 10. Prepare IR and run ILP
+    let mut ir = deep_clone(built.ir());
+    let cycles = cycle_source_to_sink_parent(&mut ir);
+    let op_parents = op_id_to_parents(&mut ir, Some(&bottleneck), &cycles);
+
+    // Infer counters for ops that inherit parent cardinality (Map, Tee, Cast, etc.)
+    let mut full_counters = op_counts.clone();
+    inject_inferred_counters(&mut ir, &op_parents, &mut full_counters);
+
+    println!(
+        "per_op_load: {} ops, total cpu: {:.1}%",
+        per_op_load.len(),
+        per_op_load.values().map(|s| s.cpu).sum::<f64>()
+    );
+
+    let ilp_inputs = ILPAnalysisInputs {
+        op_counts: full_counters,
+        op_sizes: op_output_sizes,
+        network_cost_table,
+        per_op_load,
+        max_machines: 5, // TODO: Iteratively increase
+        consider_partitioning: true,
+        cluster_size,
+    };
+
+    let ilp_start = Instant::now();
+    let results = find_optimal_budget(
+        &mut ir,
+        &bottleneck,
+        &ilp_inputs,
+        &cycles,
+    );
+    println!("ILP solved in {:.2?}", ilp_start.elapsed());
+
+    println!("ILP found {} configurations", results.len());
+    for r in &results {
+        println!(
+            "  budget={}: {} locations, max_cost={:.4}",
+            r.budget,
+            r.rewrite.num_locations(),
+            r.max_cost
+        );
+    }
+
+    results
 }
 
 pub async fn benchmark_protocol<'a>(
@@ -727,13 +874,12 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
     run_benchmark: impl Fn(usize) -> BenchmarkConfig<'a>,
 ) -> (Vec<HydroRoot>, RunMetadata) {
     let BenchmarkConfig {
-        name: config_name,
+        name,
         builder,
-        clusters: config_clusters,
-        processes: config_processes,
-        optimizations: config_optimizations,
-        client_id: config_client_id,
-        location_id_to_cluster: config_location_id_to_cluster,
+        mut clusters,
+        processes,
+        optimizations,
+        mut location_id_to_cluster,
         start_virtual_clients,
         virtual_clients_step,
         num_runs,
@@ -747,33 +893,35 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
     let built = builder.finalize().optimize_with(|leaf| {
         // Baseline: reduce_pushdown + inject_id so downstream passes have stable op ids.
         inject_id(leaf);
-        let decision = reduce_pushdown_decision(leaf, &config_optimizations.exclude);
-        println!("CHECKPOINT: before reduce_pushdown");
+        let decision = reduce_pushdown_decision(leaf, &optimizations.exclude);
         reduce_pushdown(leaf, decision);
-        println!("CHECKPOINT: after reduce_pushdown");
     });
     let mut size_analysis_ops: HashSet<usize> = HashSet::new();
     let mut pre_rewrite_parents: Option<HashMap<usize, Vec<usize>>> = None;
-    let (built, clusters, location_to_original_ops) = match &config_optimizations.kind {
-        OptimizationKind::None => (built, config_clusters, HashMap::new()),
+    let (built, location_to_original_ops) = match &optimizations.kind {
+        OptimizationKind::None | OptimizationKind::PerfOnly => (built, HashMap::new()),
         OptimizationKind::CountersOnly => {
-            let built = insert_counters(built, &config_optimizations.exclude);
-            (built, config_clusters, HashMap::new())
+            let built = insert_counters(built, &optimizations.exclude);
+            (built, HashMap::new())
         }
         OptimizationKind::LoadedRewrites(rewrites) => {
-            apply_loaded_rewrites(built, config_clusters, rewrites)
+            apply_loaded_rewrites(built, &mut clusters, rewrites)
         }
         OptimizationKind::BlowUpAnalysis => {
-            let (built, clusters, loc_ops, parents) =
-                apply_blow_up_analysis(built, config_clusters, &config_optimizations.exclude);
+            let (built, loc_ops, parents) = apply_blow_up_analysis(
+                built,
+                &mut clusters,
+                &optimizations.exclude,
+                &mut location_id_to_cluster,
+            );
             pre_rewrite_parents = Some(parents);
-            (built, clusters, loc_ops)
+            (built, loc_ops)
         }
         OptimizationKind::SizeAnalysis => {
             let mut captured_ops = HashSet::new();
             let built = built.optimize_with(|leaf| {
                 let per_loc_rewrites =
-                    greedy_decouple_analysis(leaf, &config_optimizations.exclude);
+                    greedy_decouple_analysis(leaf, &optimizations.exclude, &clusters);
                 let network_ops: HashSet<usize> = per_loc_rewrites
                     .iter()
                     .flat_map(|r| r.op_to_network.keys().copied())
@@ -784,14 +932,36 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
                 captured_ops = network_ops;
             });
             size_analysis_ops = captured_ops;
-            (built, config_clusters, HashMap::new())
+            (built, HashMap::new())
+        }
+        OptimizationKind::BottleneckElimination(config) => {
+            let results =
+                run_bottleneck_elimination(built, &clusters, &optimizations.exclude, config);
+            // Save rewrites and early exit
+            let output_dir = Path::new("benchmark_results").join(format!(
+                "{}_{}_{}",
+                name,
+                optimizations.kind.label(),
+                Local::now().format("%Y-%m-%d_%H-%M-%S")
+            ));
+            std::fs::create_dir_all(&output_dir).ok();
+            for result in &results {
+                let filename = format!("rewrite_{}machines.json", result.budget);
+                let json = serde_json::to_string_pretty(&result.rewrite).unwrap();
+                let path = output_dir.join(&filename);
+                std::fs::write(&path, json).unwrap();
+                println!("Saved rewrite: {}", path.display());
+            }
+            return (vec![], RunMetadata::default());
         }
     };
 
     let ir = built.ir();
+
     let output_dir = Path::new("benchmark_results").join(format!(
-        "{}_{}",
-        config_name,
+        "{}_{}_{}",
+        name,
+        optimizations.kind.label(),
         Local::now().format("%Y-%m-%d_%H-%M-%S")
     ));
 
@@ -806,9 +976,11 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
         let mut run = 0;
         while successful_runs < num_runs {
             println!(
-                "Running {} with {} clients (run {})",
-                config_name, num_virtual, run
+                "Running {} with {} virtual clients (run {})",
+                name, num_virtual, run
             );
+
+            reusable_hosts.insert_env(NUM_VIRTUAL_CLIENTS_ENV.to_string(), num_virtual.to_string());
 
             let mut builder = FlowBuilder::from_built(&built);
             builder.replace_ir(deep_clone(ir));
@@ -818,36 +990,51 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
                 deployment,
                 finalized,
                 &clusters,
-                &config_processes,
-                &config_optimizations,
-                &config_client_id,
-                std::cmp::max(1, num_virtual / PHYSICAL_CLIENTS), // clients per node
+                &processes,
+                &optimizations,
                 Some(RUN_SECONDS),
             )
             .await;
             run_metadata.location_to_original_ops = location_to_original_ops.clone();
 
             let run_throughput = run_metadata.avg_throughput();
-            run_metadata.print_run_summary(&config_location_id_to_cluster, MEASUREMENT_SECOND);
+            println!(
+                "Run throughput: {}, num_clients: {}",
+                run_throughput, num_virtual
+            );
+            run_metadata.print_run_summary(&location_id_to_cluster, MEASUREMENT_SECOND);
+            println!("Saving run metadata...");
             run_metadata.save_run_metadata(
-                &config_location_id_to_cluster,
+                &location_id_to_cluster,
                 &output_dir,
                 PHYSICAL_CLIENTS,
                 num_virtual,
                 run,
             );
+            println!("Run metadata saved.");
 
-            if matches!(config_optimizations.kind, OptimizationKind::BlowUpAnalysis) {
+            if matches!(optimizations.kind, OptimizationKind::BlowUpAnalysis) {
+                println!("Saving blow up stats...");
                 run_metadata.save_blow_up_stats(
                     &output_dir,
                     &mut deep_clone(ir),
                     pre_rewrite_parents.as_ref().unwrap(),
+                    PHYSICAL_CLIENTS,
+                    num_virtual,
+                    run,
                 );
+                println!("Blow up stats saved.");
             }
 
             if !size_analysis_ops.is_empty() {
                 run_metadata.save_size_analysis(&output_dir, &size_analysis_ops);
             }
+
+            if matches!(optimizations.kind, OptimizationKind::CountersOnly) {
+                run_metadata.save_counters(&output_dir);
+            }
+
+            run_metadata.save_perf(&output_dir, PHYSICAL_CLIENTS, num_virtual, run);
 
             if run_throughput == 0 {
                 zero_throughput_count += 1;
@@ -895,7 +1082,7 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
             }
         }
 
-        if matches!(config_optimizations.kind, OptimizationKind::SizeAnalysis) {
+        if matches!(optimizations.kind, OptimizationKind::SizeAnalysis) {
             break;
         }
     }

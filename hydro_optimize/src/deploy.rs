@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use hydro_deploy::gcp::GcpNetwork;
+use hydro_deploy::rust_crate::tracing_options::{
+    AL2_PERF_SETUP_COMMAND, DEBIAN_PERF_SETUP_COMMAND, TracingOptions,
+};
 use hydro_deploy::{AwsNetwork, Deployment, Host, HostTargetType, LinuxCompileType};
 use hydro_lang::deploy::TrybuildHost;
 
@@ -132,10 +135,26 @@ impl ReusableHosts {
         deployment: &mut Deployment,
         display_name: String,
         pin_to_core: usize,
+        perf: bool,
     ) -> TrybuildHost {
-        let host = TrybuildHost::new(self.lazy_create_host(deployment, display_name.clone()))
+        let mut host = TrybuildHost::new(self.lazy_create_host(deployment, display_name.clone()))
             .pin_to_core(pin_to_core)
             .rustflags(self.get_rust_flags());
+        if perf {
+            let setup_command = match &self.host_type {
+                InitializedHostType::Gcp { .. } => DEBIAN_PERF_SETUP_COMMAND.to_string(),
+                InitializedHostType::Aws { .. } => AL2_PERF_SETUP_COMMAND.to_string(),
+                InitializedHostType::Localhost => String::new(),
+            };
+            host = host.tracing(
+                TracingOptions::builder()
+                    .perf_raw_outfile(format!("{}.perf.data", display_name))
+                    .fold_outfile(format!("{}.data.folded", display_name))
+                    .frequency(128)
+                    .setup_command(setup_command)
+                    .build(),
+            );
+        }
         self.host_with_env(host)
     }
 
@@ -145,6 +164,7 @@ impl ReusableHosts {
         cluster_name: String,
         num_hosts: usize,
         pin_to_core: usize,
+        perf: bool,
     ) -> Vec<TrybuildHost> {
         (0..num_hosts)
             .map(|i| {
@@ -152,6 +172,7 @@ impl ReusableHosts {
                     deployment,
                     format!("{}{}", cluster_name, i),
                     pin_to_core,
+                    perf,
                 )
             })
             .collect()

@@ -10,6 +10,7 @@ use hydro_lang::{
     location::dynamic::LocationId,
 };
 
+use crate::deploy_and_analyze::ReusableClusters;
 use crate::rewrites::{can_decouple, is_syntactic_sugar, op_id_to_parents};
 use crate::{decouple_analysis::Rewrite, repair::cycle_source_to_sink_parent};
 
@@ -116,6 +117,7 @@ impl GreedyDecoupleState {
 pub fn greedy_decouple_analysis(
     ir: &mut [HydroRoot],
     excluded_locations: &HashSet<LocationId>,
+    clusters: &ReusableClusters,
 ) -> Vec<Rewrite> {
     let mut state = GreedyDecoupleState::new(excluded_locations.clone());
 
@@ -211,7 +213,13 @@ pub fn greedy_decouple_analysis(
         let remapped = *remap.entry(loc_idx).or_insert(next);
         results
             .entry(orig_loc.clone())
-            .or_insert_with(|| Rewrite::new(orig_loc.clone()))
+            .or_insert_with(|| {
+                let cluster_size = clusters
+                    .location_name_and_num(orig_loc)
+                    .map(|(_, n)| n)
+                    .unwrap_or(1); // If we don't find it, it must be a process (size 1)
+                Rewrite::new(orig_loc.clone(), cluster_size)
+            })
             .op_to_loc
             .insert(op_id, remapped);
     }

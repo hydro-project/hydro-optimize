@@ -1,15 +1,12 @@
 use std::collections::HashMap;
 
 use clap::{ArgAction, Parser};
-use hydro_deploy::Deployment;
 use hydro_lang::location::Location;
-use hydro_optimize::deploy::{HostType, ReusableHosts};
 use hydro_optimize::deploy_and_analyze::{
-    BenchmarkConfig, Optimizations, ReusableClusters, ReusableProcesses,
-    benchmark_protocol_with_reusable_machines,
+    BenchmarkArgs, BenchmarkConfig, Optimizations, ReusableClusters, ReusableProcesses,
+    benchmark_protocol,
 };
 use hydro_optimize_examples::network_calibrator::network_calibrator;
-
 use stageleft::q;
 
 const CALIBRATION_SIZES: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
@@ -34,22 +31,14 @@ struct Args {
 async fn main() {
     let args = Args::parse();
 
-    let mut deployment = Deployment::new();
-    let host_type = if let Some(project) = args.gcp.clone() {
-        HostType::Gcp { project }
-    } else if args.aws {
-        HostType::Aws
-    } else {
-        HostType::Localhost
-    };
-    let mut reusable_hosts = ReusableHosts::new(&host_type);
-
     for &size in CALIBRATION_SIZES {
         println!("=== Calibrating message_size={} ===", size);
 
-        benchmark_protocol_with_reusable_machines(
-            &mut reusable_hosts,
-            &mut deployment,
+        benchmark_protocol(
+            BenchmarkArgs {
+                gcp: args.gcp.clone(),
+                aws: args.aws,
+            },
             move |num_clients| {
                 let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
                 let server = builder.cluster();
@@ -69,7 +58,12 @@ async fn main() {
                     size,
                     &server,
                     &clients,
-                    clients.singleton(q!(1usize)),
+                    clients.singleton(q!({
+                        std::env::var("NUM_VIRTUAL_CLIENTS")
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap()
+                    })),
                     &client_aggregator,
                     1000,
                 );
@@ -87,7 +81,6 @@ async fn main() {
                     builder,
                     clusters,
                     processes,
-                    client_id,
                     optimizations,
                     location_id_to_cluster,
                     start_virtual_clients: 1,

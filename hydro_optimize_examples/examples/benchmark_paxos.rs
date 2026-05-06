@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use clap::{ArgAction, Parser};
 use hydro_lang::location::Location;
 use hydro_optimize::deploy_and_analyze::{
-    BenchmarkArgs, BenchmarkConfig, Optimizations, ReusableClusters, ReusableProcesses,
-    VIRTUAL_CLIENTS_STEP, benchmark_protocol,
+    BenchmarkArgs, BenchmarkConfig, BottleneckEliminationConfig, Optimizations, ReusableClusters,
+    ReusableProcesses, VIRTUAL_CLIENTS_STEP, benchmark_protocol,
 };
 use hydro_optimize_examples::print_parseable_bench_results;
 use hydro_test::cluster::paxos::{CorePaxos, PaxosConfig};
@@ -38,6 +38,14 @@ struct Args {
     #[arg(long, action = ArgAction::SetTrue)]
     blow_up_analysis: bool,
 
+    /// Deploy with perf record for flamegraph profiling on non-excluded locations
+    #[arg(long, action = ArgAction::SetTrue)]
+    perf_only: bool,
+
+    /// Run ILP bottleneck elimination (offline, no deployment).
+    #[arg(long, action = ArgAction::SetTrue)]
+    ilp: bool,
+
     /// Path(s) to JSON file(s) containing `PossibleRewrite`s to apply before deploying.
     /// Rewrites are applied in the order given.
     #[arg(long = "rewrite")]
@@ -50,6 +58,14 @@ async fn main() {
     let counters_only = args.counters_only;
     let size_analysis = args.size_analysis;
     let blow_up_analysis = args.blow_up_analysis;
+    let perf_only = args.perf_only;
+    let ilp_config = if args.ilp {
+        Some(BottleneckEliminationConfig {
+            name: "Paxos".to_string(),
+        })
+    } else {
+        None
+    };
     let rewrite_paths = args.rewrite.clone();
 
     let (_ir, _final_run_metadata) = benchmark_protocol(
@@ -96,7 +112,12 @@ async fn main() {
                     },
                 },
                 &clients,
-                clients.singleton(q!(1usize)),
+                clients.singleton(q!({
+                    std::env::var("NUM_VIRTUAL_CLIENTS")
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap()
+                })),
                 &client_aggregator,
                 &replicas,
                 print_result_frequency / 10,
@@ -123,6 +144,12 @@ async fn main() {
             if blow_up_analysis {
                 optimizations = optimizations.with_blow_up_analysis();
             }
+            if perf_only {
+                optimizations = optimizations.with_perf_only();
+            }
+            if let Some(ref config) = ilp_config {
+                optimizations = optimizations.with_bottleneck_elimination(config.clone());
+            }
             for p in &rewrite_paths {
                 optimizations = optimizations.load_rewrite(Path::new(p));
             }
@@ -132,11 +159,10 @@ async fn main() {
                 builder,
                 clusters,
                 processes,
-                client_id,
                 optimizations,
                 location_id_to_cluster,
                 start_virtual_clients: 1,
-                virtual_clients_step: VIRTUAL_CLIENTS_STEP,
+                virtual_clients_step: 10,
                 num_runs: 1,
             }
         },

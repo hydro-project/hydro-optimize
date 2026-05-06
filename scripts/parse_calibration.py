@@ -2,7 +2,8 @@
 """Parses network calibration results from benchmark CSVs and outputs a JSON cost-per-byte table.
 
 For each message size, reads the server CSV with the highest virtual client count
-at MEASUREMENT_SECOND and computes cost-per-byte for CPU, memory, and I/O.
+and averages metrics over [START_MEASUREMENT_SECOND, MEASUREMENT_SECOND] to compute
+cost-per-byte for CPU, memory, and I/O.
 
 Usage: python3 parse_calibration.py <benchmark_results_dir> <output_file>
 
@@ -24,7 +25,8 @@ import os
 import re
 import sys
 
-# Must match MEASUREMENT_SECOND in deploy_and_analyze.rs
+# Must match START_MEASUREMENT_SECOND and MEASUREMENT_SECOND in deploy_and_analyze.rs
+START_MEASUREMENT_SECOND = 30
 MEASUREMENT_SECOND = 59
 
 
@@ -67,16 +69,17 @@ def main():
             print(f"  WARNING: not enough rows in CSV for size={size} (got {len(rows)})", file=sys.stderr)
             continue
 
-        row = rows[MEASUREMENT_SECOND]
-        throughput = float(row["throughput_rps"])
-        network_bytes = float(row["network"])
+        window = rows[START_MEASUREMENT_SECOND:MEASUREMENT_SECOND + 1]
+        n = len(window)
+        throughput = sum(float(r["throughput_rps"]) for r in window) / n
+        network_bytes = sum(float(r["network"]) for r in window) / n
         if throughput <= 0 or network_bytes <= 0:
             print(f"  WARNING: zero throughput/network for size={size}", file=sys.stderr)
             continue
 
-        cpu_pct = float(row["cpu"])
-        memory_pct = float(row["memory"])
-        io_tps = float(row["io"])
+        cpu_pct = sum(float(r["cpu"]) for r in window) / n
+        memory_pct = sum(float(r["memory"]) for r in window) / n
+        io_tps = sum(float(r["io"]) for r in window) / n
 
         entry = {
             "message_size": size,

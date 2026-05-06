@@ -137,6 +137,7 @@ fn output_to_parent_fields(node: &HydroNode) -> Vec<StructOrTuple> {
         },
         // (k, (v1, v2))
         HydroNode::Join { .. }
+        | HydroNode::JoinHalf { .. }
         => {
             let mut left = StructOrTuple::default();
             left.add_dependency(&vec!["0".to_string()], vec!["0".to_string()]);
@@ -350,6 +351,7 @@ fn node_partitionability(node: &HydroNode) -> Partitionability {
         | HydroNode::Chain { .. }
         | HydroNode::ChainFirst { .. } => Partitionability::NoEffect,
         HydroNode::Join { .. }
+        | HydroNode::JoinHalf { .. }
         | HydroNode::Difference { .. }
         | HydroNode::AntiJoin { .. }
         | HydroNode::Unique { .. }
@@ -402,7 +404,7 @@ fn node_persists(node: &HydroNode) -> bool {
         | HydroNode::CrossSingleton { .. }
         | HydroNode::Sort { .. } => false,
         // Maybe, depending on if it's 'static (either hidden parent is top_level)
-        HydroNode::Join { left, right, .. } | HydroNode::CrossProduct { left, right, .. } => {
+        HydroNode::Join { left, right, .. } | HydroNode::JoinHalf { left, right, .. } | HydroNode::CrossProduct { left, right, .. } => {
             left.metadata().location_id.is_top_level()
                 || right.metadata().location_id.is_top_level()
         }
@@ -425,15 +427,12 @@ fn node_persists(node: &HydroNode) -> bool {
 }
 
 /// Whether a node's collection_kind requires TotalOrder.
+/// NOTE: Should really restrict partitioning to the key only for KeyedStream if value order is TotalOrder
 fn node_has_total_order(node: &HydroNode) -> bool {
     matches!(
         node.metadata().collection_kind,
         CollectionKind::Stream {
             order: StreamOrder::TotalOrder,
-            ..
-        } | CollectionKind::KeyedStream {
-            value_order: StreamOrder::TotalOrder,
-            // NOTE: This is unnecessarily conservative; we really just need to restrict partitioning to the key fields. Unfortunately that's somewhat hard to express, since this operator is not part of the set of operators considered during partitioning
             ..
         }
     )
@@ -615,13 +614,12 @@ fn constrain_field_vars_to_parents(
     // Create field vars for parents
     let parents = op_id_to_parents.get(&op_id).unwrap();
     if parents.is_empty() {
-        // Must be a Source, no constraints
+        // Source/Network nodes with no parents: field vars are unconstrained (free to be 0 or 1).
+        // The solver will set them to 1 if doing so helps enable partitioning downstream.
         return;
     }
-    // println!("Node id {}, parents {:?}", op_id, parents);
 
     let dependencies_on_parents = canonical_fields.get(&op_id).unwrap();
-    // println!("Canonical fields: {:?}", dependencies_on_parents);
     let parent_field_vars = parents
         .iter()
         .map(|parent_id| {
@@ -634,7 +632,7 @@ fn constrain_field_vars_to_parents(
             )
         })
         .collect::<Vec<_>>();
-    // println!("Parent fields: {:?}", parent_field_vars);
+
 
     // Get expr that is 1 if this node is an input, 0 otherwise
     let is_input_expr = add_is_input_expr(op_id, parents, decoupling_metadata);
@@ -648,7 +646,6 @@ fn constrain_field_vars_to_parents(
 
     let mut is_partitionable = Expression::default();
     for (field_name, field_var) in field_vars {
-        // println!("Op field name: {:?}", field_name.join("."));
         // If there's a link from this field to all parents, constrain it to the corresponding field in all parents
         // Otherwise, only allow using this field for partitioning if this is an input node
         let mut corresponding_parent_field_vars = vec![vec![]; parents.len()];
@@ -662,7 +659,6 @@ fn constrain_field_vars_to_parents(
             {
                 // For this field and NOT its children, what fields in the parent does it depend on?
                 let dependencies_in_field = nested_dependencies_in_field.get_dependency();
-                // println!("Corresponding parent fields: {:?}", dependencies_in_field);
                 for parent_field_name in &dependencies_in_field {
                     // Add the corresponding parent field var
                     corresponding_parent_field_vars[left_or_right].push(
@@ -679,6 +675,7 @@ fn constrain_field_vars_to_parents(
         let all_parents_have_corresponding_fields = corresponding_parent_field_vars
             .iter()
             .all(|vars| !vars.is_empty());
+
         if all_parents_have_corresponding_fields {
             // For each field:
             // 1. Both parents must partition on some corresponding field
@@ -732,6 +729,15 @@ fn partition_ilp_node_analysis(
         return;
     }
 
+    let affect_partitionability = match node_partitionability(node) {
+        Partitionability::NoEffect => false,
+        Partitionability::Conditional | Partitionability::Unpartitionable => true,
+    };
+    // TODO: Known inaccuracy: if a node is not an IDB but flows into the positive edge of a
+    // negation (e.g. an anti-join), then it should also be relevant (and partitioned) to avoid
+    // producing too many outputs
+    let is_relevant = idbs.contains(&op_id) && affect_partitionability;
+
     let PartitionILPMetadata {
         num_relevant_operators,
         num_persist_operators,
@@ -739,22 +745,16 @@ fn partition_ilp_node_analysis(
     } = metadata;
 
     // A node is relevant if it is an IDB and affects partitionability
-    let affect_partitionability = match node_partitionability(node) {
-        Partitionability::NoEffect => false,
-        Partitionability::Conditional | Partitionability::Unpartitionable => true,
-    };
-    // TODO: Known inaccuracy: if a node is not an IDB but flows into the positive edge of a negation (for example an anti-join), then it should also be relevant (and partitioned) to avoid producing too many outputs
-    let is_relevant = idbs.contains(&op_id) && affect_partitionability;
     if is_relevant {
         add_op_to_location_sum(op_id, decoupling_metadata, num_relevant_operators);
     }
 
-    // Partitioning is possible if no node in the location persists
+    // Partitioning is possible if no node in the location persists state
     if node_persists(node) {
         add_op_to_location_sum(op_id, decoupling_metadata, num_persist_operators);
     }
 
-    // Partitioning is impossible if a TotalOrder child is at a different location
+    // Partitioning is impossible if a TotalOrder stream crosses a location boundary
     if !matches!(node, HydroNode::Network { .. }) && node_has_total_order(node) {
         add_total_order_edge_constraints(
             op_id,
@@ -807,9 +807,10 @@ fn calculate_partitionable(
         ));
         constraints.push(constraint!(diff >= num_partitionable - num_relevant));
 
+        // all_partitionable: 1 iff diff == 0 (i.e., num_relevant == num_partitionable)
         let all_partitionable = variables.add(variable().binary());
-        constraints.push(constraint!(diff <= big_m * (1 - all_partitionable)));
-        constraints.push(constraint!(diff >= all_partitionable));
+        constraints.push(constraint!(diff <= big_m * (1 - all_partitionable))); // if all_partitionable=1, diff must be 0
+        constraints.push(constraint!(1 - all_partitionable <= big_m * diff)); // if diff=0, all_partitionable must be 1
 
         // no_persist: 1 iff num_persist == 0
         let num_persist = metadata
@@ -879,6 +880,7 @@ pub(crate) fn partition_ilp_analysis(
         &inputs,
         op_id_to_parents,
     );
+    println!("Partition analysis: {} inputs, {} IDBs", inputs.len(), idbs.len());
     let canonical_fields = create_canonical_fields(
         ir,
         &decoupling_metadata.borrow().bottleneck,

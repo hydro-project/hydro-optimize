@@ -238,7 +238,7 @@ fn input_dependency_analysis_node(
                 input_dependencies_entry.remove(input_id);
             }
         }
-        HydroNode::Join { .. } => {
+        HydroNode::Join { .. } | HydroNode::JoinHalf { .. } => {
             assert_eq!(parent_ids.len(), 2, "Node {:?} has the wrong number of parents.", node);
             // [(a,b)] join [(a,c)] = [(a,(b,c))]
             for input_id in input_taint_entry.iter() {
@@ -509,7 +509,7 @@ fn partitioning_constraint_analysis_node(
                     ordered_dependencies.extend(parent1_dependencies);
                 }
             }
-            HydroNode::Join { .. } => {
+            HydroNode::Join { .. } | HydroNode::JoinHalf { .. } => {
                 // Get the dependencies from field 0 of parent 0 and parent 1
                 // Only allow partitioning if both have dependencies (the earlier if statement already checks that that both are tainted)
                 if let Some((parent0_inputs, parent0_dependencies)) = get_inputs_and_dependencies(
