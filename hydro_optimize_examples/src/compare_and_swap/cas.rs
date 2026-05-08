@@ -16,7 +16,7 @@ pub struct CAS<'a, 'b> {
 
 impl<'a, 'b, State, Sender> CASLike<'a, State, Sender> for CAS<'a, 'b>
 where
-    State: Clone + Serialize + for<'de> Deserialize<'de> + Ord + 'a,
+    State: Clone + Serialize + for<'de> Deserialize<'de> + Eq + 'a,
     Sender: Clone + Serialize + for<'de> Deserialize<'de> + Eq + Hash + 'a,
 {
     fn build(

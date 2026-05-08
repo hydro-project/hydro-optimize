@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use clap::{ArgAction, Parser};
-use hydro_lang::location::Location;
+use hydro_lang::{location::Location, prelude::FlowBuilder};
 use hydro_optimize::deploy_and_analyze::{
     BenchmarkArgs, BenchmarkConfig, Optimizations, ReusableClusters, ReusableProcesses,
     benchmark_protocol,
@@ -40,7 +40,7 @@ async fn main() {
                 aws: args.aws,
             },
             move |num_clients| {
-                let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
+                let mut builder = FlowBuilder::new();
                 let server = builder.cluster();
                 let clients = builder.cluster();
                 let client_aggregator = builder.process();

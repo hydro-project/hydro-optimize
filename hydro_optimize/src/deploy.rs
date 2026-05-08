@@ -39,6 +39,10 @@ const AWS_REGION: &str = "us-west-2";
 const AWS_INSTANCE_AMI: &str = "ami-055a9df0c8c9f681c"; // Amazon Linux 2
 const AWS_INSTANCE_TYPE: &str = "m5.2xlarge"; // 8 vCPU, 32 GB RAM
 const AWS_NUM_CORES: usize = 8; // Used for pinning
+/// m5.2xlarge: up to 10 Gbps network bandwidth
+pub const AWS_NETWORK_BYTES_PER_SEC: f64 = 1_250_000_000.0;
+/// m5.2xlarge: 12,000 baseline IOPS (EBS)
+pub const AWS_IO_TPS: f64 = 12_000.0;
 const GCP_REGION: &str = "us-central1-c";
 const GCP_IMAGE: &str = "debian-cloud/debian-12";
 const GCP_MACHINE_TYPE: &str = "n2-standard-4"; // 4 vCPU, 16 GB RAM

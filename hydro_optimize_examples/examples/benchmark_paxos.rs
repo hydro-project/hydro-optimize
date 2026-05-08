@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use clap::{ArgAction, Parser};
 use hydro_lang::location::Location;
 use hydro_optimize::deploy_and_analyze::{
-    BenchmarkArgs, BenchmarkConfig, BottleneckEliminationConfig, Optimizations, ReusableClusters,
+    BenchmarkArgs, BenchmarkConfig, Optimizations, ReusableClusters,
     ReusableProcesses, VIRTUAL_CLIENTS_STEP, benchmark_protocol,
 };
 use hydro_optimize_examples::print_parseable_bench_results;
@@ -60,9 +60,7 @@ async fn main() {
     let blow_up_analysis = args.blow_up_analysis;
     let perf_only = args.perf_only;
     let ilp_config = if args.ilp {
-        Some(BottleneckEliminationConfig {
-            name: "Paxos".to_string(),
-        })
+        Some("Paxos".to_string())
     } else {
         None
     };

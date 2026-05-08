@@ -31,79 +31,7 @@ pub struct RunMetadata {
     pub perf: HashMap<LocationId, HashMap<(usize, bool), f64>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum BottleneckMetric {
-    Cpu,
-    Network,
-    Memory,
-    IO,
-}
-
-pub struct ResourceLimits {
-    pub network_bytes_per_sec: f64,
-    pub io_tps: f64,
-    /// Resources that exceed this percentage will be considered bottlenecked
-    pub bottleneck_threshold: f64,
-}
-
 impl RunMetadata {
-    /// Returns all locations that are bottlenecked at the given measurement second,
-    /// along with which metric(s) each is bottlenecked on.
-    pub fn find_bottlenecks(
-        &self,
-        measurement_second: usize,
-        limits: &ResourceLimits,
-    ) -> Vec<(LocationId, HashSet<BottleneckMetric>)> {
-        let mut result = Vec::new();
-        for (location, stats) in &self.sar_stats {
-            let Some(sar) = stats.get(measurement_second) else {
-                continue;
-            };
-            let mut metrics = HashSet::new();
-
-            let cpu_threshold = 100.0 * limits.bottleneck_threshold;
-            println!(
-                "  {:?} CPU: {:.1}% threshold={:.1}%",
-                location, sar.cpu, cpu_threshold
-            );
-            if sar.cpu >= cpu_threshold {
-                metrics.insert(BottleneckMetric::Cpu);
-            }
-
-            let net_threshold = limits.network_bytes_per_sec * limits.bottleneck_threshold;
-            println!(
-                "  {:?} Network: {:.0} B/s threshold={:.0} B/s",
-                location, sar.network, net_threshold
-            );
-            if sar.network >= net_threshold {
-                metrics.insert(BottleneckMetric::Network);
-            }
-
-            let mem_threshold = 100.0 * limits.bottleneck_threshold;
-            println!(
-                "  {:?} Memory: {:.1}% threshold={:.1}%",
-                location, sar.memory, mem_threshold
-            );
-            if sar.memory >= mem_threshold {
-                metrics.insert(BottleneckMetric::Memory);
-            }
-
-            let io_threshold = limits.io_tps * limits.bottleneck_threshold;
-            println!(
-                "  {:?} IO: {:.1} tps threshold={:.1} tps",
-                location, sar.io, io_threshold
-            );
-            if sar.io >= io_threshold {
-                metrics.insert(BottleneckMetric::IO);
-            }
-
-            if !metrics.is_empty() {
-                result.push((location.clone(), metrics));
-            }
-        }
-        result
-    }
-
     /// Average throughput over the measurement window.
     pub fn avg_throughput(&self) -> usize {
         avg_over(&self.throughputs, |&v| v as f64) as usize
@@ -412,6 +340,41 @@ pub struct BlowUpLocationStats {
     pub sar_stats: SarStats,
     pub operators: Vec<usize>,
     pub counts: HashMap<usize, usize>,
+}
+
+/// Finds the bottleneck location: the one closest to saturating any resource.
+/// CPU and memory are normalized to 100%, network to `network_bytes_per_sec`, IO to `io_tps`.
+pub fn find_bottleneck(
+    blow_up_stats: &HashMap<String, BlowUpLocationStats>,
+    network_bytes_per_sec: f64,
+    io_tps: f64,
+) -> (&String, &BlowUpLocationStats) {
+    let score = |s: &SarStats| -> f64 {
+        [
+            s.cpu / 100.0,
+            s.memory / 100.0,
+            if network_bytes_per_sec > 0.0 { s.network / network_bytes_per_sec } else { 0.0 },
+            if io_tps > 0.0 { s.io / io_tps } else { 0.0 },
+        ]
+        .into_iter()
+        .fold(0.0_f64, f64::max)
+    };
+
+    let (bottleneck_key, bottleneck_stats) = blow_up_stats
+        .iter()
+        .max_by(|(_, a), (_, b)| score(&a.sar_stats).partial_cmp(&score(&b.sar_stats)).unwrap())
+        .expect("Empty blow-up stats");
+
+    println!(
+        "Bottleneck: {} (cpu={:.1}%, net={:.0} B/s, mem={:.1}%, io={:.1} tps)",
+        bottleneck_key,
+        bottleneck_stats.sar_stats.cpu,
+        bottleneck_stats.sar_stats.network,
+        bottleneck_stats.sar_stats.memory,
+        bottleneck_stats.sar_stats.io,
+    );
+
+    (bottleneck_key, bottleneck_stats)
 }
 
 /// Builds per-operator CPU load from perf data and network calibration.

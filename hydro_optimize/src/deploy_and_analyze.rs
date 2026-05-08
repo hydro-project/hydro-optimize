@@ -18,11 +18,11 @@ use hydro_lang::telemetry::Sidecar;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::decouple_analysis::{ILPAnalysisInputs, Rewrite, find_optimal_budget};
-use crate::deploy::{HostType, ReusableHosts};
+use crate::deploy::{AWS_IO_TPS, AWS_NETWORK_BYTES_PER_SEC, HostType, ReusableHosts};
 use crate::greedy_decouple_analysis::greedy_decouple_analysis;
 use crate::parse_results::{
-    BlowUpLocationStats, IlpInputs, RunMetadata, SarStats, analyze_cluster_results,
-    load_ilp_inputs, per_op_load_from_perf,
+    IlpInputs, RunMetadata, SarStats, analyze_cluster_results, find_bottleneck, load_ilp_inputs,
+    per_op_load_from_perf,
 };
 use crate::reduce_pushdown::reduce_pushdown;
 use crate::reduce_pushdown_analysis::reduce_pushdown_decision;
@@ -390,16 +390,10 @@ pub enum OptimizationKind {
     /// Deploy with `perf record` on non-excluded locations for flamegraph profiling.
     PerfOnly,
     /// Run ILP to find optimal decoupling, save Rewrite to file, then exit without deploying.
-    BottleneckElimination(BottleneckEliminationConfig),
+    /// The string is the benchmark name (e.g. "Paxos") used to find calibration data.
+    BottleneckElimination(String),
     /// Apply `Rewrite`s loaded from files, in order.
     LoadedRewrites(Vec<Rewrite>),
-}
-
-/// Configuration for the ILP-based bottleneck elimination pass.
-#[derive(Clone)]
-pub struct BottleneckEliminationConfig {
-    /// Benchmark name (e.g. "Paxos") — used to find latest blow_up, size, and counters dirs.
-    pub name: String,
 }
 
 impl OptimizationKind {
@@ -460,8 +454,8 @@ impl Optimizations {
     }
 
     /// Run ILP-based bottleneck elimination (offline, no deployment).
-    pub fn with_bottleneck_elimination(mut self, config: BottleneckEliminationConfig) -> Self {
-        self.set_kind(OptimizationKind::BottleneckElimination(config));
+    pub fn with_bottleneck_elimination(mut self, name: String) -> Self {
+        self.set_kind(OptimizationKind::BottleneckElimination(name));
         self
     }
 
@@ -522,22 +516,21 @@ async fn deploy_and_analyze<'a>(
     let mut deployable = builder.into_deploy();
     for (cluster_id, name, num_hosts) in clusters.named_clusters.iter() {
         let excluded = optimizations.exclude.contains(cluster_id);
-        let batch_limit = if excluded {
-            None
-        } else {
-            Some(BATCH_PULL_LIMIT)
-        };
-        let hosts = reusable_hosts.get_cluster_hosts(deployment, name.clone(), *num_hosts, 0, use_perf && !excluded);
+        let batch_limit = (!excluded).then_some(BATCH_PULL_LIMIT);
+        let hosts = reusable_hosts.get_cluster_hosts(
+            deployment,
+            name.clone(),
+            *num_hosts,
+            0,
+            use_perf && !excluded,
+        );
         deployable = deployable.with_cluster_erased(cluster_id.key(), hosts, batch_limit);
     }
     for (process_id, name) in processes.named_processes.iter() {
         let excluded = optimizations.exclude.contains(process_id);
-        let batch_limit = if excluded {
-            None
-        } else {
-            Some(BATCH_PULL_LIMIT)
-        };
-        let host = reusable_hosts.get_process_host(deployment, name.clone(), 0, use_perf && !excluded);
+        let batch_limit = (!excluded).then_some(BATCH_PULL_LIMIT);
+        let host =
+            reusable_hosts.get_process_host(deployment, name.clone(), 0, use_perf && !excluded);
         deployable = deployable.with_process_erased(process_id.key(), host, batch_limit);
     }
     deployable = deployable.with_sidecar_all(&sar_sidecar);
@@ -610,8 +603,7 @@ fn apply_single_rewrite<'a>(
     tee_to_inner: &HashMap<usize, usize>,
 ) {
     // Build locations_map: index 0 = original, index > 0 = new clusters.
-    let mut locations_map = HashMap::new();
-    locations_map.insert(0, rewrite.original_location.clone());
+    let mut locations_map = HashMap::from([(0, rewrite.original_location.clone())]);
     for loc_idx in rewrite.locations() {
         if loc_idx == 0 {
             continue;
@@ -621,8 +613,17 @@ fn apply_single_rewrite<'a>(
         let name = format!("{:?}", new_loc);
         locations_map.insert(loc_idx, new_loc.clone());
         location_id_to_cluster.insert(new_loc.clone(), name.clone());
-        // TODO: cluster_size should take into consideration number of partitions
-        *clusters = std::mem::take(clusters).with_named(new_loc, name, rewrite.cluster_size);
+        let num_partitions = rewrite
+            .num_partitions
+            .get(&loc_idx)
+            .copied()
+            .unwrap_or(1)
+            .max(1);
+        *clusters = std::mem::take(clusters).with_named(
+            new_loc,
+            name,
+            rewrite.cluster_size * num_partitions,
+        );
     }
 
     for (&op_id, &loc_idx) in &rewrite.op_to_loc {
@@ -724,32 +725,36 @@ fn run_bottleneck_elimination<'a>(
     built: BuiltFlow<'a>,
     clusters: &ReusableClusters,
     exclude: &HashSet<LocationId>,
-    config: &BottleneckEliminationConfig,
+    name: &str,
+    args: &BenchmarkArgs,
 ) -> Vec<crate::decouple_analysis::ConfigResult> {
-    let IlpInputs { blow_up_stats: blow_up_raw, op_output_sizes, op_counts, perf: perf_raw, network_cost_table } =
-        load_ilp_inputs(Path::new(CALIBRATION_DIR), &config.name);
+    let IlpInputs {
+        blow_up_stats,
+        op_output_sizes,
+        op_counts,
+        perf,
+        network_cost_table,
+    } = load_ilp_inputs(Path::new(CALIBRATION_DIR), name);
 
-    // Find the bottleneck: the blow-up location with highest CPU
-    // TODO: Account for all resources, not just CPU
-    let (bottleneck_key, bottleneck_stats) = blow_up_raw
-        .iter()
-        .max_by(|(_, a), (_, b)| a.sar_stats.cpu.partial_cmp(&b.sar_stats.cpu).unwrap())
-        .expect("Empty blow-up stats");
-    println!(
-        "Bottleneck: {} (cpu={:.1}%)",
-        bottleneck_key, bottleneck_stats.sar_stats.cpu
-    );
+    // Find the bottleneck: the blow-up location with highest resource usage.
+    assert!(args.gcp.is_none(), "Bottleneck elimination is not yet supported on GCP ()");
+    let (bottleneck_key, bottleneck_stats) =
+        find_bottleneck(&blow_up_stats, AWS_NETWORK_BYTES_PER_SEC, AWS_IO_TPS);
 
     // Find the bottleneck's original LocationId by looking up one of its operators in the IR
     // TODO: Clean up after here
     let bottleneck_op = *bottleneck_stats.operators.first().unwrap();
     let mut bottleneck: Option<LocationId> = None;
     let built = built.optimize_with(|leaf| {
-        traverse_dfir(leaf, |_, _| {}, |node, id| {
-            if node.metadata().op.id == Some(bottleneck_op) {
-                bottleneck = Some(node.metadata().location_id.root().clone());
-            }
-        });
+        traverse_dfir(
+            leaf,
+            |_, _| {},
+            |node, id| {
+                if node.metadata().op.id == Some(bottleneck_op) {
+                    bottleneck = Some(node.metadata().location_id.root().clone());
+                }
+            },
+        );
     });
     let bottleneck = bottleneck.expect("Bottleneck op not found in IR");
     println!("Bottleneck LocationId: {:?}", bottleneck);
@@ -757,7 +762,7 @@ fn run_bottleneck_elimination<'a>(
     // Identify network ops: any op that appears with is_recv=true in perf is a Network recv.
     // Also find Network send ops by scanning the IR for HydroNode::Network at the bottleneck.
     let perf_key = format!("{:?}", bottleneck);
-    let bottleneck_perf = perf_raw
+    let bottleneck_perf = perf
         .get(&perf_key)
         .unwrap_or_else(|| panic!("No perf data for bottleneck (key: {})", perf_key));
 
@@ -789,7 +794,7 @@ fn run_bottleneck_elimination<'a>(
     // TODO: Clean up up to here
 
     // Add memory and IO costs from blow-up stats (assign to first op of each blown-up location)
-    for stats in blow_up_raw.values() {
+    for stats in blow_up_stats.values() {
         if let Some(&first_op) = stats.operators.first() {
             let entry = per_op_load.entry(first_op).or_default();
             entry.memory += stats.sar_stats.memory;
@@ -829,12 +834,7 @@ fn run_bottleneck_elimination<'a>(
     };
 
     let ilp_start = Instant::now();
-    let results = find_optimal_budget(
-        &mut ir,
-        &bottleneck,
-        &ilp_inputs,
-        &cycles,
-    );
+    let results = find_optimal_budget(&mut ir, &bottleneck, &ilp_inputs, &cycles);
     println!("ILP solved in {:.2?}", ilp_start.elapsed());
 
     println!("ILP found {} configurations", results.len());
@@ -864,15 +864,6 @@ pub async fn benchmark_protocol<'a>(
     };
     let mut reusable_hosts = ReusableHosts::new(&host_type);
 
-    benchmark_protocol_with_reusable_machines(&mut reusable_hosts, &mut deployment, run_benchmark)
-        .await
-}
-
-pub async fn benchmark_protocol_with_reusable_machines<'a>(
-    reusable_hosts: &mut ReusableHosts,
-    deployment: &mut Deployment,
-    run_benchmark: impl Fn(usize) -> BenchmarkConfig<'a>,
-) -> (Vec<HydroRoot>, RunMetadata) {
     let BenchmarkConfig {
         name,
         builder,
@@ -934,9 +925,9 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
             size_analysis_ops = captured_ops;
             (built, HashMap::new())
         }
-        OptimizationKind::BottleneckElimination(config) => {
+        OptimizationKind::BottleneckElimination(name) => {
             let results =
-                run_bottleneck_elimination(built, &clusters, &optimizations.exclude, config);
+                run_bottleneck_elimination(built, &clusters, &optimizations.exclude, name, &args);
             // Save rewrites and early exit
             let output_dir = Path::new("benchmark_results").join(format!(
                 "{}_{}_{}",
@@ -986,8 +977,8 @@ pub async fn benchmark_protocol_with_reusable_machines<'a>(
             builder.replace_ir(deep_clone(ir));
             let finalized = builder.finalize();
             let mut run_metadata = deploy_and_analyze(
-                reusable_hosts,
-                deployment,
+                &mut reusable_hosts,
+                &mut deployment,
                 finalized,
                 &clusters,
                 &processes,
