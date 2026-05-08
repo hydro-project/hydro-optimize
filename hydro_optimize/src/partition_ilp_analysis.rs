@@ -123,6 +123,7 @@ fn output_to_parent_fields(node: &HydroNode) -> Vec<StructOrTuple> {
         // Output contains the entirety of both parents
         HydroNode::Chain { .. }
         | HydroNode::ChainFirst { .. }
+        | HydroNode::MergeOrdered { .. }
         | HydroNode::Difference { .. } // Although output doesn't contain right parent, the parents join on all fields
         => vec![StructOrTuple::new_completely_dependent(), StructOrTuple::new_completely_dependent()],
         // Result is (left parent, right parent)
@@ -349,7 +350,8 @@ fn node_partitionability(node: &HydroNode) -> Partitionability {
         | HydroNode::FlatMap { .. }
         | HydroNode::FlatMapStreamBlocking { .. }
         | HydroNode::Chain { .. }
-        | HydroNode::ChainFirst { .. } => Partitionability::NoEffect,
+        | HydroNode::ChainFirst { .. }
+        | HydroNode::MergeOrdered { .. } => Partitionability::NoEffect,
         HydroNode::Join { .. }
         | HydroNode::JoinHalf { .. }
         | HydroNode::Difference { .. }
@@ -401,6 +403,7 @@ fn node_persists(node: &HydroNode) -> bool {
         | HydroNode::FlatMapStreamBlocking { .. }
         | HydroNode::Chain { .. }
         | HydroNode::ChainFirst { .. }
+        | HydroNode::MergeOrdered { .. }
         | HydroNode::CrossSingleton { .. }
         | HydroNode::Sort { .. } => false,
         // Maybe, depending on if it's 'static (either hidden parent is top_level)

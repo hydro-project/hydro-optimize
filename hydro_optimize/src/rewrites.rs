@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use hydro_lang::compile::ir::{
     BoundKind, CollectionKind, DebugType, HydroIrMetadata, HydroNode, HydroRoot,
@@ -144,6 +144,22 @@ pub fn tee_to_inner_id(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
     );
 
     mapping
+}
+
+pub fn get_network_op_ids(ir: &mut [HydroRoot]) -> HashSet<usize> {
+    let mut network_ids = HashSet::new();
+
+    traverse_dfir(
+        ir,
+        |_, _| {},
+        |node, op_id| {
+            if let HydroNode::Network { .. } = node {
+                network_ids.insert(*op_id);
+            }
+        },
+    );
+
+    network_ids
 }
 
 /// Check if the type is serializable. Currently a janky implementation that just looks for common unserializable types.

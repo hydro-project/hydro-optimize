@@ -26,9 +26,8 @@ pub struct RunMetadata {
     pub sar_stats: HashMap<LocationId, Vec<SarStats>>,
     /// Maps each LocationId → original op_ids assigned to it (populated when size_analysis is used)
     pub location_to_original_ops: HashMap<LocationId, Vec<usize>>,
-    /// Per-operator CPU usage fractions from perf: (op_id, is_network_recv) → fraction of total samples.
-    /// Keyed by LocationId so we can attribute per-location.
-    pub perf: HashMap<LocationId, HashMap<(usize, bool), f64>>,
+    /// Per-operator CPU usage fractions from perf: op_id → fraction of total samples.
+    pub perf: HashMap<usize, f64>,
 }
 
 impl RunMetadata {
@@ -184,24 +183,20 @@ impl RunMetadata {
     }
 
     /// Saves per-location perf profiling data to a JSON file.
-    pub fn save_perf(&self, output_dir: &Path, num_clients: usize, num_virtual: usize, run: usize) {
+    pub fn save_perf(
+        &self,
+        output_dir: &Path,
+        num_clients: usize,
+        num_virtual: usize,
+        run: usize,
+    ) {
         if self.perf.is_empty() {
             return;
         }
-        // Convert to a serializable format: location string -> vec of ((op_id, is_recv), fraction)
-        let serializable: HashMap<String, Vec<((usize, bool), f64)>> = self
-            .perf
-            .iter()
-            .map(|(loc, map)| {
-                let mut entries: Vec<_> = map.iter().map(|(&k, &v)| (k, v)).collect();
-                entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-                (format!("{:?}", loc), entries)
-            })
-            .collect();
         save_json(
             output_dir,
             &format!("perf_{}c_{}vc_r{}.json", num_clients, num_virtual, run),
-            &serializable,
+            &self.perf,
         );
     }
 
@@ -314,17 +309,6 @@ impl SarStats {
         }
     }
 
-    /// Subtract `other`, clamping each field to 0.
-    pub fn sub_floor(self, other: Self) -> Self {
-        Self {
-            cpu: (self.cpu - other.cpu).max(0.0),
-            cpu_user: (self.cpu_user - other.cpu_user).max(0.0),
-            network: (self.network - other.network).max(0.0),
-            memory: (self.memory - other.memory).max(0.0),
-            io: (self.io - other.io).max(0.0),
-        }
-    }
-
     pub fn add(&mut self, other: Self) {
         self.cpu += other.cpu;
         self.cpu_user += other.cpu_user;
@@ -342,155 +326,37 @@ pub struct BlowUpLocationStats {
     pub counts: HashMap<usize, usize>,
 }
 
-/// Finds the bottleneck location: the one closest to saturating any resource.
-/// CPU and memory are normalized to 100%, network to `network_bytes_per_sec`, IO to `io_tps`.
-pub fn find_bottleneck(
-    blow_up_stats: &HashMap<String, BlowUpLocationStats>,
-    network_bytes_per_sec: f64,
-    io_tps: f64,
-) -> (&String, &BlowUpLocationStats) {
-    let score = |s: &SarStats| -> f64 {
-        [
-            s.cpu / 100.0,
-            s.memory / 100.0,
-            if network_bytes_per_sec > 0.0 { s.network / network_bytes_per_sec } else { 0.0 },
-            if io_tps > 0.0 { s.io / io_tps } else { 0.0 },
-        ]
-        .into_iter()
-        .fold(0.0_f64, f64::max)
-    };
-
-    let (bottleneck_key, bottleneck_stats) = blow_up_stats
-        .iter()
-        .max_by(|(_, a), (_, b)| score(&a.sar_stats).partial_cmp(&score(&b.sar_stats)).unwrap())
-        .expect("Empty blow-up stats");
-
-    println!(
-        "Bottleneck: {} (cpu={:.1}%, net={:.0} B/s, mem={:.1}%, io={:.1} tps)",
-        bottleneck_key,
-        bottleneck_stats.sar_stats.cpu,
-        bottleneck_stats.sar_stats.network,
-        bottleneck_stats.sar_stats.memory,
-        bottleneck_stats.sar_stats.io,
-    );
-
-    (bottleneck_key, bottleneck_stats)
-}
-
-/// Builds per-operator CPU load from perf data and network calibration.
+/// Derives per-operator resource load for the ILP solver.
 ///
 /// - Non-network ops: CPU = perf fraction × 100 (direct measurement on saturated machine)
 /// - Network ops: CPU = count × cost_per_message from calibration (accounts for ser/deser + kernel)
-///
-/// This ensures total CPU sums to ~100% on the saturated machine with no unsampled gap.
-pub fn per_op_load_from_perf(
-    perf: &[((usize, bool), f64)],
-    op_counts: &HashMap<usize, usize>,
-    op_output_sizes: &HashMap<usize, u64>,
+/// - Memory and IO costs are added from blow-up stats (assigned to first op of each location group)
+pub fn derive_per_op_load(
+    perf: &HashMap<usize, f64>,
     network_op_ids: &HashSet<usize>,
-    calibration: &NetworkCostTable,
+    blow_up_stats: &HashMap<String, BlowUpLocationStats>,
 ) -> HashMap<usize, SarStats> {
     let mut result: HashMap<usize, SarStats> = HashMap::new();
 
-    for &((op_id, _is_recv), fraction) in perf {
-        if network_op_ids.contains(&op_id) {
-            // Network ops: use calibration cost (count × cost_per_message / 2)
-            // Divide by 2 because calibration measures round-trips (recv+send) but each
-            // Network op is only one direction (either send or recv).
-            let count = op_counts.get(&op_id).copied().unwrap_or(0);
-            let size = op_output_sizes.get(&op_id).copied().unwrap_or(0);
-            if count > 0 && size > 0 {
-                let cost = calibration.network_cost(count, size).scale(0.5);
-                let entry = result.entry(op_id).or_default();
-                entry.add(cost);
-            }
-        } else {
-            // Non-network ops: use perf fraction directly
+    for (&op_id, &fraction) in perf {
+        // Perf not calculated for network ops
+        if !network_op_ids.contains(&op_id) {
             let entry = result.entry(op_id).or_default();
             entry.cpu += fraction * 100.0;
             entry.cpu_user += fraction * 100.0;
         }
     }
 
+    // Add memory and IO costs from blow-up stats. Assign to 1st op; it's ok since they'll always decouple together
+    for stats in blow_up_stats.values() {
+        if let Some(&first_op) = stats.operators.first() {
+            let entry = result.entry(first_op).or_default();
+            entry.memory += stats.sar_stats.memory;
+            entry.io += stats.sar_stats.io;
+        }
+    }
+
     result
-}
-
-/// Derives per-operator load for the ILP solver.
-///
-/// For each blown-up location, subtracts the network overhead introduced by blowing up
-/// (using greedy analysis to identify where networks were inserted), then assigns the
-/// full adjusted SarStats to the first operator of each location group.
-///
-/// Network costs are attributed to both sender and receiver locations. The byte size
-/// used is the parent's output size (since `op_to_network` inserts BEFORE the op).
-///
-/// Returns `op_id → SarStats` load assignment. Will not contain entries for operators that were not the first in their blown-up location group.
-pub fn derive_per_op_load(
-    blow_up_stats: &HashMap<LocationId, BlowUpLocationStats>,
-    op_output_sizes: &HashMap<usize, u64>,
-    op_counts: &HashMap<usize, usize>,
-    // op_id → (src_loc_idx, dst_loc_idx): greedy analysis would insert networks BEFORE this op
-    op_to_network: &HashMap<usize, (usize, usize)>,
-    // op_id → parent op_ids
-    op_to_parents: &HashMap<usize, Vec<usize>>,
-    calibration: &NetworkCostTable,
-    // op_id → location index from the greedy rewrite
-    op_to_loc: &HashMap<usize, usize>,
-) -> HashMap<usize, SarStats> {
-    // Build loc_idx → LocationId mapping from blow_up_stats
-    // (location_to_original_ops maps LocationId → ops, op_to_loc maps op → loc_idx;
-    //  we invert to get loc_idx → LocationId)
-    let mut loc_idx_to_location: HashMap<usize, LocationId> = HashMap::new();
-    for (loc, stats) in blow_up_stats {
-        for &op_id in &stats.operators {
-            if let Some(&loc_idx) = op_to_loc.get(&op_id) {
-                loc_idx_to_location
-                    .entry(loc_idx)
-                    .or_insert_with(|| loc.clone());
-            }
-        }
-    }
-
-    // For each network insertion, compute cost and attribute to both sender and receiver locations.
-    let mut loc_network_cost: HashMap<LocationId, SarStats> = HashMap::new();
-    for (&op_id, &(src_loc_idx, dst_loc_idx)) in op_to_network {
-        // The network sends the parent's output, so use parent's size and count.
-        // If there are multiple parents, each contributes a network.
-        let parents = op_to_parents.get(&op_id).cloned().unwrap_or_default();
-        for parent in parents {
-            let count = op_counts.get(&parent).copied().unwrap_or(0);
-            let size = op_output_sizes.get(&parent).copied().unwrap_or(0);
-            if count == 0 || size == 0 {
-                continue;
-            }
-            let cost = calibration.network_cost(count, size);
-
-            for loc_idx in [src_loc_idx, dst_loc_idx] {
-                if let Some(loc) = loc_idx_to_location.get(&loc_idx) {
-                    loc_network_cost.entry(loc.clone()).or_default().add(cost);
-                }
-            }
-        }
-    }
-
-    // Subtract network overhead from each location's SarStats
-    let loc_to_no_network_stats: HashMap<LocationId, SarStats> = blow_up_stats
-        .iter()
-        .map(|(loc, stats)| {
-            let net_cost = loc_network_cost.get(loc).copied().unwrap_or_default();
-            (loc.clone(), stats.sar_stats.sub_floor(net_cost))
-        })
-        .collect();
-
-    // Assign load: first op of each location group gets the full adjusted SarStats
-    let mut per_op_load: HashMap<usize, SarStats> = HashMap::new();
-    for (loc, stats) in blow_up_stats {
-        let no_network_stats = loc_to_no_network_stats.get(loc).copied().unwrap();
-        let first_op = stats.operators.first().unwrap();
-        per_op_load.insert(*first_op, no_network_stats);
-    }
-
-    per_op_load
 }
 
 /// Parses `sar -n DEV -u -P ALL -r -b` output lines and returns per-second SarStats.
@@ -658,10 +524,10 @@ pub struct NetworkCostTable {
 impl NetworkCostTable {
     pub fn from_calibration(mut entries: Vec<(u64, SarStats)>) -> Self {
         entries.sort_by_key(|(size, _)| *size);
-        assert!(
-            !entries.is_empty(),
-            "NetworkCostTable requires at least one calibration point"
-        );
+        // Scale by 0.5: calibration measures round-trips but we want cost per message (one direction)
+        for (_, stats) in &mut entries {
+            *stats = stats.scale(0.5);
+        }
         Self { entries }
     }
 
@@ -690,6 +556,110 @@ impl NetworkCostTable {
             .scale(count as f64)
     }
 }
+
+/// Finds the bottleneck cluster from a run folder's CSV data.
+/// 1. Finds the run suffix (e.g. "10c_500vc_r0") with highest avg throughput.
+/// 2. For that run, reads all cluster CSVs and returns the cluster name whose SAR stats
+///    are closest to saturation (100% CPU, 100% memory, or at/above max network/IO).
+pub fn find_bottleneck_from_run(
+    run_dir: &Path,
+    network_bytes_per_sec: f64,
+    io_tps: f64,
+) -> String {
+    let csv_re = Regex::new(r"^(.+)_(\d+c_\d+vc_r\d+)\.csv$").unwrap();
+
+    // Group CSVs by suffix
+    let mut suffix_to_files: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new();
+    for entry in fs::read_dir(run_dir)
+        .unwrap_or_else(|e| panic!("Failed to read run dir {}: {}", run_dir.display(), e))
+        .filter_map(|e| e.ok())
+    {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(caps) = csv_re.captures(&name) {
+            let cluster_name = caps[1].to_string();
+            let suffix = caps[2].to_string();
+            suffix_to_files
+                .entry(suffix)
+                .or_default()
+                .push((cluster_name, entry.path()));
+        }
+    }
+
+    // Find suffix with highest throughput (use first CSV that has throughput data)
+    let best_suffix = suffix_to_files
+        .keys()
+        .max_by_key(|suffix| {
+            suffix_to_files[*suffix]
+                .iter()
+                .map(|(_, path)| csv_avg_throughput(path))
+                .max()
+                .unwrap_or(0)
+        })
+        .expect("No CSVs found in run dir")
+        .clone();
+
+    // For the best suffix, score each cluster by saturation
+    let score = |s: &SarStats| -> f64 {
+        [
+            s.cpu / 100.0,
+            s.memory / 100.0,
+            if network_bytes_per_sec > 0.0 { s.network / network_bytes_per_sec } else { 0.0 },
+            if io_tps > 0.0 { s.io / io_tps } else { 0.0 },
+        ]
+        .into_iter()
+        .fold(0.0_f64, f64::max)
+    };
+
+    let (bottleneck_name, _) = suffix_to_files[&best_suffix]
+        .iter()
+        .map(|(cluster_name, path)| {
+            let avg_sar = csv_avg_sar(path);
+            (cluster_name.clone(), score(&avg_sar))
+        })
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .expect("No cluster CSVs for best suffix");
+
+    println!(
+        "Bottleneck from run: {} (suffix: {})",
+        bottleneck_name, best_suffix
+    );
+    bottleneck_name
+}
+
+/// Reads a CSV and returns the average SAR stats over the measurement window.
+fn csv_avg_sar(path: &Path) -> SarStats {
+    let content = fs::read_to_string(path).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    let start = START_MEASUREMENT_SECOND + 1; // +1 for header
+    let end = MEASUREMENT_SECOND + 1;
+    if lines.len() <= end {
+        return SarStats::default();
+    }
+    let header: Vec<&str> = lines[0].split(',').collect();
+    let col = |name: &str| header.iter().position(|&h| h == name);
+    let cpu_col = col("cpu").unwrap();
+    let net_col = col("network").unwrap();
+    let mem_col = col("memory").unwrap();
+    let io_col = col("io").unwrap();
+
+    let n = (end - start + 1) as f64;
+    let mut sum = SarStats::default();
+    for line in &lines[start..=end] {
+        let fields: Vec<&str> = line.split(',').collect();
+        sum.cpu += fields[cpu_col].parse::<f64>().unwrap_or(0.0);
+        sum.network += fields[net_col].parse::<f64>().unwrap_or(0.0);
+        sum.memory += fields[mem_col].parse::<f64>().unwrap_or(0.0);
+        sum.io += fields[io_col].parse::<f64>().unwrap_or(0.0);
+    }
+    SarStats {
+        cpu: sum.cpu / n,
+        cpu_user: 0.0,
+        network: sum.network / n,
+        memory: sum.memory / n,
+        io: sum.io / n,
+    }
+}
+
 
 /// Reads a benchmark CSV and returns the average throughput over the measurement window.
 /// Returns 0 if the file is too short or has no throughput data.
@@ -731,7 +701,7 @@ pub struct IlpInputs {
     pub blow_up_stats: HashMap<String, BlowUpLocationStats>,
     pub op_output_sizes: HashMap<usize, u64>,
     pub op_counts: HashMap<usize, usize>,
-    pub perf: HashMap<String, Vec<((usize, bool), f64)>>,
+    pub perf: HashMap<usize, f64>,
     pub network_cost_table: NetworkCostTable,
 }
 
@@ -894,11 +864,11 @@ pub fn parse_byte_sizes(lines: Vec<String>) -> HashMap<usize, Vec<u64>> {
 }
 
 /// Parses folded perf output into per-operator CPU fractions.
-/// Returns a map from (op_id, is_network_recv) → fraction of total samples.
-pub fn parse_perf(folded: &str) -> HashMap<(usize, bool), f64> {
+/// Returns a map from op_id → fraction of total samples.
+pub fn parse_perf(folded: &str) -> HashMap<usize, f64> {
     let operator_regex = Regex::new(r"op_\d+v\d+__(.*?)__(send)?(recv)?(\d+)").unwrap();
     let mut total_samples = 0.0_f64;
-    let mut samples_per_id: HashMap<(usize, bool), f64> = HashMap::new();
+    let mut samples_per_id: HashMap<usize, f64> = HashMap::new();
 
     for line in folded.lines() {
         let n_samples: f64 = line
@@ -909,8 +879,7 @@ pub fn parse_perf(folded: &str) -> HashMap<(usize, bool), f64> {
 
         if let Some(cap) = operator_regex.captures_iter(line).last() {
             let id = cap[4].parse::<usize>().unwrap();
-            let is_recv = cap.get(3).is_some_and(|m| m.as_str() == "recv");
-            *samples_per_id.entry((id, is_recv)).or_default() += n_samples;
+            *samples_per_id.entry(id).or_default() += n_samples;
         }
     }
 
@@ -1096,13 +1065,10 @@ pub async fn analyze_cluster_results(
         }
     }
     while let Some(result) = perf_set.join_next().await {
-        let (loc, parsed) = result.unwrap();
-        if !parsed.is_empty() {
-            let entry = run_metadata.perf.entry(loc).or_default();
-            for (key, frac) in parsed {
-                let e = entry.entry(key).or_default();
-                *e = e.max(frac);
-            }
+        let (_loc, parsed) = result.unwrap();
+        for (op_id, frac) in parsed {
+            let e = run_metadata.perf.entry(op_id).or_default();
+            *e = e.max(frac);
         }
     }
 

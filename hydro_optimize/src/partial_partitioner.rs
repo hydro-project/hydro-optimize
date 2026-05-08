@@ -1163,7 +1163,7 @@ fn handle_replicated_output_recv(node: &mut HydroNode, num_partitions: usize) {
 fn apply_regular_partition(ir: &mut [HydroRoot], partitioner: &PartialPartitioner) {
     // Set the partitioned cluster to idx 0
     // `nodes_before_partitioned_input`.
-    let mut rewrite = Rewrite::new(partitioner.location_id.clone(), partitioner.cluster_size);
+    let mut rewrite = Rewrite::new(partitioner.location_id.clone(), partitioner.cluster_size, 1);
     rewrite.num_partitions.insert(0, partitioner.num_partitions);
     rewrite.field_partitionable.insert(0);
     rewrite.partition_field_choices = partitioner.nodes_before_partitioned_input.clone();

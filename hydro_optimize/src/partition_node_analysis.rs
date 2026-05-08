@@ -196,7 +196,8 @@ fn input_dependency_analysis_node(
         }
         // Alters parent in a predicatable way
         HydroNode::Chain { .. }
-        | HydroNode::ChainFirst { .. } => {
+        | HydroNode::ChainFirst { .. }
+        | HydroNode::MergeOrdered { .. } => {
             assert_eq!(parent_ids.len(), 2, "Node {:?} has the wrong number of parents.", node);
             // [a,b] chain [c,d] = [a,b,c,d]. Take the intersection of dependencies of the two parents for each input. If only one parent is tainted, then just take that dependency
             for (input_id, parent_positions) in parent_taints {
@@ -558,6 +559,7 @@ fn partitioning_constraint_analysis_node(
             | HydroNode::Tee { .. }
             | HydroNode::Chain { .. }
             | HydroNode::ChainFirst { .. }
+            | HydroNode::MergeOrdered { .. }
             | HydroNode::ResolveFutures { .. }
             | HydroNode::ResolveFuturesOrdered { .. }
             | HydroNode::ResolveFuturesBlocking { .. }

@@ -42,9 +42,9 @@ struct Args {
     #[arg(long, action = ArgAction::SetTrue)]
     perf_only: bool,
 
-    /// Run ILP bottleneck elimination (offline, no deployment).
-    #[arg(long, action = ArgAction::SetTrue)]
-    ilp: bool,
+    /// Run ILP bottleneck elimination using the given run folder to determine the bottleneck.
+    #[arg(long)]
+    ilp: Option<PathBuf>,
 
     /// Path(s) to JSON file(s) containing `PossibleRewrite`s to apply before deploying.
     /// Rewrites are applied in the order given.
@@ -59,11 +59,7 @@ async fn main() {
     let size_analysis = args.size_analysis;
     let blow_up_analysis = args.blow_up_analysis;
     let perf_only = args.perf_only;
-    let ilp_config = if args.ilp {
-        Some("Paxos".to_string())
-    } else {
-        None
-    };
+    let ilp_config = args.ilp.clone();
     let rewrite_paths = args.rewrite.clone();
 
     let (_ir, _final_run_metadata) = benchmark_protocol(
@@ -145,8 +141,8 @@ async fn main() {
             if perf_only {
                 optimizations = optimizations.with_perf_only();
             }
-            if let Some(ref config) = ilp_config {
-                optimizations = optimizations.with_bottleneck_elimination(config.clone());
+            if let Some(ref run_dir) = ilp_config {
+                optimizations = optimizations.with_bottleneck_elimination(run_dir.clone());
             }
             for p in &rewrite_paths {
                 optimizations = optimizations.load_rewrite(Path::new(p));

@@ -173,7 +173,8 @@ fn reduce_pushdown_analysis_node(
             check_inputs.push(input.metadata());
         }
         HydroNode::Chain { first, second, .. }
-        | HydroNode::ChainFirst { first, second, .. } => {
+        | HydroNode::ChainFirst { first, second, .. }
+        | HydroNode::MergeOrdered { first, second, .. } => {
             check_inputs.push(first.metadata());
             check_inputs.push(second.metadata());
         }

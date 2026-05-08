@@ -218,7 +218,7 @@ pub fn greedy_decouple_analysis(
                     .location_name_and_num(orig_loc)
                     .map(|(_, n)| n)
                     .unwrap_or(1); // If we don't find it, it must be a process (size 1)
-                Rewrite::new(orig_loc.clone(), cluster_size)
+                Rewrite::new(orig_loc.clone(), cluster_size, 0)
             })
             .op_to_loc
             .insert(op_id, remapped);
@@ -253,6 +253,7 @@ pub fn greedy_decouple_analysis(
             rewrite.op_to_loc.len(),
             rewrite.op_to_network.len()
         );
+        rewrite.budget = remaps[orig_loc].len();
     }
 
     results.into_values().collect()
