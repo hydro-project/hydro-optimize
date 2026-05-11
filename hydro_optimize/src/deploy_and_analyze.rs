@@ -1,8 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
-use chrono::Local;
 use hydro_deploy::Deployment;
 use hydro_lang::compile::built::BuiltFlow;
 use hydro_lang::compile::deploy::DeployResult;
@@ -21,8 +20,9 @@ use crate::decouple_analysis::{ILPAnalysisInputs, Rewrite, find_optimal_budget};
 use crate::deploy::{AWS_IO_TPS, AWS_NETWORK_BYTES_PER_SEC, HostType, ReusableHosts};
 use crate::greedy_decouple_analysis::greedy_decouple_analysis;
 use crate::parse_results::{
-    IlpInputs, RunMetadata, analyze_cluster_results, derive_per_op_load,
-    find_bottleneck_from_run, load_ilp_inputs,
+    AppliedEntry, IlpInputs, OptimizationState, RunMetadata, analyze_cluster_results,
+    derive_per_op_load, find_bottleneck_from_run, find_bottleneck_run_dir, load_ilp_inputs,
+    original_cluster_name,
 };
 use crate::reduce_pushdown::reduce_pushdown;
 use crate::reduce_pushdown_analysis::reduce_pushdown_decision;
@@ -41,6 +41,23 @@ const LATENCY_PREFIX: &str = "HYDRO_OPTIMIZE_LAT:";
 const THROUGHPUT_PREFIX: &str = "HYDRO_OPTIMIZE_THR:";
 pub const MAX_BUDGET_PER_CLUSTER: usize = 10;
 pub const MAX_OPTIMIZATION_ITERATIONS_PAST_NO_IMPROVEMENT: usize = 2;
+const BIMODAL_CV_THRESHOLD: f64 = 0.3;
+
+/// Returns true if throughput in the measurement window has high variance (bimodal).
+fn is_bimodal(throughputs: &[usize]) -> bool {
+    if throughputs.len() <= MEASUREMENT_SECOND {
+        return false;
+    }
+    let window = &throughputs[START_MEASUREMENT_SECOND..=MEASUREMENT_SECOND];
+    let n = window.len() as f64;
+    let mean = window.iter().map(|&v| v as f64).sum::<f64>() / n;
+    if mean == 0.0 {
+        return false;
+    }
+    let variance = window.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n;
+    let cv = variance.sqrt() / mean;
+    cv > BIMODAL_CV_THRESHOLD
+}
 
 // Note: Ensure edits to the match arms are consistent with infer_counter_from_parent
 fn insert_counter_node(
@@ -393,25 +410,36 @@ pub enum OptimizationKind {
     /// Deploy with `perf record` on non-excluded locations for flamegraph profiling.
     PerfOnly,
     /// Run ILP to find optimal decoupling, save Rewrite to file, then exit without deploying.
-    /// The PathBuf is the run folder used to determine the bottleneck.
-    /// The Vec<Rewrite> contains rewrites to apply before running the ILP.
-    BottleneckElimination(PathBuf, Vec<Rewrite>),
-    /// Apply `Rewrite`s loaded from files, in order.
-    LoadedRewrites(Vec<Rewrite>),
+    /// Automatically loads applied rewrites from the latest opt dir.
+    BottleneckElimination,
 }
 
 impl OptimizationKind {
-    fn label(&self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         match self {
             OptimizationKind::None => "none",
             OptimizationKind::CountersOnly => "counters",
             OptimizationKind::BlowUpAnalysis => "blow_up",
             OptimizationKind::SizeAnalysis => "size",
             OptimizationKind::PerfOnly => "perf",
-            OptimizationKind::BottleneckElimination(_, _) => "ilp",
-            OptimizationKind::LoadedRewrites(_) => "loaded",
+            OptimizationKind::BottleneckElimination => "ilp",
         }
     }
+}
+
+/// Creates a flat output directory: `{CALIBRATION_DIR}/{name}_{workload}_{label}`.
+/// Deletes and recreates if it already exists.
+pub fn make_output_dir(name: &str, workload: &str, label: &str) -> std::path::PathBuf {
+    let dir = Path::new(CALIBRATION_DIR).join(format!("{}_{}_{}", name, workload, label));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).unwrap_or_else(|e| {
+            panic!("Failed to remove {}: {}", dir.display(), e)
+        });
+    }
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
+        panic!("Failed to create {}: {}", dir.display(), e)
+    });
+    dir
 }
 
 #[derive(Clone, Default)]
@@ -458,31 +486,15 @@ impl Optimizations {
     }
 
     /// Run ILP-based bottleneck elimination (offline, no deployment).
-    /// `run_dir` is the path to the run folder whose SAR data determines the bottleneck.
-    pub fn with_bottleneck_elimination(mut self, run_dir: PathBuf) -> Self {
-        self.set_kind(OptimizationKind::BottleneckElimination(run_dir, vec![]));
+    /// Automatically finds the latest run directory for bottleneck detection
+    /// and loads applied rewrites from the latest opt dir.
+    pub fn with_bottleneck_elimination(mut self) -> Self {
+        self.set_kind(OptimizationKind::BottleneckElimination);
         self
     }
 
     pub fn excluding(mut self, location: LocationId) -> Self {
         self.exclude.insert(location);
-        self
-    }
-
-    /// Loads a `Rewrite` from `path` and queues it to be applied before deployment or ILP.
-    pub fn load_rewrite(mut self, path: &Path) -> Self {
-        let s = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("failed to read rewrite file {}: {}", path.display(), e));
-        let rewrite: Rewrite = serde_json::from_str(&s)
-            .unwrap_or_else(|e| panic!("failed to deserialize Rewrite: {}", e));
-        match &mut self.kind {
-            OptimizationKind::LoadedRewrites(v) => v.push(rewrite),
-            OptimizationKind::BottleneckElimination(_, v) => v.push(rewrite),
-            OptimizationKind::None => {
-                self.kind = OptimizationKind::LoadedRewrites(vec![rewrite]);
-            }
-            _ => panic!("load_rewrite is mutually exclusive with blow_up_analysis/size_analysis"),
-        }
         self
     }
 
@@ -576,6 +588,8 @@ pub struct BenchmarkArgs {
 
 pub struct BenchmarkConfig<'a> {
     pub name: String,
+    /// Workload variant (e.g. "read_heavy"). Determines output subdirectory name.
+    pub workload: String,
     pub builder: FlowBuilder<'a>,
     pub clusters: ReusableClusters,
     pub processes: ReusableProcesses,
@@ -677,6 +691,8 @@ pub fn apply_loaded_rewrites<'a>(
         );
     }
 
+    inject_id(&mut ir);
+
     builder.replace_ir(ir);
     (builder.finalize(), location_to_original_ops)
 }
@@ -728,77 +744,105 @@ fn apply_blow_up_analysis<'a>(
     (built, location_to_original_ops, pre_rewrite_parents)
 }
 
-/// Runs the ILP-based bottleneck elimination offline (no deployment).
-/// Uses SAR data from `run_dir` to identify the bottleneck cluster, then solves the ILP.
-fn run_bottleneck_elimination<'a>(
+/// Loads optimization state, applies previous rewrites, runs ILP if needed, saves state.
+fn load_rewrites_and_optimize<'a>(
     built: BuiltFlow<'a>,
-    clusters: &ReusableClusters,
-    run_dir: &Path,
+    clusters: &mut ReusableClusters,
+    location_id_to_cluster: &mut HashMap<LocationId, String>,
     name: &str,
-    location_id_to_cluster: &HashMap<LocationId, String>,
-) -> Vec<crate::decouple_analysis::Rewrite> {
-    // Find bottleneck cluster from run folder SAR data
+    _workload: &str,
+) -> (BuiltFlow<'a>, HashMap<LocationId, Vec<usize>>) {
+    let base = Path::new(CALIBRATION_DIR);
+    let state_path = base.join(format!("{}_optimization_state.json", name));
+    let mut state = OptimizationState::load(&state_path);
+
+    // Apply all previously applied rewrites
+    let rewrites = state.rewrites_to_apply();
+    let (built, location_to_original_ops) =
+        apply_loaded_rewrites(built, clusters, &rewrites, location_id_to_cluster);
+
+    // Find bottleneck from the latest run
+    let bottleneck_run_dir = find_bottleneck_run_dir(base, name);
     let bottleneck_name =
-        find_bottleneck_from_run(run_dir, AWS_NETWORK_BYTES_PER_SEC, AWS_IO_TPS);
+        find_bottleneck_from_run(&bottleneck_run_dir, AWS_NETWORK_BYTES_PER_SEC, AWS_IO_TPS);
+    let original_cluster = original_cluster_name(&bottleneck_name).to_string();
 
-    // Map cluster name → LocationId
-    let bottleneck = location_id_to_cluster
-        .iter()
-        .find(|(_, name)| *name == &bottleneck_name)
-        .map(|(id, _)| id.clone())
-        .unwrap_or_else(|| panic!("Bottleneck cluster '{}' not found in location_id_to_cluster", bottleneck_name));
-    println!("Bottleneck LocationId: {:?}", bottleneck);
-    let cluster_size = clusters
-        .location_name_and_num(&bottleneck)
-        .map(|(_, n)| n)
-        .unwrap_or(1);
-
-    let IlpInputs {
-        blow_up_stats,
-        op_output_sizes,
-        mut op_counts,
-        perf,
-        network_cost_table,
-    } = load_ilp_inputs(Path::new(CALIBRATION_DIR), name);
-
-    // Assign costs to ops
-    let mut ir = deep_clone(built.ir());
-    let network_op_ids = get_network_op_ids(&mut ir);
-    let per_op_load = derive_per_op_load(
-        &perf,
-        &network_op_ids,
-        &blow_up_stats,
-    );
-
-    // Inject counters where they are inferred
-    let cycles = cycle_source_to_sink_parent(&mut ir);
-    let op_parents = op_id_to_parents(&mut ir, Some(&bottleneck), &cycles);
-    inject_inferred_counters(&mut ir, &op_parents, &mut op_counts);
-
-    let ilp_inputs = ILPAnalysisInputs {
-        op_counts,
-        op_output_sizes,
-        network_cost_table,
-        per_op_load,
-        consider_partitioning: true,
-        cluster_size,
-    };
-
-    let ilp_start = Instant::now();
-    let results = find_optimal_budget(&mut ir, &bottleneck, &ilp_inputs, &cycles);
-    println!("ILP solved in {:.2?}", ilp_start.elapsed());
-
-    println!("ILP found {} configurations", results.len());
-    for r in &results {
-        println!(
-            "  budget={}: {} locations, max_cost={:.4}",
-            r.budget,
-            r.num_locations(),
-            r.max_cost()
-        );
+    // Check if exhausted
+    if state.is_exhausted(&original_cluster) {
+        println!("Cluster '{}' exhausted all budgets. Nothing to do.", original_cluster);
+        return (built, location_to_original_ops);
     }
 
-    results
+    // TODO: Recalculate perf based on new config. Op_ids will drift between 1st run and this...
+    // Compute rewrites for this cluster if not already cached
+    if !state.cluster_rewrites.contains_key(&original_cluster) {
+        // Save operators to file for later analysis
+        let applied_desc = if state.applied.is_empty() {
+            "none".to_string()
+        } else {
+            state.applied.iter()
+                .map(|e| format!("{}_b{}", e.original_cluster, e.budget))
+                .collect::<Vec<_>>()
+                .join("_")
+        };
+        let ops_path = base.join(format!("{}_operators_{}.txt", name, applied_desc));
+        let mut ir_for_save = deep_clone(built.ir());
+        crate::rewrites::save_id(&mut ir_for_save, &ops_path);
+
+        let ilp_inputs_raw = load_ilp_inputs(base, name);
+
+        let bottleneck = location_id_to_cluster
+            .iter()
+            .find(|(_, n)| *n == &bottleneck_name)
+            .map(|(id, _)| id.clone())
+            .unwrap_or_else(|| panic!("Bottleneck cluster '{}' not found", bottleneck_name));
+        let cluster_size = clusters
+            .location_name_and_num(&bottleneck)
+            .map(|(_, n)| n)
+            .unwrap_or(1);
+
+        let IlpInputs { per_op_blow_up, op_output_sizes, mut op_counts, perf, network_cost_table } =
+            ilp_inputs_raw;
+
+        let mut ir = deep_clone(built.ir());
+        let network_op_ids = get_network_op_ids(&mut ir);
+
+        let cycles = cycle_source_to_sink_parent(&mut ir);
+        let op_parents = op_id_to_parents(&mut ir, Some(&bottleneck), &cycles);
+        inject_inferred_counters(&mut ir, &op_parents, &mut op_counts);
+
+        let per_op_load = derive_per_op_load(&perf, &network_op_ids, &per_op_blow_up);
+
+        let analysis_inputs = ILPAnalysisInputs {
+            op_counts,
+            op_output_sizes,
+            network_cost_table,
+            per_op_load,
+            consider_partitioning: true,
+            cluster_size,
+        };
+
+        let ilp_start = Instant::now();
+        let results = find_optimal_budget(&mut ir, &bottleneck, &analysis_inputs, &cycles);
+        println!("ILP solved in {:.2?}", ilp_start.elapsed());
+        println!("ILP found {} configurations for '{}'", results.len(), original_cluster);
+        for r in &results {
+            println!("  budget={}: {} locations, max_cost={:.4}", r.budget, r.num_locations(), r.max_cost());
+        }
+
+        state.cluster_rewrites.insert(original_cluster.clone(), results);
+    }
+
+    // Apply next budget
+    let next_budget = state.next_budget(&original_cluster);
+    println!("Applying budget {} for cluster '{}'", next_budget, original_cluster);
+    state.applied.push(AppliedEntry {
+        original_cluster,
+        budget: next_budget,
+    });
+    state.save(&state_path);
+
+    (built, location_to_original_ops)
 }
 
 pub async fn benchmark_protocol<'a>(
@@ -817,6 +861,7 @@ pub async fn benchmark_protocol<'a>(
 
     let BenchmarkConfig {
         name,
+        workload,
         builder,
         mut clusters,
         processes,
@@ -846,9 +891,6 @@ pub async fn benchmark_protocol<'a>(
             let built = insert_counters(built, &optimizations.exclude);
             (built, HashMap::new())
         }
-        OptimizationKind::LoadedRewrites(rewrites) => {
-            apply_loaded_rewrites(built, &mut clusters, rewrites, &mut location_id_to_cluster)
-        }
         OptimizationKind::BlowUpAnalysis => {
             let (built, loc_ops, parents) = apply_blow_up_analysis(
                 built,
@@ -876,47 +918,15 @@ pub async fn benchmark_protocol<'a>(
             size_analysis_ops = captured_ops;
             (built, HashMap::new())
         }
-        OptimizationKind::BottleneckElimination(run_dir, rewrites) => {
-            // Apply rewrites in order, then re-run inject_id
-            let (built, _) = apply_loaded_rewrites(built, &mut clusters, rewrites, &mut location_id_to_cluster);
-            let built = built.optimize_with(|leaf| {
-                inject_id(leaf);
-            });
-
-            let results = run_bottleneck_elimination(
-                built,
-                &clusters,
-                run_dir,
-                &name,
-                &location_id_to_cluster,
-            );
-            // Save rewrites and early exit
-            let output_dir = Path::new(CALIBRATION_DIR).join(format!(
-                "{}_{}_{}",
-                name,
-                "ilp",
-                Local::now().format("%Y-%m-%d_%H-%M-%S")
-            ));
-            std::fs::create_dir_all(&output_dir).ok();
-            for result in &results {
-                let filename = format!("rewrite_{}machines.json", result.budget);
-                let json = serde_json::to_string_pretty(&result).unwrap();
-                let path = output_dir.join(&filename);
-                std::fs::write(&path, json).unwrap();
-                println!("Saved rewrite: {}", path.display());
-            }
-            return (vec![], RunMetadata::default());
+        OptimizationKind::BottleneckElimination => {
+            // TODO: Remove early return
+            let result = load_rewrites_and_optimize(built, &mut clusters, &mut location_id_to_cluster, &name, &workload);
+            return (deep_clone(result.0.ir()), RunMetadata::default());
         }
     };
 
     let ir = built.ir();
-
-    let output_dir = Path::new(CALIBRATION_DIR).join(format!(
-        "{}_{}_{}",
-        name,
-        optimizations.kind.label(),
-        Local::now().format("%Y-%m-%d_%H-%M-%S")
-    ));
+    let output_dir = make_output_dir(&name, &workload, optimizations.kind.label());
 
     let mut final_run_metadata = RunMetadata::default();
     let mut best_throughput: usize = 0;
@@ -984,7 +994,7 @@ pub async fn benchmark_protocol<'a>(
             }
 
             if matches!(optimizations.kind, OptimizationKind::CountersOnly) {
-                run_metadata.save_counters(&output_dir);
+                run_metadata.save_counters(&output_dir, PHYSICAL_CLIENTS, num_virtual, run);
             }
 
             run_metadata.save_perf(&output_dir, PHYSICAL_CLIENTS, num_virtual, run);
@@ -1003,6 +1013,8 @@ pub async fn benchmark_protocol<'a>(
                     final_run_metadata = run_metadata;
                     return (deep_clone(ir), final_run_metadata);
                 }
+            } else if is_bimodal(&run_metadata.throughputs) {
+                println!("Bimodal throughput detected, discarding run");
             } else {
                 throughput_sum += run_throughput;
                 successful_runs += 1;

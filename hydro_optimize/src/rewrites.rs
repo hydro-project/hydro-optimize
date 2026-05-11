@@ -1,5 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::Write;
 
 use hydro_lang::compile::ir::{
     BoundKind, CollectionKind, DebugType, HydroIrMetadata, HydroNode, HydroRoot,
@@ -52,12 +54,22 @@ impl VisitMut for ClusterSelfIdReplace {
 }
 
 pub fn print_id(ir: &mut [HydroRoot]) {
+    write_id(ir, None);
+}
+
+/// Writes operator IR to a file (same format as print_id).
+pub fn save_id(ir: &mut [HydroRoot], path: &std::path::Path) {
+    write_id(ir, Some(path));
+}
+
+fn write_id(ir: &mut [HydroRoot], path: Option<&std::path::Path>) {
+    let lines = RefCell::new(Vec::new());
     transform_bottom_up(
         ir,
         &mut |root| {
             let input = root.input_metadata().op.id;
             let id = root.op_metadata().id;
-            println!("{:?} Root {}, Inputs: {:?}", id, root.print_root(), input);
+            lines.borrow_mut().push(format!("{:?} Root {}, Inputs: {:?}", id, root.print_root(), input));
         },
         &mut |node| {
             let metadata = node.metadata();
@@ -67,16 +79,23 @@ pub fn print_id(ir: &mut [HydroRoot]) {
                 .iter()
                 .map(|m| m.op.id)
                 .collect::<Vec<Option<usize>>>();
-            println!(
-                "{:?} Node {}, {:?}, Inputs: {:?}",
-                id,
-                node.print_root(),
-                metadata,
-                inputs,
-            );
+            lines.borrow_mut().push(format!("{:?} Node {}, {:?}, Inputs: {:?}", id, node.print_root(), metadata, inputs));
         },
         false,
     );
+
+    let lines = lines.into_inner();
+    if let Some(path) = path {
+        let mut file = File::create(path).unwrap();
+        for line in &lines {
+            writeln!(file, "{}", line).unwrap();
+        }
+        println!("Saved operators to {}", path.display());
+    } else {
+        for line in &lines {
+            println!("{}", line);
+        }
+    }
 }
 
 /// Converts input metadata to IDs, filtering by location if provided

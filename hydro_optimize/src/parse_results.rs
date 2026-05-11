@@ -13,9 +13,547 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use crate::decouple_analysis::Rewrite;
 use crate::deploy_and_analyze::{
-    MEASUREMENT_SECOND, MetricLogs, START_MEASUREMENT_SECOND, inject_inferred_counters,
+    MEASUREMENT_SECOND, MetricLogs, OptimizationKind, START_MEASUREMENT_SECOND,
+    inject_inferred_counters,
 };
+
+/// Finds the bottleneck cluster from a run folder's CSV data.
+/// 1. Finds the run suffix (e.g. "10c_500vc_r0") with highest avg throughput.
+/// 2. For that run, reads all cluster CSVs and returns the cluster name whose SAR stats
+///    are closest to saturation (100% CPU, 100% memory, or at/above max network/IO).
+pub fn find_bottleneck_from_run(run_dir: &Path, network_bytes_per_sec: f64, io_tps: f64) -> String {
+    let csv_re = Regex::new(r"^(.+)_(\d+c_\d+vc_r\d+)\.csv$").unwrap();
+
+    // Group CSVs by suffix
+    let mut suffix_to_files: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new();
+    for entry in fs::read_dir(run_dir)
+        .unwrap_or_else(|e| panic!("Failed to read run dir {}: {}", run_dir.display(), e))
+        .filter_map(|e| e.ok())
+    {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(caps) = csv_re.captures(&name) {
+            let cluster_name = caps[1].to_string();
+            let suffix = caps[2].to_string();
+            suffix_to_files
+                .entry(suffix)
+                .or_default()
+                .push((cluster_name, entry.path()));
+        }
+    }
+
+    // Find suffix with highest throughput (use first CSV that has throughput data)
+    let best_suffix = suffix_to_files
+        .keys()
+        .max_by_key(|suffix| {
+            suffix_to_files[*suffix]
+                .iter()
+                .map(|(_, path)| csv_avg_throughput(path))
+                .max()
+                .unwrap_or(0)
+        })
+        .expect("No CSVs found in run dir")
+        .clone();
+
+    // For the best suffix, score each cluster by saturation
+    let score = |s: &SarStats| -> f64 {
+        [
+            s.cpu / 100.0,
+            s.memory / 100.0,
+            if network_bytes_per_sec > 0.0 {
+                s.network / network_bytes_per_sec
+            } else {
+                0.0
+            },
+            if io_tps > 0.0 { s.io / io_tps } else { 0.0 },
+        ]
+        .into_iter()
+        .fold(0.0_f64, f64::max)
+    };
+
+    let (bottleneck_name, _) = suffix_to_files[&best_suffix]
+        .iter()
+        .map(|(cluster_name, path)| {
+            let avg_sar = csv_avg_sar(path);
+            (cluster_name.clone(), score(&avg_sar))
+        })
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .expect("No cluster CSVs for best suffix");
+
+    println!(
+        "Bottleneck from run: {} (suffix: {})",
+        bottleneck_name, best_suffix
+    );
+    bottleneck_name
+}
+
+/// Reads a CSV and returns the average SAR stats over the measurement window.
+fn csv_avg_sar(path: &Path) -> SarStats {
+    let content = fs::read_to_string(path).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    let start = START_MEASUREMENT_SECOND + 1; // +1 for header
+    let end = MEASUREMENT_SECOND + 1;
+    if lines.len() <= end {
+        return SarStats::default();
+    }
+    let header: Vec<&str> = lines[0].split(',').collect();
+    let col = |name: &str| header.iter().position(|&h| h == name);
+    let cpu_col = col("cpu").unwrap();
+    let net_col = col("network").unwrap();
+    let mem_col = col("memory").unwrap();
+    let io_col = col("io").unwrap();
+
+    let n = (end - start + 1) as f64;
+    let mut sum = SarStats::default();
+    for line in &lines[start..=end] {
+        let fields: Vec<&str> = line.split(',').collect();
+        sum.cpu += fields[cpu_col].parse::<f64>().unwrap_or(0.0);
+        sum.network += fields[net_col].parse::<f64>().unwrap_or(0.0);
+        sum.memory += fields[mem_col].parse::<f64>().unwrap_or(0.0);
+        sum.io += fields[io_col].parse::<f64>().unwrap_or(0.0);
+    }
+    SarStats {
+        cpu: sum.cpu / n,
+        cpu_user: 0.0,
+        network: sum.network / n,
+        memory: sum.memory / n,
+        io: sum.io / n,
+    }
+}
+
+/// Reads a benchmark CSV and returns the average throughput over the measurement window.
+/// Returns 0 if the file is too short or has no throughput data.
+fn csv_avg_throughput(path: &Path) -> usize {
+    let content = fs::read_to_string(path).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    let start = START_MEASUREMENT_SECOND + 1; // +1 for header
+    let end = MEASUREMENT_SECOND + 1;
+    if lines.len() <= end {
+        return 0;
+    }
+    let header: Vec<&str> = lines[0].split(',').collect();
+    let thr_col = header.iter().position(|&h| h == "throughput_rps").unwrap();
+    let n = (end - start + 1) as f64;
+    let sum: f64 = lines[start..=end]
+        .iter()
+        .map(|line| {
+            line.split(',')
+                .nth(thr_col)
+                .unwrap()
+                .parse::<f64>()
+                .unwrap()
+        })
+        .sum();
+    (sum / n) as usize
+}
+
+/// ILP input data loaded from benchmark results.
+pub struct IlpInputs {
+    /// Per-op memory/IO load from blow-up analysis.
+    pub per_op_blow_up: HashMap<usize, SarStats>,
+    pub op_output_sizes: HashMap<usize, u64>,
+    pub op_counts: HashMap<usize, usize>,
+    pub perf: HashMap<usize, f64>,
+    pub network_cost_table: NetworkCostTable,
+}
+
+/// Persistent state for iterative bottleneck elimination.
+/// Stored as `{CALIBRATION_DIR}/{name}_optimization_state.json`.
+#[derive(Default, Serialize, Deserialize)]
+pub struct OptimizationState {
+    /// Ordered sequence of applied rewrites (one per iteration).
+    pub applied: Vec<AppliedEntry>,
+    /// Per original-cluster-name: precomputed rewrites for all budgets.
+    pub cluster_rewrites: HashMap<String, Vec<Rewrite>>,
+}
+
+/// A single applied rewrite entry in the optimization history.
+#[derive(Serialize, Deserialize)]
+pub struct AppliedEntry {
+    /// The original cluster name this rewrite targets (e.g. "proposer", not "proposer_loc1")
+    pub original_cluster: String,
+    /// The budget level used (index into cluster_rewrites[original_cluster])
+    pub budget: usize,
+}
+
+impl OptimizationState {
+    /// Load from disk, or return Default if file doesn't exist.
+    pub fn load(path: &Path) -> Self {
+        if path.exists() {
+            load_json(path)
+        } else {
+            Self::default()
+        }
+    }
+
+    /// Save to disk.
+    pub fn save(&self, path: &Path) {
+        save_json(
+            path.parent().unwrap(),
+            path.file_name().unwrap().to_str().unwrap(),
+            self,
+        );
+    }
+
+    /// Get all rewrites to apply (one per applied entry).
+    pub fn rewrites_to_apply(&self) -> Vec<Rewrite> {
+        self.applied
+            .iter()
+            .map(|entry| {
+                let rewrites = self
+                    .cluster_rewrites
+                    .get(&entry.original_cluster)
+                    .unwrap_or_else(|| {
+                        panic!("No rewrites for cluster '{}'", entry.original_cluster)
+                    });
+                let idx = entry.budget - 2; // budgets start at 2
+                rewrites[idx].clone()
+            })
+            .collect()
+    }
+
+    /// Next budget for a cluster (last applied budget + 1, or 2 if never applied).
+    pub fn next_budget(&self, original_cluster: &str) -> usize {
+        self.applied
+            .iter()
+            .rev()
+            .find(|e| e.original_cluster == original_cluster)
+            .map(|e| e.budget + 1)
+            .unwrap_or(2)
+    }
+
+    /// Whether the cluster has exhausted all precomputed budgets.
+    pub fn is_exhausted(&self, original_cluster: &str) -> bool {
+        let Some(rewrites) = self.cluster_rewrites.get(original_cluster) else {
+            return false;
+        };
+        self.next_budget(original_cluster) - 2 >= rewrites.len()
+    }
+}
+
+/// Loads ILP inputs by scanning all workload directories for a given protocol name and label,
+/// taking the element-wise max across workloads.
+pub fn load_ilp_inputs(base_dir: &Path, name: &str) -> IlpInputs {
+    let blow_up_dirs = find_workload_dirs(base_dir, name, OptimizationKind::BlowUpAnalysis.label());
+    let size_dirs = find_workload_dirs(base_dir, name, OptimizationKind::SizeAnalysis.label());
+    let counters_dirs = find_workload_dirs(base_dir, name, OptimizationKind::CountersOnly.label());
+    let perf_dirs = find_workload_dirs(base_dir, name, OptimizationKind::PerfOnly.label());
+
+    assert!(!blow_up_dirs.is_empty(), "No blow_up dirs for '{}'", name);
+    assert!(!size_dirs.is_empty(), "No size dirs for '{}'", name);
+    assert!(!counters_dirs.is_empty(), "No counters dirs for '{}'", name);
+    assert!(!perf_dirs.is_empty(), "No perf dirs for '{}'", name);
+
+    // Load and max across workloads
+    let mut blow_up_stats: HashMap<String, BlowUpLocationStats> = HashMap::new();
+    for dir in &blow_up_dirs {
+        let stats: HashMap<String, BlowUpLocationStats> =
+            load_json_for_best_csv(dir, "blow_up_stats");
+        for (loc, s) in stats {
+            let entry = blow_up_stats.entry(loc).or_insert_with(|| s.clone());
+            entry.sar_stats = entry.sar_stats.max(s.sar_stats);
+            for (&op, &count) in &s.counts {
+                let e = entry.counts.entry(op).or_default();
+                *e = (*e).max(count);
+            }
+        }
+    }
+
+    let op_output_sizes = max_across_dirs(&size_dirs, |dir| {
+        let path = dir.join("size_analysis.json");
+        if path.exists() {
+            load_json(&path)
+        } else {
+            HashMap::new()
+        }
+    });
+    let op_counts = max_across_dirs(&counters_dirs, |dir| load_json_for_best_csv(dir, "counters"));
+    let perf = max_across_dirs(&perf_dirs, |dir| load_json_for_best_csv(dir, "perf"));
+
+    // Convert blow-up stats to per-op memory/IO
+    let mut per_op_blow_up: HashMap<usize, SarStats> = HashMap::new();
+    for stats in blow_up_stats.values() {
+        if let Some(&first_op) = stats.operators.first() {
+            let entry = per_op_blow_up.entry(first_op).or_default();
+            if stats.sar_stats.memory > 5.0 {
+                entry.memory += stats.sar_stats.memory;
+            }
+            if stats.sar_stats.io > 10.0 {
+                entry.io += stats.sar_stats.io;
+            }
+        }
+    }
+
+    IlpInputs {
+        per_op_blow_up,
+        op_output_sizes,
+        op_counts,
+        perf,
+        network_cost_table: load_calibration_table(base_dir),
+    }
+}
+
+/// Loads calibration CSVs from directories matching `NetworkCalibration_*b_*_none/`.
+/// Returns a NetworkCostTable mapping message_size → per-round-trip resource cost.
+pub fn load_calibration_table(calibration_dir: &Path) -> NetworkCostTable {
+    let size_regex = Regex::new(r"^NetworkCalibration_(\d+)b_").unwrap();
+    let mut entries: Vec<(u64, SarStats)> = Vec::new();
+
+    for entry in fs::read_dir(calibration_dir).expect("Failed to read calibration directory") {
+        let entry = entry.unwrap();
+        let dir_name = entry.file_name().to_string_lossy().to_string();
+        let Some(cap) = size_regex.captures(&dir_name) else {
+            continue;
+        };
+        let msg_size: u64 = cap[1].parse().unwrap();
+        let dir_path = entry.path();
+
+        let server_files: Vec<_> = fs::read_dir(&dir_path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("server_"))
+            .collect();
+
+        let Some(best_file) = server_files
+            .iter()
+            .max_by_key(|e| csv_avg_throughput(&e.path()))
+        else {
+            continue;
+        };
+
+        let csv_content = fs::read_to_string(best_file.path()).unwrap();
+        let lines: Vec<&str> = csv_content.lines().collect();
+        let header: Vec<&str> = lines[0].split(',').collect();
+        let get_col = |name: &str| header.iter().position(|&h| h == name).unwrap();
+        let thr_col = get_col("throughput_rps");
+        let cpu_col = get_col("cpu");
+        let cpu_user_col = get_col("cpu_user");
+        let net_col = get_col("network");
+
+        let start = START_MEASUREMENT_SECOND + 1;
+        let end = MEASUREMENT_SECOND + 1;
+        assert!(lines.len() > end, "CSV too short: {} lines", lines.len());
+
+        let mut sum_thr = 0.0;
+        let mut sum_cpu = 0.0;
+        let mut sum_cpu_user = 0.0;
+        let mut sum_net = 0.0;
+        let n = (end - start + 1) as f64;
+
+        for row_line in &lines[start..=end] {
+            let row: Vec<&str> = row_line.split(',').collect();
+            sum_thr += row[thr_col].parse::<f64>().unwrap();
+            sum_cpu += row[cpu_col].parse::<f64>().unwrap();
+            sum_cpu_user += row[cpu_user_col].parse::<f64>().unwrap();
+            sum_net += row[net_col].parse::<f64>().unwrap();
+        }
+
+        let throughput = (sum_thr / n) as usize;
+        if throughput > 0 {
+            entries.push((
+                msg_size,
+                SarStats {
+                    cpu: (sum_cpu / n) / throughput as f64,
+                    cpu_user: (sum_cpu_user / n) / throughput as f64,
+                    network: (sum_net / n) / throughput as f64,
+                    memory: 0.0,
+                    io: 0.0,
+                },
+            ));
+        }
+    }
+
+    assert!(
+        !entries.is_empty(),
+        "No calibration data found in {:?}",
+        calibration_dir
+    );
+    println!("Loaded {} calibration points", entries.len());
+    NetworkCostTable::from_calibration(entries)
+}
+
+/// Finds the bottleneck run directory: the perf dir with highest throughput across workloads.
+pub fn find_bottleneck_run_dir(base_dir: &Path, name: &str) -> PathBuf {
+    let perf_label = OptimizationKind::PerfOnly.label();
+    let perf_dirs = find_workload_dirs(base_dir, name, perf_label);
+    assert!(!perf_dirs.is_empty(), "No perf dirs for '{}'", name);
+    // Use the one with highest throughput CSVs
+    perf_dirs
+        .into_iter()
+        .max_by_key(|dir| {
+            get_csvs_in_dir(dir)
+                .iter()
+                .map(|e| csv_avg_throughput(&e.path()))
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap()
+}
+
+/// Finds all workload directories matching `{name}_*_{label}` in base_dir.
+fn find_workload_dirs(base_dir: &Path, name: &str, label: &str) -> Vec<PathBuf> {
+    let prefix = format!("{}_", name);
+    let suffix = format!("_{}", label);
+    fs::read_dir(base_dir)
+        .unwrap_or_else(|e| panic!("Failed to read {}: {}", base_dir.display(), e))
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            n.starts_with(&prefix) && n.ends_with(&suffix) && e.path().is_dir()
+        })
+        .map(|e| e.path())
+        .collect()
+}
+
+/// Loads a JSON file associated with the best-throughput CSV in a dir.
+/// The JSON filename is `{prefix}_{vc_suffix}.json` where vc_suffix comes from the best CSV.
+fn load_json_for_best_csv<T: DeserializeOwned + Default>(dir: &Path, prefix: &str) -> T {
+    let csvs = get_csvs_in_dir(dir);
+    let Some(best_csv) = csvs.iter().max_by_key(|e| csv_avg_throughput(&e.path())) else {
+        return T::default();
+    };
+    let best_name = best_csv.file_name().to_string_lossy().to_string();
+    let vc_re = Regex::new(r"(\d+c_\d+vc_r\d+)\.csv$").unwrap();
+    let Some(cap) = vc_re.captures(&best_name) else {
+        return T::default();
+    };
+    let path = dir.join(format!("{}_{}.json", prefix, &cap[1]));
+    if path.exists() {
+        load_json(&path)
+    } else {
+        T::default()
+    }
+}
+
+/// Loads HashMap<usize, V> from each dir via a loader and takes element-wise max.
+fn max_across_dirs<V: PartialOrd + Copy + Default>(
+    dirs: &[PathBuf],
+    loader: impl Fn(&Path) -> HashMap<usize, V>,
+) -> HashMap<usize, V> {
+    let mut result: HashMap<usize, V> = HashMap::new();
+    for dir in dirs {
+        for (k, v) in loader(dir) {
+            let e = result.entry(k).or_default();
+            if v > *e {
+                *e = v;
+            }
+        }
+    }
+    result
+}
+
+/// Given a bottleneck name (possibly "proposer_loc1"), return the original cluster name.
+pub fn original_cluster_name(name: &str) -> &str {
+    name.split("_loc").next().unwrap_or(name)
+}
+
+/// Loads a JSON file and deserializes it.
+pub fn load_json<T: DeserializeOwned>(path: &Path) -> T {
+    let file =
+        File::open(path).unwrap_or_else(|e| panic!("Failed to open {}: {}", path.display(), e));
+    serde_json::from_reader(std::io::BufReader::new(file))
+        .unwrap_or_else(|e| panic!("Failed to deserialize {}: {}", path.display(), e))
+}
+
+/// Serialize `value` as pretty JSON and write to `dir/filename`.
+pub fn save_json(dir: &Path, filename: &str, value: &impl Serialize) {
+    fs::create_dir_all(dir).ok();
+    let path = dir.join(filename);
+    let json = serde_json::to_string_pretty(value).expect("failed to serialize JSON");
+    match fs::write(&path, json) {
+        Ok(()) => println!("Saved {}", path.display()),
+        Err(e) => eprintln!("Failed to save {}: {}", path.display(), e),
+    }
+}
+
+/// Returns all CSV files in a directory.
+fn get_csvs_in_dir(dir: &Path) -> Vec<fs::DirEntry> {
+    fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".csv"))
+        .collect()
+}
+
+/// Lookup table mapping message size (bytes) → per-message resource costs.
+/// Built from calibration runs at various message sizes. Interpolates linearly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkCostTable {
+    /// Sorted by message size. Each entry is (message_size, cost_per_message).
+    entries: Vec<(u64, SarStats)>,
+}
+
+impl NetworkCostTable {
+    pub fn from_calibration(mut entries: Vec<(u64, SarStats)>) -> Self {
+        entries.sort_by_key(|(size, _)| *size);
+        // Scale by 0.5: calibration measures round-trips but we want cost per message (one direction)
+        for (_, stats) in &mut entries {
+            *stats = stats.scale(0.5);
+        }
+        Self { entries }
+    }
+
+    /// Returns the cost per message for the given message size.
+    /// Uses the next larger calibrated size (ceiling) to avoid underestimating.
+    pub fn cost_per_message(&self, message_size_bytes: u64) -> SarStats {
+        let n = self.entries.len();
+        if n == 1 || message_size_bytes >= self.entries[n - 1].0 {
+            return self.entries[n - 1].1;
+        }
+        let i = self
+            .entries
+            .partition_point(|(s, _)| *s <= message_size_bytes);
+        if i >= n {
+            self.entries[n - 1].1
+        } else {
+            self.entries[i].1
+        }
+    }
+
+    /// Total resource cost for sending `count` messages of `message_size_bytes` each.
+    pub fn network_cost(&self, count: usize, message_size_bytes: u64) -> SarStats {
+        self.cost_per_message(message_size_bytes)
+            .scale(count as f64)
+    }
+}
+
+/// Per-location blow-up analysis output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BlowUpLocationStats {
+    sar_stats: SarStats,
+    operators: Vec<usize>,
+    counts: HashMap<usize, usize>,
+}
+
+/// Derives per-operator resource load for the ILP solver.
+///
+/// - Non-network ops: CPU = perf fraction × 100 (total CPU% at measured throughput)
+/// - Memory/IO from pre-computed blow-up per-op stats
+/// - Network ops are excluded (handled by calibration table in the ILP).
+pub fn derive_per_op_load(
+    perf: &HashMap<usize, f64>,
+    network_op_ids: &HashSet<usize>,
+    per_op_blow_up: &HashMap<usize, SarStats>,
+) -> HashMap<usize, SarStats> {
+    let mut result: HashMap<usize, SarStats> = HashMap::new();
+
+    for (&op_id, &fraction) in perf {
+        if !network_op_ids.contains(&op_id) {
+            let entry = result.entry(op_id).or_default();
+            entry.cpu += fraction * 100.0;
+            entry.cpu_user += fraction * 100.0;
+        }
+    }
+
+    for (&op_id, load) in per_op_blow_up {
+        let entry = result.entry(op_id).or_default();
+        entry.memory += load.memory;
+        entry.io += load.io;
+    }
+
+    result
+}
 
 #[derive(Default, Clone)]
 pub struct RunMetadata {
@@ -46,9 +584,15 @@ impl RunMetadata {
 
     /// Median byte size for a single op.
     pub fn median_byte_size(&self, op_id: usize) -> Option<u64> {
-        self.byte_sizes
-            .get(&op_id)
-            .map(|sizes| median(&mut sizes.clone()))
+        self.byte_sizes.get(&op_id).map(|sizes| {
+            if sizes.is_empty() {
+                0
+            } else {
+                let mut sorted = sizes.clone();
+                sorted.sort_unstable();
+                sorted[sorted.len() / 2]
+            }
+        })
     }
 
     /// Average SAR stats over the measurement window for each location.
@@ -183,13 +727,7 @@ impl RunMetadata {
     }
 
     /// Saves per-location perf profiling data to a JSON file.
-    pub fn save_perf(
-        &self,
-        output_dir: &Path,
-        num_clients: usize,
-        num_virtual: usize,
-        run: usize,
-    ) {
+    pub fn save_perf(&self, output_dir: &Path, num_clients: usize, num_virtual: usize, run: usize) {
         if self.perf.is_empty() {
             return;
         }
@@ -212,9 +750,19 @@ impl RunMetadata {
     }
 
     /// Saves average per-op counters over the measurement window to a JSON file.
-    pub fn save_counters(&self, output_dir: &Path) {
+    pub fn save_counters(
+        &self,
+        output_dir: &Path,
+        num_clients: usize,
+        num_virtual: usize,
+        run: usize,
+    ) {
         let avg = self.avg_counters();
-        save_json(output_dir, "counters.json", &avg);
+        save_json(
+            output_dir,
+            &format!("counters_{}c_{}vc_r{}.json", num_clients, num_virtual, run),
+            &avg,
+        );
     }
 
     /// Saves per-location blow-up stats: sar_stats, operator list, per-op counts.
@@ -231,6 +779,7 @@ impl RunMetadata {
         inject_inferred_counters(ir, pre_rewrite_parents, &mut avg_counters);
         let avg_sar = self.avg_sar_stats();
 
+        // TODO: Remove BlowUpLocationStats. Save stats per unit (based on count of first op in each group if there are multiple). Should only do if we will rerun blow up analysis again afterwards.
         let mut location_stats: HashMap<String, BlowUpLocationStats> = HashMap::new();
         for (loc, ops) in &self.location_to_original_ops {
             if ops.is_empty() {
@@ -262,6 +811,19 @@ impl RunMetadata {
     }
 }
 
+/// Average of `f(item)` over the measurement window
+fn avg_over<T>(slice: &[T], f: impl Fn(&T) -> f64) -> f64 {
+    assert!(
+        slice.len() > MEASUREMENT_SECOND,
+        "measurement window [{}, {}] out of range for slice of length {}",
+        START_MEASUREMENT_SECOND,
+        MEASUREMENT_SECOND,
+        slice.len()
+    );
+    let window = &slice[START_MEASUREMENT_SECOND..=MEASUREMENT_SECOND];
+    window.iter().map(&f).sum::<f64>() / window.len() as f64
+}
+
 /// Per-second SAR statistics
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 pub struct SarStats {
@@ -288,16 +850,6 @@ impl SarStats {
         }
     }
 
-    fn lerp(self, other: Self, t: f64) -> Self {
-        Self {
-            cpu: self.cpu + t * (other.cpu - self.cpu),
-            cpu_user: self.cpu_user + t * (other.cpu_user - self.cpu_user),
-            network: self.network + t * (other.network - self.network),
-            memory: self.memory + t * (other.memory - self.memory),
-            io: self.io + t * (other.io - self.io),
-        }
-    }
-
     /// Multiply each field by `s`.
     pub fn scale(self, s: f64) -> Self {
         Self {
@@ -316,47 +868,6 @@ impl SarStats {
         self.memory += other.memory;
         self.io += other.io;
     }
-}
-
-/// Per-location blow-up analysis output.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BlowUpLocationStats {
-    pub sar_stats: SarStats,
-    pub operators: Vec<usize>,
-    pub counts: HashMap<usize, usize>,
-}
-
-/// Derives per-operator resource load for the ILP solver.
-///
-/// - Non-network ops: CPU = perf fraction × 100 (direct measurement on saturated machine)
-/// - Network ops: CPU = count × cost_per_message from calibration (accounts for ser/deser + kernel)
-/// - Memory and IO costs are added from blow-up stats (assigned to first op of each location group)
-pub fn derive_per_op_load(
-    perf: &HashMap<usize, f64>,
-    network_op_ids: &HashSet<usize>,
-    blow_up_stats: &HashMap<String, BlowUpLocationStats>,
-) -> HashMap<usize, SarStats> {
-    let mut result: HashMap<usize, SarStats> = HashMap::new();
-
-    for (&op_id, &fraction) in perf {
-        // Perf not calculated for network ops
-        if !network_op_ids.contains(&op_id) {
-            let entry = result.entry(op_id).or_default();
-            entry.cpu += fraction * 100.0;
-            entry.cpu_user += fraction * 100.0;
-        }
-    }
-
-    // Add memory and IO costs from blow-up stats. Assign to 1st op; it's ok since they'll always decouple together
-    for stats in blow_up_stats.values() {
-        if let Some(&first_op) = stats.operators.first() {
-            let entry = result.entry(first_op).or_default();
-            entry.memory += stats.sar_stats.memory;
-            entry.io += stats.sar_stats.io;
-        }
-    }
-
-    result
 }
 
 /// Parses `sar -n DEV -u -P ALL -r -b` output lines and returns per-second SarStats.
@@ -513,342 +1024,6 @@ pub fn parse_counter_usage(lines: Vec<String>) -> HashMap<usize, Vec<usize>> {
     result
 }
 
-/// Lookup table mapping message size (bytes) → per-message resource costs.
-/// Built from calibration runs at various message sizes. Interpolates linearly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NetworkCostTable {
-    /// Sorted by message size. Each entry is (message_size, cost_per_message).
-    entries: Vec<(u64, SarStats)>,
-}
-
-impl NetworkCostTable {
-    pub fn from_calibration(mut entries: Vec<(u64, SarStats)>) -> Self {
-        entries.sort_by_key(|(size, _)| *size);
-        // Scale by 0.5: calibration measures round-trips but we want cost per message (one direction)
-        for (_, stats) in &mut entries {
-            *stats = stats.scale(0.5);
-        }
-        Self { entries }
-    }
-
-    /// Returns the interpolated cost per message for the given message size.
-    /// Clamps to the nearest endpoint if outside the calibrated range.
-    pub fn cost_per_message(&self, message_size_bytes: u64) -> SarStats {
-        let n = self.entries.len();
-        if n == 1 || message_size_bytes <= self.entries[0].0 {
-            return self.entries[0].1;
-        }
-        if message_size_bytes >= self.entries[n - 1].0 {
-            return self.entries[n - 1].1;
-        }
-        let i = self
-            .entries
-            .partition_point(|(s, _)| *s <= message_size_bytes);
-        let (s0, c0) = self.entries[i - 1];
-        let (s1, c1) = self.entries[i];
-        let t = (message_size_bytes - s0) as f64 / (s1 - s0) as f64;
-        c0.lerp(c1, t)
-    }
-
-    /// Total resource cost for sending `count` messages of `message_size_bytes` each.
-    pub fn network_cost(&self, count: usize, message_size_bytes: u64) -> SarStats {
-        self.cost_per_message(message_size_bytes)
-            .scale(count as f64)
-    }
-}
-
-/// Finds the bottleneck cluster from a run folder's CSV data.
-/// 1. Finds the run suffix (e.g. "10c_500vc_r0") with highest avg throughput.
-/// 2. For that run, reads all cluster CSVs and returns the cluster name whose SAR stats
-///    are closest to saturation (100% CPU, 100% memory, or at/above max network/IO).
-pub fn find_bottleneck_from_run(
-    run_dir: &Path,
-    network_bytes_per_sec: f64,
-    io_tps: f64,
-) -> String {
-    let csv_re = Regex::new(r"^(.+)_(\d+c_\d+vc_r\d+)\.csv$").unwrap();
-
-    // Group CSVs by suffix
-    let mut suffix_to_files: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new();
-    for entry in fs::read_dir(run_dir)
-        .unwrap_or_else(|e| panic!("Failed to read run dir {}: {}", run_dir.display(), e))
-        .filter_map(|e| e.ok())
-    {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if let Some(caps) = csv_re.captures(&name) {
-            let cluster_name = caps[1].to_string();
-            let suffix = caps[2].to_string();
-            suffix_to_files
-                .entry(suffix)
-                .or_default()
-                .push((cluster_name, entry.path()));
-        }
-    }
-
-    // Find suffix with highest throughput (use first CSV that has throughput data)
-    let best_suffix = suffix_to_files
-        .keys()
-        .max_by_key(|suffix| {
-            suffix_to_files[*suffix]
-                .iter()
-                .map(|(_, path)| csv_avg_throughput(path))
-                .max()
-                .unwrap_or(0)
-        })
-        .expect("No CSVs found in run dir")
-        .clone();
-
-    // For the best suffix, score each cluster by saturation
-    let score = |s: &SarStats| -> f64 {
-        [
-            s.cpu / 100.0,
-            s.memory / 100.0,
-            if network_bytes_per_sec > 0.0 { s.network / network_bytes_per_sec } else { 0.0 },
-            if io_tps > 0.0 { s.io / io_tps } else { 0.0 },
-        ]
-        .into_iter()
-        .fold(0.0_f64, f64::max)
-    };
-
-    let (bottleneck_name, _) = suffix_to_files[&best_suffix]
-        .iter()
-        .map(|(cluster_name, path)| {
-            let avg_sar = csv_avg_sar(path);
-            (cluster_name.clone(), score(&avg_sar))
-        })
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .expect("No cluster CSVs for best suffix");
-
-    println!(
-        "Bottleneck from run: {} (suffix: {})",
-        bottleneck_name, best_suffix
-    );
-    bottleneck_name
-}
-
-/// Reads a CSV and returns the average SAR stats over the measurement window.
-fn csv_avg_sar(path: &Path) -> SarStats {
-    let content = fs::read_to_string(path).unwrap();
-    let lines: Vec<&str> = content.lines().collect();
-    let start = START_MEASUREMENT_SECOND + 1; // +1 for header
-    let end = MEASUREMENT_SECOND + 1;
-    if lines.len() <= end {
-        return SarStats::default();
-    }
-    let header: Vec<&str> = lines[0].split(',').collect();
-    let col = |name: &str| header.iter().position(|&h| h == name);
-    let cpu_col = col("cpu").unwrap();
-    let net_col = col("network").unwrap();
-    let mem_col = col("memory").unwrap();
-    let io_col = col("io").unwrap();
-
-    let n = (end - start + 1) as f64;
-    let mut sum = SarStats::default();
-    for line in &lines[start..=end] {
-        let fields: Vec<&str> = line.split(',').collect();
-        sum.cpu += fields[cpu_col].parse::<f64>().unwrap_or(0.0);
-        sum.network += fields[net_col].parse::<f64>().unwrap_or(0.0);
-        sum.memory += fields[mem_col].parse::<f64>().unwrap_or(0.0);
-        sum.io += fields[io_col].parse::<f64>().unwrap_or(0.0);
-    }
-    SarStats {
-        cpu: sum.cpu / n,
-        cpu_user: 0.0,
-        network: sum.network / n,
-        memory: sum.memory / n,
-        io: sum.io / n,
-    }
-}
-
-
-/// Reads a benchmark CSV and returns the average throughput over the measurement window.
-/// Returns 0 if the file is too short or has no throughput data.
-fn csv_avg_throughput(path: &Path) -> usize {
-    let content = fs::read_to_string(path).unwrap();
-    let lines: Vec<&str> = content.lines().collect();
-    let start = START_MEASUREMENT_SECOND + 1; // +1 for header
-    let end = MEASUREMENT_SECOND + 1;
-    if lines.len() <= end {
-        return 0;
-    }
-    let header: Vec<&str> = lines[0].split(',').collect();
-    let thr_col = header.iter().position(|&h| h == "throughput_rps").unwrap();
-    let n = (end - start + 1) as f64;
-    let sum: f64 = lines[start..=end]
-        .iter()
-        .map(|line| line.split(',').nth(thr_col).unwrap().parse::<f64>().unwrap())
-        .sum();
-    (sum / n) as usize
-}
-
-/// Finds the most recent directory in `base_dir` whose name starts with `prefix`.
-/// "Most recent" = lexicographically last (works because timestamps are YYYY-MM-DD_HH-MM-SS).
-pub fn find_latest_dir(base_dir: &Path, prefix: &str) -> PathBuf {
-    fs::read_dir(base_dir)
-        .unwrap_or_else(|e| panic!("Failed to read {}: {}", base_dir.display(), e))
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
-        .max_by_key(|e| e.file_name().to_string_lossy().to_string())
-        .unwrap_or_else(|| panic!("No directory matching '{}*' in {}", prefix, base_dir.display()))
-        .path()
-}
-
-/// Locates the blow_up_stats JSON, size_analysis JSON, counters JSON, and perf JSON for a given
-/// benchmark name (e.g. "Paxos") by finding the latest directory of each type.
-/// Returns (blow_up_stats_path, size_analysis_path, counters_path, perf_path).
-/// ILP input data loaded from benchmark results.
-pub struct IlpInputs {
-    pub blow_up_stats: HashMap<String, BlowUpLocationStats>,
-    pub op_output_sizes: HashMap<usize, u64>,
-    pub op_counts: HashMap<usize, usize>,
-    pub perf: HashMap<usize, f64>,
-    pub network_cost_table: NetworkCostTable,
-}
-
-/// Locates and loads all ILP inputs for a given benchmark name (e.g. "Paxos")
-/// by finding the latest directory of each type in `base_dir`.
-pub fn load_ilp_inputs(base_dir: &Path, name: &str) -> IlpInputs {
-    let blow_up_dir = find_latest_dir(base_dir, &format!("{}_blow_up_", name));
-    let size_dir = find_latest_dir(base_dir, &format!("{}_size_", name));
-    let counters_dir = find_latest_dir(base_dir, &format!("{}_counters_", name));
-    let perf_dir = find_latest_dir(base_dir, &format!("{}_perf_", name));
-
-    // Find the blow_up_stats JSON whose vc had the highest throughput
-    let blow_up_csvs: Vec<_> = fs::read_dir(&blow_up_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".csv"))
-        .collect();
-    let best_csv = blow_up_csvs
-        .iter()
-        .max_by_key(|e| csv_avg_throughput(&e.path()))
-        .expect("No CSVs in blow_up dir");
-    let best_name = best_csv.file_name().to_string_lossy().to_string();
-    let vc_suffix = Regex::new(r"(\d+c_\d+vc_r\d+)\.csv$").unwrap()
-        .captures(&best_name).unwrap()[1].to_string();
-    let blow_up_path = blow_up_dir.join(format!("blow_up_stats_{}.json", vc_suffix));
-    assert!(blow_up_path.exists(), "Missing {}", blow_up_path.display());
-
-    let size_path = size_dir.join("size_analysis.json");
-    assert!(size_path.exists(), "Missing {}", size_path.display());
-
-    let counters_path = counters_dir.join("counters.json");
-    assert!(counters_path.exists(), "Missing {}", counters_path.display());
-
-    // Find the perf JSON with highest throughput
-    let perf_csvs: Vec<_> = fs::read_dir(&perf_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".csv"))
-        .collect();
-    let best_perf_csv = perf_csvs
-        .iter()
-        .max_by_key(|e| csv_avg_throughput(&e.path()))
-        .expect("No CSVs in perf dir");
-    let best_perf_name = best_perf_csv.file_name().to_string_lossy().to_string();
-    let perf_vc_suffix = Regex::new(r"(\d+c_\d+vc_r\d+)\.csv$").unwrap()
-        .captures(&best_perf_name).unwrap()[1].to_string();
-    let perf_path = perf_dir.join(format!("perf_{}.json", perf_vc_suffix));
-    assert!(perf_path.exists(), "Missing {}", perf_path.display());
-
-    IlpInputs {
-        blow_up_stats: load_json(&blow_up_path),
-        op_output_sizes: load_json(&size_path),
-        op_counts: load_json(&counters_path),
-        perf: load_json(&perf_path),
-        network_cost_table: load_calibration_table(base_dir),
-    }
-}
-
-/// Loads calibration CSVs from a directory containing NetworkCalibration_*b_none_* subdirs.
-/// For each message size, uses the most recent calibration directory.
-/// Returns a NetworkCostTable mapping message_size → per-round-trip resource cost.
-pub fn load_calibration_table(calibration_dir: &Path) -> NetworkCostTable {
-    // Find all unique message sizes, then use find_latest_dir for each
-    let size_regex = Regex::new(r"NetworkCalibration_(\d+)b").unwrap();
-    let mut sizes: HashSet<u64> = HashSet::new();
-    for entry in fs::read_dir(calibration_dir).expect("Failed to read calibration directory") {
-        let entry = entry.unwrap();
-        let dir_name = entry.file_name().to_string_lossy().to_string();
-        if let Some(cap) = size_regex.captures(&dir_name) {
-            sizes.insert(cap[1].parse().unwrap());
-        }
-    }
-
-    let mut entries: Vec<(u64, SarStats)> = Vec::new();
-    for &msg_size in &sizes {
-        let dir_path = find_latest_dir(calibration_dir, &format!("NetworkCalibration_{}b", msg_size));
-        let server_files: Vec<_> = fs::read_dir(&dir_path)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("server_"))
-            .collect();
-
-        // Pick the server CSV with highest average throughput over the measurement window
-        let best_file = server_files
-            .iter()
-            .max_by_key(|e| csv_avg_throughput(&e.path()));
-
-        let Some(best_file) = best_file else {
-            continue;
-        };
-
-        let csv_content = fs::read_to_string(best_file.path()).unwrap();
-        let lines: Vec<&str> = csv_content.lines().collect();
-        let header: Vec<&str> = lines[0].split(',').collect();
-        let get_col = |name: &str| header.iter().position(|&h| h == name).unwrap();
-        let thr_col = get_col("throughput_rps");
-        let cpu_col = get_col("cpu");
-        let cpu_user_col = get_col("cpu_user");
-        let net_col = get_col("network");
-
-        let start = START_MEASUREMENT_SECOND + 1;
-        let end = MEASUREMENT_SECOND + 1;
-        assert!(lines.len() > end, "CSV too short: {} lines", lines.len());
-
-        let mut sum_thr = 0.0;
-        let mut sum_cpu = 0.0;
-        let mut sum_cpu_user = 0.0;
-        let mut sum_net = 0.0;
-        let n = (end - start + 1) as f64;
-
-        for row_line in &lines[start..=end] {
-            let row: Vec<&str> = row_line.split(',').collect();
-            sum_thr += row[thr_col].parse::<f64>().unwrap();
-            sum_cpu += row[cpu_col].parse::<f64>().unwrap();
-            sum_cpu_user += row[cpu_user_col].parse::<f64>().unwrap();
-            sum_net += row[net_col].parse::<f64>().unwrap();
-        }
-
-        let throughput = (sum_thr / n) as usize;
-        if throughput > 0 {
-            entries.push((msg_size, SarStats {
-                cpu: (sum_cpu / n) / throughput as f64,
-                cpu_user: (sum_cpu_user / n) / throughput as f64,
-                network: (sum_net / n) / throughput as f64,
-                memory: 0.0,
-                io: 0.0,
-            }));
-        }
-    }
-
-    assert!(
-        !entries.is_empty(),
-        "No calibration data found in {:?}",
-        calibration_dir
-    );
-    println!("Loaded {} calibration points", entries.len());
-    NetworkCostTable::from_calibration(entries)
-}
-
-/// Loads a JSON file and deserializes it.
-pub fn load_json<T: DeserializeOwned>(path: &Path) -> T {
-    let file = File::open(path)
-        .unwrap_or_else(|e| panic!("Failed to open {}: {}", path.display(), e));
-    serde_json::from_reader(std::io::BufReader::new(file))
-        .unwrap_or_else(|e| panic!("Failed to deserialize {}: {}", path.display(), e))
-}
-
 /// Parses byte-size measurement lines of the form `_optimize_byte_size(op_id): size`.
 pub fn parse_byte_sizes(lines: Vec<String>) -> HashMap<usize, Vec<u64>> {
     let regex = Regex::new(r"\((\d+)\): (\d+)").unwrap();
@@ -891,16 +1066,6 @@ pub fn parse_perf(folded: &str) -> HashMap<usize, f64> {
     samples_per_id
 }
 
-/// Computes median of a sorted slice.
-fn median(sorted: &mut [u64]) -> u64 {
-    sorted.sort_unstable();
-    if sorted.is_empty() {
-        0
-    } else {
-        sorted[sorted.len() / 2]
-    }
-}
-
 /// Drains all currently available messages from a receiver into a Vec.
 async fn drain_receiver(receiver: &mut UnboundedReceiver<String>) -> Vec<String> {
     let mut lines = Vec::new();
@@ -914,29 +1079,6 @@ async fn drain_receiver(receiver: &mut UnboundedReceiver<String>) -> Vec<String>
     lines
 }
 
-/// Serialize `value` as pretty JSON and write to `dir/filename`.
-fn save_json(dir: &Path, filename: &str, value: &impl Serialize) {
-    fs::create_dir_all(dir).ok();
-    let path = dir.join(filename);
-    let json = serde_json::to_string_pretty(value).expect("failed to serialize JSON");
-    match fs::write(&path, json) {
-        Ok(()) => println!("Saved {}", path.display()),
-        Err(e) => eprintln!("Failed to save {}: {}", path.display(), e),
-    }
-}
-
-/// Average of `f(item)` over the measurement window
-fn avg_over<T>(slice: &[T], f: impl Fn(&T) -> f64) -> f64 {
-    assert!(
-        slice.len() > MEASUREMENT_SECOND,
-        "measurement window [{}, {}] out of range for slice of length {}",
-        START_MEASUREMENT_SECOND,
-        MEASUREMENT_SECOND,
-        slice.len()
-    );
-    let window = &slice[START_MEASUREMENT_SECOND..=MEASUREMENT_SECOND];
-    window.iter().map(&f).sum::<f64>() / window.len() as f64
-}
 
 /// Element-wise max merge of a time series, extending `dst` as needed.
 fn merge_max_vec<T: Clone>(dst: &mut Vec<T>, src: &[T], max_fn: fn(T, T) -> T) {

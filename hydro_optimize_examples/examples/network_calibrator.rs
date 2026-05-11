@@ -9,7 +9,7 @@ use hydro_optimize::deploy_and_analyze::{
 use hydro_optimize_examples::network_calibrator::network_calibrator;
 use stageleft::q;
 
-const CALIBRATION_SIZES: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
+const CALIBRATION_SIZES: &[usize] = &[1, 64, 128, 256, 512, 1024, 2048, 4096];
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, group(
@@ -78,6 +78,7 @@ async fn main() {
 
                 BenchmarkConfig {
                     name: format!("NetworkCalibration_{}b", size),
+                    workload: "default".to_string(),
                     builder,
                     clusters,
                     processes,

@@ -61,6 +61,7 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
 
     BenchmarkConfig {
         name: "CAS_Write".to_string(),
+        workload: "default".to_string(),
         builder,
         clusters,
         processes,

@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 
 use clap::{ArgAction, Parser};
 use hydro_lang::location::Location;
@@ -42,14 +41,13 @@ struct Args {
     #[arg(long, action = ArgAction::SetTrue)]
     perf_only: bool,
 
-    /// Run ILP bottleneck elimination using the given run folder to determine the bottleneck.
-    #[arg(long)]
-    ilp: Option<PathBuf>,
+    /// Workload variant name (determines output directory)
+    #[arg(long, default_value = "default")]
+    workload: String,
 
-    /// Path(s) to JSON file(s) containing `PossibleRewrite`s to apply before deploying.
-    /// Rewrites are applied in the order given.
-    #[arg(long = "rewrite")]
-    rewrite: Vec<PathBuf>,
+    /// Run ILP-based bottleneck elimination (auto-detects inputs and rewrites)
+    #[arg(long, action = ArgAction::SetTrue)]
+    optimize: bool,
 }
 
 #[tokio::main]
@@ -59,8 +57,8 @@ async fn main() {
     let size_analysis = args.size_analysis;
     let blow_up_analysis = args.blow_up_analysis;
     let perf_only = args.perf_only;
-    let ilp_config = args.ilp.clone();
-    let rewrite_paths = args.rewrite.clone();
+    let optimize = args.optimize;
+    let workload = args.workload.clone();
 
     let (_ir, _final_run_metadata) = benchmark_protocol(
         BenchmarkArgs {
@@ -131,25 +129,19 @@ async fn main() {
                 .excluding(client_aggregator_id);
             if counters_only {
                 optimizations = optimizations.with_counters_only();
-            }
-            if size_analysis {
+            } else if size_analysis {
                 optimizations = optimizations.with_size_analysis();
-            }
-            if blow_up_analysis {
+            } else if blow_up_analysis {
                 optimizations = optimizations.with_blow_up_analysis();
-            }
-            if perf_only {
+            } else if perf_only {
                 optimizations = optimizations.with_perf_only();
-            }
-            if let Some(ref run_dir) = ilp_config {
-                optimizations = optimizations.with_bottleneck_elimination(run_dir.clone());
-            }
-            for p in &rewrite_paths {
-                optimizations = optimizations.load_rewrite(Path::new(p));
+            } else if optimize {
+                optimizations = optimizations.with_bottleneck_elimination();
             }
 
             BenchmarkConfig {
                 name: "Paxos".to_string(),
+                workload: workload.clone(),
                 builder,
                 clusters,
                 processes,

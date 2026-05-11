@@ -11,7 +11,7 @@ use hydro_lang::{
 use syn::visit::Visit;
 
 use crate::{
-    decouple_analysis::DecoupleILPMetadata,
+    decouple_analysis::{DecoupleILPMetadata, ResourceExpressions},
     partition_node_analysis::all_inputs,
     partition_syn_analysis::{AnalyzeClosure, StructOrTuple, StructOrTupleIndex},
     rewrites::node_at_location,
@@ -933,36 +933,32 @@ pub(crate) fn apply_budget_constraints(
 
     // --- loc_used[loc]: 1 iff any operator is assigned to location loc ---
     let mut loc_used: Vec<Variable> = Vec::with_capacity(max_num_locations);
-    {
-        let DecoupleILPMetadata {
-            op_id_to_var,
-            variables,
-            constraints,
-            ..
-        } = &mut *decoupling_metadata.borrow_mut();
+    let DecoupleILPMetadata {
+        op_id_to_var,
+        variables,
+        constraints,
+        resource_usages,
+        ..
+    } = &mut *decoupling_metadata.borrow_mut();
 
-        for loc in 0..max_num_locations {
-            let used = variables.add(variable().binary());
-            let mut sum_at_loc = Expression::default();
-            for op_vars in op_id_to_var.values() {
-                if let Some(&v) = op_vars.get(&loc) {
-                    constraints.push(constraint!(used >= v));
-                    sum_at_loc += v;
-                }
+    for loc in 0..max_num_locations {
+        let used = variables.add(variable().binary());
+        let mut sum_at_loc = Expression::default();
+        for op_vars in op_id_to_var.values() {
+            if let Some(&v) = op_vars.get(&loc) {
+                constraints.push(constraint!(used >= v));
+                sum_at_loc += v;
             }
-            constraints.push(constraint!(used <= sum_at_loc));
-            loc_used.push(used);
         }
+        constraints.push(constraint!(used <= sum_at_loc));
+        loc_used.push(used);
     }
 
     // If partitioning is disabled, each used location gets exactly 1 machine.
     // Budget constraint: sum(loc_used) <= budget.
     let Some(pm) = partition_metadata else {
         let num_unique_locs: Expression = loc_used.iter().copied().map(Expression::from).sum();
-        decoupling_metadata
-            .borrow_mut()
-            .constraints
-            .push(constraint!(num_unique_locs <= budget as f64));
+        constraints.push(constraint!(num_unique_locs <= budget as f64));
         // Return trivial is_n_partitions: each loc has [loc_used] (0 or 1 machine).
         let is_n_partitions: Vec<Vec<Variable>> = (0..max_num_locations)
             .map(|loc| vec![loc_used[loc]])
@@ -971,87 +967,56 @@ pub(crate) fn apply_budget_constraints(
     };
 
     // --- is_n_partitions[loc][n]: binary, 1 iff location loc uses exactly n machines ---
-    // n ranges from 0 (unused) to budget (all machines at one location).
     let mut is_n_partitions: Vec<Vec<Variable>> = Vec::with_capacity(max_num_locations);
+    let big_m = 1000.0_f64;
+    let mut total_machines = Expression::default();
 
-    {
-        let DecoupleILPMetadata {
-            variables,
-            constraints,
-            ..
-        } = &mut *decoupling_metadata.borrow_mut();
+    for loc in 0..max_num_locations {
+        let mut vars_for_loc = Vec::with_capacity(budget + 1);
+        let mut sum_vars = Expression::default();
 
-        // Build is_n_partitions per location
-        for loc in 0..max_num_locations {
-            let mut vars_for_loc = Vec::with_capacity(budget + 1);
-            let mut sum_vars = Expression::default();
+        // Resource division: effective usage = usage / num_partitions
+        let res = resource_usages.get(&loc).cloned().unwrap_or_default();
+        let effective_cpu = variables.add(variable().min(0));
+        let effective_memory = variables.add(variable().min(0));
+        let effective_network = variables.add(variable().min(0));
+        let effective_io = variables.add(variable().min(0));
 
-            for num_partitions in 0..=budget {
-                let has_n_partitions = variables.add(variable().binary());
+        for num_partitions in 0..=budget {
+            let has_n_partitions = variables.add(variable().binary());
 
-                // For a location, num_partitions=0 means that this location has nothing on it
-                // So it has 0 partitions if loc_used=0
-                if num_partitions == 0 {
-                    constraints.push(constraint!(has_n_partitions == 1 - loc_used[loc]));
-                } else {
-                    // If location is unused (0), then num_partitions = 0
-                    constraints.push(constraint!(has_n_partitions <= loc_used[loc]));
-                }
-                // num_partitions >= 2 requires partitionable
-                if num_partitions >= 2 {
-                    constraints.push(constraint!(has_n_partitions <= *pm.can_partition.get(&loc).unwrap()));
-                }
-
-                sum_vars += has_n_partitions;
-                vars_for_loc.push(has_n_partitions);
+            if num_partitions == 0 {
+                constraints.push(constraint!(has_n_partitions == 1 - loc_used[loc]));
+            } else {
+                constraints.push(constraint!(has_n_partitions <= loc_used[loc]));
+                let scale = 1.0 / num_partitions as f64;
+                let penalty = big_m * (1 - has_n_partitions);
+                constraints.push(constraint!(effective_cpu >= res.cpu.clone() * scale - penalty.clone()));
+                constraints.push(constraint!(effective_memory >= res.memory.clone() * scale - penalty.clone()));
+                constraints.push(constraint!(effective_network >= res.network.clone() * scale - penalty.clone()));
+                constraints.push(constraint!(effective_io >= res.io.clone() * scale - penalty));
+            }
+            if num_partitions >= 2 {
+                constraints.push(constraint!(has_n_partitions <= *pm.can_partition.get(&loc).unwrap()));
             }
 
-            // Exactly one choice of num_partitions per location
-            constraints.push(constraint!(sum_vars == 1));
-            is_n_partitions.push(vars_for_loc);
+            total_machines += Expression::from(has_n_partitions) * num_partitions as f64;
+            sum_vars += has_n_partitions;
+            vars_for_loc.push(has_n_partitions);
         }
 
-        // Budget: sum of machines across all locations = budget
-        let mut total_machines = Expression::default();
-        for loc in 0..max_num_locations {
-            for num_partitions in 0..=budget {
-                total_machines += Expression::from(is_n_partitions[loc][num_partitions]) * num_partitions as f64;
-            }
-        }
-        constraints.push(constraint!(total_machines <= budget as f64));
+        constraints.push(constraint!(sum_vars == 1));
+
+        resource_usages.insert(loc, ResourceExpressions {
+            cpu: Expression::from(effective_cpu),
+            memory: Expression::from(effective_memory),
+            network: Expression::from(effective_network),
+            io: Expression::from(effective_io),
+        });
+
+        is_n_partitions.push(vars_for_loc);
     }
-
-    // --- CPU division constraints ---
-    // For each location, effective_cpu = cpu / num_partitions when
-    // is_n_partitions[loc][num_partitions]=1 and num_partitions>=1.
-    {
-        let DecoupleILPMetadata {
-            cpu_usages,
-            variables,
-            constraints,
-            ..
-        } = &mut *decoupling_metadata.borrow_mut();
-
-        // Big-M for CPU division linearization. Must exceed the maximum possible
-        // cpu_usage at any single location (op costs + decoupling overhead).
-        // A generous constant suffices; an overly large M only affects solver
-        // performance, not correctness.
-        let cpu_big_m = 5.0_f64;
-
-        for loc in 0..max_num_locations {
-            let cpu = cpu_usages.get(&loc).cloned().unwrap_or_default();
-            let effective_cpu = variables.add(variable().min(0));
-
-            for num_partitions in 1..=budget {
-                constraints.push(constraint!(
-                    effective_cpu >= cpu.clone() * (1.0 / num_partitions as f64)
-                        - cpu_big_m * (1 - is_n_partitions[loc][num_partitions])
-                ));
-            }
-
-            cpu_usages.insert(loc, Expression::from(effective_cpu));
-        }
-    }
+    constraints.push(constraint!(total_machines <= budget as f64));
 
     is_n_partitions
 }

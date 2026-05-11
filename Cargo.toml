@@ -3,7 +3,6 @@
 members = [
     "hydro_optimize",
     "hydro_optimize_examples",
-    "tcp_bench",
 ]
 
 resolver = "2"

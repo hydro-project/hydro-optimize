@@ -1,9 +1,13 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::deploy_and_analyze::{MAX_BUDGET_PER_CLUSTER, MAX_OPTIMIZATION_ITERATIONS_PAST_NO_IMPROVEMENT};
+use crate::deploy::{AWS_IO_TPS, AWS_NETWORK_BYTES_PER_SEC};
+use crate::deploy_and_analyze::{
+    MAX_BUDGET_PER_CLUSTER, MAX_OPTIMIZATION_ITERATIONS_PAST_NO_IMPROVEMENT,
+};
 use crate::parse_results::{NetworkCostTable, SarStats};
 use crate::partition_ilp_analysis::{apply_budget_constraints, partition_ilp_analysis};
 use crate::partition_syn_analysis::StructOrTupleIndex;
@@ -21,6 +25,10 @@ use hydro_lang::compile::ir::{
 use hydro_lang::location::dynamic::LocationId;
 
 use super::rewrites::{NetworkType, get_network_type};
+
+// Penalty for decoupling regardless of cardinality (to prevent decoupling low cardinality operators)
+const DECOUPLING_PENALTY: f64 = 0.0001;
+const IMPROVEMENT_THRESHOLD: f64 = 0.01; // Minimum improvement to keep increasing budget
 
 /// Each operator is assigned either 0 or 1
 /// 0 means that its output will go to the original node, 1 means that it will go to the decoupled node
@@ -48,11 +56,33 @@ pub(crate) struct DecoupleILPMetadata {
     // Model variables to construct final cost function
     pub(crate) variables: ProblemVariables,
     pub(crate) constraints: Vec<Constraint>,
-    pub(crate) cpu_usages: HashMap<usize, Expression>, // location_id: cpu_usage
+    /// Per-location resource usage expressions (each field accumulates independently).
+    pub(crate) resource_usages: HashMap<usize, ResourceExpressions>,
     pub(crate) op_id_to_var: HashMap<usize, HashMap<usize, Variable>>, // op_id: (location_id: var). Var = 1 for a location if the op is assigned to that location
     prev_op_parent_with_tick: HashMap<ClockId, usize>, // tick_id: last op_id with that tick_id
     tee_inner_to_decoupled_vars: HashMap<usize, HashMap<usize, (Variable, Variable)>>, /* inner_id: (loc: (send var, recv var)) */
     pub(crate) network_ids: HashMap<usize, NetworkType>,
+}
+
+/// Per-location ILP expressions for each resource type.
+#[derive(Clone, Default)]
+pub(crate) struct ResourceExpressions {
+    pub cpu: Expression,
+    pub memory: Expression,
+    pub network: Expression,
+    pub io: Expression,
+}
+
+impl ResourceExpressions {
+    pub fn iter(&self) -> impl Iterator<Item = (&Expression, f64)> {
+        [
+            (&self.cpu, 100.0),
+            (&self.memory, 100.0),
+            (&self.network, AWS_NETWORK_BYTES_PER_SEC),
+            (&self.io, AWS_IO_TPS),
+        ]
+        .into_iter()
+    }
 }
 
 /// All inputs needed by the ILP decoupling/partitioning solver.
@@ -72,9 +102,6 @@ pub struct ILPAnalysisInputs {
     /// Number of replicas in the bottleneck cluster
     pub cluster_size: usize,
 }
-
-// Penalty for decoupling regardless of cardinality (to prevent decoupling low cardinality operators)
-const DECOUPLING_PENALTY: f64 = 0.0001;
 
 /// Returns a map from location to a binary var
 /// Lazily creates the var
@@ -170,7 +197,7 @@ fn add_tick_constraint(
     }
 }
 
-fn add_cpu_usage(
+fn add_op_resource_usage(
     metadata: &HydroIrOpMetadata,
     network_type: &Option<NetworkType>,
     op_id_to_parents: &HashMap<usize, Vec<usize>>,
@@ -178,56 +205,86 @@ fn add_cpu_usage(
 ) {
     let DecoupleILPMetadata {
         per_op_load,
+        op_counts,
+        op_sizes,
+        network_cost_table,
         variables,
         constraints,
         max_num_locations: num_locations,
-        cpu_usages,
+        resource_usages,
         op_id_to_var,
         ..
     } = &mut *decoupling_metadata.borrow_mut();
 
     let op_id = metadata.id.unwrap();
-    let Some(op_cost) = per_op_load.get(&op_id).map(|s| s.cpu) else {
-        // If the op's cost was not recorded, it's because it must be decoupled with some other op. Don't need to factor it in
+    let op_load = if let Some(load) = per_op_load.get(&op_id) {
+        *load
+    } else if network_type.is_some() {
+        // Network ops aren't in per_op_load; derive cost from calibration table
+        // Use parent's count (total messages sent) and the network op's own size
+        let parent_id = op_id_to_parents
+            .get(&op_id)
+            .and_then(|p| p.first().copied());
+        let count = op_counts
+            .get(&parent_id.unwrap_or(op_id))
+            .copied()
+            .unwrap_or(0);
+        let size = op_sizes.get(&op_id).copied().unwrap_or(0);
+        if count > 0 && size > 0 {
+            network_cost_table.network_cost(count, size)
+        } else {
+            return;
+        }
+    } else {
         return;
     };
-    if op_cost <= 0.0 {
-        // The op is free, nothing to do
+    if op_load.cpu <= 0.0 && op_load.memory <= 0.0 && op_load.network <= 0.0 && op_load.io <= 0.0 {
         return;
     }
 
-    // Calculate total CPU usage on each node (before overheads). Operators are run on the machine that their parents send to.
+    // Operators are run on the machine that their parents send to.
     match network_type {
         Some(NetworkType::Send) | Some(NetworkType::SendRecv) | None => {
-            if let Some(parents) = op_id_to_parents.get(&op_id) {
-                // All parents must be assigned the same var (by constraints above), so it suffices to check one
-                if let Some(first_parent) = parents.first() {
-                    let parent_vars = var_from_op_id(
-                        *first_parent,
-                        *num_locations,
-                        op_id_to_var,
-                        variables,
-                        constraints,
-                    );
-                    for (loc, parent_var) in parent_vars {
-                        let node_cpu_usage = cpu_usages.get_mut(&loc).unwrap();
-                        let node_cpu_usage_temp = std::mem::take(node_cpu_usage);
-                        *node_cpu_usage = node_cpu_usage_temp + op_cost * parent_var;
-                    }
+            if let Some(parents) = op_id_to_parents.get(&op_id)
+                && let Some(first_parent) = parents.first()
+            {
+                let parent_vars = var_from_op_id(
+                    *first_parent,
+                    *num_locations,
+                    op_id_to_var,
+                    variables,
+                    constraints,
+                );
+                for (loc, parent_var) in parent_vars {
+                    let res = resource_usages.get_mut(&loc).unwrap();
+                    let cpu_temp = std::mem::take(&mut res.cpu);
+                    res.cpu = cpu_temp + op_load.cpu * parent_var;
+                    let mem_temp = std::mem::take(&mut res.memory);
+                    res.memory = mem_temp + op_load.memory * parent_var;
+                    let net_temp = std::mem::take(&mut res.network);
+                    res.network = net_temp + op_load.network * parent_var;
+                    let io_temp = std::mem::take(&mut res.io);
+                    res.io = io_temp + op_load.io * parent_var;
                 }
             }
         }
         _ => {}
     }
-    // Special case for network receives: their cpu usage (deserialization) is paid by the receiver, aka the machine they send to.
+    // Special case for network receives: their cost (deserialization) is paid by the receiver.
     match network_type {
         Some(NetworkType::Recv) | Some(NetworkType::SendRecv) => {
             let op_vars =
                 var_from_op_id(op_id, *num_locations, op_id_to_var, variables, constraints);
             for (loc, parent_var) in op_vars {
-                let node_cpu_usage = cpu_usages.get_mut(&loc).unwrap();
-                let node_cpu_usage_temp = std::mem::take(node_cpu_usage);
-                *node_cpu_usage = node_cpu_usage_temp + op_cost * parent_var;
+                let res = resource_usages.get_mut(&loc).unwrap();
+                let cpu_temp = std::mem::take(&mut res.cpu);
+                res.cpu = cpu_temp + op_load.cpu * parent_var;
+                let mem_temp = std::mem::take(&mut res.memory);
+                res.memory = mem_temp + op_load.memory * parent_var;
+                let net_temp = std::mem::take(&mut res.network);
+                res.network = net_temp + op_load.network * parent_var;
+                let io_temp = std::mem::take(&mut res.io);
+                res.io = io_temp + op_load.io * parent_var;
             }
         }
         _ => {}
@@ -265,19 +322,18 @@ fn add_decouple_vars(
     decouple_vars
 }
 
-/// CPU cost of sending this operator's output over the network.
-/// Returns 0 if byte size was never recorded (operator was never invoked or
-/// cannot be decoupled on its own).
+/// Resource cost of sending this operator's output over the network.
+/// Returns zero SarStats if byte size was never recorded.
 fn network_cost_for_decoupling_op(
     op_id: usize,
     op_counts: &HashMap<usize, usize>,
     op_sizes: &HashMap<usize, u64>,
     network_cost_table: &NetworkCostTable,
-) -> f64 {
+) -> SarStats {
     let cardinality = op_counts.get(&op_id).copied().unwrap_or(0);
     match op_sizes.get(&op_id) {
-        Some(&bytes) => network_cost_table.network_cost(cardinality, bytes).cpu,
-        None => 0.0,
+        Some(&bytes) => network_cost_table.network_cost(cardinality, bytes),
+        None => SarStats::default(),
     }
 }
 
@@ -293,7 +349,7 @@ fn add_decoupling_overhead(
         variables,
         constraints,
         max_num_locations: num_locations,
-        cpu_usages,
+        resource_usages,
         op_id_to_var,
         ..
     } = &mut *decoupling_metadata.borrow_mut();
@@ -302,27 +358,36 @@ fn add_decoupling_overhead(
     let op_id = metadata.op.id.unwrap();
     let net_cost = network_cost_for_decoupling_op(op_id, op_counts, op_sizes, network_cost_table);
 
-    if let Some(parents) = op_id_to_parents.get(&op_id) {
-        // All parents must be assigned the same var (by constraints above), so it suffices to check one
-        if let Some(parent) = parents.first() {
-            let decouple_vars = add_decouple_vars(
-                *num_locations,
-                variables,
-                constraints,
-                *parent,
-                op_id,
-                op_id_to_var,
-            );
-            for loc in 0..*num_locations {
-                let cpu_usage = cpu_usages.get_mut(&loc).unwrap();
-                let (send_var, recv_var) = decouple_vars.get(&loc).unwrap();
-                let cpu_usage_temp = std::mem::take(cpu_usage);
-                *cpu_usage = cpu_usage_temp
-                    + (net_cost + DECOUPLING_PENALTY) * *send_var
-                    + (net_cost + DECOUPLING_PENALTY) * *recv_var;
-            }
+    if let Some(parents) = op_id_to_parents.get(&op_id)
+        && let Some(parent) = parents.first()
+    {
+        let decouple_vars = add_decouple_vars(
+            *num_locations,
+            variables,
+            constraints,
+            *parent,
+            op_id,
+            op_id_to_var,
+        );
+        for loc in 0..*num_locations {
+            let res = resource_usages.get_mut(&loc).unwrap();
+            let (send_var, recv_var) = decouple_vars.get(&loc).unwrap();
+            add_resource_cost(res, &net_cost, *send_var);
+            add_resource_cost(res, &net_cost, *recv_var);
         }
     }
+}
+
+/// Adds `(cost_field + DECOUPLING_PENALTY) * var` to each resource expression.
+fn add_resource_cost(res: &mut ResourceExpressions, cost: &SarStats, var: Variable) {
+    let cpu_temp = std::mem::take(&mut res.cpu);
+    res.cpu = cpu_temp + (cost.cpu + DECOUPLING_PENALTY) * var;
+    let mem_temp = std::mem::take(&mut res.memory);
+    res.memory = mem_temp + cost.memory * var;
+    let net_temp = std::mem::take(&mut res.network);
+    res.network = net_temp + cost.network * var;
+    let io_temp = std::mem::take(&mut res.io);
+    res.io = io_temp + cost.io * var;
 }
 
 /// Only penalize decoupling inner from Tees once per unique location.
@@ -339,7 +404,7 @@ fn add_tee_decoupling_overhead(
         variables,
         constraints,
         max_num_locations: num_locations,
-        cpu_usages,
+        resource_usages,
         op_id_to_var,
         tee_inner_to_decoupled_vars,
         ..
@@ -347,8 +412,6 @@ fn add_tee_decoupling_overhead(
 
     let op_id = metadata.op.id.unwrap();
     let net_cost = network_cost_for_decoupling_op(op_id, op_counts, op_sizes, network_cost_table);
-
-    println!("Tee {} has inner {}", op_id, inner_id);
 
     // For each location,
     // send_var is 1 if the inner (at that location) sends to any Tee (including this op),
@@ -360,13 +423,9 @@ fn add_tee_decoupling_overhead(
             for loc in 0..*num_locations {
                 let send_var = variables.add(variable().binary());
                 let recv_var = variables.add(variable().binary());
-                let cpu_usage = cpu_usages.get_mut(&loc).unwrap();
-
-                let cpu_usage_temp = std::mem::take(cpu_usage);
-                *cpu_usage = cpu_usage_temp
-                    + (net_cost + DECOUPLING_PENALTY) * send_var
-                    + (net_cost + DECOUPLING_PENALTY) * recv_var;
-
+                let res = resource_usages.get_mut(&loc).unwrap();
+                add_resource_cost(res, &net_cost, send_var);
+                add_resource_cost(res, &net_cost, recv_var);
                 loc_to_vars.insert(loc, (send_var, recv_var));
             }
             loc_to_vars
@@ -473,7 +532,7 @@ fn decouple_analysis_node(
         add_decoupling_overhead(node, op_id_to_parents, decoupling_metadata);
     }
 
-    add_cpu_usage(
+    add_op_resource_usage(
         node.op_metadata(),
         &network_type,
         op_id_to_parents,
@@ -486,29 +545,47 @@ fn solve(decoupling_metadata: &RefCell<DecoupleILPMetadata>) -> (HighsSolution, 
     let DecoupleILPMetadata {
         variables,
         constraints,
-        cpu_usages,
+        resource_usages,
         ..
     } = &mut *decoupling_metadata.borrow_mut();
 
-    // Need values to be taken instead of &mut
     let mut vars = std::mem::take(variables);
     let mut constrs = std::mem::take(constraints);
 
-    // Which node has the highest CPU usage?
-    let highest_cpu = vars.add_variable();
-    for cpu_usage in cpu_usages.values() {
-        constrs.push(constraint!(highest_cpu >= cpu_usage.clone()));
+    // Minimize the highest saturation across all locations and resources
+    let highest_saturation = vars.add_variable();
+    for res in resource_usages.values() {
+        for (usage, capacity) in res.iter() {
+            constrs.push(constraint!(
+                highest_saturation >= usage.clone() * (1.0 / capacity)
+            ));
+        }
     }
 
-    // Minimize the CPU usage of that node
-    let problem = vars.minimise(highest_cpu);
+    println!(
+        "  Solving ILP: {} vars, {} constraints",
+        vars.len(),
+        constrs.len()
+    );
+    let problem = vars.minimise(highest_saturation);
+    let solve_start = Instant::now();
     let solution = highs(problem).with_all(constrs).solve().unwrap();
+    println!("  Solver finished in {:.2?}", solve_start.elapsed());
 
     let mut max_cost = 0.0f64;
-    for (loc, cpu_usage) in cpu_usages {
-        let cost = solution.eval(cpu_usage.clone());
-        println!("Projected CPU usage at location {}: {}", loc, cost);
-        max_cost = max_cost.max(cost);
+    for (loc, res) in resource_usages {
+        for (usage, capacity) in res.iter() {
+            let saturation = solution.eval(usage.clone()) / capacity;
+            if saturation > 0.01 {
+                println!(
+                    "  Location {} saturation: {:.4} ({:.1}%)",
+                    loc,
+                    saturation,
+                    saturation * 100.0
+                );
+            }
+            max_cost = max_cost.max(saturation);
+        }
     }
 
     (solution, max_cost)
@@ -532,7 +609,7 @@ pub struct Rewrite {
     pub cluster_size: usize,
     /// The machine budget used for this rewrite (max_num_locations).
     pub budget: usize,
-    /// Projected CPU cost per location.
+    /// Projected max saturation per location (0-1, across all resources).
     pub location_costs: HashMap<usize, f64>,
     /// Number of partitions per location (0 or absent = no partitioning).
     pub num_partitions: HashMap<usize, usize>,
@@ -595,6 +672,7 @@ pub(crate) fn decouple_analysis(
     max_num_locations: usize,
     cycle_source_to_sink_parent: &HashMap<usize, usize>,
 ) -> Rewrite {
+    println!("  Building ILP for budget={}...", max_num_locations);
     assert!(
         max_num_locations >= 2,
         "Must decouple to at least 2 locations (original location, decoupled location)"
@@ -619,8 +697,8 @@ pub(crate) fn decouple_analysis(
         max_num_locations,
         variables: variables! {},
         constraints: vec![],
-        cpu_usages: HashMap::from_iter(
-            (0..max_num_locations).map(|loc_id| (loc_id, Expression::default())),
+        resource_usages: HashMap::from_iter(
+            (0..max_num_locations).map(|loc_id| (loc_id, ResourceExpressions::default())),
         ),
         op_id_to_var: HashMap::new(),
         prev_op_parent_with_tick: HashMap::new(),
@@ -679,17 +757,19 @@ pub(crate) fn decouple_analysis(
     let DecoupleILPMetadata {
         op_id_to_var,
         network_ids,
-        cpu_usages,
+        resource_usages,
         ..
     } = &*decoupling_metadata.borrow();
 
     let mut result = Rewrite::new(bottleneck.clone(), cluster_size, max_num_locations);
 
-    // Populate per-location costs from the solution
-    for (loc, expr) in cpu_usages {
-        result
-            .location_costs
-            .insert(*loc, solution.eval(expr.clone()));
+    // Populate per-location costs (max saturation) from the solution
+    for (loc, res) in resource_usages {
+        let max_sat = res
+            .iter()
+            .map(|(expr, cap)| solution.eval(expr.clone()) / cap)
+            .fold(0.0_f64, f64::max);
+        result.location_costs.insert(*loc, max_sat);
     }
 
     for (&op_id, parents) in &op_id_to_parents {
@@ -788,41 +868,62 @@ pub(crate) fn decouple_analysis(
         }
     }
 
-    // Print per-location resource breakdown
+    // Compute actual per-location costs from op assignments
     let metadata = decoupling_metadata.borrow();
-    let mut loc_costs: HashMap<usize, SarStats> = HashMap::new();
+    let mut actual_costs: HashMap<usize, SarStats> = HashMap::new();
 
-    // Sum per_op_load for each op at its assigned location
-    for (&op_id, load) in &metadata.per_op_load {
-        if let Some(op_vars) = metadata.op_id_to_var.get(&op_id) {
-            let loc = op_loc(op_vars, &solution);
-            loc_costs.entry(loc).or_default().add(*load);
-        }
+    // Op costs (from per_op_load + network ops via calibration)
+    for &op_id in op_id_to_parents.keys() {
+        let Some(op_vars) = metadata.op_id_to_var.get(&op_id) else {
+            continue;
+        };
+        let loc = op_loc(op_vars, &solution);
+
+        // Determine cost: per_op_load or calibration for network ops
+        let cost = if let Some(load) = metadata.per_op_load.get(&op_id) {
+            *load
+        } else if metadata.network_ids.contains_key(&op_id) {
+            let parent_id = op_id_to_parents
+                .get(&op_id)
+                .and_then(|p| p.first().copied())
+                .unwrap_or(op_id);
+            let count = metadata.op_counts.get(&parent_id).copied().unwrap_or(0);
+            let size = metadata.op_sizes.get(&op_id).copied().unwrap_or(0);
+            if count > 0 && size > 0 {
+                metadata.network_cost_table.network_cost(count, size)
+            } else {
+                continue;
+            }
+        } else {
+            continue;
+        };
+
+        actual_costs.entry(loc).or_default().add(cost);
     }
 
-    // Add network costs for each new network boundary (op_to_network in result)
+    // New network boundary costs
     for (&op_id, &(src_loc, dst_loc)) in &result.op_to_network {
         let count = metadata.op_counts.get(&op_id).copied().unwrap_or(0);
         let size = metadata.op_sizes.get(&op_id).copied().unwrap_or(0);
         if count > 0 && size > 0 {
             let cost = metadata.network_cost_table.network_cost(count, size);
-            loc_costs.entry(src_loc).or_default().add(cost);
-            loc_costs.entry(dst_loc).or_default().add(cost);
+            actual_costs.entry(src_loc).or_default().add(cost);
+            actual_costs.entry(dst_loc).or_default().add(cost);
         }
     }
 
-    println!("Per-location resource breakdown:");
+    println!("  Actual per-location costs:");
     for loc in 0..max_num_locations {
-        let cost = loc_costs.get(&loc).copied().unwrap_or_default();
-        let partitions = result.num_partitions.get(&loc).copied().unwrap_or(1);
-        if cost.cpu > 0.0 || cost.network > 0.0 {
+        let cost = actual_costs.get(&loc).copied().unwrap_or_default();
+        let p = result.num_partitions.get(&loc).copied().unwrap_or(1);
+        if cost.cpu > 0.0 {
             println!(
-                "  Location {}: cpu={:.1}% net={:.0} B/s (partitions={}, effective_cpu={:.1}%)",
+                "    Loc {}: cpu={:.1}% (effective={:.1}%), net={:.0} B/s, p={}",
                 loc,
                 cost.cpu,
+                cost.cpu / p as f64,
                 cost.network,
-                partitions,
-                cost.cpu / partitions as f64
+                p
             );
         }
     }
@@ -844,6 +945,7 @@ pub fn find_optimal_budget(
     let mut no_improvement = 0;
 
     for budget in 2..=MAX_BUDGET_PER_CLUSTER {
+        let start = Instant::now();
         let rewrite = decouple_analysis(
             ir,
             bottleneck,
@@ -852,7 +954,17 @@ pub fn find_optimal_budget(
             cycle_source_to_sink_parent,
         );
         let cost = rewrite.max_cost();
-        let improved = results.last().map_or(true, |prev: &Rewrite| cost < prev.max_cost());
+        println!(
+            "  budget={}: max_saturation={:.4}, {} locations, solved in {:.2?}",
+            budget,
+            cost,
+            rewrite.num_locations(),
+            start.elapsed()
+        );
+
+        let improved = results
+            .last()
+            .is_none_or(|prev: &Rewrite| prev.max_cost() - cost > IMPROVEMENT_THRESHOLD);
         results.push(rewrite);
 
         if improved {
