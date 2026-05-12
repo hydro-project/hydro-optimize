@@ -52,6 +52,7 @@ pub(crate) struct DecoupleILPMetadata {
     pub(crate) op_sizes: HashMap<usize, u64>,
     pub(crate) network_cost_table: NetworkCostTable,
     pub(crate) per_op_load: HashMap<usize, SarStats>,
+    pub(crate) cluster_size: usize,
     pub(crate) max_num_locations: usize,
     // Model variables to construct final cost function
     pub(crate) variables: ProblemVariables,
@@ -88,7 +89,7 @@ impl ResourceExpressions {
 /// All inputs needed by the ILP decoupling/partitioning solver.
 /// Contains pre-computed averages rather than time series.
 #[derive(Clone, Debug)]
-pub struct ILPAnalysisInputs {
+pub struct IlpInputs {
     /// Per-op cardinality (messages/sec, averaged over measurement window)
     pub op_counts: HashMap<usize, usize>,
     /// Per-op serialized message size in bytes (median)
@@ -208,6 +209,7 @@ fn add_op_resource_usage(
         op_counts,
         op_sizes,
         network_cost_table,
+        cluster_size,
         variables,
         constraints,
         max_num_locations: num_locations,
@@ -231,7 +233,7 @@ fn add_op_resource_usage(
             .unwrap_or(0);
         let size = op_sizes.get(&op_id).copied().unwrap_or(0);
         if count > 0 && size > 0 {
-            network_cost_table.network_cost(count, size)
+            network_cost_table.network_cost(count, size, *cluster_size)
         } else {
             return;
         }
@@ -322,7 +324,8 @@ fn add_decouple_vars(
     decouple_vars
 }
 
-/// Resource cost of sending this operator's output over the network.
+/// Resource cost of sending this operator's output over the network (for new decoupled networks).
+/// Uses num_sockets=1 since a newly decoupled network has a single source.
 /// Returns zero SarStats if byte size was never recorded.
 fn network_cost_for_decoupling_op(
     op_id: usize,
@@ -332,7 +335,7 @@ fn network_cost_for_decoupling_op(
 ) -> SarStats {
     let cardinality = op_counts.get(&op_id).copied().unwrap_or(0);
     match op_sizes.get(&op_id) {
-        Some(&bytes) => network_cost_table.network_cost(cardinality, bytes),
+        Some(&bytes) => network_cost_table.network_cost(cardinality, bytes, 1),
         None => SarStats::default(),
     }
 }
@@ -668,7 +671,7 @@ impl Rewrite {
 pub(crate) fn decouple_analysis(
     ir: &mut [HydroRoot],
     bottleneck: &LocationId,
-    inputs: ILPAnalysisInputs,
+    inputs: IlpInputs,
     max_num_locations: usize,
     cycle_source_to_sink_parent: &HashMap<usize, usize>,
 ) -> Rewrite {
@@ -678,7 +681,7 @@ pub(crate) fn decouple_analysis(
         "Must decouple to at least 2 locations (original location, decoupled location)"
     );
 
-    let ILPAnalysisInputs {
+    let IlpInputs {
         op_counts,
         op_output_sizes: op_sizes,
         network_cost_table,
@@ -694,6 +697,7 @@ pub(crate) fn decouple_analysis(
         op_sizes,
         network_cost_table,
         per_op_load,
+        cluster_size,
         max_num_locations,
         variables: variables! {},
         constraints: vec![],
@@ -890,7 +894,7 @@ pub(crate) fn decouple_analysis(
             let count = metadata.op_counts.get(&parent_id).copied().unwrap_or(0);
             let size = metadata.op_sizes.get(&op_id).copied().unwrap_or(0);
             if count > 0 && size > 0 {
-                metadata.network_cost_table.network_cost(count, size)
+                metadata.network_cost_table.network_cost(count, size, metadata.cluster_size)
             } else {
                 continue;
             }
@@ -901,12 +905,12 @@ pub(crate) fn decouple_analysis(
         actual_costs.entry(loc).or_default().add(cost);
     }
 
-    // New network boundary costs
+    // New network boundary costs (num_sockets=1 for newly created networks)
     for (&op_id, &(src_loc, dst_loc)) in &result.op_to_network {
         let count = metadata.op_counts.get(&op_id).copied().unwrap_or(0);
         let size = metadata.op_sizes.get(&op_id).copied().unwrap_or(0);
         if count > 0 && size > 0 {
-            let cost = metadata.network_cost_table.network_cost(count, size);
+            let cost = metadata.network_cost_table.network_cost(count, size, 1);
             actual_costs.entry(src_loc).or_default().add(cost);
             actual_costs.entry(dst_loc).or_default().add(cost);
         }
@@ -931,6 +935,242 @@ pub(crate) fn decouple_analysis(
     result
 }
 
+/// Diagnostic: estimates the total resource cost on the bottleneck location assuming
+/// no decoupling (everything stays on the bottleneck). Mirrors the per-op cost
+/// derivation in [`add_op_resource_usage`]: non-network ops draw from `per_op_load`,
+/// network ops draw from the calibration table. Send contributions are charged to the
+/// sender (bottleneck when the op's parent is on the bottleneck), Recv contributions
+/// to the receiver, and SendRecv to both.
+///
+/// Prints the per-op breakdown (sorted by CPU contribution) and a total. Useful for
+/// sanity-checking that the calibration + perf inputs sum to ~100% CPU when the
+/// bottleneck is saturated.
+/// TODO: Clean up this function
+pub fn estimate_bottleneck_cost(
+    ir: &mut [HydroRoot],
+    bottleneck: &LocationId,
+    inputs: &IlpInputs,
+    cycle_source_to_sink_parent: &HashMap<usize, usize>,
+    clusters: &crate::deploy_and_analyze::ReusableClusters,
+) -> SarStats {
+    let IlpInputs {
+        op_counts,
+        op_output_sizes: op_sizes,
+        network_cost_table,
+        per_op_load,
+        ..
+    } = inputs;
+
+    let op_parents = op_id_to_parents(ir, Some(bottleneck), cycle_source_to_sink_parent);
+    // Unfiltered parent map so we can walk to the sender-side parent of a Recv network op
+    // (whose parent lives on the sender cluster, not the bottleneck).
+    let op_parents_unfiltered = op_id_to_parents(ir, None, cycle_source_to_sink_parent);
+
+    // Identify network ops relative to the bottleneck, exactly like decouple_analysis does.
+    // Also record the peer cluster size for each network op (used as num_sockets).
+    let network_ids: RefCell<HashMap<usize, NetworkType>> = RefCell::new(HashMap::new());
+    let network_sockets: RefCell<HashMap<usize, usize>> = RefCell::new(HashMap::new());
+    traverse_dfir(
+        ir,
+        |_, _| {},
+        |node, _| {
+            if let Some(id) = node.metadata().op.id
+                && let Some(nt) = get_network_type(node, bottleneck)
+            {
+                // Determine peer cluster size: for Send, peer is the receiver (node's location).
+                // For Recv, peer is the sender (input's location).
+                let peer_loc = match &nt {
+                    NetworkType::Send | NetworkType::SendRecv => {
+                        // Bottleneck is sender; peer is receiver = node's own location
+                        node.metadata().location_id.root().clone()
+                    }
+                    NetworkType::Recv => {
+                        // Bottleneck is receiver; peer is sender = input's location
+                        if let HydroNode::Network { input, .. } = node {
+                            input.metadata().location_id.root().clone()
+                        } else {
+                            bottleneck.root().clone()
+                        }
+                    }
+                };
+                let peer_size = clusters
+                    .location_name_and_num(&peer_loc)
+                    .map(|(_, n)| n)
+                    .unwrap_or(1);
+                network_ids.borrow_mut().insert(id, nt);
+                network_sockets.borrow_mut().insert(id, peer_size);
+            }
+        },
+    );
+    let network_ids = network_ids.into_inner();
+    let network_sockets = network_sockets.into_inner();
+
+    // Resolve op_id → cost, replicating add_op_resource_usage's op_load lookup.
+    // `use_parent_cardinality`:
+    //   - true  → use the parent's op_count (sender-side: what the parent produced)
+    //   - false → use the op's own op_count (receiver-side: what actually arrived here,
+    //             which may be less if the sender demuxes to multiple recipients)
+    let lookup_op_load = |op_id: usize, is_network: bool, use_parent_cardinality: bool| -> Option<SarStats> {
+        if let Some(load) = per_op_load.get(&op_id) {
+            return Some(*load);
+        }
+        if is_network {
+            let count_key = if use_parent_cardinality {
+                // For senders the bottleneck's parent is on the bottleneck, so either
+                // filtered or unfiltered gives the same answer. For receivers the parent
+                // lives on the sender cluster, so we must use the unfiltered map.
+                op_parents_unfiltered
+                    .get(&op_id)
+                    .and_then(|p| p.first().copied())
+                    .unwrap_or(op_id)
+            } else {
+                op_id
+            };
+            let count = op_counts.get(&count_key).copied().unwrap_or(0);
+            let size = op_sizes.get(&op_id).copied().unwrap_or(0);
+            if count > 0 && size > 0 {
+                let num_sockets = network_sockets.get(&op_id).copied().unwrap_or(1);
+                return Some(network_cost_table.network_cost(count, size, num_sockets));
+            }
+        }
+        None
+    };
+
+    let mut total = SarStats::default();
+    // (op_id, role label, contribution)
+    let mut contributions: Vec<(usize, &'static str, SarStats)> = Vec::new();
+
+    traverse_dfir(
+        ir,
+        |_, _| {},
+        |node, _| {
+            let Some(op_id) = node.metadata().op.id else {
+                return;
+            };
+
+            let network_type = network_ids.get(&op_id).cloned();
+            let on_bottleneck_non_network = network_type.is_none()
+                && node.metadata().location_id.root() == bottleneck.root();
+
+            // Skip anything unrelated to the bottleneck — matches the early return in
+            // decouple_analysis_node.
+            if network_type.is_none() && !on_bottleneck_non_network {
+                return;
+            }
+
+            // Sender-side contribution: non-network ops (executed at parent's loc == bottleneck)
+            // and Send / SendRecv network boundaries where the bottleneck is the sender.
+            // Use parent's cardinality (what the sender produced).
+            let sender_charged = matches!(
+                network_type,
+                None | Some(NetworkType::Send) | Some(NetworkType::SendRecv)
+            );
+            if sender_charged
+                && let Some(op_load) = lookup_op_load(op_id, network_type.is_some(), true)
+                && !(op_load.cpu <= 0.0
+                    && op_load.memory <= 0.0
+                    && op_load.network <= 0.0
+                    && op_load.io <= 0.0)
+            {
+                if network_type.is_some() {
+                    let parent_id = op_parents_unfiltered
+                        .get(&op_id)
+                        .and_then(|p| p.first().copied())
+                        .unwrap_or(op_id);
+                    let parent_count = op_counts.get(&parent_id).copied().unwrap_or(0);
+                    let own_count = op_counts.get(&op_id).copied().unwrap_or(0);
+                    let size = op_sizes.get(&op_id).copied().unwrap_or(0);
+                    eprintln!(
+                        "  [send-debug] op={} parent={} parent_count={} own_count={} size={} sockets={}",
+                        op_id, parent_id, parent_count, own_count, size,
+                        network_sockets.get(&op_id).copied().unwrap_or(0)
+                    );
+                }
+                let label = match network_type {
+                    None => "op",
+                    Some(NetworkType::Send) => "net-send",
+                    Some(NetworkType::SendRecv) => "net-sendrecv(send)",
+                    _ => unreachable!(),
+                };
+                contributions.push((op_id, label, op_load));
+                total.add(op_load);
+            }
+
+            // Receiver-side contribution: Recv / SendRecv network boundaries where the
+            // bottleneck is the receiver (deserialization cost). Use the op's own
+            // cardinality, since the sender may demux across multiple recipients.
+            let receiver_charged = matches!(
+                network_type,
+                Some(NetworkType::Recv) | Some(NetworkType::SendRecv)
+            );
+            if receiver_charged {
+                // Debug: compare parent (sender-side) vs own (receiver-side) cardinality
+                let parent_id = op_parents_unfiltered
+                    .get(&op_id)
+                    .and_then(|p| p.first().copied())
+                    .unwrap_or(op_id);
+                let parent_count = op_counts.get(&parent_id).copied().unwrap_or(0);
+                let own_count = op_counts.get(&op_id).copied().unwrap_or(0);
+                eprintln!(
+                    "  [recv-debug] op={} parent={} parent_count={} own_count={} sockets={}",
+                    op_id, parent_id, parent_count, own_count,
+                    network_sockets.get(&op_id).copied().unwrap_or(0)
+                );
+
+                if let Some(op_load) = lookup_op_load(op_id, true, false)
+                    && !(op_load.cpu <= 0.0
+                        && op_load.memory <= 0.0
+                        && op_load.network <= 0.0
+                        && op_load.io <= 0.0)
+                {
+                    let label = match network_type {
+                        Some(NetworkType::Recv) => "net-recv",
+                        Some(NetworkType::SendRecv) => "net-sendrecv(recv)",
+                        _ => unreachable!(),
+                    };
+                    contributions.push((op_id, label, op_load));
+                    total.add(op_load);
+                }
+            }
+        },
+    );
+
+    contributions.sort_by(|a, b| {
+        b.2.cpu
+            .partial_cmp(&a.2.cpu)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    println!(
+        "Estimated cost contributions on bottleneck {:?} (top 40 by CPU):",
+        bottleneck
+    );
+    for (op_id, kind, cost) in contributions.iter().take(40) {
+        if cost.cpu <= 0.0 {
+            continue;
+        }
+        println!(
+            "  op {:>4} [{}]: cpu={:.3}%  mem={:.2}%  net={:.0} B/s  io={:.3} tps",
+            op_id, kind, cost.cpu, cost.memory, cost.network, cost.io
+        );
+    }
+    let shown = contributions.len().min(40);
+    let remaining = contributions.len().saturating_sub(40);
+    if remaining > 0 {
+        let remaining_cpu: f64 = contributions.iter().skip(shown).map(|(_, _, c)| c.cpu).sum();
+        println!(
+            "  ... {} more contributions omitted (sum cpu={:.3}%)",
+            remaining, remaining_cpu
+        );
+    }
+    println!("Total estimated cost on bottleneck {:?}:", bottleneck);
+    println!("  CPU:     {:.2}%", total.cpu);
+    println!("  Memory:  {:.2}%", total.memory);
+    println!("  Network: {:.0} B/s", total.network);
+    println!("  IO:      {:.2} tps", total.io);
+
+    total
+}
+
 /// Tries increasing machine budgets (2, 3, ...) for the given bottleneck.
 /// For each budget the ILP decides the optimal split between locations and
 /// partitions internally, so only one ILP run is needed per budget level.
@@ -938,7 +1178,7 @@ pub(crate) fn decouple_analysis(
 pub fn find_optimal_budget(
     ir: &mut [HydroRoot],
     bottleneck: &LocationId,
-    inputs: &ILPAnalysisInputs,
+    inputs: &IlpInputs,
     cycle_source_to_sink_parent: &HashMap<usize, usize>,
 ) -> Vec<Rewrite> {
     let mut results = Vec::new();

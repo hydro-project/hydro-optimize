@@ -36,10 +36,10 @@ regex = "1.11.1"
 
 # Uncomment to use local hydro checkout on Mac
 # [patch."https://github.com/davidchuyaya/hydroflow.git"]
-# hydro_lang = { path = "/Users/chudc/Desktop/hydro/hydro_lang" }
-# hydro_std = { path = "/Users/chudc/Desktop/hydro/hydro_std" }
-# hydro_test = { path = "/Users/chudc/Desktop/hydro/hydro_test" }
-# dfir_lang = { path = "/Users/chudc/Desktop/hydro/dfir_lang" }
-# hydro_build_utils = { path = "/Users/chudc/Desktop/hydro/hydro_build_utils" }
-# hydro_deploy = { path = "/Users/chudc/Desktop/hydro/hydro_deploy/core" }
-# include_mdtests = { path = "/Users/chudc/Desktop/hydro/include_mdtests" }
+# hydro_lang = { path = "/home/chudc/hydroflow/hydro_lang" }
+# hydro_std = { path = "/home/chudc/hydroflow/hydro_std" }
+# hydro_test = { path = "/home/chudc/hydroflow/hydro_test" }
+# dfir_lang = { path = "/home/chudc/hydroflow/dfir_lang" }
+# hydro_build_utils = { path = "/home/chudc/hydroflow/hydro_build_utils" }
+# hydro_deploy = { path = "/home/chudc/hydroflow/hydro_deploy/core" }
+# include_mdtests = { path = "/home/chudc/hydroflow/include_mdtests" }

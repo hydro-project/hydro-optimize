@@ -32,65 +32,68 @@ async fn main() {
     let args = Args::parse();
 
     for &size in CALIBRATION_SIZES {
-        println!("=== Calibrating message_size={} ===", size);
+        for num_physical in 2..=10 {
+            println!("=== Calibrating message_size={}, physical_clients={} ===", size, num_physical);
 
-        benchmark_protocol(
-            BenchmarkArgs {
-                gcp: args.gcp.clone(),
-                aws: args.aws,
-            },
-            move |num_clients| {
-                let mut builder = FlowBuilder::new();
-                let server = builder.cluster();
-                let clients = builder.cluster();
-                let client_aggregator = builder.process();
+            benchmark_protocol(
+                BenchmarkArgs {
+                    gcp: args.gcp.clone(),
+                    aws: args.aws,
+                },
+                move || {
+                    let mut builder = FlowBuilder::new();
+                    let server = builder.cluster();
+                    let clients = builder.cluster();
+                    let client_aggregator = builder.process();
 
-                let client_id = clients.id();
-                let aggregator_id = client_aggregator.id();
+                    let client_id = clients.id();
+                    let aggregator_id = client_aggregator.id();
 
-                let location_id_to_cluster = HashMap::from([
-                    (server.id(), "server".to_string()),
-                    (client_id.clone(), "client".to_string()),
-                    (aggregator_id.clone(), "client_aggregator".to_string()),
-                ]);
+                    let location_id_to_cluster = HashMap::from([
+                        (server.id(), "server".to_string()),
+                        (client_id.clone(), "client".to_string()),
+                        (aggregator_id.clone(), "client_aggregator".to_string()),
+                    ]);
 
-                network_calibrator(
-                    size,
-                    &server,
-                    &clients,
-                    clients.singleton(q!({
-                        std::env::var("NUM_VIRTUAL_CLIENTS")
-                            .unwrap()
-                            .parse::<usize>()
-                            .unwrap()
-                    })),
-                    &client_aggregator,
-                    1000,
-                );
+                    network_calibrator(
+                        size,
+                        &server,
+                        &clients,
+                        clients.singleton(q!({
+                            std::env::var("NUM_VIRTUAL_CLIENTS")
+                                .unwrap()
+                                .parse::<usize>()
+                                .unwrap()
+                        })),
+                        &client_aggregator,
+                        1000,
+                    );
 
-                let clusters = ReusableClusters::default()
-                    .with_cluster(server, 1)
-                    .with_cluster(clients, num_clients);
-                let processes = ReusableProcesses::default().with_process(client_aggregator);
-                let optimizations = Optimizations::default()
-                    .excluding(client_id.clone())
-                    .excluding(aggregator_id);
+                    let clusters = ReusableClusters::default()
+                        .with_cluster(server, 1)
+                        .with_cluster(clients, num_physical);
+                    let processes = ReusableProcesses::default().with_process(client_aggregator);
+                    let optimizations = Optimizations::default()
+                        .excluding(client_id.clone())
+                        .excluding(aggregator_id);
 
-                BenchmarkConfig {
-                    name: format!("NetworkCalibration_{}b", size),
-                    workload: "default".to_string(),
-                    builder,
-                    clusters,
-                    processes,
-                    optimizations,
-                    location_id_to_cluster,
-                    start_virtual_clients: 1,
-                    virtual_clients_step: 10,
-                    num_runs: 1,
-                }
-            },
-        )
-        .await;
+                    (builder, BenchmarkConfig {
+                        name: format!("Network_{}b_{}c", size, num_physical),
+                        workload: "default".to_string(),
+                        clusters,
+                        processes,
+                        optimizations,
+                        location_id_to_cluster,
+                        num_physical_clients: num_physical,
+                        start_virtual_clients: 1,
+                        virtual_clients_step: 10,
+                        num_runs: 1,
+                        stop_on_cpu_saturated: true,
+                    })
+                },
+            )
+            .await;
+        }
     }
 
     println!("=== Calibration complete ===");

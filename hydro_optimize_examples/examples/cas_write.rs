@@ -4,8 +4,8 @@ use clap::{ArgAction, Parser};
 use hydro_lang::location::Location;
 use hydro_lang::viz::config::GraphConfig;
 use hydro_optimize::deploy_and_analyze::{
-    BenchmarkArgs, BenchmarkConfig, Optimizations, ReusableClusters, ReusableProcesses,
-    VIRTUAL_CLIENTS_STEP, benchmark_protocol,
+    BenchmarkArgs, BenchmarkConfig, NUM_PHYSICAL_CLIENTS, Optimizations, ReusableClusters,
+    ReusableProcesses, VIRTUAL_CLIENTS_STEP, benchmark_protocol,
 };
 use hydro_optimize_examples::compare_and_swap::cas_write_bench::cas_write_bench;
 
@@ -28,10 +28,11 @@ struct Args {
     aws: bool,
 }
 
-fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
+fn run_benchmark<'a>() -> (hydro_lang::compile::builder::FlowBuilder<'a>, BenchmarkConfig) {
     let f = 1;
     let retry_timeout = 5000;
     let print_result_frequency = 1000;
+    let num_clients = NUM_PHYSICAL_CLIENTS;
 
     let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
     let replicas = builder.cluster();
@@ -42,7 +43,6 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
         (clients.id(), "client".to_string()),
         (client_aggregator.id(), "client_aggregator".to_string()),
     ]);
-    let client_id = clients.id();
 
     cas_write_bench(
         &replicas,
@@ -59,18 +59,19 @@ fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
     let processes = ReusableProcesses::default().with_process(client_aggregator);
     let optimizations = Optimizations::default();
 
-    BenchmarkConfig {
+    (builder, BenchmarkConfig {
         name: "CAS_Write".to_string(),
         workload: "default".to_string(),
-        builder,
         clusters,
         processes,
         optimizations,
         location_id_to_cluster,
+        num_physical_clients: num_clients,
         start_virtual_clients: 1,
         virtual_clients_step: VIRTUAL_CLIENTS_STEP,
         num_runs: 1,
-    }
+        stop_on_cpu_saturated: false,
+    })
 }
 
 #[tokio::main]

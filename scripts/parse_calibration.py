@@ -8,8 +8,8 @@ cost-per-byte for CPU, memory, and I/O.
 Usage: python3 parse_calibration.py <benchmark_results_dir> <output_file>
 
 Expects benchmark_results_dir to contain directories like:
-  NetworkCalibration_1b_<timestamp>/server_10c_81vc_r0.csv
-  NetworkCalibration_2b_<timestamp>/server_10c_81vc_r0.csv
+  Network_1b_<timestamp>/server_10c_81vc_r0.csv
+  Network_2b_<timestamp>/server_10c_81vc_r0.csv
   ...
 
 CSV columns: time_s,cpu,network,memory,io,throughput_rps,...
@@ -40,7 +40,7 @@ def main():
     entries = []
 
     for dirname in sorted(os.listdir(results_dir)):
-        m = re.match(r"NetworkCalibration_(\d+)b_", dirname)
+        m = re.match(r"Network_(\d+)b_", dirname)
         if not m:
             continue
         size = int(m.group(1))

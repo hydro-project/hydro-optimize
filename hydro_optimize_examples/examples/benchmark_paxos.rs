@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use clap::{ArgAction, Parser};
 use hydro_lang::location::Location;
 use hydro_optimize::deploy_and_analyze::{
-    BenchmarkArgs, BenchmarkConfig, Optimizations, ReusableClusters,
-    ReusableProcesses, VIRTUAL_CLIENTS_STEP, benchmark_protocol,
+    BenchmarkArgs, BenchmarkConfig, NUM_PHYSICAL_CLIENTS, Optimizations, ReusableClusters,
+    ReusableProcesses, benchmark_protocol,
 };
 use hydro_optimize_examples::print_parseable_bench_results;
 use hydro_test::cluster::paxos::{CorePaxos, PaxosConfig};
@@ -25,27 +25,7 @@ struct Args {
     #[arg(long, action = ArgAction::SetTrue)]
     aws: bool,
 
-    /// Disable counter instrumentation (for baseline runs)
-    #[arg(long, action = ArgAction::SetTrue)]
-    counters_only: bool,
-
-    /// Insert byte-size inspection at network boundaries
-    #[arg(long, action = ArgAction::SetTrue)]
-    size_analysis: bool,
-
-    /// Apply greedy decoupling, deploy decoupled system, gather per-operator SAR costs
-    #[arg(long, action = ArgAction::SetTrue)]
-    blow_up_analysis: bool,
-
-    /// Deploy with perf record for flamegraph profiling on non-excluded locations
-    #[arg(long, action = ArgAction::SetTrue)]
-    perf_only: bool,
-
-    /// Workload variant name (determines output directory)
-    #[arg(long, default_value = "default")]
-    workload: String,
-
-    /// Run ILP-based bottleneck elimination (auto-detects inputs and rewrites)
+    /// Run ILP-based bottleneck elimination (auto-runs missing analyses)
     #[arg(long, action = ArgAction::SetTrue)]
     optimize: bool,
 }
@@ -53,19 +33,15 @@ struct Args {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    let counters_only = args.counters_only;
-    let size_analysis = args.size_analysis;
-    let blow_up_analysis = args.blow_up_analysis;
-    let perf_only = args.perf_only;
     let optimize = args.optimize;
-    let workload = args.workload.clone();
 
     let (_ir, _final_run_metadata) = benchmark_protocol(
         BenchmarkArgs {
             gcp: args.gcp,
             aws: args.aws,
         },
-        move |num_clients| {
+        move || {
+            let num_clients = NUM_PHYSICAL_CLIENTS;
             let f = 1;
             let checkpoint_frequency = 1000;
             let i_am_leader_send_timeout = 5;
@@ -127,30 +103,23 @@ async fn main() {
             let mut optimizations = Optimizations::default()
                 .excluding(client_id.clone())
                 .excluding(client_aggregator_id);
-            if counters_only {
-                optimizations = optimizations.with_counters_only();
-            } else if size_analysis {
-                optimizations = optimizations.with_size_analysis();
-            } else if blow_up_analysis {
-                optimizations = optimizations.with_blow_up_analysis();
-            } else if perf_only {
-                optimizations = optimizations.with_perf_only();
-            } else if optimize {
+            if optimize {
                 optimizations = optimizations.with_bottleneck_elimination();
             }
 
-            BenchmarkConfig {
+            (builder, BenchmarkConfig {
                 name: "Paxos".to_string(),
-                workload: workload.clone(),
-                builder,
+                workload: "default".to_string(),
                 clusters,
                 processes,
                 optimizations,
                 location_id_to_cluster,
+                num_physical_clients: num_clients,
                 start_virtual_clients: 1,
                 virtual_clients_step: 10,
                 num_runs: 1,
-            }
+                stop_on_cpu_saturated: false,
+            })
         },
     )
     .await;

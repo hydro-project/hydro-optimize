@@ -998,7 +998,7 @@ dependencies = [
 [[package]]
 name = "copy_span"
 version = "0.1.1"
-source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#84b700fdb93f28f128ad4251f5ff276b11aef8d4"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#559624715ffc6c8630aa4a85da11b4e801d604aa"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1235,7 +1235,7 @@ dependencies = [
 [[package]]
 name = "dfir_lang"
 version = "0.16.0"
-source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#84b700fdb93f28f128ad4251f5ff276b11aef8d4"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#559624715ffc6c8630aa4a85da11b4e801d604aa"
 dependencies = [
  "auto_impl",
  "documented",
@@ -1253,7 +1253,7 @@ dependencies = [
 [[package]]
 name = "dfir_pipes"
 version = "0.0.1"
-source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#84b700fdb93f28f128ad4251f5ff276b11aef8d4"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#559624715ffc6c8630aa4a85da11b4e801d604aa"
 dependencies = [
  "futures-core",
  "futures-sink",
@@ -1269,7 +1269,7 @@ dependencies = [
 [[package]]
 name = "dfir_rs"
 version = "0.16.0"
-source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#84b700fdb93f28f128ad4251f5ff276b11aef8d4"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#559624715ffc6c8630aa4a85da11b4e801d604aa"
 dependencies = [
  "bincode",
  "bytes",
@@ -1973,7 +1973,7 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 [[package]]
 name = "hydro_build_utils"
 version = "0.1.0"
-source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#84b700fdb93f28f128ad4251f5ff276b11aef8d4"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#559624715ffc6c8630aa4a85da11b4e801d604aa"
 dependencies = [
  "insta",
  "rustc_version",
@@ -1982,7 +1982,7 @@ dependencies = [
 [[package]]
 name = "hydro_deploy"
 version = "0.16.0"
-source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#84b700fdb93f28f128ad4251f5ff276b11aef8d4"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#559624715ffc6c8630aa4a85da11b4e801d604aa"
 dependencies = [
  "anyhow",
  "append-only-vec",
@@ -2018,7 +2018,7 @@ dependencies = [
 [[package]]
 name = "hydro_deploy_integration"
 version = "0.16.0"
-source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#84b700fdb93f28f128ad4251f5ff276b11aef8d4"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#559624715ffc6c8630aa4a85da11b4e801d604aa"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -2036,7 +2036,7 @@ dependencies = [
 [[package]]
 name = "hydro_lang"
 version = "0.16.0"
-source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#84b700fdb93f28f128ad4251f5ff276b11aef8d4"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#559624715ffc6c8630aa4a85da11b4e801d604aa"
 dependencies = [
  "auto_impl",
  "backtrace",
@@ -2137,7 +2137,7 @@ dependencies = [
 [[package]]
 name = "hydro_std"
 version = "0.16.0"
-source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#84b700fdb93f28f128ad4251f5ff276b11aef8d4"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#559624715ffc6c8630aa4a85da11b4e801d604aa"
 dependencies = [
  "hdrhistogram",
  "hydro_lang",
@@ -2149,7 +2149,7 @@ dependencies = [
 [[package]]
 name = "hydro_test"
 version = "0.0.0"
-source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#84b700fdb93f28f128ad4251f5ff276b11aef8d4"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#559624715ffc6c8630aa4a85da11b4e801d604aa"
 dependencies = [
  "bytes",
  "colored",
@@ -2363,7 +2363,7 @@ dependencies = [
 [[package]]
 name = "include_mdtests"
 version = "0.0.0"
-source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#84b700fdb93f28f128ad4251f5ff276b11aef8d4"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#559624715ffc6c8630aa4a85da11b4e801d604aa"
 dependencies = [
  "glob",
  "proc-macro2",
@@ -2540,7 +2540,7 @@ dependencies = [
 [[package]]
 name = "lattices"
 version = "0.7.0"
-source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#84b700fdb93f28f128ad4251f5ff276b11aef8d4"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#559624715ffc6c8630aa4a85da11b4e801d604aa"
 dependencies = [
  "cc-traits",
  "fst",
@@ -2556,7 +2556,7 @@ dependencies = [
 [[package]]
 name = "lattices_macro"
 version = "0.6.0"
-source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#84b700fdb93f28f128ad4251f5ff276b11aef8d4"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#559624715ffc6c8630aa4a85da11b4e801d604aa"
 dependencies = [
  "hydro_build_utils",
  "proc-macro-crate 3.5.0",
@@ -4235,7 +4235,7 @@ checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 [[package]]
 name = "sinktools"
 version = "0.1.0"
-source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#84b700fdb93f28f128ad4251f5ff276b11aef8d4"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#559624715ffc6c8630aa4a85da11b4e801d604aa"
 dependencies = [
  "futures-util",
  "pin-project-lite",
@@ -5043,7 +5043,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 [[package]]
 name = "variadics"
 version = "0.1.0"
-source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#84b700fdb93f28f128ad4251f5ff276b11aef8d4"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#559624715ffc6c8630aa4a85da11b4e801d604aa"
 dependencies = [
  "hashbrown 0.14.5",
  "hydro_build_utils",
@@ -5053,7 +5053,7 @@ dependencies = [
 [[package]]
 name = "variadics_macro"
 version = "0.7.0"
-source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#84b700fdb93f28f128ad4251f5ff276b11aef8d4"
+source = "git+https://github.com/davidchuyaya/hydroflow.git?branch=fix_network_pull_count#559624715ffc6c8630aa4a85da11b4e801d604aa"
 dependencies = [
  "proc-macro-crate 3.5.0",
  "proc-macro2",
