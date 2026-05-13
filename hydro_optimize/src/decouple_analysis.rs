@@ -12,9 +12,9 @@ use crate::parse_results::{NetworkCostTable, SarStats};
 use crate::partition_ilp_analysis::{apply_budget_constraints, partition_ilp_analysis};
 use crate::partition_syn_analysis::StructOrTupleIndex;
 use crate::rewrites::{is_syntactic_sugar, op_id_to_parents};
-use good_lp::solvers::highs::HighsSolution;
+use good_lp::solvers::lp_solvers::{GurobiSolver, LpSolver, LpSolution};
 use good_lp::{
-    Constraint, Expression, ProblemVariables, Solution, SolverModel, Variable, constraint, highs,
+    Constraint, Expression, ProblemVariables, Solution, SolverModel, Variable, constraint,
     variable, variables,
 };
 use hydro_lang::compile::builder::ClockId;
@@ -29,7 +29,6 @@ use super::rewrites::{NetworkType, get_network_type};
 // Penalty for decoupling regardless of cardinality (to prevent decoupling low cardinality operators)
 const DECOUPLING_PENALTY: f64 = 0.0001;
 const IMPROVEMENT_THRESHOLD: f64 = 0.01; // Minimum improvement to keep increasing budget
-const SOLVER_TIME_LIMIT_SECS: f64 = 60_f64; // Time limit for the ILP solver per iteration
 
 /// Each operator is assigned either 0 or 1
 /// 0 means that its output will go to the original node, 1 means that it will go to the decoupled node
@@ -631,7 +630,7 @@ fn solve(
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
     baseline_sockets: usize,
     is_n_partitions: &[Vec<Variable>],
-) -> HighsSolution {
+) -> LpSolution {
     let DecoupleILPMetadata {
         variables,
         constraints,
@@ -778,13 +777,11 @@ fn solve(
     );
     let problem = vars.minimise(highest_saturation);
     let solve_start = Instant::now();
-    let mut model = highs(problem)
-        .set_mip_rel_gap(0.01) // Stop within 1% of optimal
-        .expect("Failed to set MIP gap")
-        .set_threads(8)
-        .set_time_limit(SOLVER_TIME_LIMIT_SECS)
-        .with_all(constrs);
-    let solution = model.solve().unwrap();
+    let solution = problem
+        .using(LpSolver(GurobiSolver::new()))
+        .with_all(constrs)
+        .solve()
+        .unwrap();
     println!("  Solver finished in {:.2?}", solve_start.elapsed());
 
     let mut max_cost = 0.0f64;
@@ -806,7 +803,7 @@ fn solve(
     solution
 }
 
-fn op_loc(op_vars: &HashMap<usize, Variable>, solution: &HighsSolution) -> usize {
+fn op_loc(op_vars: &HashMap<usize, Variable>, solution: &LpSolution) -> usize {
     for (loc, var) in op_vars {
         let value = solution.value(*var).round();
         if value == 1.0 {

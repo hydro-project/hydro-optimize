@@ -1808,6 +1808,7 @@ checksum = "cf53d2a05420f562c917615b80018647ca03766aa58376de077034627da0fb10"
 dependencies = [
  "fnv",
  "highs",
+ "lp-solvers",
 ]
 
 [[package]]
@@ -2414,7 +2415,7 @@ dependencies = [
  "log",
  "num-format",
  "once_cell",
- "quick-xml",
+ "quick-xml 0.26.0",
  "rgb",
  "str_stack",
 ]
@@ -2670,6 +2671,16 @@ name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+
+[[package]]
+name = "lp-solvers"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a372225e65a15f8ae0ac981071891700955ff01084e0276cb061e87cf08dcea"
+dependencies = [
+ "quick-xml 0.38.4",
+ "tempfile",
+]
 
 [[package]]
 name = "lru-slab"
@@ -3416,6 +3427,15 @@ name = "quick-xml"
 version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f50b1c63b38611e7d4d7f68b82d3ad0cc71a2ad2e7f61fc10f1328d917c93cd"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.38.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
 dependencies = [
  "memchr",
 ]

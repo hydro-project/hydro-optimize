@@ -42,7 +42,7 @@ const LATENCY_PREFIX: &str = "HYDRO_OPTIMIZE_LAT:";
 const THROUGHPUT_PREFIX: &str = "HYDRO_OPTIMIZE_THR:";
 const SOCKET_STATS_PREFIX: &str = "HYDRO_SOCKET_STATS:";
 const SINK_STATS_PREFIX: &str = "HYDRO_SINK_STATS:";
-pub const MAX_BUDGET_PER_CLUSTER: usize = 10;
+pub const MAX_BUDGET_PER_CLUSTER: usize = 7;
 pub const MAX_OPTIMIZATION_ITERATIONS_PAST_NO_IMPROVEMENT: usize = 2;
 const BIMODAL_CV_THRESHOLD: f64 = 0.3;
 const BIMODAL_START_SECOND: usize = 2;
@@ -1018,6 +1018,32 @@ async fn run_bottleneck_elimination<'a>(
 
     // Only look for bottleneck/analyses if a previous _none run exists.
     if let Some(latest_iter) = latest {
+        // Early exit: if there are at least 2 previous iterations and the last one didn't
+        // improve throughput over the one before it, stop optimizing.
+        if latest_iter >= 2 {
+            let name_prev = format!("{}_opt{}", base_name, latest_iter);
+            let name_prev_prev = format!("{}_opt{}", base_name, latest_iter - 1);
+            let thr_prev = find_workload_dirs(base, &name_prev, OptimizationKind::None.label())
+                .iter()
+                .flat_map(|d| get_csvs_in_dir(d))
+                .map(|e| csv_avg_throughput(&e.path()))
+                .max()
+                .unwrap_or(0);
+            let thr_prev_prev =
+                find_workload_dirs(base, &name_prev_prev, OptimizationKind::None.label())
+                    .iter()
+                    .flat_map(|d| get_csvs_in_dir(d))
+                    .map(|e| csv_avg_throughput(&e.path()))
+                    .max()
+                    .unwrap_or(0);
+            if thr_prev > 0 && thr_prev_prev > 0 && thr_prev <= thr_prev_prev {
+                println!(
+                    "Throughput did not improve from opt{} ({}) to opt{} ({}). Stopping optimization.",
+                    latest_iter - 1, thr_prev_prev, latest_iter, thr_prev
+                );
+                return built;
+            }
+        }
         // Find the bottleneck from the most recent _none run.
         let prev_analysis_name = if latest_iter == 0 {
             base_name.clone()
@@ -1036,53 +1062,6 @@ async fn run_bottleneck_elimination<'a>(
             find_bottleneck_from_run(&prev_run_dir, AWS_NETWORK_BYTES_PER_SEC, AWS_IO_TPS);
         // e.g. "proposer_loc1" → "proposer"
         let bottleneck_cluster = original_cluster_name(&bottleneck_name).to_string();
-
-        // Estimate bottleneck cost using existing data and exit early
-        {
-            let raw_ilp_inputs = load_raw_ilp_inputs(base, &prev_analysis_name);
-            let bottleneck = config
-                .location_id_to_cluster
-                .iter()
-                .find(|(_, n)| *n == &bottleneck_name)
-                .map(|(id, _)| id.clone())
-                .unwrap_or_else(|| panic!("Bottleneck cluster '{}' not found", bottleneck_name));
-
-            let RawIlpInputs {
-                per_op_blow_up,
-                op_output_sizes,
-                mut op_counts,
-                perf,
-                network_cost_table,
-            } = raw_ilp_inputs;
-
-            let mut ir = deep_clone(built.ir());
-            let network_op_ids = get_network_op_ids(&mut ir);
-            let cycles = cycle_source_to_sink_parent(&mut ir);
-            let op_parents = op_id_to_parents(&mut ir, Some(&bottleneck), &cycles);
-            inject_inferred_counters(&mut ir, &op_parents, &mut op_counts);
-
-            let per_op_load = derive_per_op_load(&perf, &network_op_ids, &per_op_blow_up);
-            let baseline_sockets =
-                load_num_avg_sockets_per_tick(&prev_run_dir, &bottleneck_name).round().max(1.0) as usize;
-
-            let ilp_inputs = IlpInputs {
-                op_counts,
-                op_output_sizes,
-                network_cost_table,
-                per_op_load,
-                consider_partitioning: true,
-                cluster_size: config.clusters.location_name_and_num(&bottleneck).map(|(_, n)| n).unwrap_or(1),
-                baseline_sockets,
-            };
-
-            let rewrites = find_optimal_budget(&mut ir, &bottleneck, &ilp_inputs, &cycles);
-            for (i, r) in rewrites.iter().enumerate() {
-                println!("  Rewrite budget={}: max_cost={:.4}, locs={}, partitions={:?}",
-                    i + 2, r.max_cost(), r.num_locations(), r.num_partitions);
-            }
-            std::process::exit(0);
-        }
-
         // If this cluster has precomputed rewrites and isn't exhausted, apply next budget directly.
         if state.cluster_rewrites.contains_key(&bottleneck_cluster)
             && !state.is_exhausted(&bottleneck_cluster)
