@@ -445,7 +445,10 @@ fn repair_existing_network_for_partitioning(
     else {
         return;
     };
-    let sender_op_id = input.op_metadata().id.unwrap();
+    let Some(sender_op_id) = input.op_metadata().id else {
+        // If the input doesn't have an op ID, then it must have been added during the rewrite, so we can ignore it
+        return;
+    };
     let sender_location_idx = rewrite.op_to_loc.get(&sender_op_id);
     let sender_location = sender_location_idx
         .map(|idx| locations_map.get(idx).unwrap().clone())
