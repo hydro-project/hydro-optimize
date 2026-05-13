@@ -54,6 +54,7 @@ impl<S: Ord> Ord for CASState<S> {
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct UniqueRequestId {
     pub id: u64,
+    pub virtual_client_id: u32,
     pub is_generated: bool,
 }
 
@@ -61,6 +62,7 @@ impl UniqueRequestId {
     pub fn generate() -> Self {
         Self {
             id: random(),
+            virtual_client_id: 0, // irrelevant when generated
             is_generated: true,
         }
     }

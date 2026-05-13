@@ -246,14 +246,6 @@ pub enum NetworkType {
 
 /// Returns true if the node is at the given location, treating Networks as present
 /// at both their send and receive locations.
-pub fn node_at_location(node: &HydroNode, location: &LocationId) -> bool {
-    if let HydroNode::Network { .. } = node {
-        get_network_type(node, location).is_some()
-    } else {
-        node.metadata().location_id.root() == location.root()
-    }
-}
-
 pub fn get_network_type(node: &HydroNode, location: &LocationId) -> Option<NetworkType> {
     let mut is_to_us = false;
     let mut is_from_us = false;

@@ -14,14 +14,14 @@ use hydro_lang::prelude::{Cluster, FlowBuilder, Process};
 use hydro_lang::telemetry::Sidecar;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::decouple_analysis::{IlpInputs, Rewrite, estimate_bottleneck_cost, find_optimal_budget};
+use crate::decouple_analysis::{IlpInputs, Rewrite, find_optimal_budget};
 use crate::deploy::{AWS_IO_TPS, AWS_NETWORK_BYTES_PER_SEC, HostType, ReusableHosts};
 use crate::greedy_decouple_analysis::greedy_decouple_analysis;
 use crate::parse_results::{
     AppliedEntry, OptimizationState, RawIlpInputs, RunMetadata, analyze_cluster_results,
     csv_avg_throughput, decoupled_cluster_name, derive_per_op_load, find_bottleneck_from_run,
     find_bottleneck_run_dir, find_latest_iteration, find_workload_dirs, get_csvs_in_dir,
-    load_raw_ilp_inputs, original_cluster_name,
+    load_num_avg_sockets_per_tick, load_raw_ilp_inputs, original_cluster_name,
 };
 use crate::reduce_pushdown::reduce_pushdown;
 use crate::reduce_pushdown_analysis::reduce_pushdown_decision;
@@ -609,8 +609,8 @@ pub struct BenchmarkConfig {
     pub virtual_clients_step: usize,
     /// Number of successful runs to collect per virtual-client count.
     pub num_runs: usize,
-    /// If true, stop scaling virtual clients when any non-excluded location hits 100% CPU.
-    pub stop_on_cpu_saturated: bool,
+    /// If true, ignore throughput plateau and CPU saturation — run all virtual client steps.
+    pub run_until_completion: bool,
 }
 
 pub const START_MEASUREMENT_SECOND: usize = 30;
@@ -774,7 +774,11 @@ async fn run_scaling_loop<'a>(
     let mut final_run_metadata = RunMetadata::default();
     let mut best_throughput: usize = 0;
     let mut no_improvement_count: usize = 0;
-    let virtual_clients_max = VIRTUAL_CLIENTS_PER_PHYSICAL * config.num_physical_clients;
+    let virtual_clients_max = if config.run_until_completion {
+        VIRTUAL_CLIENTS_PER_PHYSICAL
+    } else {
+        VIRTUAL_CLIENTS_PER_PHYSICAL * config.num_physical_clients
+    };
 
     'outer: for num_virtual in
         (config.start_virtual_clients..=virtual_clients_max).step_by(config.virtual_clients_step)
@@ -875,39 +879,29 @@ async fn run_scaling_loop<'a>(
             }
         }
 
-        // Check CPU saturation across non-excluded locations
-        if config.stop_on_cpu_saturated {
-            let saturated = final_run_metadata
-                .sar_stats
-                .values()
-                .any(|stats| stats.iter().any(|s| s.cpu >= 100.0));
-            if saturated {
-                println!("CPU saturated, stopping scaling.");
-                break;
-            }
-        }
-
         let current_throughput = throughput_sum / successful_runs;
         println!(
             "clients={}, avg_throughput={}",
             num_virtual, current_throughput
         );
 
-        if current_throughput > best_throughput {
-            best_throughput = current_throughput;
-            no_improvement_count = 0;
-        } else {
-            no_improvement_count += 1;
-            println!(
-                "No throughput improvement ({}/{})",
-                no_improvement_count, NO_IMPROVEMENT_LIMIT
-            );
-            if no_improvement_count >= NO_IMPROVEMENT_LIMIT {
+        if !config.run_until_completion {
+            if current_throughput > best_throughput {
+                best_throughput = current_throughput;
+                no_improvement_count = 0;
+            } else {
+                no_improvement_count += 1;
                 println!(
-                    "Throughput plateaued for {} consecutive iterations. Terminating.",
-                    NO_IMPROVEMENT_LIMIT
+                    "No throughput improvement ({}/{})",
+                    no_improvement_count, NO_IMPROVEMENT_LIMIT
                 );
-                break;
+                if no_improvement_count >= NO_IMPROVEMENT_LIMIT {
+                    println!(
+                        "Throughput plateaued for {} consecutive iterations. Terminating.",
+                        NO_IMPROVEMENT_LIMIT
+                    );
+                    break;
+                }
             }
         }
     }
@@ -1043,6 +1037,52 @@ async fn run_bottleneck_elimination<'a>(
         // e.g. "proposer_loc1" → "proposer"
         let bottleneck_cluster = original_cluster_name(&bottleneck_name).to_string();
 
+        // Estimate bottleneck cost using existing data and exit early
+        {
+            let raw_ilp_inputs = load_raw_ilp_inputs(base, &prev_analysis_name);
+            let bottleneck = config
+                .location_id_to_cluster
+                .iter()
+                .find(|(_, n)| *n == &bottleneck_name)
+                .map(|(id, _)| id.clone())
+                .unwrap_or_else(|| panic!("Bottleneck cluster '{}' not found", bottleneck_name));
+
+            let RawIlpInputs {
+                per_op_blow_up,
+                op_output_sizes,
+                mut op_counts,
+                perf,
+                network_cost_table,
+            } = raw_ilp_inputs;
+
+            let mut ir = deep_clone(built.ir());
+            let network_op_ids = get_network_op_ids(&mut ir);
+            let cycles = cycle_source_to_sink_parent(&mut ir);
+            let op_parents = op_id_to_parents(&mut ir, Some(&bottleneck), &cycles);
+            inject_inferred_counters(&mut ir, &op_parents, &mut op_counts);
+
+            let per_op_load = derive_per_op_load(&perf, &network_op_ids, &per_op_blow_up);
+            let baseline_sockets =
+                load_num_avg_sockets_per_tick(&prev_run_dir, &bottleneck_name).round().max(1.0) as usize;
+
+            let ilp_inputs = IlpInputs {
+                op_counts,
+                op_output_sizes,
+                network_cost_table,
+                per_op_load,
+                consider_partitioning: true,
+                cluster_size: config.clusters.location_name_and_num(&bottleneck).map(|(_, n)| n).unwrap_or(1),
+                baseline_sockets,
+            };
+
+            let rewrites = find_optimal_budget(&mut ir, &bottleneck, &ilp_inputs, &cycles);
+            for (i, r) in rewrites.iter().enumerate() {
+                println!("  Rewrite budget={}: max_cost={:.4}, locs={}, partitions={:?}",
+                    i + 2, r.max_cost(), r.num_locations(), r.num_partitions);
+            }
+            std::process::exit(0);
+        }
+
         // If this cluster has precomputed rewrites and isn't exhausted, apply next budget directly.
         if state.cluster_rewrites.contains_key(&bottleneck_cluster)
             && !state.is_exhausted(&bottleneck_cluster)
@@ -1118,6 +1158,9 @@ async fn run_bottleneck_elimination<'a>(
 
             let per_op_load = derive_per_op_load(&perf, &network_op_ids, &per_op_blow_up);
 
+            let baseline_sockets =
+                load_num_avg_sockets_per_tick(&prev_run_dir, &bottleneck_name).round().max(1.0) as usize;
+
             let ilp_inputs = IlpInputs {
                 op_counts,
                 op_output_sizes,
@@ -1125,6 +1168,7 @@ async fn run_bottleneck_elimination<'a>(
                 per_op_load,
                 consider_partitioning: true,
                 cluster_size,
+                baseline_sockets,
             };
 
             // Compute rewrites for all budgets and save to state

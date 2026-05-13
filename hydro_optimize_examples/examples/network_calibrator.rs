@@ -9,7 +9,10 @@ use hydro_optimize::deploy_and_analyze::{
 use hydro_optimize_examples::network_calibrator::network_calibrator;
 use stageleft::q;
 
+// Message sizes between 1 and 64 have similar costs
 const CALIBRATION_SIZES: &[usize] = &[1, 64, 128, 256, 512, 1024, 2048, 4096];
+// Saturating only starts at 4 cliens for 1B messages
+const NUM_PHYSICAL_CLIENTS_TO_TEST: &[usize] = &[4, 10];
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, group(
@@ -32,7 +35,7 @@ async fn main() {
     let args = Args::parse();
 
     for &size in CALIBRATION_SIZES {
-        for num_physical in 2..=10 {
+        for &num_physical in NUM_PHYSICAL_CLIENTS_TO_TEST {
             println!("=== Calibrating message_size={}, physical_clients={} ===", size, num_physical);
 
             benchmark_protocol(
@@ -85,10 +88,10 @@ async fn main() {
                         optimizations,
                         location_id_to_cluster,
                         num_physical_clients: num_physical,
-                        start_virtual_clients: 1,
-                        virtual_clients_step: 10,
-                        num_runs: 1,
-                        stop_on_cpu_saturated: true,
+                        start_virtual_clients: 100, // No need to test non-saturated regimes
+                        virtual_clients_step: 10, // irrelevant
+                        num_runs: 3,
+                        run_until_completion: true,
                     })
                 },
             )

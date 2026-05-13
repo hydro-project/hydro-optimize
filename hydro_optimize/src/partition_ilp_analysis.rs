@@ -14,7 +14,6 @@ use crate::{
     decouple_analysis::{DecoupleILPMetadata, ResourceExpressions},
     partition_node_analysis::all_inputs,
     partition_syn_analysis::{AnalyzeClosure, StructOrTuple, StructOrTupleIndex},
-    rewrites::node_at_location,
 };
 
 /// Add id to dependent_nodes if its parent_id is already in dependent_nodes
@@ -54,7 +53,7 @@ fn nodes_dependent_on_inputs(
                 }
             },
             |node, next_stmt_id| {
-                if node_at_location(node, location)
+                if node.metadata().location_id.root() == location.root()
                     && let Some(parents) = op_to_parents.get(next_stmt_id)
                 {
                     for parent_id in parents {
@@ -286,7 +285,7 @@ fn create_canonical_fields(
             ir,
             |_, _| {},
             |node, id| {
-                if node_at_location(node, location) {
+                if node.metadata().location_id.root() == location.root() {
                     let mutated = create_canonical_fields_node(
                         Some(node),
                         *id,
@@ -535,7 +534,7 @@ fn add_is_input_expr(
     for (loc, var) in op_id_to_var.get(&id).unwrap() {
         let is_loc_input = variables.add(variable().binary());
         let parent_var = parent_vars.get(loc).unwrap();
-        // Force is_input_var == |var - parent_var| for binary vars.
+        // Force is_loc_input == |var - parent_var| for binary vars.
         constraints.push(constraint!(is_loc_input >= *var - *parent_var));
         constraints.push(constraint!(is_loc_input >= *parent_var - *var));
         // Force is_loc_input to be 0 if both vars are 0
@@ -728,7 +727,7 @@ fn partition_ilp_node_analysis(
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
     op_id_to_parents: &HashMap<usize, Vec<usize>>,
 ) {
-    if !node_at_location(node, &decoupling_metadata.borrow().bottleneck) {
+    if node.metadata().location_id.root() != decoupling_metadata.borrow().bottleneck.root() {
         return;
     }
 
