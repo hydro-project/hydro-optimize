@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
 
+use hydro_lang::compile::builder::ClockId;
 use hydro_lang::compile::ir::{
     BoundKind, CollectionKind, DebugType, HydroIrMetadata, HydroNode, HydroRoot,
     KeyedSingletonBoundKind, SingletonBoundKind, StreamOrder, StreamRetry, transform_bottom_up,
@@ -69,7 +70,12 @@ fn write_id(ir: &mut [HydroRoot], path: Option<&std::path::Path>) {
         &mut |root| {
             let input = root.input_metadata().op.id;
             let id = root.op_metadata().id;
-            lines.borrow_mut().push(format!("{:?} Root {}, Inputs: {:?}", id, root.print_root(), input));
+            lines.borrow_mut().push(format!(
+                "{:?} Root {}, Inputs: {:?}",
+                id,
+                root.print_root(),
+                input
+            ));
         },
         &mut |node| {
             let metadata = node.metadata();
@@ -79,7 +85,13 @@ fn write_id(ir: &mut [HydroRoot], path: Option<&std::path::Path>) {
                 .iter()
                 .map(|m| m.op.id)
                 .collect::<Vec<Option<usize>>>();
-            lines.borrow_mut().push(format!("{:?} Node {}, {:?}, Inputs: {:?}", id, node.print_root(), metadata, inputs));
+            lines.borrow_mut().push(format!(
+                "{:?} Node {}, {:?}, Inputs: {:?}",
+                id,
+                node.print_root(),
+                metadata,
+                inputs
+            ));
         },
         false,
     );
@@ -132,6 +144,12 @@ pub fn op_id_to_parents(
             mapping.borrow_mut().insert(*op_id, relevant_input_ids);
         },
         |node, op_id| {
+            if let Some(location) = location
+                && node.metadata().location_id.root() != location.root()
+            {
+                // If the node itself is not at the location, skip it
+                return;
+            }
             let input_ids = match node {
                 HydroNode::CycleSource { .. } => {
                     // For CycleSource, its input is its CycleSink's input. Note: assumes the CycleSink is on the same cluster
@@ -218,23 +236,33 @@ pub fn is_syntactic_sugar(node: &HydroNode) -> bool {
 /// False if:
 /// 1. The node relies on knowing the initial value (Singleton, KeyedSingleton without BoundedValue)
 /// 2. The output type is not serializable
-pub fn can_decouple(output_type: &CollectionKind) -> bool {
-    !output_type.is_bounded()
-        && match output_type {
-            CollectionKind::Stream { element_type, .. }
-            | CollectionKind::Optional { element_type, .. } => type_is_serializable(element_type),
-            CollectionKind::KeyedSingleton {
-                bound: KeyedSingletonBoundKind::BoundedValue,
-                key_type,
-                value_type,
-            }
-            | CollectionKind::KeyedStream {
-                key_type,
-                value_type,
-                ..
-            } => type_is_serializable(key_type) && type_is_serializable(value_type),
-            CollectionKind::Singleton { .. } | CollectionKind::KeyedSingleton { .. } => false,
+pub fn is_serializable(output_type: &CollectionKind) -> bool {
+    match output_type {
+        CollectionKind::Stream { element_type, .. }
+        | CollectionKind::Optional { element_type, .. } => type_is_serializable(element_type),
+        CollectionKind::KeyedSingleton {
+            bound: KeyedSingletonBoundKind::BoundedValue,
+            key_type,
+            value_type,
         }
+        | CollectionKind::KeyedStream {
+            key_type,
+            value_type,
+            ..
+        } => type_is_serializable(key_type) && type_is_serializable(value_type),
+        CollectionKind::Singleton { .. } | CollectionKind::KeyedSingleton { .. } => false,
+    }
+}
+
+pub fn get_tick_id(location_id: &LocationId) -> Option<ClockId> {
+    match location_id {
+        LocationId::Tick(tick_id, _) => Some(*tick_id),
+        LocationId::Atomic(tick) => match tick.as_ref() {
+            LocationId::Tick(tick_id, _) => Some(*tick_id),
+            _ => panic!("Expected tick location for atomic node"),
+        },
+        _ => None,
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]

@@ -11,8 +11,8 @@ use crate::deploy_and_analyze::{
 use crate::parse_results::{NetworkCostTable, SarStats};
 use crate::partition_ilp_analysis::{apply_budget_constraints, partition_ilp_analysis};
 use crate::partition_syn_analysis::StructOrTupleIndex;
-use crate::rewrites::{is_syntactic_sugar, op_id_to_parents};
-use good_lp::solvers::lp_solvers::{GurobiSolver, LpSolver, LpSolution};
+use crate::rewrites::{get_tick_id, is_serializable, is_syntactic_sugar, op_id_to_parents};
+use good_lp::solvers::lp_solvers::{GurobiSolver, LpSolution, LpSolver};
 use good_lp::{
     Constraint, Expression, ProblemVariables, Solution, SolverModel, Variable, constraint,
     variable, variables,
@@ -26,9 +26,21 @@ use hydro_lang::location::dynamic::LocationId;
 
 use super::rewrites::{NetworkType, get_network_type};
 
+pub fn num_to_alpha(n: usize) -> String {
+    const DIGITS: [&str; 10] = [
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    ];
+    n.to_string()
+        .chars()
+        .map(|c| DIGITS[c as usize - '0' as usize])
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 // Penalty for decoupling regardless of cardinality (to prevent decoupling low cardinality operators)
 const DECOUPLING_PENALTY: f64 = 0.0001;
 const IMPROVEMENT_THRESHOLD: f64 = 0.01; // Minimum improvement to keep increasing budget
+const LEXICOGRAPHIC_EPSILON: f64 = 0.0001; // Tiebreaker weight to minimize non-bottleneck locations
 
 /// Each operator is assigned either 0 or 1
 /// 0 means that its output will go to the original node, 1 means that it will go to the decoupled node
@@ -129,13 +141,17 @@ fn var_from_op_id(
     variables: &mut ProblemVariables,
     constraints: &mut Vec<Constraint>,
 ) -> HashMap<usize, Variable> {
-    op_id_to_var
+    let result = op_id_to_var
         .entry(op_id)
         .or_insert_with(|| {
             let mut loc_to_var = HashMap::new();
             let mut sum_expr = Expression::default();
             for loc in 0..num_locations {
-                let var = variables.add(variable().binary());
+                let var = variables.add(variable().binary().name(format!(
+                    "op{}loc{}",
+                    num_to_alpha(op_id),
+                    num_to_alpha(loc)
+                )));
                 loc_to_var.insert(loc, var);
                 sum_expr += var;
             }
@@ -143,7 +159,8 @@ fn var_from_op_id(
             constraints.push(constraint!(sum_expr == 1));
             loc_to_var
         })
-        .clone()
+        .clone();
+    result
 }
 
 fn add_equality_constr(
@@ -190,7 +207,7 @@ fn add_tick_constraint(
         ..
     } = &mut *decoupling_metadata.borrow_mut();
 
-    if let LocationId::Tick(tick_id, _) = metadata.location_id {
+    if let Some(tick_id) = get_tick_id(&metadata.location_id) {
         // Set each parent = to the last parent
         let mut parents: Vec<usize> = op_id_to_parents
             .get(&metadata.op.id.unwrap())
@@ -397,8 +414,18 @@ fn add_decouple_vars(
     let op2_vars = var_from_op_id(op2, num_locations, op_id_to_var, variables, constraints);
     let mut decouple_vars = HashMap::new();
     for loc in 0..num_locations {
-        let send_var = variables.add(variable().min(0));
-        let recv_var = variables.add(variable().min(0));
+        let send_var = variables.add(variable().min(0).name(format!(
+            "decouplesend{}x{}loc{}",
+            num_to_alpha(op1),
+            num_to_alpha(op2),
+            num_to_alpha(loc)
+        )));
+        let recv_var = variables.add(variable().min(0).name(format!(
+            "decouplerecv{}x{}loc{}",
+            num_to_alpha(op1),
+            num_to_alpha(op2),
+            num_to_alpha(loc)
+        )));
 
         let op1_var = op1_vars.get(&loc).unwrap();
         let op2_var = op2_vars.get(&loc).unwrap();
@@ -500,8 +527,16 @@ fn add_tee_decoupling_overhead(
         .or_insert_with(|| {
             let mut loc_to_vars = HashMap::new();
             for loc in 0..*num_locations {
-                let send_var = variables.add(variable().binary());
-                let recv_var = variables.add(variable().binary());
+                let send_var = variables.add(variable().binary().name(format!(
+                    "teesend{}loc{}",
+                    num_to_alpha(inner_id),
+                    num_to_alpha(loc)
+                )));
+                let recv_var = variables.add(variable().binary().name(format!(
+                    "teerecv{}loc{}",
+                    num_to_alpha(inner_id),
+                    num_to_alpha(loc)
+                )));
                 loc_to_vars.insert(loc, (send_var, recv_var));
             }
             register_decoupled_network(
@@ -583,8 +618,9 @@ fn decouple_analysis_node(
             variables,
             constraints,
         );
-    } else if is_syntactic_sugar(node) {
+    } else if is_syntactic_sugar(node) || !is_serializable(&node.metadata().collection_kind) {
         // Syntactic sugar nodes (Cast, Batch, YieldConcat, etc.) must stay with their parent
+        // So do nodes that we do not know how to serialize
         if let Some(parents) = op_id_to_parents.get(op_id)
             && let Some(&parent_id) = parents.first()
         {
@@ -692,7 +728,14 @@ fn solve(
                             if n == 0 {
                                 continue;
                             }
-                            let is_sending_to_n_partitions = vars.add(variable().min(0).max(1));
+                            let is_sending_to_n_partitions =
+                                vars.add(variable().min(0).max(1).name(format!(
+                                    "sendton{}loc{}rloc{}e{}",
+                                    num_to_alpha(n),
+                                    num_to_alpha(loc),
+                                    num_to_alpha(recv_loc),
+                                    num_to_alpha(entry_idx)
+                                )));
                             constrs.push(constraint!(is_sending_to_n_partitions <= var));
                             constrs.push(constraint!(is_sending_to_n_partitions <= has_n));
                             constrs
@@ -712,8 +755,12 @@ fn solve(
             let mut is_s_vars: Vec<Variable> = Vec::new();
             let mut sum_indicators = Expression::default();
             let mut num_sockets_int = Expression::default();
-            for s in 1..=max_sockets {
-                let is_s = vars.add(variable().binary());
+            for s in 2..=max_sockets {
+                let is_s = vars.add(variable().binary().name(format!(
+                    "issocket{}loc{}",
+                    num_to_alpha(s),
+                    num_to_alpha(loc)
+                )));
                 sum_indicators += is_s;
                 num_sockets_int += s as f64 * is_s;
                 is_s_vars.push(is_s);
@@ -725,7 +772,11 @@ fn solve(
             ));
 
             // effective_network_cpu: continuous var, lower-bounded by the active level's cost
-            let effective_network_cpu = vars.add(variable().min(0));
+            let effective_network_cpu = vars.add(
+                variable()
+                    .min(0)
+                    .name(format!("netcpuloc{}", num_to_alpha(loc))),
+            );
 
             for (idx, &is_s) in is_s_vars.iter().enumerate() {
                 let s = idx + 1;
@@ -753,29 +804,50 @@ fn solve(
                 ));
             }
 
-            // Add effective_network_cpu to this location's CPU resource usage
+            // Divide effective_network_cpu by partition count for this location
+            let divided_network_cpu = vars.add(
+                variable()
+                    .min(0)
+                    .name(format!("divnetcpuloc{}", num_to_alpha(loc))),
+            );
+            for (n, &has_n) in is_n_partitions[loc].iter().enumerate() {
+                if n == 0 {
+                    continue;
+                }
+                let scale = 1.0 / n as f64;
+                constrs.push(constraint!(
+                    divided_network_cpu >= effective_network_cpu * scale - big_m * (1 - has_n)
+                ));
+            }
+
+            // Add divided network CPU to this location's CPU resource usage
             let res = resource_usages.get_mut(&loc).unwrap();
             let cpu_temp = std::mem::take(&mut res.cpu);
-            res.cpu = cpu_temp + effective_network_cpu;
+            res.cpu = cpu_temp + divided_network_cpu;
         }
     }
 
-    // Minimize the highest saturation across all locations and resources
-    let highest_saturation = vars.add_variable();
+    // Minimize the highest saturation across all locations and resources,
+    // with a small tiebreaker to also minimize non-bottleneck locations.
+    let highest_saturation = vars.add(variable().name("maxsaturation"));
+    let mut sum_saturations = Expression::default();
     for res in resource_usages.values() {
         for (usage, capacity) in res.iter() {
-            constrs.push(constraint!(
-                highest_saturation >= usage.clone() * (1.0 / capacity)
-            ));
+            let sat = usage.clone() * (1.0 / capacity);
+            constrs.push(constraint!(highest_saturation >= sat.clone()));
+            sum_saturations += sat;
         }
     }
+
+    let objective = highest_saturation + LEXICOGRAPHIC_EPSILON * sum_saturations;
 
     println!(
         "  Solving ILP: {} vars, {} constraints",
         vars.len(),
         constrs.len()
     );
-    let problem = vars.minimise(highest_saturation);
+
+    let problem = vars.minimise(objective);
     let solve_start = Instant::now();
     let solution = problem
         .using(LpSolver(GurobiSolver::new()))
@@ -783,22 +855,6 @@ fn solve(
         .solve()
         .unwrap();
     println!("  Solver finished in {:.2?}", solve_start.elapsed());
-
-    let mut max_cost = 0.0f64;
-    for (loc, res) in resource_usages {
-        for (usage, capacity) in res.iter() {
-            let saturation = solution.eval(usage.clone()) / capacity;
-            if saturation > 0.01 {
-                println!(
-                    "  Location {} saturation: {:.4} ({:.1}%)",
-                    loc,
-                    saturation,
-                    saturation * 100.0
-                );
-            }
-            max_cost = max_cost.max(saturation);
-        }
-    }
 
     solution
 }

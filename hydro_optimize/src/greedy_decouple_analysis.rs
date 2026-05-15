@@ -11,7 +11,8 @@ use hydro_lang::{
 };
 
 use crate::deploy_and_analyze::ReusableClusters;
-use crate::rewrites::{can_decouple, is_syntactic_sugar, op_id_to_parents};
+use crate::rewrites::get_tick_id;
+use crate::rewrites::{is_serializable, is_syntactic_sugar, op_id_to_parents};
 use crate::{decouple_analysis::Rewrite, repair::cycle_source_to_sink_parent};
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -79,22 +80,11 @@ impl GreedyDecoupleState {
             self.network_ids.insert(*op_id);
         }
 
-        let tick_id = match &location_id {
-            LocationId::Tick(tick_id, _) => Some(*tick_id),
-            LocationId::Atomic(tick) => match tick.as_ref() {
-                LocationId::Tick(tick_id, _) => Some(*tick_id),
-                _ => panic!("Expected tick location for atomic node"),
-            },
-            _ => None,
-        };
-
-        if let Some(tick_id) = tick_id {
+        if let Some(tick_id) = get_tick_id(&location_id) {
             self.tick_to_ops.entry(tick_id).or_default().insert(*op_id);
         }
 
-        // All ticked ops must stay where the tick executes, even if their
-        // collection kind is unbounded (e.g. YieldConcat at the tick boundary).
-        if is_syntactic_sugar(node) || !can_decouple(&node.metadata().collection_kind) {
+        if is_syntactic_sugar(node) || !is_serializable(&node.metadata().collection_kind) {
             self.do_not_decouple.insert(*op_id);
         }
 

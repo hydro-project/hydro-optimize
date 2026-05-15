@@ -46,6 +46,9 @@ fn build_scan_reduce(
     }
 }
 
+/// Tag value for cpu_usage to mark commutative+associative reduces from pushdown.
+pub const COM_ASSOC_REDUCE_TAG: f64 = -1.0;
+
 pub fn reduce_pushdown(ir: &mut [HydroRoot], decision: HashMap<usize, usize>) {
     let mut reduce_to_insert_locations = HashMap::new();
     for (op_id, reduce_id) in decision {
@@ -72,6 +75,8 @@ pub fn reduce_pushdown(ir: &mut [HydroRoot], decision: HashMap<usize, usize>) {
                 for reduce_id in ops_to_insert {
                     op_id_to_reduce_info.insert(*reduce_id, (f_expr.clone(), metadata.clone()));
                 }
+                // Tag the original reduce as commutative+associative
+                node.op_metadata_mut().cpu_usage = Some(COM_ASSOC_REDUCE_TAG);
             }
         },
     );
@@ -84,6 +89,8 @@ pub fn reduce_pushdown(ir: &mut [HydroRoot], decision: HashMap<usize, usize>) {
             if let Some((f, metadata)) = op_id_to_reduce_info.remove(op_id) {
                 let input = std::mem::replace(node, HydroNode::Placeholder);
                 *node = build_scan_reduce(input, f, metadata);
+                // Tag the newly created scan as commutative+associative
+                node.op_metadata_mut().cpu_usage = Some(COM_ASSOC_REDUCE_TAG);
             }
         },
     );

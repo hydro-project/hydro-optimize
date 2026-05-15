@@ -10,8 +10,9 @@ use hydro_lang::{
 };
 use syn::visit::Visit;
 
+use crate::reduce_pushdown::COM_ASSOC_REDUCE_TAG;
 use crate::{
-    decouple_analysis::{DecoupleILPMetadata, ResourceExpressions},
+    decouple_analysis::{DecoupleILPMetadata, ResourceExpressions, num_to_alpha},
     partition_node_analysis::all_inputs,
     partition_syn_analysis::{AnalyzeClosure, StructOrTuple, StructOrTupleIndex},
 };
@@ -68,7 +69,6 @@ fn nodes_dependent_on_inputs(
             break;
         }
         num_dependent_nodes = dependent_nodes.borrow().len();
-        println!("Rerunning nodes_dependent_on_inputs loop until fixpoint.");
     }
 
     dependent_nodes.take()
@@ -260,7 +260,7 @@ fn create_canonical_fields_node(
 
         if parent_mutated {
             mutated = true;
-            // println!("Recursing from op {} to parent {}", recurse_id, parent);
+            // println!("Recursing from op {} to parent {}", id, parent);
             create_canonical_fields_node(None, *parent, op_to_parents, op_to_dependencies);
         } else {
             // println!("No mutation for parent {}, exiting {}", parent, id);
@@ -297,13 +297,45 @@ fn create_canonical_fields(
             },
         );
 
+        // Downward pass: propagate parent fields to children.
+        // If child dep says "child_root maps to parent_target", and parent has "parent_target.X",
+        // then child should have field "child_root.X".
+        let snapshot = op_to_dependencies.clone();
+        for (id, deps) in &snapshot {
+            let parents = op_to_parents.get(id).unwrap();
+            for (parent_idx, parent_id) in parents.iter().enumerate() {
+                let Some(parent_deps) = snapshot.get(parent_id) else {
+                    continue;
+                };
+                let dep = &deps[parent_idx];
+                for child_root in dep.get_all_nested_fields() {
+                    if let Some(sub) = dep.get_dependencies(&child_root) {
+                        for parent_target in sub.get_dependency() {
+                            for parent_dep in parent_deps {
+                                for parent_field in parent_dep.get_all_nested_fields() {
+                                    if parent_field.starts_with(&parent_target)
+                                        && parent_field.len() > parent_target.len()
+                                    {
+                                        let suffix = parent_field[parent_target.len()..].to_vec();
+                                        let mut child_field = child_root.clone();
+                                        child_field.extend(suffix);
+                                        let (_, mutated) = op_to_dependencies.get_mut(id).unwrap()
+                                            [parent_idx]
+                                            .create_child(child_field);
+                                        fixpoint &= !mutated;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if fixpoint {
             break;
         }
-        println!("Rerunning create_canonical_fields loop until fixpoint.");
     }
-
-    println!("Canonical fields: {:?}", op_to_dependencies);
 
     op_to_dependencies
 }
@@ -320,6 +352,10 @@ pub enum Partitionability {
 /// - `Conditional`: Yes, we can partition on some specific keys.
 /// - `Unpartitionable`: No.
 fn node_partitionability(node: &HydroNode) -> Partitionability {
+    // Commutative+associative reduces from reduce pushdown are tagged and can be partitioned
+    if node.op_metadata().cpu_usage == Some(COM_ASSOC_REDUCE_TAG) {
+        return Partitionability::NoEffect;
+    }
     match node {
         HydroNode::Placeholder => {
             panic!()
@@ -373,6 +409,10 @@ fn node_partitionability(node: &HydroNode) -> Partitionability {
 /// Whether this node introduces persistence.
 /// Note: Must keep in sync with `emit_core` in hydro_lang.
 fn node_persists(node: &HydroNode) -> bool {
+    use crate::reduce_pushdown::COM_ASSOC_REDUCE_TAG;
+    if node.op_metadata().cpu_usage == Some(COM_ASSOC_REDUCE_TAG) {
+        return false;
+    }
     match node {
         HydroNode::Placeholder => {
             panic!()
@@ -406,7 +446,9 @@ fn node_persists(node: &HydroNode) -> bool {
         | HydroNode::CrossSingleton { .. }
         | HydroNode::Sort { .. } => false,
         // Maybe, depending on if it's 'static (either hidden parent is top_level)
-        HydroNode::Join { left, right, .. } | HydroNode::JoinHalf { left, right, .. } | HydroNode::CrossProduct { left, right, .. } => {
+        HydroNode::Join { left, right, .. }
+        | HydroNode::JoinHalf { left, right, .. }
+        | HydroNode::CrossProduct { left, right, .. } => {
             left.metadata().location_id.is_top_level()
                 || right.metadata().location_id.is_top_level()
         }
@@ -470,7 +512,11 @@ fn add_total_order_edge_constraints(
             let child_at_loc = *child_vars.get(&loc).unwrap();
 
             // e == 1 iff parent is at loc AND child is NOT at loc
-            let e = variables.add(variable().binary());
+            let e = variables.add(variable().binary().name(format!(
+                "totalorderedgeop{}loc{}",
+                num_to_alpha(child_id),
+                num_to_alpha(loc)
+            )));
             constraints.push(constraint!(e <= parent_at_loc));
             constraints.push(constraint!(e <= 1 - child_at_loc));
             constraints.push(constraint!(e >= parent_at_loc - child_at_loc));
@@ -532,7 +578,11 @@ fn add_is_input_expr(
     // Only consider the 1st parent, since there's the invariant that both parents must have the same location
     let parent_vars = op_id_to_var.get(parents.first().unwrap()).unwrap();
     for (loc, var) in op_id_to_var.get(&id).unwrap() {
-        let is_loc_input = variables.add(variable().binary());
+        let is_loc_input = variables.add(variable().binary().name(format!(
+            "isinputop{}loc{}",
+            num_to_alpha(id),
+            num_to_alpha(*loc)
+        )));
         let parent_var = parent_vars.get(loc).unwrap();
         // Force is_loc_input == |var - parent_var| for binary vars.
         constraints.push(constraint!(is_loc_input >= *var - *parent_var));
@@ -568,11 +618,15 @@ fn field_vars_from_op(
 
             let mut field_to_var = HashMap::new();
             let mut sum_expr = Expression::default();
-            for field_name in field_names {
+            for (idx, field_name) in field_names.iter().enumerate() {
                 let var = decoupling_metadata
                     .borrow_mut()
                     .variables
-                    .add(variable().binary());
+                    .add(variable().binary().name(format!(
+                        "fieldop{}f{}",
+                        num_to_alpha(op_id),
+                        num_to_alpha(idx)
+                    )));
                 field_to_var.insert(field_name.clone(), var);
                 sum_expr += var;
             }
@@ -595,7 +649,7 @@ fn constrain_field_vars_to_parents(
     canonical_fields: &HashMap<usize, Vec<StructOrTuple>>,
     metadata: &mut PartitionILPMetadata,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
-    is_relevant: bool,
+    idbs: &HashSet<usize>,
 ) {
     let PartitionILPMetadata {
         op_id_to_field_vars,
@@ -616,14 +670,25 @@ fn constrain_field_vars_to_parents(
     // Create field vars for parents
     let parents = op_id_to_parents.get(&op_id).unwrap();
     if parents.is_empty() {
-        // Source/Network nodes with no parents: field vars are unconstrained (free to be 0 or 1).
+        // Network nodes with no parents: field vars are unconstrained (free to be 0 or 1).
         // The solver will set them to 1 if doing so helps enable partitioning downstream.
         return;
     }
 
-    let dependencies_on_parents = canonical_fields.get(&op_id).unwrap();
+    // Only worry about parents that are relevant
+    let dependencies_on_parents = canonical_fields
+        .get(&op_id)
+        .unwrap()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, dependencies)| {
+            idbs.contains(parents.get(index).unwrap())
+                .then_some(dependencies)
+        })
+        .collect::<Vec<_>>();
     let parent_field_vars = parents
         .iter()
+        .filter(|parent_id| idbs.contains(parent_id))
         .map(|parent_id| {
             field_vars_from_op(
                 *parent_id,
@@ -634,7 +699,6 @@ fn constrain_field_vars_to_parents(
             )
         })
         .collect::<Vec<_>>();
-
 
     // Get expr that is 1 if this node is an input, 0 otherwise
     let is_input_expr = add_is_input_expr(op_id, parents, decoupling_metadata);
@@ -650,7 +714,7 @@ fn constrain_field_vars_to_parents(
     for (field_name, field_var) in field_vars {
         // If there's a link from this field to all parents, constrain it to the corresponding field in all parents
         // Otherwise, only allow using this field for partitioning if this is an input node
-        let mut corresponding_parent_field_vars = vec![vec![]; parents.len()];
+        let mut corresponding_parent_field_vars = vec![vec![]; dependencies_on_parents.len()];
         for (left_or_right, dependencies_on_parent) in dependencies_on_parents.iter().enumerate() {
             // For this field and its children, what fields in the parent does it depend on?
             // Note: We can't unwrap here, because
@@ -672,6 +736,7 @@ fn constrain_field_vars_to_parents(
                     );
                 }
             }
+            is_partitionable += field_var;
         }
 
         let all_parents_have_corresponding_fields = corresponding_parent_field_vars
@@ -701,20 +766,18 @@ fn constrain_field_vars_to_parents(
         is_partitionable += field_var;
     }
 
-    // Add to partitionable operators only if this op is relevant (IDB that affects partitionability)
-    if is_relevant {
-        for (loc, partitionable_expr) in partitionable_operators {
-            let is_at_loc_and_partitionable = variables.add(variable().binary());
-            let is_at_loc = op_id_to_var.get(&op_id).unwrap().get(loc).unwrap();
+    // Add to partitionable operators
+    for (loc, partitionable_expr) in partitionable_operators {
+        let is_at_loc_and_partitionable = variables.add(variable().binary());
+        let is_at_loc = op_id_to_var.get(&op_id).unwrap().get(loc).unwrap();
 
-            constraints.push(constraint!(
-                is_at_loc_and_partitionable <= is_partitionable.clone()
-            ));
-            constraints.push(constraint!(is_at_loc_and_partitionable <= *is_at_loc));
+        constraints.push(constraint!(
+            is_at_loc_and_partitionable <= is_partitionable.clone()
+        ));
+        constraints.push(constraint!(is_at_loc_and_partitionable <= *is_at_loc));
 
-            let temp_expr = std::mem::take(partitionable_expr);
-            *partitionable_expr = temp_expr + is_at_loc_and_partitionable;
-        }
+        let temp_expr = std::mem::take(partitionable_expr);
+        *partitionable_expr = temp_expr + is_at_loc_and_partitionable;
     }
 }
 
@@ -766,14 +829,16 @@ fn partition_ilp_node_analysis(
         );
     }
 
-    constrain_field_vars_to_parents(
-        op_id,
-        op_id_to_parents,
-        canonical_fields,
-        metadata,
-        decoupling_metadata,
-        is_relevant,
-    );
+    if is_relevant {
+        constrain_field_vars_to_parents(
+            op_id,
+            op_id_to_parents,
+            canonical_fields,
+            metadata,
+            decoupling_metadata,
+            idbs,
+        );
+    }
 }
 
 /// Derive `can_partition[loc]` from the accumulated per-location expressions.
@@ -793,7 +858,11 @@ fn calculate_partitionable(
 
     for loc in 0..num_locations {
         // all_partitionable: 1 iff num_relevant == partitionable
-        let diff = variables.add(variable().min(0));
+        let diff = variables.add(
+            variable()
+                .min(0)
+                .name(format!("partdiffloc{}", num_to_alpha(loc))),
+        );
         let num_relevant = metadata
             .num_relevant_operators
             .get(&loc)
@@ -810,7 +879,11 @@ fn calculate_partitionable(
         constraints.push(constraint!(diff >= num_partitionable - num_relevant));
 
         // all_partitionable: 1 iff diff == 0 (i.e., num_relevant == num_partitionable)
-        let all_partitionable = variables.add(variable().binary());
+        let all_partitionable = variables.add(
+            variable()
+                .binary()
+                .name(format!("allpartitionableloc{}", num_to_alpha(loc))),
+        );
         constraints.push(constraint!(diff <= big_m * (1 - all_partitionable))); // if all_partitionable=1, diff must be 0
         constraints.push(constraint!(1 - all_partitionable <= big_m * diff)); // if diff=0, all_partitionable must be 1
 
@@ -820,10 +893,18 @@ fn calculate_partitionable(
             .get(&loc)
             .cloned()
             .unwrap_or_default();
-        let has_persist = variables.add(variable().binary());
+        let has_persist = variables.add(
+            variable()
+                .binary()
+                .name(format!("haspersistloc{}", num_to_alpha(loc))),
+        );
         constraints.push(constraint!(num_persist.clone() <= big_m * has_persist));
         constraints.push(constraint!(num_persist >= has_persist));
-        let no_persist = variables.add(variable().binary());
+        let no_persist = variables.add(
+            variable()
+                .binary()
+                .name(format!("nopersistloc{}", num_to_alpha(loc))),
+        );
         constraints.push(constraint!(no_persist == 1 - has_persist));
 
         // no_total_order: 1 iff num_total_order == 0
@@ -832,20 +913,32 @@ fn calculate_partitionable(
             .get(&loc)
             .cloned()
             .unwrap_or_default();
-        let has_total_order = variables.add(variable().binary());
+        let has_total_order = variables.add(
+            variable()
+                .binary()
+                .name(format!("hastotalorderloc{}", num_to_alpha(loc))),
+        );
         constraints.push(constraint!(
             num_total_order.clone() <= big_m * has_total_order
         ));
         constraints.push(constraint!(num_total_order >= has_total_order));
 
         // or_cond = all_partitionable OR no_persist
-        let or_cond = variables.add(variable().binary());
+        let or_cond = variables.add(
+            variable()
+                .binary()
+                .name(format!("orcondloc{}", num_to_alpha(loc))),
+        );
         constraints.push(constraint!(or_cond >= all_partitionable));
         constraints.push(constraint!(or_cond >= no_persist));
         constraints.push(constraint!(or_cond <= all_partitionable + no_persist));
 
         // can_partition = or_cond AND no_total_order
-        let can_partition = variables.add(variable().binary());
+        let can_partition = variables.add(
+            variable()
+                .binary()
+                .name(format!("canpartitionloc{}", num_to_alpha(loc))),
+        );
         constraints.push(constraint!(can_partition <= or_cond));
         constraints.push(constraint!(can_partition <= 1 - has_total_order));
         constraints.push(constraint!(
@@ -876,13 +969,13 @@ pub(crate) fn partition_ilp_analysis(
     };
 
     let inputs = all_inputs(ir, &decoupling_metadata.borrow().bottleneck);
+    // TODO: Known inaccuracy: This assumes that no edge will be created that converts EDBs to IDBs. That needs to be a constraint on decoupling
     let idbs = nodes_dependent_on_inputs(
         ir,
         &decoupling_metadata.borrow().bottleneck,
         &inputs,
         op_id_to_parents,
     );
-    println!("Partition analysis: {} inputs, {} IDBs", inputs.len(), idbs.len());
     let canonical_fields = create_canonical_fields(
         ir,
         &decoupling_metadata.borrow().bottleneck,
@@ -941,7 +1034,11 @@ pub(crate) fn apply_budget_constraints(
     } = &mut *decoupling_metadata.borrow_mut();
 
     for loc in 0..max_num_locations {
-        let used = variables.add(variable().binary());
+        let used = variables.add(
+            variable()
+                .binary()
+                .name(format!("locused{}", num_to_alpha(loc))),
+        );
         let mut sum_at_loc = Expression::default();
         for op_vars in op_id_to_var.values() {
             if let Some(&v) = op_vars.get(&loc) {
@@ -976,13 +1073,33 @@ pub(crate) fn apply_budget_constraints(
 
         // Resource division: effective usage = usage / num_partitions
         let res = resource_usages.get(&loc).cloned().unwrap_or_default();
-        let effective_cpu = variables.add(variable().min(0));
-        let effective_memory = variables.add(variable().min(0));
-        let effective_network = variables.add(variable().min(0));
-        let effective_io = variables.add(variable().min(0));
+        let effective_cpu = variables.add(
+            variable()
+                .min(0)
+                .name(format!("effcpuloc{}", num_to_alpha(loc))),
+        );
+        let effective_memory = variables.add(
+            variable()
+                .min(0)
+                .name(format!("effmemloc{}", num_to_alpha(loc))),
+        );
+        let effective_network = variables.add(
+            variable()
+                .min(0)
+                .name(format!("effnetloc{}", num_to_alpha(loc))),
+        );
+        let effective_io = variables.add(
+            variable()
+                .min(0)
+                .name(format!("effioloc{}", num_to_alpha(loc))),
+        );
 
         for num_partitions in 0..=budget {
-            let has_n_partitions = variables.add(variable().binary());
+            let has_n_partitions = variables.add(variable().binary().name(format!(
+                "has{}partsloc{}",
+                num_to_alpha(num_partitions),
+                num_to_alpha(loc)
+            )));
 
             if num_partitions == 0 {
                 constraints.push(constraint!(has_n_partitions == 1 - loc_used[loc]));
@@ -990,13 +1107,23 @@ pub(crate) fn apply_budget_constraints(
                 constraints.push(constraint!(has_n_partitions <= loc_used[loc]));
                 let scale = 1.0 / num_partitions as f64;
                 let penalty = big_m * (1 - has_n_partitions);
-                constraints.push(constraint!(effective_cpu >= res.cpu.clone() * scale - penalty.clone()));
-                constraints.push(constraint!(effective_memory >= res.memory.clone() * scale - penalty.clone()));
-                constraints.push(constraint!(effective_network >= res.network.clone() * scale - penalty.clone()));
-                constraints.push(constraint!(effective_io >= res.io.clone() * scale - penalty));
+                constraints.push(constraint!(
+                    effective_cpu >= res.cpu.clone() * scale - penalty.clone()
+                ));
+                constraints.push(constraint!(
+                    effective_memory >= res.memory.clone() * scale - penalty.clone()
+                ));
+                constraints.push(constraint!(
+                    effective_network >= res.network.clone() * scale - penalty.clone()
+                ));
+                constraints.push(constraint!(
+                    effective_io >= res.io.clone() * scale - penalty
+                ));
             }
             if num_partitions >= 2 {
-                constraints.push(constraint!(has_n_partitions <= *pm.can_partition.get(&loc).unwrap()));
+                constraints.push(constraint!(
+                    has_n_partitions <= *pm.can_partition.get(&loc).unwrap()
+                ));
             }
 
             total_machines += Expression::from(has_n_partitions) * num_partitions as f64;
@@ -1006,12 +1133,15 @@ pub(crate) fn apply_budget_constraints(
 
         constraints.push(constraint!(sum_vars == 1));
 
-        resource_usages.insert(loc, ResourceExpressions {
-            cpu: Expression::from(effective_cpu),
-            memory: Expression::from(effective_memory),
-            network: Expression::from(effective_network),
-            io: Expression::from(effective_io),
-        });
+        resource_usages.insert(
+            loc,
+            ResourceExpressions {
+                cpu: Expression::from(effective_cpu),
+                memory: Expression::from(effective_memory),
+                network: Expression::from(effective_network),
+                io: Expression::from(effective_io),
+            },
+        );
 
         is_n_partitions.push(vars_for_loc);
     }

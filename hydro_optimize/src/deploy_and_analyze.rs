@@ -42,7 +42,7 @@ const LATENCY_PREFIX: &str = "HYDRO_OPTIMIZE_LAT:";
 const THROUGHPUT_PREFIX: &str = "HYDRO_OPTIMIZE_THR:";
 const SOCKET_STATS_PREFIX: &str = "HYDRO_SOCKET_STATS:";
 const SINK_STATS_PREFIX: &str = "HYDRO_SINK_STATS:";
-pub const MAX_BUDGET_PER_CLUSTER: usize = 5;
+pub const MAX_BUDGET_PER_CLUSTER: usize = 7;
 pub const MAX_OPTIMIZATION_ITERATIONS_PAST_NO_IMPROVEMENT: usize = 2;
 const BIMODAL_CV_THRESHOLD: f64 = 0.3;
 
@@ -800,47 +800,6 @@ async fn run_scaling_loop<'a>(
             builder.replace_ir(deep_clone(ir));
             let finalized = builder.finalize();
 
-            // Debug: dump Tee sharing info
-            {
-                let mut debug_ir = deep_clone(finalized.ir());
-                let mut tee_inners: HashMap<usize, Vec<(Option<usize>, String)>> = HashMap::new();
-                traverse_dfir(
-                    &mut debug_ir,
-                    |_, _| {},
-                    |node, _| {
-                        if let HydroNode::Tee { inner, metadata, .. } = node {
-                            let ptr = std::rc::Rc::as_ptr(&inner.0) as usize;
-                            let op_id = metadata.op.id;
-                            let loc = format!("{:?}", metadata.location_id.root().key());
-                            tee_inners.entry(ptr).or_default().push((op_id, loc));
-                        }
-                    },
-                );
-                for (ptr, tees) in &tee_inners {
-                    if tees.len() == 1 {
-                        let inner_node = {
-                            let mut inner_type = String::new();
-                            traverse_dfir(
-                                &mut debug_ir,
-                                |_, _| {},
-                                |node, _| {
-                                    if let HydroNode::Tee { inner, .. } = node {
-                                        if std::rc::Rc::as_ptr(&inner.0) as usize == *ptr {
-                                            inner_type = inner.0.borrow().print_root().to_string();
-                                        }
-                                    }
-                                },
-                            );
-                            inner_type
-                        };
-                        println!(
-                            "WARNING: Tee inner @{:x} has only 1 ref: {:?}, inner_type={}",
-                            ptr, tees, inner_node
-                        );
-                    }
-                }
-            }
-
             let mut run_metadata = deploy_and_analyze(
                 reusable_hosts,
                 deployment,
@@ -1199,15 +1158,6 @@ async fn run_bottleneck_elimination<'a>(
         &state.rewrites_to_apply(),
         &mut config.location_id_to_cluster,
     );
-
-    // Validate: try to build a copy to catch errors early
-    {
-        let mut test_builder = FlowBuilder::from_built(&built);
-        test_builder.replace_ir(deep_clone(built.ir()));
-        println!("=== Validating rewritten IR by building a test copy ===");
-        let _test = test_builder.finalize(); // Will panic here if invalid
-        println!("=== Validation passed ===");
-    }
 
     state.save(&state_path);
     config.name = format!("{}_opt{}", base_name, iteration);
