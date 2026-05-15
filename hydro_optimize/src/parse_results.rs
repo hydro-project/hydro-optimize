@@ -148,6 +148,16 @@ pub fn csv_avg_throughput(path: &Path) -> usize {
     (sum / n) as usize
 }
 
+/// Returns the max average throughput across all CSVs in `_none` workload dirs for `name`.
+pub fn max_throughput_for(base_dir: &Path, name: &str) -> usize {
+    find_workload_dirs(base_dir, name, OptimizationKind::None.label())
+        .iter()
+        .flat_map(|d| get_csvs_in_dir(d))
+        .map(|e| csv_avg_throughput(&e.path()))
+        .max()
+        .unwrap_or(0)
+}
+
 /// ILP input data loaded from benchmark results.
 pub struct RawIlpInputs {
     /// Per-op memory/IO load from blow-up analysis.
@@ -162,19 +172,11 @@ pub struct RawIlpInputs {
 /// Stored as `{CALIBRATION_DIR}/{name}_optimization_state.json`.
 #[derive(Default, Serialize, Deserialize)]
 pub struct OptimizationState {
-    /// Ordered sequence of applied rewrites (one per iteration).
-    pub applied: Vec<AppliedEntry>,
+    /// Current budget per cluster (cluster name → budget level).
+    /// Only the latest budget per cluster is stored; higher budgets supersede lower ones.
+    pub applied: HashMap<String, usize>,
     /// Per original-cluster-name: precomputed rewrites for all budgets.
     pub cluster_rewrites: HashMap<String, Vec<Rewrite>>,
-}
-
-/// A single applied rewrite entry in the optimization history.
-#[derive(Serialize, Deserialize)]
-pub struct AppliedEntry {
-    /// The original cluster name this rewrite targets (e.g. "proposer", not "proposer_loc1")
-    pub original_cluster: String,
-    /// The budget level used (index into cluster_rewrites[original_cluster])
-    pub budget: usize,
 }
 
 impl OptimizationState {
@@ -196,39 +198,31 @@ impl OptimizationState {
         );
     }
 
-    /// Get all rewrites to apply (one per applied entry).
+    /// Get one rewrite per applied cluster (at its current budget).
     pub fn rewrites_to_apply(&self) -> Vec<Rewrite> {
         self.applied
             .iter()
-            .map(|entry| {
+            .map(|(cluster, &budget)| {
                 let rewrites = self
                     .cluster_rewrites
-                    .get(&entry.original_cluster)
-                    .unwrap_or_else(|| {
-                        panic!("No rewrites for cluster '{}'", entry.original_cluster)
-                    });
-                let idx = entry.budget - 2; // budgets start at 2
-                rewrites[idx].clone()
+                    .get(cluster)
+                    .unwrap_or_else(|| panic!("No rewrites for cluster '{}'", cluster));
+                rewrites[budget - 2].clone() // budgets start at 2
             })
             .collect()
     }
 
-    /// Next budget for a cluster (last applied budget + 1, or 2 if never applied).
-    pub fn next_budget(&self, original_cluster: &str) -> usize {
-        self.applied
-            .iter()
-            .rev()
-            .find(|e| e.original_cluster == original_cluster)
-            .map(|e| e.budget + 1)
-            .unwrap_or(2)
+    /// Next budget for a cluster (current + 1, or 2 if never applied).
+    pub fn next_budget(&self, cluster: &str) -> usize {
+        self.applied.get(cluster).map(|&b| b + 1).unwrap_or(2)
     }
 
     /// Whether the cluster has exhausted all precomputed budgets.
-    pub fn is_exhausted(&self, original_cluster: &str) -> bool {
-        let Some(rewrites) = self.cluster_rewrites.get(original_cluster) else {
+    pub fn is_exhausted(&self, cluster: &str) -> bool {
+        let Some(rewrites) = self.cluster_rewrites.get(cluster) else {
             return false;
         };
-        self.next_budget(original_cluster) - 2 >= rewrites.len()
+        self.next_budget(cluster) - 2 >= rewrites.len()
     }
 }
 
@@ -507,6 +501,14 @@ pub fn find_latest_iteration(base_dir: &Path, name: &str) -> Option<usize> {
         .filter_map(|e| {
             let n = e.file_name().to_string_lossy().to_string();
             if n.starts_with(&prefix) && n.ends_with(&suffix) {
+                // Only count dirs that actually have CSV files
+                let has_csvs = std::fs::read_dir(e.path())
+                    .into_iter()
+                    .flatten()
+                    .any(|f| f.ok().is_some_and(|f| f.file_name().to_string_lossy().ends_with(".csv")));
+                if !has_csvs {
+                    return None;
+                }
                 let after_prefix = &n[prefix.len()..];
                 let num_str = after_prefix.split('_').next()?;
                 num_str.parse::<usize>().ok()
@@ -520,15 +522,9 @@ pub fn find_latest_iteration(base_dir: &Path, name: &str) -> Option<usize> {
 }
 
 /// Loads avg total sockets (sources + sinks) per tick for a given cluster from the best-throughput
-/// run in a `_none` dir. Handles both Vec<f64> and Vec<[f64; 2]> ([throughput, avg_sockets]) formats.
+/// run in a `_none` dir.
 pub fn load_num_avg_sockets_per_tick(none_dir: &Path, cluster_name: &str) -> f64 {
     let load_stats = |prefix: &str| -> f64 {
-        let pairs: HashMap<String, Vec<[f64; 2]>> = load_json_for_best_csv(none_dir, prefix);
-        if let Some(v) = pairs.get(cluster_name) {
-            if !v.is_empty() {
-                return v.iter().map(|pair| pair[1]).sum::<f64>() / v.len() as f64;
-            }
-        }
         let stats: HashMap<String, Vec<f64>> = load_json_for_best_csv(none_dir, prefix);
         stats
             .get(cluster_name)

@@ -118,7 +118,7 @@ async fn main() {
                 start_virtual_clients: 1,
                 virtual_clients_step: 10,
                 num_runs: 1,
-                run_until_completion: false,
+                fix_virtual_clients: None,
             })
         },
     )

@@ -921,12 +921,18 @@ pub(crate) fn decouple_analysis(
     });
     let op_id_to_parents = op_id_to_parents(ir, Some(bottleneck), cycle_source_to_sink_parent);
 
+    let bottleneck_ops: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
     traverse_dfir(
         ir,
         |root, _| {
             decouple_analysis_root(root, &op_id_to_parents, &decoupling_metadata);
         },
         |node, next_op_id| {
+            if *node.metadata().location_id.root() == decoupling_metadata.borrow().bottleneck
+                || get_network_type(node, &decoupling_metadata.borrow().bottleneck).is_some()
+            {
+                bottleneck_ops.borrow_mut().insert(*next_op_id);
+            }
             decouple_analysis_node(node, next_op_id, &op_id_to_parents, &decoupling_metadata);
         },
     );
@@ -1009,9 +1015,11 @@ pub(crate) fn decouple_analysis(
             }
         }
 
-        // Place sources, network recv/sendrecv, and non-network ops.
-        // Do NOT place network send-only nodes (they live on other clusters).
-        if !network_type.is_some_and(|t| *t == NetworkType::Send) {
+        // Only place ops that are actually on the bottleneck or are network
+        // boundaries into it. Skip Send-only ops and ops from other clusters.
+        if bottleneck_ops.borrow().contains(&op_id)
+            && !network_type.is_some_and(|t| *t == NetworkType::Send)
+        {
             result.op_to_loc.insert(op_id, op_location);
         }
     }

@@ -91,7 +91,7 @@ async fn main() {
                         start_virtual_clients: 100, // No need to test non-saturated regimes
                         virtual_clients_step: 10, // irrelevant
                         num_runs: 3,
-                        run_until_completion: true,
+                        fix_virtual_clients: Some(100),
                     })
                 },
             )

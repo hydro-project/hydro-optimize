@@ -1,5 +1,6 @@
 use std::cell::RefCell;
-use std::{collections::HashMap, rc::Rc};
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use hydro_lang::compile::ir::{
     CollectionKind, DebugExpr, DebugInstantiate, HydroNode, HydroRoot, HydroSource, SharedNode,
@@ -357,6 +358,16 @@ fn insert_network(
         return;
     };
 
+    println!(
+        "insert_network: op_id={}, node_type={}, sender_loc={}, receiver_loc={}, is_tee={}, is_optional={}",
+        op_id,
+        node.print_root(),
+        sender_location_idx,
+        receiver_location_idx,
+        matches!(node, HydroNode::Tee { .. }),
+        matches!(node.metadata().collection_kind, CollectionKind::Optional { .. }),
+    );
+
     // Construct NetworkMetadata
     let sender_location = locations_map.get(sender_location_idx).unwrap().clone();
     let receiver_location = locations_map.get(receiver_location_idx).unwrap();
@@ -395,6 +406,10 @@ fn insert_network(
             let orig_inner_id = *tee_to_inner_id_before_rewrites.get(&op_id).unwrap();
             let metadata = metadata.clone();
             let cache_key = (orig_inner_id, receiver_location.clone());
+            println!(
+                "  Tee handling: op_id={}, orig_inner_id={}, inner_loc={:?}, receiver={:?}, cache_hit={}",
+                op_id, orig_inner_id, inner_loc.key(), receiver_location.key(), new_inners.contains_key(&cache_key)
+            );
             let new_inner = new_inners
                 .entry(cache_key)
                 .or_insert_with(|| {
@@ -438,16 +453,16 @@ fn repair_existing_network_for_partitioning(
     op_id: usize,
     rewrite: &Rewrite,
     locations_map: &HashMap<usize, LocationId>,
-) {
+) -> bool {
     let HydroNode::Network {
         input, metadata, ..
     } = node
     else {
-        return;
+        return false;
     };
     let Some(sender_op_id) = input.op_metadata().id else {
         // If the input doesn't have an op ID, then it must have been added during the rewrite, so we can ignore it
-        return;
+        return true;
     };
     let sender_location_idx = rewrite.op_to_loc.get(&sender_op_id);
     let sender_location = sender_location_idx
@@ -474,14 +489,30 @@ fn repair_existing_network_for_partitioning(
         new: false,
     };
 
+    // Move the Network to its assigned location before wrapping
+    if let Some(&loc_idx) = rewrite.op_to_loc.get(&op_id) {
+        let new_location = locations_map.get(&loc_idx).unwrap();
+        metadata.location_id.swap_root(new_location.clone());
+    }
+
     // If the receiver is now partitioned, add a Map before the Network to route to the correct partition
     if receiver_partitions > 0 {
+        println!(
+            "repair_existing_network: op_id={}, inserting map_before_network (receiver_partitions={})",
+            op_id, receiver_partitions
+        );
         map_before_network(node, &network_metadata);
     }
     // If the source is now partitioned, departition the ID on the receiving end
     if sender_partitions > 0 {
+        println!(
+            "repair_existing_network: op_id={}, inserting map_after_network (sender_partitions={})",
+            op_id, sender_partitions
+        );
         map_after_network(node, &network_metadata);
     }
+
+    true
 }
 
 /// Returns the location index where the node actually executes.
@@ -515,7 +546,9 @@ fn decouple_node(
         return;
     };
 
-    repair_existing_network_for_partitioning(node, op_id, rewrite, locations_map);
+    if repair_existing_network_for_partitioning(node, op_id, rewrite, locations_map) {
+        return;
+    }
 
     if let Some(loc_idx) = execution_loc_of_op(op_id, node, rewrite) {
         let new_location = locations_map.get(&loc_idx).unwrap();
@@ -649,4 +682,70 @@ pub fn apply_rewrite(
     );
 
     // NOTE: We do not re-inject IDs, because we need to know each op's original ID to associate it with their stats
+
+    // Debug: print the graph after rewrite
+    println!("=== Graph after apply_rewrite (budget={}) ===", rewrite.budget);
+    traverse_dfir(
+        ir,
+        |root, _| {
+            let meta = root.input_metadata();
+            println!(
+                "  ROOT id={:?} loc={:?}",
+                meta.op.id,
+                meta.location_id.root().key()
+            );
+        },
+        |node, _| {
+            let meta = node.metadata();
+            let id = meta.op.id;
+            let loc = meta.location_id.root().key();
+            println!(
+                "  NODE id={:?} loc={:?} type={}",
+                id,
+                loc,
+                node.print_root()
+            );
+        },
+    );
+    println!("=== End graph ===");
+
+    // Check for Tee inners that span multiple locations (the root cause of "map with 0 outputs")
+    let mut checked_ptrs: HashSet<usize> = HashSet::new();
+    traverse_dfir(
+        ir,
+        |_, _| {},
+        |node, _| {
+            if let HydroNode::Tee { inner, metadata, .. } = node {
+                let ptr = Rc::as_ptr(&inner.0) as usize;
+                if checked_ptrs.insert(ptr) {
+                    // Walk the inner's node chain and collect locations
+                    let inner_ref = inner.0.borrow();
+                    let top_loc = inner_ref.metadata().location_id.root().key();
+                    // Check recursively by looking at the inner's children
+                    fn collect_locs(node: &HydroNode, locs: &mut HashSet<hydro_lang::location::LocationKey>) {
+                        locs.insert(node.metadata().location_id.root().key());
+                        match node {
+                            HydroNode::Map { input, .. }
+                            | HydroNode::Filter { input, .. }
+                            | HydroNode::FilterMap { input, .. }
+                            | HydroNode::FlatMap { input, .. }
+                            | HydroNode::Inspect { input, .. }
+                            | HydroNode::Network { input, .. } => {
+                                collect_locs(input, locs);
+                            }
+                            _ => {}
+                        }
+                    }
+                    let mut locs = HashSet::new();
+                    collect_locs(&inner_ref, &mut locs);
+                    if locs.len() > 1 {
+                        println!(
+                            "BUG: Tee inner @{:x} (tee op={:?}, tee_loc={:?}) spans multiple locations: {:?}, inner_type={}",
+                            ptr, metadata.op.id, metadata.location_id.root().key(), locs, inner_ref.print_root()
+                        );
+                    }
+                }
+            }
+        },
+    );
 }
