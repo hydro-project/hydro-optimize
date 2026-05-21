@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
+use std::path::Path;
 
 use hydro_lang::compile::builder::ClockId;
 use hydro_lang::compile::ir::{
@@ -59,11 +60,11 @@ pub fn print_id(ir: &mut [HydroRoot]) {
 }
 
 /// Writes operator IR to a file (same format as print_id).
-pub fn save_id(ir: &mut [HydroRoot], path: &std::path::Path) {
+pub fn save_id(ir: &mut [HydroRoot], path: &Path) {
     write_id(ir, Some(path));
 }
 
-fn write_id(ir: &mut [HydroRoot], path: Option<&std::path::Path>) {
+fn write_id(ir: &mut [HydroRoot], path: Option<&Path>) {
     let lines = RefCell::new(Vec::new());
     transform_bottom_up(
         ir,

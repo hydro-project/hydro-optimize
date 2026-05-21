@@ -28,7 +28,7 @@ use crate::reduce_pushdown_analysis::reduce_pushdown_decision;
 use crate::repair::{cycle_source_to_sink_parent, inject_id};
 use crate::rewriter::apply_rewrite;
 use crate::rewrites::{
-    collection_kind_to_debug_type, get_network_op_ids, op_id_to_parents, tee_to_inner_id,
+    collection_kind_to_debug_type, get_network_op_ids, op_id_to_parents, save_id, tee_to_inner_id,
 };
 
 const METRIC_INTERVAL_SECS: u64 = 1;
@@ -768,6 +768,9 @@ async fn run_scaling_loop<'a>(
 ) -> RunMetadata {
     let output_dir = make_output_dir(&config.name, &config.workload, optimizations.kind.label());
     let ir = built.ir();
+    if matches!(optimizations.kind, OptimizationKind::PerfOnly) {
+        save_id(&mut deep_clone(ir), &output_dir.join("id.txt"));
+    }
     let mut final_run_metadata = RunMetadata::default();
     let mut best_throughput: usize = 0;
     let mut no_improvement_count: usize = 0;
