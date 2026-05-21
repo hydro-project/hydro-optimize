@@ -64,6 +64,7 @@ pub(crate) struct DecoupleILPMetadata {
     pub(crate) op_sizes: HashMap<usize, u64>,
     pub(crate) network_cost_table: NetworkCostTable,
     pub(crate) per_op_load: HashMap<usize, SarStats>,
+    pub(crate) cluster_size: usize,
     pub(crate) max_num_locations: usize,
     // Model variables to construct final cost function
     pub(crate) variables: ProblemVariables,
@@ -74,21 +75,6 @@ pub(crate) struct DecoupleILPMetadata {
     prev_op_parent_with_tick: HashMap<ClockId, usize>, // tick_id: last op_id with that tick_id
     tee_inner_to_decoupled_vars: HashMap<usize, HashMap<usize, (Variable, Variable)>>, /* inner_id: (loc: (send var, recv var)) */
     pub(crate) network_ids: HashMap<usize, NetworkType>,
-    /// Network ops with their cardinality, size, and per-location assignment variables.
-    pub(crate) network_op_loc_vars: Vec<NetworkOpEntry>,
-    /// Total cardinality of original (pre-decoupling) network ops, for socket scaling.
-    pub(crate) original_network_cardinality: usize,
-}
-
-/// A network op's contribution to the discretized socket/CPU model.
-pub(crate) struct NetworkOpEntry {
-    pub count: usize,
-    pub msg_size: u64,
-    /// loc -> assignment_var (1 if this op is active on that location)
-    pub loc_vars: HashMap<usize, Variable>,
-    /// For decoupled send entries: the receiver's loc vars. Used to multiply
-    /// socket contribution by receiver's partition count.
-    pub recv_loc_vars: Option<HashMap<usize, Variable>>,
 }
 
 /// Per-location ILP expressions for each resource type.
@@ -128,8 +114,6 @@ pub struct IlpInputs {
     pub consider_partitioning: bool,
     /// Number of replicas in the bottleneck cluster
     pub cluster_size: usize,
-    /// Total avg active sockets (sources + sinks) on the bottleneck location
-    pub baseline_sockets: usize,
 }
 
 /// Returns a map from location to a binary var
@@ -242,21 +226,21 @@ fn add_op_resource_usage(
         op_counts,
         op_sizes,
         network_cost_table,
+        cluster_size,
         variables,
         constraints,
         max_num_locations: num_locations,
         resource_usages,
         op_id_to_var,
-        network_op_loc_vars,
-        original_network_cardinality,
         ..
     } = &mut *decoupling_metadata.borrow_mut();
 
     let op_id = metadata.id.unwrap();
-
-    // Network ops: CPU cost handled by discretized socket model in solve().
-    // Here we just record the op's assignment vars and add non-CPU costs directly.
-    if network_type.is_some() {
+    let op_load = if let Some(load) = per_op_load.get(&op_id) {
+        *load
+    } else if network_type.is_some() {
+        // Network ops aren't in per_op_load; derive cost from calibration table
+        // Use parent's count (total messages sent) and the network op's own size
         let parent_id = op_id_to_parents
             .get(&op_id)
             .and_then(|p| p.first().copied());
@@ -266,137 +250,77 @@ fn add_op_resource_usage(
             .unwrap_or(0);
         let size = op_sizes.get(&op_id).copied().unwrap_or(0);
         if count > 0 && size > 0 {
-            let bandwidth_per_msg = network_cost_table.cost_per_message(size, 1).network;
-
-            let mut loc_vars: HashMap<usize, Variable> = HashMap::new();
-            match network_type {
-                Some(NetworkType::Send) | Some(NetworkType::SendRecv) | None => {
-                    if let Some(parents) = op_id_to_parents.get(&op_id)
-                        && let Some(first_parent) = parents.first()
-                    {
-                        let parent_vars = var_from_op_id(
-                            *first_parent,
-                            *num_locations,
-                            op_id_to_var,
-                            variables,
-                            constraints,
-                        );
-                        add_bandwidth_cost(
-                            &parent_vars,
-                            bandwidth_per_msg * count as f64,
-                            resource_usages,
-                            &mut loc_vars,
-                        );
-                    }
-                }
-                _ => {}
-            }
-            match network_type {
-                Some(NetworkType::Recv) | Some(NetworkType::SendRecv) => {
-                    let op_vars =
-                        var_from_op_id(op_id, *num_locations, op_id_to_var, variables, constraints);
-                    add_bandwidth_cost(
-                        &op_vars,
-                        bandwidth_per_msg * count as f64,
-                        resource_usages,
-                        &mut loc_vars,
-                    );
-                }
-                _ => {}
-            }
-            network_op_loc_vars.push(NetworkOpEntry {
-                count,
-                msg_size: size,
-                loc_vars,
-                recv_loc_vars: None,
-            });
-            *original_network_cardinality += count;
+            network_cost_table.network_cost(count, size, *cluster_size)
+        } else {
+            return;
         }
-        return;
-    }
-
-    let Some(op_load) = per_op_load.get(&op_id) else {
+    } else {
         return;
     };
     if op_load.cpu <= 0.0 && op_load.memory <= 0.0 && op_load.network <= 0.0 && op_load.io <= 0.0 {
         return;
     }
 
-    // Non-network ops: cost is paid at the parent's location
-    if let Some(parents) = op_id_to_parents.get(&op_id)
-        && let Some(first_parent) = parents.first()
-    {
-        let parent_vars = var_from_op_id(
-            *first_parent,
-            *num_locations,
-            op_id_to_var,
-            variables,
-            constraints,
-        );
-        for (loc, parent_var) in parent_vars {
-            let res = resource_usages.get_mut(&loc).unwrap();
-            let cpu_temp = std::mem::take(&mut res.cpu);
-            res.cpu = cpu_temp + op_load.cpu * parent_var;
-            let mem_temp = std::mem::take(&mut res.memory);
-            res.memory = mem_temp + op_load.memory * parent_var;
-            let net_temp = std::mem::take(&mut res.network);
-            res.network = net_temp + op_load.network * parent_var;
-            let io_temp = std::mem::take(&mut res.io);
-            res.io = io_temp + op_load.io * parent_var;
+    // Operators are run on the machine that their parents send to.
+    match network_type {
+        Some(NetworkType::Send) | Some(NetworkType::SendRecv) | None => {
+            if let Some(parents) = op_id_to_parents.get(&op_id)
+                && let Some(first_parent) = parents.first()
+            {
+                let parent_vars = var_from_op_id(
+                    *first_parent,
+                    *num_locations,
+                    op_id_to_var,
+                    variables,
+                    constraints,
+                );
+                for (loc, parent_var) in parent_vars {
+                    let res = resource_usages.get_mut(&loc).unwrap();
+                    let cpu_temp = std::mem::take(&mut res.cpu);
+                    res.cpu = cpu_temp + op_load.cpu * parent_var;
+                    let mem_temp = std::mem::take(&mut res.memory);
+                    res.memory = mem_temp + op_load.memory * parent_var;
+                    let net_temp = std::mem::take(&mut res.network);
+                    res.network = net_temp + op_load.network * parent_var;
+                    let io_temp = std::mem::take(&mut res.io);
+                    res.io = io_temp + op_load.io * parent_var;
+                }
+            }
         }
+        _ => {}
+    }
+    // Special case for network receives: their cost (deserialization) is paid by the receiver.
+    match network_type {
+        Some(NetworkType::Recv) | Some(NetworkType::SendRecv) => {
+            let op_vars =
+                var_from_op_id(op_id, *num_locations, op_id_to_var, variables, constraints);
+            for (loc, parent_var) in op_vars {
+                let res = resource_usages.get_mut(&loc).unwrap();
+                let cpu_temp = std::mem::take(&mut res.cpu);
+                res.cpu = cpu_temp + op_load.cpu * parent_var;
+                let mem_temp = std::mem::take(&mut res.memory);
+                res.memory = mem_temp + op_load.memory * parent_var;
+                let net_temp = std::mem::take(&mut res.network);
+                res.network = net_temp + op_load.network * parent_var;
+                let io_temp = std::mem::take(&mut res.io);
+                res.io = io_temp + op_load.io * parent_var;
+            }
+        }
+        _ => {}
     }
 }
 
-/// Adds network bandwidth cost to resource usages and collects loc_vars for each location.
-fn add_bandwidth_cost(
-    vars: &HashMap<usize, Variable>,
-    total_bandwidth: f64,
-    resource_usages: &mut HashMap<usize, ResourceExpressions>,
-    loc_vars: &mut HashMap<usize, Variable>,
-) {
-    for (loc, var) in vars {
-        loc_vars.insert(*loc, *var);
-        let res = resource_usages.get_mut(loc).unwrap();
-        let net_temp = std::mem::take(&mut res.network);
-        res.network = net_temp + total_bandwidth * *var;
+fn network_cost_for_decoupling_op(
+    op_id: usize,
+    op_counts: &HashMap<usize, usize>,
+    op_sizes: &HashMap<usize, u64>,
+    network_cost_table: &NetworkCostTable,
+) -> SarStats {
+    let cardinality = op_counts.get(&op_id).copied().unwrap_or(0);
+    match op_sizes.get(&op_id) {
+        Some(&bytes) => network_cost_table.network_cost(cardinality, bytes, 1),
+        None => SarStats::default(),
     }
-}
-
-/// Adds network bandwidth + decoupling penalty for a pair of send/recv vars per location,
-/// and registers them in the discretized socket model.
-fn register_decoupled_network(
-    send_recv_vars: &HashMap<usize, (Variable, Variable)>,
-    num_locations: usize,
-    total_bandwidth: f64,
-    cardinality: usize,
-    msg_size: u64,
-    resource_usages: &mut HashMap<usize, ResourceExpressions>,
-    network_op_loc_vars: &mut Vec<NetworkOpEntry>,
-) {
-    let mut send_loc_vars: HashMap<usize, Variable> = HashMap::new();
-    let mut recv_loc_vars: HashMap<usize, Variable> = HashMap::new();
-    for loc in 0..num_locations {
-        let (send_var, recv_var) = send_recv_vars.get(&loc).unwrap();
-        send_loc_vars.insert(loc, *send_var);
-        recv_loc_vars.insert(loc, *recv_var);
-        let res = resource_usages.get_mut(&loc).unwrap();
-        let net_temp = std::mem::take(&mut res.network);
-        res.network = net_temp + total_bandwidth * *send_var + total_bandwidth * *recv_var;
-        let cpu_temp = std::mem::take(&mut res.cpu);
-        res.cpu = cpu_temp + DECOUPLING_PENALTY * *send_var + DECOUPLING_PENALTY * *recv_var;
-    }
-    network_op_loc_vars.push(NetworkOpEntry {
-        count: cardinality,
-        msg_size,
-        loc_vars: send_loc_vars,
-        recv_loc_vars: Some(recv_loc_vars.clone()),
-    });
-    network_op_loc_vars.push(NetworkOpEntry {
-        count: cardinality,
-        msg_size,
-        loc_vars: recv_loc_vars,
-        recv_loc_vars: None,
-    });
 }
 
 /// For each location, return (send_var, recv_var).
@@ -454,19 +378,12 @@ fn add_decoupling_overhead(
         max_num_locations: num_locations,
         resource_usages,
         op_id_to_var,
-        network_op_loc_vars,
         ..
     } = &mut *decoupling_metadata.borrow_mut();
 
     let metadata = node.metadata();
     let op_id = metadata.op.id.unwrap();
-    let cardinality = op_counts.get(&op_id).copied().unwrap_or(0);
-    let size = op_sizes.get(&op_id).copied().unwrap_or(0);
-    if cardinality == 0 || size == 0 {
-        return;
-    }
-    let bandwidth_per_msg = network_cost_table.cost_per_message(size, 1).network;
-    let total_bandwidth = bandwidth_per_msg * cardinality as f64;
+    let net_cost = network_cost_for_decoupling_op(op_id, op_counts, op_sizes, network_cost_table);
 
     if let Some(parents) = op_id_to_parents.get(&op_id)
         && let Some(parent) = parents.first()
@@ -479,17 +396,25 @@ fn add_decoupling_overhead(
             op_id,
             op_id_to_var,
         );
-
-        register_decoupled_network(
-            &decouple_vars,
-            *num_locations,
-            total_bandwidth,
-            cardinality,
-            size,
-            resource_usages,
-            network_op_loc_vars,
-        );
+        for loc in 0..*num_locations {
+            let res = resource_usages.get_mut(&loc).unwrap();
+            let (send_var, recv_var) = decouple_vars.get(&loc).unwrap();
+            add_resource_cost(res, &net_cost, *send_var);
+            add_resource_cost(res, &net_cost, *recv_var);
+        }
     }
+}
+
+/// Adds `(cost_field + DECOUPLING_PENALTY) * var` to each resource expression.
+fn add_resource_cost(res: &mut ResourceExpressions, cost: &SarStats, var: Variable) {
+    let cpu_temp = std::mem::take(&mut res.cpu);
+    res.cpu = cpu_temp + (cost.cpu + DECOUPLING_PENALTY) * var;
+    let mem_temp = std::mem::take(&mut res.memory);
+    res.memory = mem_temp + cost.memory * var;
+    let net_temp = std::mem::take(&mut res.network);
+    res.network = net_temp + cost.network * var;
+    let io_temp = std::mem::take(&mut res.io);
+    res.io = io_temp + cost.io * var;
 }
 
 /// Only penalize decoupling inner from Tees once per unique location.
@@ -509,19 +434,15 @@ fn add_tee_decoupling_overhead(
         resource_usages,
         op_id_to_var,
         tee_inner_to_decoupled_vars,
-        network_op_loc_vars,
         ..
     } = &mut *decoupling_metadata.borrow_mut();
 
     let op_id = metadata.op.id.unwrap();
-    let cardinality = op_counts.get(&op_id).copied().unwrap_or(0);
-    let size = op_sizes.get(&op_id).copied().unwrap_or(0);
-    if cardinality == 0 || size == 0 {
-        return;
-    }
-    let total_bandwidth = network_cost_table.cost_per_message(size, 1).network * cardinality as f64;
+    let net_cost = network_cost_for_decoupling_op(op_id, op_counts, op_sizes, network_cost_table);
 
-    // For each location, send_var/recv_var are created once per unique inner_id
+    // For each location,
+    // send_var is 1 if the inner (at that location) sends to any Tee (including this op),
+    // recv_var is 1 if the inner (at a different location) sends to any Tee (including this op)
     let any_send_recv_vars = tee_inner_to_decoupled_vars
         .entry(inner_id)
         .or_insert_with(|| {
@@ -537,17 +458,11 @@ fn add_tee_decoupling_overhead(
                     num_to_alpha(inner_id),
                     num_to_alpha(loc)
                 )));
+                let res = resource_usages.get_mut(&loc).unwrap();
+                add_resource_cost(res, &net_cost, send_var);
+                add_resource_cost(res, &net_cost, recv_var);
                 loc_to_vars.insert(loc, (send_var, recv_var));
             }
-            register_decoupled_network(
-                &loc_to_vars,
-                *num_locations,
-                total_bandwidth,
-                cardinality,
-                size,
-                resource_usages,
-                network_op_loc_vars,
-            );
             loc_to_vars
         });
 
@@ -662,20 +577,13 @@ fn decouple_analysis_node(
     add_tick_constraint(node.metadata(), op_id_to_parents, decoupling_metadata);
 }
 
-fn solve(
-    decoupling_metadata: &RefCell<DecoupleILPMetadata>,
-    baseline_sockets: usize,
-    is_n_partitions: &[Vec<Variable>],
-) -> LpSolution {
+fn solve(decoupling_metadata: &RefCell<DecoupleILPMetadata>) -> LpSolution {
     let DecoupleILPMetadata {
         variables,
         constraints,
         resource_usages,
-        network_op_loc_vars,
-        max_num_locations,
-        network_cost_table,
-        original_network_cardinality,
         op_id_to_var,
+        max_num_locations,
         ..
     } = &mut *decoupling_metadata.borrow_mut();
 
@@ -696,135 +604,6 @@ fn solve(
             }
         }
         constrs.push(constraint!(ops_at_prev >= ops_at_curr));
-    }
-
-    // Discretized socket-aware network CPU cost.
-    // For each location, enumerate possible socket counts and use big-M to select the correct cost.
-    let max_sockets = (baseline_sockets * 2).max(1);
-
-    if *original_network_cardinality > 0 {
-        let big_m = 200.0; // Network CPU can't exceed 200% per location
-        let sockets_per_cardinality =
-            baseline_sockets as f64 / *original_network_cardinality as f64;
-
-        for loc in 0..*max_num_locations {
-            // For decoupled sends, precompute z = send_var AND has_n for each (entry, recv_loc, n).
-            // These are reused for both socket-level scaling and CPU cost scaling.
-            // entry_index -> vec of (n, z_var)
-            let mut decoupled_send_z_vars: HashMap<usize, Vec<(usize, Variable)>> = HashMap::new();
-
-            // Socket contribution for this location: sum of count_i * assignment_var[i][loc]
-            // For decoupled sends, scale by receiver's partition count (more partitions = more sockets).
-            let mut location_total_network_cardinality = Expression::default();
-            for (entry_idx, entry) in network_op_loc_vars.iter().enumerate() {
-                let Some(&var) = entry.loc_vars.get(&loc) else {
-                    continue;
-                };
-                if let Some(recv_locs) = &entry.recv_loc_vars {
-                    // Decoupled send: contribution = count * n * is_sending_to_n_partitions
-                    let mut z_vars_for_entry = Vec::new();
-                    for (&recv_loc, &_recv_var) in recv_locs {
-                        for (n, &has_n) in is_n_partitions[recv_loc].iter().enumerate() {
-                            if n == 0 {
-                                continue;
-                            }
-                            let is_sending_to_n_partitions =
-                                vars.add(variable().min(0).max(1).name(format!(
-                                    "sendton{}loc{}rloc{}e{}",
-                                    num_to_alpha(n),
-                                    num_to_alpha(loc),
-                                    num_to_alpha(recv_loc),
-                                    num_to_alpha(entry_idx)
-                                )));
-                            constrs.push(constraint!(is_sending_to_n_partitions <= var));
-                            constrs.push(constraint!(is_sending_to_n_partitions <= has_n));
-                            constrs
-                                .push(constraint!(is_sending_to_n_partitions >= var + has_n - 1));
-                            location_total_network_cardinality +=
-                                entry.count as f64 * n as f64 * is_sending_to_n_partitions;
-                            z_vars_for_entry.push((n, is_sending_to_n_partitions));
-                        }
-                    }
-                    decoupled_send_z_vars.insert(entry_idx, z_vars_for_entry);
-                } else {
-                    location_total_network_cardinality += entry.count as f64 * var;
-                }
-            }
-
-            // Binary indicators for socket level S = 1..max_sockets
-            let mut is_s_vars: Vec<Variable> = Vec::new();
-            let mut sum_indicators = Expression::default();
-            let mut num_sockets_int = Expression::default();
-            for s in 2..=max_sockets {
-                let is_s = vars.add(variable().binary().name(format!(
-                    "issocket{}loc{}",
-                    num_to_alpha(s),
-                    num_to_alpha(loc)
-                )));
-                sum_indicators += is_s;
-                num_sockets_int += s as f64 * is_s;
-                is_s_vars.push(is_s);
-            }
-            constrs.push(constraint!(sum_indicators == 1));
-            constrs.push(constraint!(
-                num_sockets_int.clone()
-                    >= location_total_network_cardinality.clone() * sockets_per_cardinality
-            ));
-
-            // effective_network_cpu: continuous var, lower-bounded by the active level's cost
-            let effective_network_cpu = vars.add(
-                variable()
-                    .min(0)
-                    .name(format!("netcpuloc{}", num_to_alpha(loc))),
-            );
-
-            for (idx, &is_s) in is_s_vars.iter().enumerate() {
-                let s = idx + 1;
-                let mut cpu_at_s = Expression::default();
-                for (entry_idx, entry) in network_op_loc_vars.iter().enumerate() {
-                    let Some(&var) = entry.loc_vars.get(&loc) else {
-                        continue;
-                    };
-                    let cpu_per_msg = network_cost_table.cost_per_message(entry.msg_size, s).cpu;
-                    if let Some(sending_to_partitions_vars) = decoupled_send_z_vars.get(&entry_idx)
-                    {
-                        // Decoupled send: CPU = count * n * cpu_per_msg * is_sending_to_n_partitions
-                        for &(n, is_sending_to_n_partitions) in sending_to_partitions_vars {
-                            cpu_at_s += entry.count as f64
-                                * n as f64
-                                * cpu_per_msg
-                                * is_sending_to_n_partitions;
-                        }
-                    } else {
-                        cpu_at_s += entry.count as f64 * cpu_per_msg * var;
-                    }
-                }
-                constrs.push(constraint!(
-                    effective_network_cpu >= cpu_at_s - big_m * (1 - is_s)
-                ));
-            }
-
-            // Divide effective_network_cpu by partition count for this location
-            let divided_network_cpu = vars.add(
-                variable()
-                    .min(0)
-                    .name(format!("divnetcpuloc{}", num_to_alpha(loc))),
-            );
-            for (n, &has_n) in is_n_partitions[loc].iter().enumerate() {
-                if n == 0 {
-                    continue;
-                }
-                let scale = 1.0 / n as f64;
-                constrs.push(constraint!(
-                    divided_network_cpu >= effective_network_cpu * scale - big_m * (1 - has_n)
-                ));
-            }
-
-            // Add divided network CPU to this location's CPU resource usage
-            let res = resource_usages.get_mut(&loc).unwrap();
-            let cpu_temp = std::mem::take(&mut res.cpu);
-            res.cpu = cpu_temp + divided_network_cpu;
-        }
     }
 
     // Minimize the highest saturation across all locations and resources,
@@ -953,7 +732,6 @@ pub(crate) fn decouple_analysis(
         per_op_load,
         consider_partitioning,
         cluster_size,
-        baseline_sockets,
     } = inputs;
 
     let decoupling_metadata = RefCell::new(DecoupleILPMetadata {
@@ -962,6 +740,7 @@ pub(crate) fn decouple_analysis(
         op_sizes: op_sizes.clone(),
         network_cost_table: network_cost_table.clone(),
         per_op_load: per_op_load.clone(),
+        cluster_size,
         max_num_locations,
         variables: variables! {},
         constraints: vec![],
@@ -972,8 +751,6 @@ pub(crate) fn decouple_analysis(
         prev_op_parent_with_tick: HashMap::new(),
         tee_inner_to_decoupled_vars: HashMap::new(),
         network_ids: HashMap::new(),
-        network_op_loc_vars: Vec::new(),
-        original_network_cardinality: 0,
     });
     let op_id_to_parents = op_id_to_parents(ir, Some(bottleneck), cycle_source_to_sink_parent);
 
@@ -1027,7 +804,7 @@ pub(crate) fn decouple_analysis(
         &decoupling_metadata,
     );
 
-    let solution = solve(&decoupling_metadata, baseline_sockets, &is_n_partitions);
+    let solution = solve(&decoupling_metadata);
 
     // Build the DecoupleDecision by separating placement ops from network-insertion ops.
     let DecoupleILPMetadata {
