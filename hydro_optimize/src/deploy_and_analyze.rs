@@ -20,7 +20,7 @@ use crate::greedy_decouple_analysis::greedy_decouple_analysis;
 use crate::parse_results::{
     OptimizationState, RawIlpInputs, RunMetadata, analyze_cluster_results,
     decoupled_cluster_name, derive_per_op_load, find_bottleneck_from_run, find_latest_iteration,
-    find_workload_dirs, load_num_avg_sockets_per_tick, load_raw_ilp_inputs,
+    find_workload_dirs, load_raw_ilp_inputs,
     max_throughput_for, original_cluster_name,
 };
 use crate::reduce_pushdown::reduce_pushdown;
@@ -32,7 +32,7 @@ use crate::rewrites::{
 };
 
 const METRIC_INTERVAL_SECS: u64 = 1;
-const BATCH_PULL_LIMIT: usize = 32;
+const BATCH_PULL_LIMIT: usize = 1;
 const CALIBRATION_DIR: &str = "benchmark_results";
 const COUNTER_PREFIX: &str = "_optimize_counter";
 const BYTE_SIZE_PREFIX: &str = "_optimize_byte_size";
@@ -40,8 +40,7 @@ const CPU_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_CPU:";
 const SAR_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_SAR:";
 const LATENCY_PREFIX: &str = "HYDRO_OPTIMIZE_LAT:";
 const THROUGHPUT_PREFIX: &str = "HYDRO_OPTIMIZE_THR:";
-const SOCKET_STATS_PREFIX: &str = "HYDRO_SOCKET_STATS:";
-const SINK_STATS_PREFIX: &str = "HYDRO_SINK_STATS:";
+
 pub const MAX_BUDGET_PER_CLUSTER: usize = 7;
 pub const MAX_OPTIMIZATION_ITERATIONS_PAST_NO_IMPROVEMENT: usize = 2;
 const BIMODAL_CV_THRESHOLD: f64 = 0.3;
@@ -265,8 +264,6 @@ pub struct MetricLogs {
     pub sar: UnboundedReceiver<String>,
     pub counters: UnboundedReceiver<String>,
     pub byte_sizes: UnboundedReceiver<String>,
-    pub socket_stats: UnboundedReceiver<String>,
-    pub sink_stats: UnboundedReceiver<String>,
 }
 
 async fn track_process_metrics(process: &impl DeployCrateWrapper) -> MetricLogs {
@@ -277,8 +274,6 @@ async fn track_process_metrics(process: &impl DeployCrateWrapper) -> MetricLogs 
         sar: process.stdout_filter(SAR_USAGE_PREFIX),
         counters: process.stdout_filter(COUNTER_PREFIX),
         byte_sizes: process.stdout_filter(BYTE_SIZE_PREFIX),
-        socket_stats: process.stdout_filter(SOCKET_STATS_PREFIX),
-        sink_stats: process.stdout_filter(SINK_STATS_PREFIX),
     }
 }
 
@@ -543,7 +538,6 @@ async fn deploy_and_analyze<'a>(
             deployment,
             name.clone(),
             *num_hosts,
-            0,
             use_perf && !excluded,
         );
         deployable = deployable.with_cluster_erased(cluster_id.key(), hosts);
@@ -551,7 +545,7 @@ async fn deploy_and_analyze<'a>(
     for (process_id, name) in processes.named_processes.iter() {
         let excluded = optimizations.exclude.contains(process_id);
         let host =
-            reusable_hosts.get_process_host(deployment, name.clone(), 0, use_perf && !excluded);
+            reusable_hosts.get_process_host(deployment, name.clone(), use_perf && !excluded);
         deployable = deployable.with_process_erased(process_id.key(), host);
     }
     for excluded_location in optimizations.exclude.iter() {
@@ -848,13 +842,6 @@ async fn run_scaling_loop<'a>(
                 );
             }
             run_metadata.save_perf(&output_dir, config.num_physical_clients, num_virtual, run);
-            run_metadata.save_socket_and_sink_stats(
-                &output_dir,
-                &config.location_id_to_cluster,
-                config.num_physical_clients,
-                num_virtual,
-                run,
-            );
 
             if run_throughput == 0 {
                 zero_throughput_count += 1;
@@ -1081,10 +1068,10 @@ async fn run_bottleneck_elimination<'a>(
         }
 
         for kind in &[
+            OptimizationKind::PerfOnly,
             OptimizationKind::CountersOnly,
             OptimizationKind::SizeAnalysis,
             OptimizationKind::BlowUpAnalysis,
-            OptimizationKind::PerfOnly,
         ] {
             if find_workload_dirs(base, &analysis_name, kind.label()).is_empty() {
                 let run_built = analysis_built.as_ref().unwrap_or(&built);
@@ -1125,10 +1112,6 @@ async fn run_bottleneck_elimination<'a>(
         inject_inferred_counters(&mut ir, &op_parents, &mut op_counts);
 
         let per_op_load = derive_per_op_load(&perf, &network_op_ids, &per_op_blow_up);
-        let baseline_sockets = load_num_avg_sockets_per_tick(&prev_run_dir, &bottleneck_name)
-            .round()
-            .max(1.0) as usize;
-
         let ilp_inputs = IlpInputs {
             op_counts,
             op_output_sizes,
@@ -1136,7 +1119,6 @@ async fn run_bottleneck_elimination<'a>(
             per_op_load,
             consider_partitioning: true,
             cluster_size,
-            baseline_sockets,
         };
 
         let computed_rewrites = find_optimal_budget(&mut ir, &bottleneck_loc, &ilp_inputs, &cycles);

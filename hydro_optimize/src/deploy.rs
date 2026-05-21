@@ -47,6 +47,7 @@ const GCP_REGION: &str = "us-central1-c";
 const GCP_IMAGE: &str = "debian-cloud/debian-12";
 const GCP_MACHINE_TYPE: &str = "n2-standard-4"; // 4 vCPU, 16 GB RAM
 const GCP_NUM_CORES: usize = 4; // Used for pinning
+const LOCAL_NUM_CORES: usize = 8; // Used for pinning, assuming the machine that launches the tests has 8 cores
 
 impl ReusableHosts {
     pub fn new(host_type: &HostType) -> Self {
@@ -78,7 +79,7 @@ impl ReusableHosts {
         match &self.host_type {
             InitializedHostType::Gcp { .. } => GCP_NUM_CORES,
             InitializedHostType::Aws { .. } => AWS_NUM_CORES,
-            InitializedHostType::Localhost => 1, // Can't pin to cores locally anyway
+            InitializedHostType::Localhost => LOCAL_NUM_CORES, 
         }
     }
 
@@ -108,6 +109,7 @@ impl ReusableHosts {
                     .instance_type(AWS_INSTANCE_TYPE)
                     .ami(AWS_INSTANCE_AMI)
                     .network(network.clone())
+                    .display_name(display_name)
                     // Better performance than MUSL, perf reporting fewer unidentified stacks, but requires launching from Linux
                     .target_type(HostTargetType::Linux(LinuxCompileType::Glibc))
                     .add(),
@@ -138,11 +140,10 @@ impl ReusableHosts {
         &mut self,
         deployment: &mut Deployment,
         display_name: String,
-        pin_to_core: usize,
         perf: bool,
     ) -> TrybuildHost {
         let mut host = TrybuildHost::new(self.lazy_create_host(deployment, display_name.clone()))
-            .pin_to_core(pin_to_core)
+            .networking_cores(self.num_cores() - 1)
             .rustflags(self.get_rust_flags());
         if perf {
             let setup_command = match &self.host_type {
@@ -167,7 +168,6 @@ impl ReusableHosts {
         deployment: &mut Deployment,
         cluster_name: String,
         num_hosts: usize,
-        pin_to_core: usize,
         perf: bool,
     ) -> Vec<TrybuildHost> {
         (0..num_hosts)
@@ -175,7 +175,6 @@ impl ReusableHosts {
                 self.get_process_host(
                     deployment,
                     format!("{}{}", cluster_name, i),
-                    pin_to_core,
                     perf,
                 )
             })

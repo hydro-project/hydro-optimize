@@ -521,25 +521,6 @@ pub fn find_latest_iteration(base_dir: &Path, name: &str) -> Option<usize> {
     Some(max_opt.unwrap_or(0))
 }
 
-/// Loads avg total sockets (sources + sinks) per tick for a given cluster from the best-throughput
-/// run in a `_none` dir.
-pub fn load_num_avg_sockets_per_tick(none_dir: &Path, cluster_name: &str) -> f64 {
-    let load_stats = |prefix: &str| -> f64 {
-        let stats: HashMap<String, Vec<f64>> = load_json_for_best_csv(none_dir, prefix);
-        stats
-            .get(cluster_name)
-            .and_then(|v| {
-                if v.is_empty() {
-                    None
-                } else {
-                    Some(v.iter().sum::<f64>() / v.len() as f64)
-                }
-            })
-            .unwrap_or(0.0)
-    };
-    load_stats("socket_stats") + load_stats("sink_stats")
-}
-
 /// Loads a JSON file and deserializes it.
 pub fn load_json<T: DeserializeOwned>(path: &Path) -> T {
     let file =
@@ -732,10 +713,6 @@ pub struct RunMetadata {
     pub location_to_original_ops: HashMap<LocationId, Vec<usize>>,
     /// Per-operator CPU usage fractions from perf: op_id → fraction of total samples.
     pub perf: HashMap<usize, f64>,
-    /// Per-location avg active read sockets per tick.
-    pub socket_stats: HashMap<LocationId, Vec<f64>>,
-    /// Per-location avg active write sockets per tick.
-    pub sink_stats: HashMap<LocationId, Vec<f64>>,
 }
 
 impl RunMetadata {
@@ -908,37 +885,6 @@ impl RunMetadata {
         );
     }
 
-    /// Saves socket and sink stats per location to JSON files.
-    pub fn save_socket_and_sink_stats(
-        &self,
-        output_dir: &Path,
-        location_id_to_cluster: &HashMap<LocationId, String>,
-        num_clients: usize,
-        num_virtual: usize,
-        run: usize,
-    ) {
-        save_location_stats(
-            &self.socket_stats,
-            "socket_stats",
-            "Socket stats",
-            output_dir,
-            location_id_to_cluster,
-            num_clients,
-            num_virtual,
-            run,
-        );
-        save_location_stats(
-            &self.sink_stats,
-            "sink_stats",
-            "Sink stats",
-            output_dir,
-            location_id_to_cluster,
-            num_clients,
-            num_virtual,
-            run,
-        );
-    }
-
     /// Saves median output byte size per decoupleable operator and existing network nodes.
     pub fn save_size_analysis(&self, output_dir: &Path, decoupleable_ops: &HashSet<usize>) {
         let sizes: HashMap<usize, u64> = self
@@ -1009,45 +955,6 @@ impl RunMetadata {
             ),
             &location_stats,
         );
-    }
-}
-
-/// Average of `f(item)` over the measurement window
-fn save_location_stats(
-    stats: &HashMap<LocationId, Vec<f64>>,
-    file_prefix: &str,
-    label: &str,
-    output_dir: &Path,
-    location_id_to_cluster: &HashMap<LocationId, String>,
-    num_clients: usize,
-    num_virtual: usize,
-    run: usize,
-) {
-    if stats.is_empty() {
-        return;
-    }
-    let named: HashMap<String, &Vec<f64>> = stats
-        .iter()
-        .map(|(loc, s)| {
-            let name = location_id_to_cluster
-                .get(loc)
-                .cloned()
-                .unwrap_or_else(|| format!("{:?}", loc));
-            (name, s)
-        })
-        .collect();
-    save_json(
-        output_dir,
-        &format!(
-            "{}_{}c_{}vc_r{}.json",
-            file_prefix, num_clients, num_virtual, run
-        ),
-        &named,
-    );
-    for (name, s) in &named {
-        if let Some(avg) = s.last() {
-            println!("  {} [{}]: avg_active_per_tick={:.2}", label, name, avg);
-        }
     }
 }
 
@@ -1277,20 +1184,6 @@ pub fn parse_byte_sizes(lines: Vec<String>) -> HashMap<usize, Vec<u64>> {
     op_to_sizes
 }
 
-/// Parses socket/sink stats lines: "HYDRO_SOCKET_STATS: avg_active_per_tick=X.XX ticks=M"
-/// Returns all reported avg_active_per_tick values in order.
-pub fn parse_socket_stats(lines: Vec<String>) -> Vec<f64> {
-    let regex = Regex::new(r"avg_active_per_tick=(\d+\.?\d*)").unwrap();
-    lines
-        .iter()
-        .filter_map(|line| {
-            regex
-                .captures(line)
-                .map(|cap| cap[1].parse::<f64>().unwrap())
-        })
-        .collect()
-}
-
 /// Parses folded perf output into per-operator CPU fractions.
 /// Returns a map from op_id → fraction of total samples.
 pub fn parse_perf(folded: &str) -> HashMap<usize, f64> {
@@ -1361,16 +1254,12 @@ pub async fn analyze_cluster_results(
                 throughputs,
                 latencies,
                 byte_sizes,
-                socket_stats,
-                sink_stats,
             ) = tokio::join!(
                 async { parse_sar_output(drain_receiver(&mut metrics.sar).await) },
                 async { parse_counter_usage(drain_receiver(&mut metrics.counters).await) },
                 async { parse_throughput(drain_receiver(&mut metrics.throughputs).await) },
                 async { parse_latency(drain_receiver(&mut metrics.latencies).await) },
                 async { parse_byte_sizes(drain_receiver(&mut metrics.byte_sizes).await) },
-                async { parse_socket_stats(drain_receiver(&mut metrics.socket_stats).await) },
-                async { parse_socket_stats(drain_receiver(&mut metrics.sink_stats).await) },
             );
             println!("Parsed stats from cluster {:?}: {}", name, idx);
             (
@@ -1380,8 +1269,6 @@ pub async fn analyze_cluster_results(
                 throughputs,
                 latencies,
                 byte_sizes,
-                socket_stats,
-                sink_stats,
             )
         });
     }
@@ -1396,8 +1283,6 @@ pub async fn analyze_cluster_results(
             throughputs,
             latencies,
             byte_sizes,
-            socket_stats,
-            sink_stats,
         ) = result.unwrap();
         drained.entry((id, name)).or_default().push((
             sar_stats,
@@ -1405,8 +1290,6 @@ pub async fn analyze_cluster_results(
             throughputs,
             latencies,
             byte_sizes,
-            socket_stats,
-            sink_stats,
         ));
     }
 
@@ -1417,7 +1300,7 @@ pub async fn analyze_cluster_results(
         let mut max_sar: Vec<SarStats> = vec![];
         let mut max_counters: HashMap<usize, Vec<usize>> = HashMap::new();
 
-        for (sar_stats, counters, _, _, byte_sizes, socket_stats, sink_stats) in cluster_data {
+        for (sar_stats, counters, _, _, byte_sizes) in cluster_data {
             merge_max_vec(&mut max_sar, sar_stats, SarStats::max);
             for (op_id, rates) in counters {
                 let entry = max_counters.entry(*op_id).or_default();
@@ -1430,16 +1313,6 @@ pub async fn analyze_cluster_results(
                     .or_default()
                     .extend(sizes);
             }
-            run_metadata
-                .socket_stats
-                .entry(id.clone())
-                .or_default()
-                .extend(socket_stats.iter().cloned());
-            run_metadata
-                .sink_stats
-                .entry(id.clone())
-                .or_default()
-                .extend(sink_stats.iter().cloned());
         }
 
         for (op_id, rates) in max_counters {
@@ -1454,7 +1327,7 @@ pub async fn analyze_cluster_results(
 
     // Collect throughput/latency from all processes (aggregator outputs these)
     for node_data in drained.into_values().flatten() {
-        let (_, _, throughputs, latencies, _, _, _) = node_data;
+        let (_, _, throughputs, latencies, _) = node_data;
         let has_throughput = !throughputs.is_empty();
         run_metadata.throughputs.extend(throughputs);
         run_metadata.latencies.extend(latencies);

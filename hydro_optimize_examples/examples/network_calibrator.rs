@@ -10,8 +10,9 @@ use hydro_optimize_examples::network_calibrator::network_calibrator;
 use stageleft::q;
 
 // Message sizes between 1 and 64 have similar costs
-const CALIBRATION_SIZES: &[usize] = &[1, 64, 128, 256, 512, 1024, 2048, 4096];
-// Saturating only starts at 4 cliens for 1B messages
+// const CALIBRATION_SIZES: &[usize] = &[1, 64, 128, 256, 512, 1024, 2048, 4096];
+const CALIBRATION_SIZES: &[usize] = &[64];
+// Saturating only starts at 4 clients for 1B messages
 const NUM_PHYSICAL_CLIENTS_TO_TEST: &[usize] = &[4, 10];
 
 #[derive(Parser, Debug)]
@@ -88,10 +89,10 @@ async fn main() {
                         optimizations,
                         location_id_to_cluster,
                         num_physical_clients: num_physical,
-                        start_virtual_clients: 100, // No need to test non-saturated regimes
+                        start_virtual_clients: 1, // No need to test non-saturated regimes
                         virtual_clients_step: 10, // irrelevant
-                        num_runs: 3,
-                        fix_virtual_clients: Some(100),
+                        num_runs: 1,
+                        fix_virtual_clients: None,
                     })
                 },
             )
