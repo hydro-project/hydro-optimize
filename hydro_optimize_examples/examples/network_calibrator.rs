@@ -1,19 +1,18 @@
 use std::collections::HashMap;
 
 use clap::{ArgAction, Parser};
-use hydro_lang::{location::Location, prelude::FlowBuilder};
+use hydro_lang::{
+    location::Location,
+    prelude::{FlowBuilder, TCP},
+};
 use hydro_optimize::deploy_and_analyze::{
     BenchmarkArgs, BenchmarkConfig, Optimizations, ReusableClusters, ReusableProcesses,
     benchmark_protocol,
 };
-use hydro_optimize_examples::network_calibrator::network_calibrator;
+use hydro_optimize_examples::network_calibrator::{Client, Server};
 use stageleft::q;
 
-// Message sizes between 1 and 64 have similar costs
-// const CALIBRATION_SIZES: &[usize] = &[1, 64, 128, 256, 512, 1024, 2048, 4096];
-const CALIBRATION_SIZES: &[usize] = &[64];
-// Saturating only starts at 4 clients for 1B messages
-const NUM_PHYSICAL_CLIENTS_TO_TEST: &[usize] = &[4, 10];
+const CALIBRATION_SIZES: &[usize] = &[64, 128, 256, 512, 1024, 2048, 4096];
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, group(
@@ -36,68 +35,56 @@ async fn main() {
     let args = Args::parse();
 
     for &size in CALIBRATION_SIZES {
-        for &num_physical in NUM_PHYSICAL_CLIENTS_TO_TEST {
-            println!("=== Calibrating message_size={}, physical_clients={} ===", size, num_physical);
+        println!("=== Calibrating message_size={} ===", size);
 
-            benchmark_protocol(
-                BenchmarkArgs {
-                    gcp: args.gcp.clone(),
-                    aws: args.aws,
-                },
-                move || {
-                    let mut builder = FlowBuilder::new();
-                    let server = builder.cluster();
-                    let clients = builder.cluster();
-                    let client_aggregator = builder.process();
+        benchmark_protocol(
+            BenchmarkArgs {
+                gcp: args.gcp.clone(),
+                aws: args.aws,
+            },
+            move || {
+                let mut builder = FlowBuilder::new();
+                let server = builder.process::<Server>();
+                let clients = builder.process::<Client>();
+                let client_id = clients.id();
 
-                    let client_id = clients.id();
-                    let aggregator_id = client_aggregator.id();
+                let location_id_to_cluster = HashMap::from([
+                    (server.id(), "server".to_string()),
+                    (client_id.clone(), "client".to_string()),
+                ]);
 
-                    let location_id_to_cluster = HashMap::from([
-                        (server.id(), "server".to_string()),
-                        (client_id.clone(), "client".to_string()),
-                        (aggregator_id.clone(), "client_aggregator".to_string()),
-                    ]);
+                // Dummy code. Just need to make sure that the server receives and sends.
+                // The actual message generation is done by the Hydro IR.
+                clients
+                    .source_iter(q!(vec![0usize]))
+                    .send(&server, TCP.fail_stop().bincode())
+                    .send(&clients, TCP.fail_stop().bincode());
 
-                    network_calibrator(
-                        size,
-                        &server,
-                        &clients,
-                        clients.singleton(q!({
-                            std::env::var("NUM_VIRTUAL_CLIENTS")
-                                .unwrap()
-                                .parse::<usize>()
-                                .unwrap()
-                        })),
-                        &client_aggregator,
-                        1000,
-                    );
+                let clusters = ReusableClusters::default();
+                let processes = ReusableProcesses::default()
+                    .with_process(server)
+                    .with_process(clients);
+                let optimizations = Optimizations::default().excluding(client_id);
 
-                    let clusters = ReusableClusters::default()
-                        .with_cluster(server, 1)
-                        .with_cluster(clients, num_physical);
-                    let processes = ReusableProcesses::default().with_process(client_aggregator);
-                    let optimizations = Optimizations::default()
-                        .excluding(client_id.clone())
-                        .excluding(aggregator_id);
-
-                    (builder, BenchmarkConfig {
-                        name: format!("Network_{}b_{}c", size, num_physical),
+                (
+                    builder,
+                    BenchmarkConfig {
+                        name: format!("Network_{}b", size),
                         workload: "default".to_string(),
                         clusters,
                         processes,
                         optimizations,
                         location_id_to_cluster,
-                        num_physical_clients: num_physical,
-                        start_virtual_clients: 1, // No need to test non-saturated regimes
-                        virtual_clients_step: 10, // irrelevant
+                        num_physical_clients: 1,
+                        start_virtual_clients: 1,
+                        virtual_clients_step: 1,
                         num_runs: 1,
-                        fix_virtual_clients: None,
-                    })
-                },
-            )
-            .await;
-        }
+                        calibrate_message_size: Some(size),
+                    },
+                )
+            },
+        )
+        .await;
     }
 
     println!("=== Calibration complete ===");

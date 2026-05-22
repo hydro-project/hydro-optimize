@@ -119,6 +119,7 @@ async fn main() {
                 virtual_clients_step: 10,
                 num_runs: 1,
                 fix_virtual_clients: None,
+                calibrate_message_size: None,
             })
         },
     )

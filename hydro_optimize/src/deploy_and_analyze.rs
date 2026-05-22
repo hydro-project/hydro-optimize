@@ -18,10 +18,9 @@ use crate::decouple_analysis::{IlpInputs, Rewrite, find_optimal_budget};
 use crate::deploy::{AWS_IO_TPS, AWS_NETWORK_BYTES_PER_SEC, HostType, ReusableHosts};
 use crate::greedy_decouple_analysis::greedy_decouple_analysis;
 use crate::parse_results::{
-    OptimizationState, RawIlpInputs, RunMetadata, analyze_cluster_results,
-    decoupled_cluster_name, derive_per_op_load, find_bottleneck_from_run, find_latest_iteration,
-    find_workload_dirs, load_raw_ilp_inputs,
-    max_throughput_for, original_cluster_name,
+    OptimizationState, RawIlpInputs, RunMetadata, analyze_cluster_results, decoupled_cluster_name,
+    derive_per_op_load, find_bottleneck_from_run, find_latest_iteration, find_workload_dirs,
+    load_raw_ilp_inputs, max_throughput_for, original_cluster_name,
 };
 use crate::reduce_pushdown::reduce_pushdown;
 use crate::reduce_pushdown_analysis::reduce_pushdown_decision;
@@ -544,8 +543,7 @@ async fn deploy_and_analyze<'a>(
     }
     for (process_id, name) in processes.named_processes.iter() {
         let excluded = optimizations.exclude.contains(process_id);
-        let host =
-            reusable_hosts.get_process_host(deployment, name.clone(), use_perf && !excluded);
+        let host = reusable_hosts.get_process_host(deployment, name.clone(), use_perf && !excluded);
         deployable = deployable.with_process_erased(process_id.key(), host);
     }
     for excluded_location in optimizations.exclude.iter() {
@@ -599,8 +597,9 @@ pub struct BenchmarkConfig {
     pub virtual_clients_step: usize,
     /// Number of successful runs to collect per virtual-client count.
     pub num_runs: usize,
-    /// If set, run only this exact number of virtual clients and return immediately.
-    pub fix_virtual_clients: Option<usize>,
+    /// If set, enables network calibration mode: sets `HYDRO_NET_CALIBRATE=<size>`
+    /// on all hosts and forces single-host deployment.
+    pub calibrate_message_size: Option<usize>,
 }
 
 pub const START_MEASUREMENT_SECOND: usize = 30;
@@ -774,9 +773,7 @@ async fn run_scaling_loop<'a>(
     let mut final_run_metadata = RunMetadata::default();
     let mut best_throughput: usize = 0;
     let mut no_improvement_count: usize = 0;
-    let mut num_virtual = config
-        .fix_virtual_clients
-        .unwrap_or(config.start_virtual_clients);
+    let mut num_virtual = config.start_virtual_clients;
 
     'outer: loop {
         let mut throughput_sum = 0;
@@ -864,7 +861,7 @@ async fn run_scaling_loop<'a>(
             run += 1;
             final_run_metadata = run_metadata;
 
-            if matches!(optimizations.kind, OptimizationKind::SizeAnalysis) {
+            if matches!(optimizations.kind, OptimizationKind::SizeAnalysis) || config.calibrate_message_size.is_some() {
                 break 'outer;
             }
         }
@@ -874,10 +871,6 @@ async fn run_scaling_loop<'a>(
             "clients={}, avg_throughput={}",
             num_virtual, current_throughput
         );
-
-        if config.fix_virtual_clients.is_some() {
-            break;
-        }
 
         if current_throughput > best_throughput {
             best_throughput = current_throughput;
@@ -1168,6 +1161,11 @@ pub async fn benchmark_protocol<'a>(
         config.num_runs > 0,
         "Must run at least one iteration of the benchmark"
     );
+
+    if let Some(size) = config.calibrate_message_size {
+        reusable_hosts.insert_env("HYDRO_NET_CALIBRATE".to_string(), size.to_string());
+        reusable_hosts.set_single_host(true);
+    }
 
     // Apply the selected optimization strategy exactly once.
     let exclude = config.optimizations.exclude.clone();

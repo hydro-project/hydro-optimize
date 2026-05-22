@@ -32,6 +32,7 @@ pub struct ReusableHosts {
     hosts: HashMap<String, Arc<dyn Host>>, // Key = display_name
     host_type: InitializedHostType,
     env: HashMap<String, String>,
+    single_host: bool,
 }
 
 // Note: Aws AMIs vary by region. If you are changing the region, please also change the AMI.
@@ -66,6 +67,7 @@ impl ReusableHosts {
             hosts: HashMap::new(),
             host_type: initialized,
             env: HashMap::new(),
+            single_host: false,
         }
     }
 
@@ -73,6 +75,11 @@ impl ReusableHosts {
     /// If a value with the same key already exists, it will be overwritten.
     pub fn insert_env(&mut self, key: String, value: String) {
         self.env.insert(key, value);
+    }
+
+    /// When true, all locations share a single underlying host.
+    pub fn set_single_host(&mut self, single_host: bool) {
+        self.single_host = single_host;
     }
 
     pub fn num_cores(&self) -> usize {
@@ -89,8 +96,14 @@ impl ReusableHosts {
         deployment: &mut Deployment,
         display_name: String,
     ) -> Arc<dyn Host> {
+        // All clusters share the same machine if single_host is true
+        let key = if self.single_host {
+            "shared".to_string()
+        } else {
+            display_name.clone()
+        };
         self.hosts
-            .entry(display_name.clone())
+            .entry(key)
             .or_insert_with(|| match &self.host_type {
                 InitializedHostType::Gcp { project, network } => deployment
                     .GcpComputeEngineHost()
