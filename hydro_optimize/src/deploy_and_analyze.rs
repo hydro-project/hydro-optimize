@@ -51,13 +51,15 @@ fn run_was_unstable(throughputs: &[usize]) -> bool {
         return false;
     }
     let window = &throughputs[START_MEASUREMENT_SECOND..=MEASUREMENT_SECOND];
-    let max_all = throughputs.iter().copied().max().unwrap_or(0) as f64;
-    if max_all == 0.0 {
-        println!("Max throughput was 0, cannot determine stability");
+    let mut sorted = throughputs.to_vec();
+    sorted.sort_unstable_by(|a, b| b.cmp(a));
+    let second_highest = sorted.get(1).copied().unwrap_or(0) as f64;
+    if second_highest == 0.0 {
+        println!("2nd highest throughput was 0, cannot determine stability");
         return false;
     }
     let min_window = window.iter().copied().min().unwrap_or(0) as f64;
-    (max_all - min_window) / max_all > BIMODAL_CV_THRESHOLD
+    (second_highest - min_window) / second_highest > BIMODAL_CV_THRESHOLD
 }
 
 // Note: Ensure edits to the match arms are consistent with infer_counter_from_parent
