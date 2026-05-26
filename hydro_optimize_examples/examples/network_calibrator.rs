@@ -1,15 +1,18 @@
 use std::collections::HashMap;
 
 use clap::{ArgAction, Parser};
-use hydro_lang::location::Location;
-use hydro_lang::viz::config::GraphConfig;
+use hydro_lang::{
+    location::Location,
+    prelude::{FlowBuilder, TCP},
+};
 use hydro_optimize::deploy_and_analyze::{
     BenchmarkArgs, BenchmarkConfig, Optimizations, ReusableClusters, ReusableProcesses,
     benchmark_protocol,
 };
-use hydro_optimize_examples::network_calibrator::network_calibrator;
-
+use hydro_optimize_examples::network_calibrator::{Client, Server};
 use stageleft::q;
+
+const CALIBRATION_SIZES: &[usize] = &[64, 128, 256, 512, 1024, 2048, 4096];
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, group(
@@ -18,9 +21,6 @@ use stageleft::q;
         .multiple(false)
 ))]
 struct Args {
-    #[command(flatten)]
-    graph: GraphConfig,
-
     /// Use Gcp for deployment (provide project name)
     #[arg(long)]
     gcp: Option<String>,
@@ -30,58 +30,62 @@ struct Args {
     aws: bool,
 }
 
-fn run_benchmark<'a>(num_clients: usize) -> BenchmarkConfig<'a> {
-    let message_size = 8;
-    let print_result_frequency = 1000;
-
-    let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
-    let server = builder.cluster();
-    let clients = builder.cluster();
-    let client_aggregator = builder.process();
-    let location_id_to_cluster = HashMap::from([
-        (server.id(), "server".to_string()),
-        (clients.id(), "client".to_string()),
-        (client_aggregator.id(), "client_aggregator".to_string()),
-    ]);
-    let client_id = clients.id();
-
-    network_calibrator(
-        message_size,
-        &server,
-        &clients,
-        clients.singleton(q!(1usize)),
-        &client_aggregator,
-        print_result_frequency,
-    );
-
-    let clusters = ReusableClusters::default()
-        .with_cluster(server, 1)
-        .with_cluster(clients, num_clients);
-    let processes = ReusableProcesses::default().with_process(client_aggregator);
-    let optimizations = Optimizations::default();
-
-    BenchmarkConfig {
-        name: "Network".to_string(),
-        builder,
-        clusters,
-        processes,
-        client_id,
-        optimizations,
-        location_id_to_cluster,
-    }
-}
-
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    let num_runs = 3;
-    benchmark_protocol(
-        BenchmarkArgs {
-            gcp: args.gcp,
-            aws: args.aws,
-        },
-        num_runs,
-        run_benchmark,
-    )
-    .await;
+
+    for &size in CALIBRATION_SIZES {
+        println!("=== Calibrating message_size={} ===", size);
+
+        benchmark_protocol(
+            BenchmarkArgs {
+                gcp: args.gcp.clone(),
+                aws: args.aws,
+            },
+            move || {
+                let mut builder = FlowBuilder::new();
+                let server = builder.process::<Server>();
+                let clients = builder.process::<Client>();
+                let client_id = clients.id();
+
+                let location_id_to_cluster = HashMap::from([
+                    (server.id(), "server".to_string()),
+                    (client_id.clone(), "client".to_string()),
+                ]);
+
+                // Dummy code. Just need to make sure that the server receives and sends.
+                // The actual message generation is done by the Hydro IR.
+                clients
+                    .source_iter(q!(vec![0usize]))
+                    .send(&server, TCP.fail_stop().bincode())
+                    .send(&clients, TCP.fail_stop().bincode());
+
+                let clusters = ReusableClusters::default();
+                let processes = ReusableProcesses::default()
+                    .with_process(server)
+                    .with_process(clients);
+                let optimizations = Optimizations::default().excluding(client_id);
+
+                (
+                    builder,
+                    BenchmarkConfig {
+                        name: format!("Network_{}b", size),
+                        workload: "default".to_string(),
+                        clusters,
+                        processes,
+                        optimizations,
+                        location_id_to_cluster,
+                        num_physical_clients: 1,
+                        start_virtual_clients: 1,
+                        virtual_clients_step: 1,
+                        num_runs: 1,
+                        calibrate_message_size: Some(size),
+                    },
+                )
+            },
+        )
+        .await;
+    }
+
+    println!("=== Calibration complete ===");
 }

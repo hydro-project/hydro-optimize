@@ -1,11 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use hydro_lang::compile::{
-    builder::CycleId,
-    ir::{BoundKind, CollectionKind, HydroIrMetadata, HydroNode, HydroRoot, StreamOrder},
+use hydro_lang::{
+    compile::{
+        builder::CycleId,
+        ir::{BoundKind, CollectionKind, HydroIrMetadata, HydroNode, HydroRoot, StreamOrder},
+    },
+    location::dynamic::LocationId,
 };
 
-use crate::{repair::cycle_source_to_sink_input, rewrites::op_id_to_inputs};
+use crate::{repair::cycle_source_to_sink_parent, rewrites::op_id_to_parents};
 
 /// - `reduce_op_id`: The op_id of the `Reduce` that can pushed after this node
 /// - `distance_from_reduce`: Number of nodes between this node and the `Reduce`. If this node's child is Reduce, the distance is 0.
@@ -53,23 +56,37 @@ fn can_pushdown(metadata: &HydroIrMetadata) -> bool {
 
 fn recurse_reduce_pushdown_analysis(
     node: &HydroNode,
+    exclude: &HashSet<LocationId>,
     reduce_metadata: &mut ReducePushdownMetadata,
 ) {
     match node {
         HydroNode::Tee { inner, .. } | HydroNode::Partition { inner, .. } => {
             let inner_node = inner.0.borrow();
-            reduce_pushdown_analysis_node(&inner_node, reduce_metadata);
+            reduce_pushdown_analysis_node(&inner_node, exclude, reduce_metadata);
         }
         _ => {
             for input in node.input() {
-                reduce_pushdown_analysis_node(input, reduce_metadata);
+                reduce_pushdown_analysis_node(input, exclude, reduce_metadata);
             }
         }
     }
 }
 
 /// Analyze if a `Reduce` can be pushed "down" through the node's input
-fn reduce_pushdown_analysis_node(node: &HydroNode, reduce_metadata: &mut ReducePushdownMetadata) {
+/// - `reduces_pending_cycle_resolution`: Map from cycle_id to HydroNode::Reduce that should be pushed through the CycleSink, but we don't have a reference to the sink without another iteration.
+fn reduce_pushdown_analysis_node(
+    node: &HydroNode,
+    exclude: &HashSet<LocationId>,
+    reduce_metadata: &mut ReducePushdownMetadata,
+) {
+    if exclude
+        .iter()
+        .any(|loc| node.metadata().location_id.root() == loc.root())
+    {
+        recurse_reduce_pushdown_analysis(node, exclude, reduce_metadata);
+        return;
+    }
+
     let op_id = node.op_metadata().id.unwrap();
     let my_pushed_reduce = match node {
         HydroNode::Reduce { f, input, metadata } => {
@@ -96,7 +113,7 @@ fn reduce_pushdown_analysis_node(node: &HydroNode, reduce_metadata: &mut ReduceP
                     },
                 );
             }
-            recurse_reduce_pushdown_analysis(node, reduce_metadata);
+            recurse_reduce_pushdown_analysis(node, exclude, reduce_metadata);
             return;
         }
         HydroNode::ObserveNonDet { inner, .. } => {
@@ -114,17 +131,15 @@ fn reduce_pushdown_analysis_node(node: &HydroNode, reduce_metadata: &mut ReduceP
                         );
                     }
                     _ => {
-                        if can_pushdown(inner.metadata()) {
-                            reduce_metadata.possible_locations.insert(
-                                inner.op_metadata().id.unwrap(),
-                                possible_reduce.increment_distance(),
-                            );
-                        }
+                        reduce_metadata.possible_locations.insert(
+                            inner.op_metadata().id.unwrap(),
+                            possible_reduce.increment_distance(),
+                        );
                     }
                 }
             }
 
-            recurse_reduce_pushdown_analysis(node, reduce_metadata);
+            recurse_reduce_pushdown_analysis(node, exclude, reduce_metadata);
             return;
         }
         _ => reduce_metadata.possible_locations.get(&op_id).cloned(),
@@ -132,7 +147,7 @@ fn reduce_pushdown_analysis_node(node: &HydroNode, reduce_metadata: &mut ReduceP
 
     // Can't push through the input if we don't have a reduce
     let Some(my_bubbled_reduce) = my_pushed_reduce else {
-        recurse_reduce_pushdown_analysis(node, reduce_metadata);
+        recurse_reduce_pushdown_analysis(node, exclude, reduce_metadata);
         return;
     };
 
@@ -158,7 +173,8 @@ fn reduce_pushdown_analysis_node(node: &HydroNode, reduce_metadata: &mut ReduceP
             check_inputs.push(input.metadata());
         }
         HydroNode::Chain { first, second, .. }
-        | HydroNode::ChainFirst { first, second, .. } => {
+        | HydroNode::ChainFirst { first, second, .. }
+        | HydroNode::MergeOrdered { first, second, .. } => {
             check_inputs.push(first.metadata());
             check_inputs.push(second.metadata());
         }
@@ -178,6 +194,7 @@ fn reduce_pushdown_analysis_node(node: &HydroNode, reduce_metadata: &mut ReduceP
         | HydroNode::CrossSingleton { .. }
         | HydroNode::CrossProduct { .. }
         | HydroNode::Join { .. }
+        | HydroNode::JoinHalf { .. }
         | HydroNode::Enumerate { .. }
         | HydroNode::ResolveFutures { .. }
         | HydroNode::ResolveFuturesOrdered { .. }
@@ -199,17 +216,21 @@ fn reduce_pushdown_analysis_node(node: &HydroNode, reduce_metadata: &mut ReduceP
 
     // Insert the reduce into the parent if possible
     for input in check_inputs {
-        if can_pushdown(input) {
+        can_pushdown(input).then(|| {
             reduce_metadata
                 .possible_locations
                 .insert(input.op.id.unwrap(), my_bubbled_reduce.increment_distance());
-        }
+        });
     }
 
-    recurse_reduce_pushdown_analysis(node, reduce_metadata);
+    recurse_reduce_pushdown_analysis(node, exclude, reduce_metadata);
 }
 
-fn reduce_pushdown_analysis_root(root: &HydroRoot, reduce_metadata: &mut ReducePushdownMetadata) {
+fn reduce_pushdown_analysis_root(
+    root: &HydroRoot,
+    exclude: &HashSet<LocationId>,
+    reduce_metadata: &mut ReducePushdownMetadata,
+) {
     if let HydroRoot::CycleSink {
         cycle_id, input, ..
     } = root
@@ -221,17 +242,20 @@ fn reduce_pushdown_analysis_root(root: &HydroRoot, reduce_metadata: &mut ReduceP
     }
 
     // Tail recursion up
-    reduce_pushdown_analysis_node(root.input(), reduce_metadata);
+    reduce_pushdown_analysis_node(root.input(), exclude, reduce_metadata);
 }
 
 /// Finds all possible locations where we can push any commutative `Reduce` on `node_to_analyze` down through `Unbounded`, `NoOrder` streams
-fn reduce_pushdown_analysis(ir: &mut [HydroRoot]) -> ReducePushdownMetadata {
+fn reduce_pushdown_analysis(
+    ir: &mut [HydroRoot],
+    exclude: &HashSet<LocationId>,
+) -> ReducePushdownMetadata {
     let mut metadata = ReducePushdownMetadata::default();
     loop {
         let num_cycle_sink_possibilites = metadata.cycle_possibilities.len();
         // Manual tail recursion so we process the roots first, walking to the source
         for root in ir.iter() {
-            reduce_pushdown_analysis_root(root, &mut metadata);
+            reduce_pushdown_analysis_root(root, exclude, &mut metadata);
         }
 
         if metadata.cycle_possibilities.len() == num_cycle_sink_possibilites {
@@ -244,17 +268,20 @@ fn reduce_pushdown_analysis(ir: &mut [HydroRoot]) -> ReducePushdownMetadata {
 /// Push commutative `Reduce` down as far as possible.
 /// # Returns
 /// Map from op_id to the `Reduce` that should be added as the child of that op
-pub fn reduce_pushdown_decision(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
-    let metadata = reduce_pushdown_analysis(ir);
-    let cycle_map = cycle_source_to_sink_input(ir);
+pub fn reduce_pushdown_decision(
+    ir: &mut [HydroRoot],
+    exclude: &HashSet<LocationId>,
+) -> HashMap<usize, usize> {
+    let metadata = reduce_pushdown_analysis(ir, exclude);
+    let cycle_map = cycle_source_to_sink_parent(ir);
     // Note: This accounts for cycles (parent of a CycleSource is its CycleSink's input)
-    let op_id_to_input = op_id_to_inputs(ir, None, &cycle_map);
+    let op_id_to_parent = op_id_to_parents(ir, None, &cycle_map);
 
     let mut decisions = HashMap::new();
     // Pushing down furthest = pushing to nodes where we can't push to all of their parents.
     // If they have no parents, push down to here too.
     for (op_id, reduce_ref) in &metadata.possible_locations {
-        let parents = op_id_to_input.get(op_id).cloned().unwrap_or_default();
+        let parents = op_id_to_parent.get(op_id).cloned().unwrap_or_default();
         let no_parents = parents.is_empty();
         let mut cant_push_to_some_parent = false;
 
@@ -277,6 +304,8 @@ pub fn reduce_pushdown_decision(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use hydro_lang::{
         compile::ir::deep_clone,
         live_collections::stream::{ExactlyOnce, NoOrder, TotalOrder},
@@ -288,7 +317,7 @@ mod tests {
 
     use crate::{
         reduce_pushdown_analysis::reduce_pushdown_analysis,
-        repair::{cycle_source_to_sink_input, inject_id, inject_location},
+        repair::{cycle_source_to_sink_parent, inject_id, inject_location},
     };
 
     #[test]
@@ -317,12 +346,12 @@ mod tests {
             builder
                 .optimize_with(|ir| {
                     inject_id(ir);
-                    let cycle_data = cycle_source_to_sink_input(ir);
+                    let cycle_data = cycle_source_to_sink_parent(ir);
                     inject_location(ir, &cycle_data);
                 })
                 .ir(),
         );
-        let analysis = reduce_pushdown_analysis(&mut ir);
+        let analysis = reduce_pushdown_analysis(&mut ir, &HashSet::from([cluster1.id()]));
         assert!(
             !analysis.possible_locations.is_empty(),
             "Expected to be able to push down reduce"

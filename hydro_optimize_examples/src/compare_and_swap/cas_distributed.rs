@@ -247,7 +247,7 @@ impl<'a, 'b> DistributedCAS<'a, 'b> {
 /// 2. Each client subscribes at most once. (Doesn't break correctness but will duplicate messages).
 impl<'a, 'b, State, Sender> CASLike<'a, State, Sender> for DistributedCAS<'a, 'b>
 where
-    State: Clone + Debug + Serialize + for<'de> Deserialize<'de> + PartialOrd + Eq + 'a,
+    State: Clone + Debug + Serialize + for<'de> Deserialize<'de> + Ord + 'a,
     Sender: Clone + Debug + Serialize + for<'de> Deserialize<'de> + Eq + Hash + 'a,
 {
     fn build(
@@ -380,12 +380,7 @@ where
                 .clone()
                 .map(q!(|(response, _all_agree)| (response.max_ballot, response.state)))
                 .chain(committed_state.into_stream())
-                .reduce(q!(|(ballot, state), (new_ballot, new_state)| {
-                    if new_ballot >= *ballot {
-                        *ballot = new_ballot;
-                        *state = new_state;
-                    }
-                }, commutative = manual_proof!(/** Max is commutative. If the new ballot is the same, then state can be overwritten based on order and that's ok. */)));
+                .max();
             // Propose a valid client write if the election is succesful and all agree
             let proposed_client_write = write_queue
                 .clone()

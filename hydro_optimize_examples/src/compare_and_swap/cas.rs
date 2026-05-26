@@ -11,12 +11,12 @@ use super::cas_like::{CASLike, CASOutput, CASState, UniqueRequestId};
 pub struct CASNode {}
 
 pub struct CAS<'a, 'b> {
-    pub process: &'b Process<'a, CASNode>,
+    pub cluster: &'b Cluster<'a, CASNode>,
 }
 
 impl<'a, 'b, State, Sender> CASLike<'a, State, Sender> for CAS<'a, 'b>
 where
-    State: Clone + Serialize + for<'de> Deserialize<'de> + PartialOrd + 'a,
+    State: Clone + Serialize + for<'de> Deserialize<'de> + Eq + 'a,
     Sender: Clone + Serialize + for<'de> Deserialize<'de> + Eq + Hash + 'a,
 {
     fn build(
@@ -32,13 +32,16 @@ where
         subscribe: Stream<MemberId<Sender>, Cluster<'a, Sender>, impl Boundedness, impl Ordering>,
         sender: &Cluster<'a, Sender>,
     ) -> CASOutput<'a, State, Sender> {
-        let incoming_writes = writes.send(self.process, TCP.fail_stop().bincode());
+        let incoming_writes = writes
+            .entries()
+            .map(q!(|payload| (MemberId::from_raw_id(0), payload)))
+            .demux(self.cluster, TCP.fail_stop().bincode());
         let incoming_reads = reads
-            .send(self.process, TCP.fail_stop().bincode())
-            .entries();
+            .map(q!(|payload| (MemberId::from_raw_id(0), payload)))
+            .demux(self.cluster, TCP.fail_stop().bincode());
         let incoming_subscribes = subscribe
-            .send(self.process, TCP.fail_stop().bincode())
-            .values();
+            .map(q!(|payload| (MemberId::from_raw_id(0), payload)))
+            .demux(self.cluster, TCP.fail_stop().bincode());
 
         let nondet_state =
             nondet!(/** State updates and reads are non-deterministic based on arrival order */);
@@ -50,7 +53,7 @@ where
                 .entries()
                 .assume_ordering::<TotalOrder>(nondet_state)
                 .across_ticks(|s| s.scan(q!(|| Option::<CASState<_>>::None),
-                    q!(|prev, ((client_id, request_id), write)| {
+                    q!(|prev, (client_id, (request_id, write))| {
                         // Allow the same version if it's from the same writer
                         if let Some(prev_write) = prev
                             && write.version != prev_write.version + 1
@@ -82,7 +85,7 @@ where
             let write_outputs = use(write_outputs.clone(), nondet_subscribe);
             let mut curr_subscribes = use::state_null::<Stream<MemberId<Sender>, _, _, NoOrder>>();
 
-            let new_subscribes = curr_subscribes.chain(subscribes);
+            let new_subscribes = curr_subscribes.chain(subscribes.values());
             let subscribe_outputs = new_subscribes
                 .clone()
                 .cross_product(write_outputs);
@@ -97,24 +100,24 @@ where
                 (req_id, successful)
             )))
             .demux(sender, TCP.fail_stop().bincode())
+            .values()
             .into_keyed()
             .weaken_ordering();
         let read_result = read_outputs
-            .map(q!(|((sender, req_id), last_write)| (
-                sender,
-                (
-                    req_id,
-                    last_write.map(|(_sender, _request_id, state, _successful)| state)
-                )
+            .map(q!(|(req_id, last_write)| (
+                req_id,
+                last_write.map(|(_sender, _request_id, state, _successful)| state)
             )))
             .demux(sender, TCP.fail_stop().bincode())
+            .values()
             .into_keyed();
         let subscribe_updates = subscribe_outputs
             .map(q!(|(
                 subscriber,
                 (_sender, _req_id, state, _successful),
             )| (subscriber, state)))
-            .demux(sender, TCP.fail_stop().bincode());
+            .demux(sender, TCP.fail_stop().bincode())
+            .values();
 
         CASOutput {
             write_processed,

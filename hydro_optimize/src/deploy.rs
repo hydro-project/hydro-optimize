@@ -32,6 +32,7 @@ pub struct ReusableHosts {
     hosts: HashMap<String, Arc<dyn Host>>, // Key = display_name
     host_type: InitializedHostType,
     env: HashMap<String, String>,
+    single_host: bool,
 }
 
 // Note: Aws AMIs vary by region. If you are changing the region, please also change the AMI.
@@ -39,10 +40,15 @@ const AWS_REGION: &str = "us-west-2";
 const AWS_INSTANCE_AMI: &str = "ami-055a9df0c8c9f681c"; // Amazon Linux 2
 const AWS_INSTANCE_TYPE: &str = "m5.2xlarge"; // 8 vCPU, 32 GB RAM
 const AWS_NUM_CORES: usize = 8; // Used for pinning
+/// m5.2xlarge: up to 10 Gbps network bandwidth
+pub const AWS_NETWORK_BYTES_PER_SEC: f64 = 1_250_000_000.0;
+/// m5.2xlarge: 12,000 baseline IOPS (EBS)
+pub const AWS_IO_TPS: f64 = 12_000.0;
 const GCP_REGION: &str = "us-central1-c";
 const GCP_IMAGE: &str = "debian-cloud/debian-12";
 const GCP_MACHINE_TYPE: &str = "n2-standard-4"; // 4 vCPU, 16 GB RAM
 const GCP_NUM_CORES: usize = 4; // Used for pinning
+const LOCAL_NUM_CORES: usize = 8; // Used for pinning, assuming the machine that launches the tests has 8 cores
 
 impl ReusableHosts {
     pub fn new(host_type: &HostType) -> Self {
@@ -61,6 +67,7 @@ impl ReusableHosts {
             hosts: HashMap::new(),
             host_type: initialized,
             env: HashMap::new(),
+            single_host: false,
         }
     }
 
@@ -70,11 +77,16 @@ impl ReusableHosts {
         self.env.insert(key, value);
     }
 
+    /// When true, all locations share a single underlying host.
+    pub fn set_single_host(&mut self, single_host: bool) {
+        self.single_host = single_host;
+    }
+
     pub fn num_cores(&self) -> usize {
         match &self.host_type {
             InitializedHostType::Gcp { .. } => GCP_NUM_CORES,
             InitializedHostType::Aws { .. } => AWS_NUM_CORES,
-            InitializedHostType::Localhost => 1, // Can't pin to cores locally anyway
+            InitializedHostType::Localhost => LOCAL_NUM_CORES,
         }
     }
 
@@ -84,8 +96,14 @@ impl ReusableHosts {
         deployment: &mut Deployment,
         display_name: String,
     ) -> Arc<dyn Host> {
+        // All clusters share the same machine if single_host is true
+        let key = if self.single_host {
+            "shared".to_string()
+        } else {
+            display_name.clone()
+        };
         self.hosts
-            .entry(display_name.clone())
+            .entry(key)
             .or_insert_with(|| match &self.host_type {
                 InitializedHostType::Gcp { project, network } => deployment
                     .GcpComputeEngineHost()
@@ -104,6 +122,7 @@ impl ReusableHosts {
                     .instance_type(AWS_INSTANCE_TYPE)
                     .ami(AWS_INSTANCE_AMI)
                     .network(network.clone())
+                    .display_name(display_name)
                     // Better performance than MUSL, perf reporting fewer unidentified stacks, but requires launching from Linux
                     .target_type(HostTargetType::Linux(LinuxCompileType::Glibc))
                     .add(),
@@ -130,40 +149,30 @@ impl ReusableHosts {
         })
     }
 
-    pub fn get_no_perf_process_hosts(
+    pub fn get_process_host(
         &mut self,
         deployment: &mut Deployment,
         display_name: String,
-        pin_to_core: usize,
+        perf: bool,
     ) -> TrybuildHost {
-        let host = TrybuildHost::new(self.lazy_create_host(deployment, display_name.clone()))
-            .pin_to_core(pin_to_core)
+        let mut host = TrybuildHost::new(self.lazy_create_host(deployment, display_name.clone()))
+            .networking_cores(self.num_cores() - 1)
             .rustflags(self.get_rust_flags());
-        self.host_with_env(host)
-    }
-
-    pub fn get_process_hosts(
-        &mut self,
-        deployment: &mut Deployment,
-        display_name: String,
-        pin_to_core: usize,
-    ) -> TrybuildHost {
-        let setup_command = match &self.host_type {
-            InitializedHostType::Gcp { .. } => DEBIAN_PERF_SETUP_COMMAND,
-            InitializedHostType::Aws { .. } => AL2_PERF_SETUP_COMMAND,
-            InitializedHostType::Localhost => "", // Isn't run on localhost anyway
-        };
-        let host = TrybuildHost::new(self.lazy_create_host(deployment, display_name.clone()))
-            .pin_to_core(pin_to_core)
-            .rustflags(self.get_rust_flags())
-            .tracing(
+        if perf {
+            let setup_command = match &self.host_type {
+                InitializedHostType::Gcp { .. } => DEBIAN_PERF_SETUP_COMMAND.to_string(),
+                InitializedHostType::Aws { .. } => AL2_PERF_SETUP_COMMAND.to_string(),
+                InitializedHostType::Localhost => String::new(),
+            };
+            host = host.tracing(
                 TracingOptions::builder()
-                    .perf_raw_outfile(format!("{}.perf.data", display_name.clone()))
+                    .perf_raw_outfile(format!("{}.perf.data", display_name))
                     .fold_outfile(format!("{}.data.folded", display_name))
                     .frequency(128)
                     .setup_command(setup_command)
                     .build(),
             );
+        }
         self.host_with_env(host)
     }
 
@@ -172,18 +181,10 @@ impl ReusableHosts {
         deployment: &mut Deployment,
         cluster_name: String,
         num_hosts: usize,
-        pin_to_core: usize,
         perf: bool,
     ) -> Vec<TrybuildHost> {
         (0..num_hosts)
-            .map(|i| {
-                let name = format!("{}{}", cluster_name, i);
-                if perf {
-                    self.get_process_hosts(deployment, name, pin_to_core)
-                } else {
-                    self.get_no_perf_process_hosts(deployment, name, pin_to_core)
-                }
-            })
+            .map(|i| self.get_process_host(deployment, format!("{}{}", cluster_name, i), perf))
             .collect()
     }
 }

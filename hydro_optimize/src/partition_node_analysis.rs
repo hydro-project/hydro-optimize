@@ -7,7 +7,7 @@ use syn::visit::Visit;
 
 use super::rewrites::{NetworkType, get_network_type};
 use crate::partition_syn_analysis::{AnalyzeClosure, StructOrTuple, StructOrTupleIndex};
-use crate::rewrites::op_id_to_inputs;
+use crate::rewrites::op_id_to_parents;
 
 /// Create a mapping from all input nodes to their parents (across locations)
 fn all_inputs_parents(
@@ -15,7 +15,7 @@ fn all_inputs_parents(
     inputs: &[usize],
     cycle_source_to_sink_input: &HashMap<usize, usize>,
 ) -> BTreeMap<usize, usize> {
-    op_id_to_inputs(ir, None, cycle_source_to_sink_input)
+    op_id_to_parents(ir, None, cycle_source_to_sink_input)
         .iter()
         .filter_map(|(op_id, parents)| {
             if inputs.contains(op_id) {
@@ -28,13 +28,13 @@ fn all_inputs_parents(
 }
 
 /// Find all input nodes of a location
-fn all_inputs(ir: &mut [HydroRoot], location: &LocationId) -> Vec<usize> {
+pub fn all_inputs(ir: &mut [HydroRoot], location: &LocationId) -> Vec<usize> {
     let mut inputs = vec![];
 
     traverse_dfir(
         ir,
         |_, _| {},
-        |node, next_stmt_id| match get_network_type(node, &location.root().key()) {
+        |node, next_stmt_id| match get_network_type(node, location.root()) {
             Some(NetworkType::Recv) | Some(NetworkType::SendRecv) => {
                 inputs.push(*next_stmt_id);
             }
@@ -196,7 +196,8 @@ fn input_dependency_analysis_node(
         }
         // Alters parent in a predicatable way
         HydroNode::Chain { .. }
-        | HydroNode::ChainFirst { .. } => {
+        | HydroNode::ChainFirst { .. }
+        | HydroNode::MergeOrdered { .. } => {
             assert_eq!(parent_ids.len(), 2, "Node {:?} has the wrong number of parents.", node);
             // [a,b] chain [c,d] = [a,b,c,d]. Take the intersection of dependencies of the two parents for each input. If only one parent is tainted, then just take that dependency
             for (input_id, parent_positions) in parent_taints {
@@ -238,7 +239,7 @@ fn input_dependency_analysis_node(
                 input_dependencies_entry.remove(input_id);
             }
         }
-        HydroNode::Join { .. } => {
+        HydroNode::Join { .. } | HydroNode::JoinHalf { .. } => {
             assert_eq!(parent_ids.len(), 2, "Node {:?} has the wrong number of parents.", node);
             // [(a,b)] join [(a,c)] = [(a,(b,c))]
             for input_id in input_taint_entry.iter() {
@@ -509,7 +510,7 @@ fn partitioning_constraint_analysis_node(
                     ordered_dependencies.extend(parent1_dependencies);
                 }
             }
-            HydroNode::Join { .. } => {
+            HydroNode::Join { .. } | HydroNode::JoinHalf { .. } => {
                 // Get the dependencies from field 0 of parent 0 and parent 1
                 // Only allow partitioning if both have dependencies (the earlier if statement already checks that that both are tainted)
                 if let Some((parent0_inputs, parent0_dependencies)) = get_inputs_and_dependencies(
@@ -558,6 +559,7 @@ fn partitioning_constraint_analysis_node(
             | HydroNode::Tee { .. }
             | HydroNode::Chain { .. }
             | HydroNode::ChainFirst { .. }
+            | HydroNode::MergeOrdered { .. }
             | HydroNode::ResolveFutures { .. }
             | HydroNode::ResolveFuturesOrdered { .. }
             | HydroNode::ResolveFuturesBlocking { .. }
@@ -613,7 +615,7 @@ pub fn partitioning_analysis(
     Vec<BTreeMap<usize, StructOrTupleIndex>>,
     BTreeMap<usize, usize>,
 )> {
-    let op_id_to_parents = op_id_to_inputs(ir, Some(&location.key()), cycle_source_to_sink_input);
+    let op_id_to_parents = op_id_to_parents(ir, Some(location), cycle_source_to_sink_input);
     let dependency_metadata = input_dependency_analysis(ir, location, op_id_to_parents);
     let mut possible_partitionings = BTreeMap::new();
 
@@ -777,7 +779,7 @@ mod tests {
     use stageleft::q;
 
     use crate::partition_node_analysis::partitioning_analysis;
-    use crate::repair::{cycle_source_to_sink_input, inject_id, inject_location};
+    use crate::repair::{cycle_source_to_sink_parent, inject_id, inject_location};
 
     fn test_input_partitionable(
         builder: FlowBuilder<'_>,
@@ -788,7 +790,7 @@ mod tests {
         let built = builder
             .optimize_with(|ir| {
                 inject_id(ir);
-                cycle_data = cycle_source_to_sink_input(ir);
+                cycle_data = cycle_source_to_sink_parent(ir);
                 inject_location(ir, &cycle_data);
             })
             .into_deploy::<HydroDeploy>();

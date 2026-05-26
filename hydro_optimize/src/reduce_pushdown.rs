@@ -46,6 +46,9 @@ fn build_scan_reduce(
     }
 }
 
+/// Tag value for cpu_usage to mark commutative+associative reduces from pushdown.
+pub const COM_ASSOC_REDUCE_TAG: f64 = -1.0;
+
 pub fn reduce_pushdown(ir: &mut [HydroRoot], decision: HashMap<usize, usize>) {
     let mut reduce_to_insert_locations = HashMap::new();
     for (op_id, reduce_id) in decision {
@@ -72,6 +75,8 @@ pub fn reduce_pushdown(ir: &mut [HydroRoot], decision: HashMap<usize, usize>) {
                 for reduce_id in ops_to_insert {
                     op_id_to_reduce_info.insert(*reduce_id, (f_expr.clone(), metadata.clone()));
                 }
+                // Tag the original reduce as commutative+associative
+                node.op_metadata_mut().cpu_usage = Some(COM_ASSOC_REDUCE_TAG);
             }
         },
     );
@@ -84,6 +89,8 @@ pub fn reduce_pushdown(ir: &mut [HydroRoot], decision: HashMap<usize, usize>) {
             if let Some((f, metadata)) = op_id_to_reduce_info.remove(op_id) {
                 let input = std::mem::replace(node, HydroNode::Placeholder);
                 *node = build_scan_reduce(input, f, metadata);
+                // Tag the newly created scan as commutative+associative
+                node.op_metadata_mut().cpu_usage = Some(COM_ASSOC_REDUCE_TAG);
             }
         },
     );
@@ -94,8 +101,12 @@ pub fn reduce_pushdown(ir: &mut [HydroRoot], decision: HashMap<usize, usize>) {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashSet, time::Duration};
+
+    use futures::StreamExt;
+    use hydro_deploy::Deployment;
     use hydro_lang::{
-        compile::ir::{HydroNode, traverse_dfir},
+        compile::ir::{HydroNode, HydroRoot, traverse_dfir},
         live_collections::stream::{ExactlyOnce, NoOrder, TotalOrder},
         location::Location,
         nondet::nondet,
@@ -106,10 +117,10 @@ mod tests {
     use crate::{
         reduce_pushdown::reduce_pushdown,
         reduce_pushdown_analysis::reduce_pushdown_decision,
-        repair::{cycle_source_to_sink_input, inject_id, inject_location},
+        repair::{cycle_source_to_sink_parent, inject_id, inject_location},
     };
 
-    fn count_reduces(ir: &mut [hydro_lang::compile::ir::HydroRoot]) -> usize {
+    fn count_reduces(ir: &mut [HydroRoot]) -> usize {
         let mut count = 0;
         traverse_dfir(
             ir,
@@ -126,9 +137,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_reduce_pushdown() {
-        use futures::StreamExt;
-        use hydro_deploy::Deployment;
-
         let mut builder = FlowBuilder::new();
         let external = builder.external::<()>();
         let gateway = builder.process::<()>();
@@ -153,12 +161,12 @@ mod tests {
 
         let built = builder.optimize_with(|ir| {
             inject_id(ir);
-            let cycle_data = cycle_source_to_sink_input(ir);
+            let cycle_data = cycle_source_to_sink_parent(ir);
             inject_location(ir, &cycle_data);
 
             let before = count_reduces(ir);
 
-            let decision = reduce_pushdown_decision(ir);
+            let decision = reduce_pushdown_decision(ir, &HashSet::from([cluster1.id()]));
             assert!(!decision.is_empty(), "Expected non-empty pushdown decision");
             reduce_pushdown(ir, decision);
 
@@ -181,7 +189,7 @@ mod tests {
         let mut output = nodes.connect(output).await;
         deployment.start().await.unwrap();
 
-        let val: i32 = tokio::time::timeout(std::time::Duration::from_secs(30), output.next())
+        let val: i32 = tokio::time::timeout(Duration::from_secs(30), output.next())
             .await
             .expect("timeout waiting for output")
             .expect("output channel closed");

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hash;
+
 use syn::visit::Visit;
 
 pub type StructOrTupleIndex = Vec<String>; // Ex: ["a", "b"] represents x.a.b
@@ -7,15 +8,15 @@ pub type StructOrTupleIndex = Vec<String>; // Ex: ["a", "b"] represents x.a.b
 // Invariant: Cannot have both a dependency and fields (fields are more specific)
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct StructOrTuple {
-    dependencies: BTreeSet<StructOrTupleIndex>, /* Input tuple indices this tuple is equal to, if any */
-    fields: BTreeMap<String, Box<StructOrTuple>>, // Fields 1 layer deep
-    could_be_none: bool, // True if this field could also be None (used for FilterMap)
+    pub dependencies: BTreeSet<StructOrTupleIndex>, /* Parent tuple indices this tuple is equal to, if any */
+    pub fields: BTreeMap<String, Box<StructOrTuple>>, // Fields 1 layer deep
+    pub could_be_none: bool, // True if this field could also be None (used for FilterMap)
 }
 
 impl StructOrTuple {
     pub fn new_completely_dependent() -> Self {
         StructOrTuple {
-            dependencies: BTreeSet::from([vec![]]), /* Empty vec means it is completely dependent on the input tuple */
+            dependencies: BTreeSet::from([vec![]]), /* Empty vec means it is completely dependent on the parent tuple */
             fields: BTreeMap::new(),
             could_be_none: false,
         }
@@ -25,15 +26,39 @@ impl StructOrTuple {
         self.dependencies.is_empty() && self.fields.is_empty()
     }
 
-    fn create_child(&mut self, index: StructOrTupleIndex) -> &mut StructOrTuple {
+    /// Create the child field if necessary, and duplicate any general dependencies to the child field.
+    /// Returns the child field, and whether any mutations were made.
+    pub fn create_child(&mut self, index: StructOrTupleIndex) -> (&mut StructOrTuple, bool) {
+        let mut deps = self.dependencies.clone();
         let mut child = self;
+        let mut mutated = false;
+
         for i in index {
-            child = &mut **child
-                .fields
-                .entry(i)
-                .or_insert_with(|| Box::new(StructOrTuple::default()));
+            child = &mut **child.fields.entry(i.clone()).or_insert_with(|| {
+                mutated = true;
+                Box::new(StructOrTuple::default())
+            });
+
+            // Create more specific dependencies
+            let mut new_deps = BTreeSet::new();
+            for dependency in &deps {
+                let mut new_dependency = dependency.clone();
+                new_dependency.push(i.clone());
+                new_deps.insert(new_dependency);
+            }
+
+            // Add any existing dependencies in the child to the deps to track
+            deps = child.dependencies.clone();
+            // Modify the child's dependencies with more specific ones
+            let prev_num_child_dependencies = child.dependencies.len();
+            child.dependencies.extend(new_deps.clone());
+            if child.dependencies.len() > prev_num_child_dependencies {
+                mutated = true;
+            }
+            // Add new dependencies to track
+            deps.extend(new_deps);
         }
-        child
+        (child, mutated)
     }
 
     /// Copy dependencies from RHS, extending it with rhs_index
@@ -61,7 +86,7 @@ impl StructOrTuple {
                 rhs = child.as_ref();
             } else if !rhs.dependencies.is_empty() {
                 // Create a child if necessary and set the dependency
-                let child = self.create_child(index.clone());
+                let (child, _) = self.create_child(index.clone());
                 child.add_dependencies(rhs, rhs_index);
                 child.could_be_none = rhs.could_be_none;
                 return;
@@ -72,7 +97,7 @@ impl StructOrTuple {
         }
 
         // Create a child if necessary and copy everything from the RHS
-        let child = self.create_child(index.clone());
+        let (child, _) = self.create_child(index.clone());
         child.dependencies.extend(rhs.dependencies.clone());
         child.fields = rhs.fields.clone();
         child.could_be_none = rhs.could_be_none;
@@ -81,29 +106,63 @@ impl StructOrTuple {
     pub fn add_dependency(
         &mut self,
         index: &StructOrTupleIndex,
-        input_tuple_index: StructOrTupleIndex,
+        parent_tuple_index: StructOrTupleIndex,
     ) {
-        let child = self.create_child(index.clone());
-        child.dependencies.insert(input_tuple_index);
+        let (child, _) = self.create_child(index.clone());
+        child.dependencies.insert(parent_tuple_index);
     }
 
     /// Note: May return redundant dependencies; no easy fix given we can the same field can depend on multiple things
     pub fn get_dependencies(&self, index: &StructOrTupleIndex) -> Option<StructOrTuple> {
         let mut child = self.clone();
-        for (i, field) in index.iter().enumerate() {
+        for field in index {
             if let Some(grandchild) = child.fields.get(field) {
                 let mut temp_grandchild = *grandchild.clone();
-                temp_grandchild.add_dependencies(&child, &index[i..].to_vec());
+                temp_grandchild.add_dependencies(&child, &vec![field.clone()]);
                 child = temp_grandchild;
             } else if !child.dependencies.is_empty() {
                 let mut new_child = StructOrTuple::default();
-                new_child.add_dependencies(&child, &index[i..].to_vec());
+                new_child.add_dependencies(&child, &vec![field.clone()]);
                 return Some(new_child);
             } else {
                 return None; // No dependency or child
             }
         }
         Some(child)
+    }
+
+    pub fn get_dependency(&self) -> BTreeSet<StructOrTupleIndex> {
+        self.dependencies.clone()
+    }
+
+    pub fn get_all_nested_dependencies(&self) -> BTreeSet<StructOrTupleIndex> {
+        let mut all_dependencies = self.dependencies.clone();
+        for child in self.fields.values() {
+            let child_dependencies = child.get_all_nested_dependencies();
+            all_dependencies.extend(child_dependencies);
+        }
+        all_dependencies
+    }
+
+    fn get_nested_fields(&self, prefix: StructOrTupleIndex) -> BTreeSet<StructOrTupleIndex> {
+        let mut all_fields = BTreeSet::new();
+        for (field, child) in &self.fields {
+            let mut cloned_prefix = prefix.clone();
+            cloned_prefix.push(field.clone());
+            all_fields.insert(cloned_prefix.clone());
+
+            let child_fields = child.get_nested_fields(cloned_prefix);
+            all_fields.extend(child_fields);
+        }
+        all_fields
+    }
+
+    /// Returns all known fields, including nested fields.
+    /// If there are more and less specific versions of the same field, return both.
+    pub fn get_all_nested_fields(&self) -> BTreeSet<StructOrTupleIndex> {
+        let mut nested_fields = self.get_nested_fields(vec![]);
+        nested_fields.insert(vec![]); // Include the entire struct/tuple as a field
+        nested_fields
     }
 
     /// Remove any fields that could be None. If a parent could be None, then remove all children.
@@ -125,7 +184,10 @@ impl StructOrTuple {
     }
 
     /// Create a tuple representing dependencies present in both tuples, keeping the more specific dependency if there is one
-    pub fn intersect(tuple1: &StructOrTuple, tuple2: &StructOrTuple) -> Option<StructOrTuple> {
+    pub fn intersect(
+        tuple1: &StructOrTuple,
+        tuple2: &StructOrTuple,
+    ) -> Option<StructOrTuple> {
         // If either tuple1 or tuple2 are empty and None, just return the other tuple
         for (tuple, other) in [(tuple1, tuple2), (tuple2, tuple1)] {
             if tuple.is_empty() && tuple.could_be_none {
@@ -313,6 +375,7 @@ impl StructOrTuple {
         if new_tuple.is_empty() {
             None
         } else {
+            println!("Unioned {:?} and {:?} into {:?}", tuple1, tuple2, new_tuple);
             Some(new_tuple)
         }
     }
@@ -321,7 +384,10 @@ impl StructOrTuple {
     ///
     /// The parent's dependencies are absolute (dependency on an input to the node);
     /// the child's dependencies are relative (dependency within the function).
-    pub fn project_parent(parent: &StructOrTuple, child: &StructOrTuple) -> Option<StructOrTuple> {
+    pub fn project_parent(
+        parent: &StructOrTuple,
+        child: &StructOrTuple,
+    ) -> Option<StructOrTuple> {
         let mut new_child = StructOrTuple::default();
         assert!(
             !parent.could_be_none && !child.could_be_none,
@@ -355,6 +421,24 @@ impl StructOrTuple {
             Some(new_child)
         }
     }
+
+    pub fn to_syn_expr(mut tuple: syn::Expr, indices: &StructOrTupleIndex) -> syn::Expr {
+        for index in indices {
+            let member = if let Ok(num_index) = index.parse::<usize>() {
+                syn::Member::Unnamed(syn::Index::from(num_index))
+            } else {
+                syn::Member::Named(syn::Ident::new(index, proc_macro2::Span::call_site()))
+            };
+            let dot_token = <syn::Token![.]>::default();
+            tuple = syn::Expr::Field(syn::ExprField {
+                attrs: vec![],
+                base: Box::new(tuple),
+                dot_token,
+                member,
+            });
+        }
+        tuple
+    }
 }
 
 // Find whether a tuple's usage (Ex: a.0.1) references an existing var (Ex: a), and if so, calculate the new StructOrTupleIndex
@@ -378,7 +462,7 @@ impl StructOrTupleUseRhs {
     }
 
     fn set_field_could_be_none(&mut self) {
-        let field = self.rhs_tuple.create_child(self.field_index.clone());
+        let (field, _) = self.rhs_tuple.create_child(self.field_index.clone());
         field.could_be_none = true;
     }
 }
@@ -563,6 +647,13 @@ impl Visit<'_> for StructOrTupleUseRhs {
         }
     }
 
+    fn visit_expr_unary(&mut self, unary: &syn::ExprUnary) {
+        if let syn::UnOp::Deref(_) = unary.op {
+            // Allow deref
+            self.visit_expr(&unary.expr);
+        }
+    }
+
     fn visit_expr(&mut self, expr: &syn::Expr) {
         match expr {
             syn::Expr::Path(path) => self.visit_expr_path(path),
@@ -575,6 +666,7 @@ impl Visit<'_> for StructOrTupleUseRhs {
             syn::Expr::If(if_expr) => self.visit_expr_if(if_expr),
             syn::Expr::Match(match_expr) => self.visit_expr_match(match_expr),
             syn::Expr::Call(call_expr) => self.visit_expr_call(call_expr),
+            syn::Expr::Unary(unary_expr) => self.visit_expr_unary(unary_expr),
             _ => println!(
                 "StructOrTupleUseRhs skipping unsupported RHS expression: {:?}",
                 expr
@@ -583,7 +675,7 @@ impl Visit<'_> for StructOrTupleUseRhs {
     }
 }
 
-// Create a mapping from Ident to tuple indices (Note: Not necessarily input tuple indices)
+// Create a mapping from Ident to tuple indices (Note: Not necessarily parent tuple indices)
 // For example, (a, (b, c)) -> { a: [0], b: [1, 0], c: [1, 1] }
 #[derive(Default)]
 struct TupleDeclareLhs {
@@ -622,14 +714,22 @@ impl Visit<'_> for TupleDeclareLhs {
                 }
             }
             syn::Pat::TupleStruct(tuple_struct) => {
-                if tuple_struct.path.is_ident("Some") {
-                    assert_eq!(tuple_struct.elems.len(), 1); // Some should have exactly one element
-                    self.visit_pat(tuple_struct.elems.first().unwrap());
-                } else {
-                    panic!(
-                        "TupleDeclareLhs does not support tuple structs: {:?}",
-                        tuple_struct
-                    );
+                match tuple_struct.path.get_ident() {
+                    Some(ident) if ident == "Some" => {
+                        assert_eq!(tuple_struct.elems.len(), 1); // Some should have exactly one element
+                        self.visit_pat(tuple_struct.elems.first().unwrap());
+                    }
+                    Some(ident) if ident == "Ok" => {
+                        assert_eq!(tuple_struct.elems.len(), 1); // Ok should have exactly one element
+                        self.visit_pat(tuple_struct.elems.first().unwrap());
+                    }
+                    Some(ident) if ident == "Err" => {} // Ignore dependencies from Err
+                    Some(_) | None => {
+                        panic!(
+                            "TupleDeclareLhs does not support generic tuple structs: {:?}",
+                            tuple_struct
+                        );
+                    }
                 }
             }
             syn::Pat::Wild(_) | syn::Pat::Lit(_) => {} // Ignore wildcards, literals
@@ -652,8 +752,8 @@ struct EqualityAnalysis {
 impl EqualityAnalysis {
     pub fn visit_assignment(&mut self, lhs: &syn::Pat, rhs: Option<Box<syn::Expr>>) {
         // Analyze LHS
-        let mut input_analysis: TupleDeclareLhs = TupleDeclareLhs::default();
-        input_analysis.visit_pat(lhs);
+        let mut parent_analysis: TupleDeclareLhs = TupleDeclareLhs::default();
+        parent_analysis.visit_pat(lhs);
 
         // Analyze RHS
         let mut analysis = StructOrTupleUseRhs::default();
@@ -664,7 +764,7 @@ impl EqualityAnalysis {
         }
 
         // Set dependencies from LHS to RHS
-        for (lhs, tuple_index) in input_analysis.lhs_tuple.iter() {
+        for (lhs, tuple_index) in parent_analysis.lhs_tuple.iter() {
             let mut tuple = StructOrTuple::default();
             tuple.set_dependencies(tuple_index, &analysis.rhs_tuple, tuple_index);
             if tuple.is_empty() {
@@ -730,7 +830,7 @@ impl Visit<'_> for EqualityAnalysis {
 
 #[derive(Default)]
 pub struct AnalyzeClosure {
-    found_closure: bool, // Used to avoid executing visit_pat on anything but the function body
+    pub found_closure: bool, // Used to avoid executing visit_pat on anything but the function body
     pub output_dependencies: StructOrTuple,
 }
 
@@ -740,25 +840,25 @@ impl Visit<'_> for AnalyzeClosure {
             panic!("Nested closures found in a single Expr during partitioning analysis.");
         }
 
-        // Find all input vars
+        // Find all parent vars
         self.output_dependencies = StructOrTuple::default();
         self.found_closure = true;
         if closure.inputs.len() > 1 {
             panic!(
-                "Partitioning analysis does not currently support closures with multiple inputs (such as reduce): {:?}.",
+                "Partitioning analysis does not currently support closures with multiple parents (such as reduce): {:?}.",
                 closure
             );
         }
-        let mut input_analysis = TupleDeclareLhs::default();
-        input_analysis.visit_pat(&closure.inputs[0]);
+        let mut parent_analysis = TupleDeclareLhs::default();
+        parent_analysis.visit_pat(&closure.inputs[0]);
         println!(
             "Input idents to tuple indices: {:?}",
-            input_analysis.lhs_tuple
+            parent_analysis.lhs_tuple
         );
 
         // Perform dependency analysis on the body
         let mut analyzer = EqualityAnalysis {
-            dependencies: input_analysis.into_tuples(),
+            dependencies: parent_analysis.into_tuples(),
             ..Default::default()
         };
         analyzer.visit_expr(&closure.body);
@@ -859,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tuple_input_assignment() {
+    fn test_tuple_parent_assignment() {
         let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
@@ -872,7 +972,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tuple_input_implicit_nesting() {
+    fn test_tuple_parent_implicit_nesting() {
         let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
@@ -933,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tuple_input_output_implicit_nesting() {
+    fn test_tuple_parent_output_implicit_nesting() {
         let mut builder = FlowBuilder::new();
         let cluster = builder.cluster::<()>();
         cluster
@@ -1206,6 +1306,7 @@ mod tests {
         c: Option<usize>,
     }
 
+    #[expect(dead_code, reason = "Not actually dead, used for testing below")]
     struct TestNestedStruct {
         struct_1: TestStruct,
         struct_2: TestStruct,

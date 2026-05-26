@@ -1,89 +1,28 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::Write;
+use std::path::Path;
 
-use hydro_lang::compile::builder::FlowBuilder;
-use hydro_lang::compile::built::BuiltFlow;
+use hydro_lang::compile::builder::ClockId;
 use hydro_lang::compile::ir::{
     BoundKind, CollectionKind, DebugType, HydroIrMetadata, HydroNode, HydroRoot,
-    KeyedSingletonBoundKind, SingletonBoundKind, StreamOrder, StreamRetry, deep_clone,
+    KeyedSingletonBoundKind, SingletonBoundKind, StreamOrder, StreamRetry, transform_bottom_up,
     traverse_dfir,
 };
+use hydro_lang::location::LocationKey;
 use hydro_lang::location::dynamic::LocationId;
-use hydro_lang::location::{Cluster, LocationKey};
 use proc_macro2::{Span, TokenStream};
 use quote::{ToTokens, quote};
-use serde::{Deserialize, Serialize};
 use syn::parse_quote;
 use syn::visit_mut::{self, VisitMut};
 
-use crate::decoupler::{self, DecoupleDecision};
-use crate::partitioner::Partitioner;
-
-#[derive(Clone, Serialize, Deserialize)]
-pub enum Rewrite {
-    Decouple {
-        decision: DecoupleDecision,
-        orig_location: LocationId,
-    },
-    Partition(Partitioner),
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct RewriteMetadata {
-    pub node: LocationId,
-    pub num_nodes: usize,
-    pub rewrite: Rewrite,
-}
-
-pub type Rewrites = Vec<RewriteMetadata>;
-
-/// Replays the rewrites in order.
-/// Returns Vec(Cluster, number of nodes) for each created cluster and a new FlowBuilder
-pub fn replay<'a>(
-    rewrites: Rewrites,
-    built: BuiltFlow<'a>,
-) -> (Vec<(Cluster<'a, ()>, usize)>, FlowBuilder<'a>) {
-    let mut all_new_clusters = vec![];
-
-    let mut ir = deep_clone(built.ir());
-    let mut builder = FlowBuilder::from_built(&built);
-
-    // Apply decoupling/partitioning in order
-    for rewrite_metadata in rewrites {
-        match rewrite_metadata.rewrite {
-            Rewrite::Decouple {
-                decision,
-                orig_location,
-            } => {
-                let new_clusters =
-                    decoupler::decouple(&mut ir, decision, &orig_location, &mut builder);
-                for cluster in new_clusters {
-                    all_new_clusters.push((cluster, rewrite_metadata.num_nodes));
-                }
-            }
-            Rewrite::Partition(_partitioner) => {
-                panic!("Partitioning is not yet replayable");
-            }
-        }
-    }
-
-    builder.replace_ir(ir);
-
-    (all_new_clusters, builder)
-}
-
 /// Replace CLUSTER_SELF_ID with the ID of the original node the partition is assigned to
 #[derive(Copy, Clone)]
-pub enum ClusterSelfIdReplace {
-    Decouple {
-        orig_cluster_id: LocationKey,
-        decoupled_cluster_id: LocationKey,
-    },
-    Partition {
-        num_partitions: usize,
-        partitioned_cluster_id: LocationKey,
-        op_id: usize,
-    },
+pub struct ClusterSelfIdReplace {
+    pub orig_cluster_id: LocationKey,
+    pub new_cluster_id: LocationKey,
+    pub num_partitions: usize,
 }
 
 impl VisitMut for ClusterSelfIdReplace {
@@ -91,38 +30,24 @@ impl VisitMut for ClusterSelfIdReplace {
         if let syn::Expr::Path(path_expr) = expr {
             for segment in path_expr.path.segments.iter_mut() {
                 let ident = segment.ident.to_string();
-
-                match self {
-                    ClusterSelfIdReplace::Decouple {
-                        orig_cluster_id,
-                        decoupled_cluster_id,
-                    } => {
-                        let prefix = format!("__hydro_lang_cluster_self_id_{}", orig_cluster_id);
-                        if ident.starts_with(&prefix) {
-                            segment.ident = syn::Ident::new(
-                                &format!("__hydro_lang_cluster_self_id_{}", decoupled_cluster_id),
-                                segment.ident.span(),
-                            );
-                            println!("Decoupling: Replaced CLUSTER_SELF_ID");
-                            return;
-                        }
+                let prefix = format!("__hydro_lang_cluster_self_id_{}", self.orig_cluster_id);
+                if ident.starts_with(&prefix) {
+                    if self.orig_cluster_id != self.new_cluster_id {
+                        segment.ident = syn::Ident::new(
+                            &format!("__hydro_lang_cluster_self_id_{}", self.new_cluster_id),
+                            segment.ident.span(),
+                        );
+                        println!("Decoupling: Replaced CLUSTER_SELF_ID");
                     }
-                    ClusterSelfIdReplace::Partition {
-                        num_partitions,
-                        partitioned_cluster_id,
-                        op_id,
-                    } => {
-                        let prefix =
-                            format!("__hydro_lang_cluster_self_id_{}", partitioned_cluster_id);
-                        if ident.starts_with(&prefix) {
-                            let expr_content = std::mem::replace(expr, syn::Expr::PLACEHOLDER);
-                            *expr = syn::parse_quote!({
-                                #expr_content / #num_partitions as u32
-                            });
-                            println!("Partitioning: Replaced CLUSTER_SELF_ID for node {}", op_id);
-                            return;
-                        }
+                    if self.num_partitions > 0 {
+                        let num_partitions = self.num_partitions;
+                        let expr_content = std::mem::replace(expr, syn::Expr::PLACEHOLDER);
+                        *expr = syn::parse_quote!({
+                            #expr_content / #num_partitions as u32
+                        });
+                        println!("Partitioning: Replaced CLUSTER_SELF_ID");
                     }
+                    return;
                 }
             }
         }
@@ -130,29 +55,85 @@ impl VisitMut for ClusterSelfIdReplace {
     }
 }
 
+pub fn print_id(ir: &mut [HydroRoot]) {
+    write_id(ir, None);
+}
+
+/// Writes operator IR to a file (same format as print_id).
+pub fn save_id(ir: &mut [HydroRoot], path: &Path) {
+    write_id(ir, Some(path));
+}
+
+fn write_id(ir: &mut [HydroRoot], path: Option<&Path>) {
+    let lines = RefCell::new(Vec::new());
+    transform_bottom_up(
+        ir,
+        &mut |root| {
+            let input = root.input_metadata().op.id;
+            let id = root.op_metadata().id;
+            lines.borrow_mut().push(format!(
+                "{:?} Root {}, Inputs: {:?}",
+                id,
+                root.print_root(),
+                input
+            ));
+        },
+        &mut |node| {
+            let metadata = node.metadata();
+            let id = metadata.op.id;
+            let inputs = node
+                .input_metadata()
+                .iter()
+                .map(|m| m.op.id)
+                .collect::<Vec<Option<usize>>>();
+            lines.borrow_mut().push(format!(
+                "{:?} Node {}, {:?}, Inputs: {:?}",
+                id,
+                node.print_root(),
+                metadata,
+                inputs
+            ));
+        },
+        false,
+    );
+
+    let lines = lines.into_inner();
+    if let Some(path) = path {
+        let mut file = File::create(path).unwrap();
+        for line in &lines {
+            writeln!(file, "{}", line).unwrap();
+        }
+        println!("Saved operators to {}", path.display());
+    } else {
+        for line in &lines {
+            println!("{}", line);
+        }
+    }
+}
+
 /// Converts input metadata to IDs, filtering by location if provided
-pub fn relevant_inputs(
-    input_metadatas: Vec<&HydroIrMetadata>,
-    location: Option<&LocationKey>,
+pub fn filter_location(
+    metadatas: Vec<&HydroIrMetadata>,
+    location: Option<&LocationId>,
 ) -> Vec<usize> {
-    input_metadatas
+    metadatas
         .iter()
-        .filter_map(|input_metadata| {
+        .filter_map(|metadata| {
             if let Some(location) = location
-                && input_metadata.location_id.root().key() != *location
+                && metadata.location_id.root() != location.root()
             {
                 None
             } else {
-                Some(input_metadata.op.id.unwrap())
+                Some(metadata.op.id.unwrap())
             }
         })
         .collect()
 }
 
 /// Creates a mapping from op_id to its input op_ids, filtered by location if provided
-pub fn op_id_to_inputs(
+pub fn op_id_to_parents(
     ir: &mut [HydroRoot],
-    location: Option<&LocationKey>,
+    location: Option<&LocationId>,
     cycle_source_to_sink_input: &HashMap<usize, usize>,
 ) -> HashMap<usize, Vec<usize>> {
     let mapping = RefCell::new(HashMap::new());
@@ -160,10 +141,16 @@ pub fn op_id_to_inputs(
     traverse_dfir(
         ir,
         |leaf, op_id| {
-            let relevant_input_ids = relevant_inputs(vec![leaf.input_metadata()], location);
+            let relevant_input_ids = filter_location(vec![leaf.input_metadata()], location);
             mapping.borrow_mut().insert(*op_id, relevant_input_ids);
         },
         |node, op_id| {
+            if let Some(location) = location
+                && node.metadata().location_id.root() != location.root()
+            {
+                // If the node itself is not at the location, skip it
+                return;
+            }
             let input_ids = match node {
                 HydroNode::CycleSource { .. } => {
                     // For CycleSource, its input is its CycleSink's input. Note: assumes the CycleSink is on the same cluster
@@ -172,37 +159,13 @@ pub fn op_id_to_inputs(
                 HydroNode::Tee { inner, .. } | HydroNode::Partition { inner, .. } => {
                     vec![inner.0.borrow().op_metadata().id.unwrap()]
                 }
-                _ => relevant_inputs(node.input_metadata(), location),
+                _ => filter_location(node.input_metadata(), location),
             };
             mapping.borrow_mut().insert(*op_id, input_ids);
         },
     );
 
     mapping.take()
-}
-
-/// Creates a mapping from op_id to the other (if any) op_id that outputs to the same node.
-pub fn op_id_to_partner(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
-    let mut output = HashMap::new();
-
-    traverse_dfir(
-        ir,
-        |_, _| {},
-        |node, _op_id| {
-            let input_metadatas = node.input_metadata();
-            if input_metadatas.len() == 2 {
-                let dad_op_id = input_metadatas[0].op.id.unwrap();
-                let mom_op_id = input_metadatas[1].op.id.unwrap();
-                output.insert(dad_op_id, mom_op_id);
-                output.insert(mom_op_id, dad_op_id);
-            }
-            assert!(
-                input_metadatas.len() > 2,
-                "Logic needs to be updated to handle nodes with more than 2 inputs"
-            );
-        },
-    );
-    output
 }
 
 pub fn tee_to_inner_id(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
@@ -219,6 +182,22 @@ pub fn tee_to_inner_id(ir: &mut [HydroRoot]) -> HashMap<usize, usize> {
     );
 
     mapping
+}
+
+pub fn get_network_op_ids(ir: &mut [HydroRoot]) -> HashSet<usize> {
+    let mut network_ids = HashSet::new();
+
+    traverse_dfir(
+        ir,
+        |_, _| {},
+        |node, op_id| {
+            if let HydroNode::Network { .. } = node {
+                network_ids.insert(*op_id);
+            }
+        },
+    );
+
+    network_ids
 }
 
 /// Check if the type is serializable. Currently a janky implementation that just looks for common unserializable types.
@@ -238,28 +217,53 @@ fn type_is_serializable(t: &DebugType) -> bool {
         .any(|unser| type_name.contains(unser))
 }
 
+/// Returns true for IR nodes that are syntactic sugar — they exist for type system
+/// or tick/atomic boundary purposes but don't represent real computation.
+/// These nodes should not be decoupled.
+pub fn is_syntactic_sugar(node: &HydroNode) -> bool {
+    matches!(
+        node,
+        HydroNode::Cast { .. }
+            | HydroNode::ObserveNonDet { .. }
+            | HydroNode::BeginAtomic { .. }
+            | HydroNode::EndAtomic { .. }
+            | HydroNode::Batch { .. }
+            | HydroNode::YieldConcat { .. }
+    )
+}
+
 /// Returns whether a node can be decoupled.
 ///
 /// False if:
 /// 1. The node relies on knowing the initial value (Singleton, KeyedSingleton without BoundedValue)
 /// 2. The output type is not serializable
-pub fn can_decouple(output_type: &CollectionKind) -> bool {
-    !output_type.is_bounded()
-        && match output_type {
-            CollectionKind::Stream { element_type, .. }
-            | CollectionKind::Optional { element_type, .. } => type_is_serializable(element_type),
-            CollectionKind::KeyedSingleton {
-                bound: KeyedSingletonBoundKind::BoundedValue,
-                key_type,
-                value_type,
-            }
-            | CollectionKind::KeyedStream {
-                key_type,
-                value_type,
-                ..
-            } => type_is_serializable(key_type) && type_is_serializable(value_type),
-            CollectionKind::Singleton { .. } | CollectionKind::KeyedSingleton { .. } => false,
+pub fn is_serializable(output_type: &CollectionKind) -> bool {
+    match output_type {
+        CollectionKind::Stream { element_type, .. }
+        | CollectionKind::Optional { element_type, .. } => type_is_serializable(element_type),
+        CollectionKind::KeyedSingleton {
+            bound: KeyedSingletonBoundKind::BoundedValue,
+            key_type,
+            value_type,
         }
+        | CollectionKind::KeyedStream {
+            key_type,
+            value_type,
+            ..
+        } => type_is_serializable(key_type) && type_is_serializable(value_type),
+        CollectionKind::Singleton { .. } | CollectionKind::KeyedSingleton { .. } => false,
+    }
+}
+
+pub fn get_tick_id(location_id: &LocationId) -> Option<ClockId> {
+    match location_id {
+        LocationId::Tick(tick_id, _) => Some(*tick_id),
+        LocationId::Atomic(tick) => match tick.as_ref() {
+            LocationId::Tick(tick_id, _) => Some(*tick_id),
+            _ => panic!("Expected tick location for atomic node"),
+        },
+        _ => None,
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -269,15 +273,17 @@ pub enum NetworkType {
     SendRecv,
 }
 
-pub fn get_network_type(node: &HydroNode, location: &LocationKey) -> Option<NetworkType> {
+/// Returns true if the node is at the given location, treating Networks as present
+/// at both their send and receive locations.
+pub fn get_network_type(node: &HydroNode, location: &LocationId) -> Option<NetworkType> {
     let mut is_to_us = false;
     let mut is_from_us = false;
 
     if let HydroNode::Network { input, .. } = node {
-        if input.metadata().location_id.root().key() == *location {
+        if input.metadata().location_id.root() == location.root() {
             is_from_us = true;
         }
-        if node.metadata().location_id.root().key() == *location {
+        if node.metadata().location_id.root() == location.root() {
             is_to_us = true;
         }
 
