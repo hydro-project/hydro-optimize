@@ -45,16 +45,16 @@ pub fn all_inputs(ir: &mut [HydroRoot], location: &LocationId) -> Vec<usize> {
     inputs
 }
 
-struct InputDependencyMetadata {
+pub struct InputDependencyMetadata {
     // Const fields
-    location: LocationId,
-    inputs: Vec<usize>,
-    op_id_to_parents: HashMap<usize, Vec<usize>>,
+    pub location: LocationId,
+    pub inputs: Vec<usize>,
+    pub op_id_to_parents: HashMap<usize, Vec<usize>>,
     // Variables
-    optimistic_phase: bool, /* If true, tuple intersection continues even if one side does not exist */
-    input_taint: BTreeMap<usize, BTreeSet<usize>>, /* op_id -> set of input op_ids that taint this node */
-    input_dependencies: BTreeMap<usize, BTreeMap<usize, StructOrTuple>>, /* op_id -> (input op_id -> index of input in output) */
-    syn_analysis: BTreeMap<usize, StructOrTuple>, /* Cached results for analyzing f for each operator */
+    pub optimistic_phase: bool, /* If true, tuple intersection continues even if one side does not exist */
+    pub input_taint: BTreeMap<usize, BTreeSet<usize>>, /* op_id -> set of input op_ids that taint this node */
+    pub input_dependencies: BTreeMap<usize, BTreeMap<usize, StructOrTuple>>, /* op_id -> (input op_id -> index of input in output) */
+    pub syn_analysis: BTreeMap<usize, StructOrTuple>, /* Cached results for analyzing f for each operator */
 }
 
 impl Hash for InputDependencyMetadata {

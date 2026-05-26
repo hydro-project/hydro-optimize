@@ -79,7 +79,7 @@ pub(crate) struct DecoupleILPMetadata {
 
 /// Per-location ILP expressions for each resource type.
 #[derive(Clone, Default)]
-pub(crate) struct ResourceExpressions {
+pub struct ResourceExpressions {
     pub cpu: Expression,
     pub memory: Expression,
     pub network: Expression,

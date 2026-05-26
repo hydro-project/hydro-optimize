@@ -3,18 +3,18 @@ use std::hash::Hash;
 
 use syn::visit::Visit;
 
-pub(crate) type StructOrTupleIndex = Vec<String>; // Ex: ["a", "b"] represents x.a.b
+pub type StructOrTupleIndex = Vec<String>; // Ex: ["a", "b"] represents x.a.b
 
 // Invariant: Cannot have both a dependency and fields (fields are more specific)
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub(crate) struct StructOrTuple {
-    dependencies: BTreeSet<StructOrTupleIndex>, /* Parent tuple indices this tuple is equal to, if any */
-    fields: BTreeMap<String, Box<StructOrTuple>>, // Fields 1 layer deep
-    could_be_none: bool, // True if this field could also be None (used for FilterMap)
+pub struct StructOrTuple {
+    pub dependencies: BTreeSet<StructOrTupleIndex>, /* Parent tuple indices this tuple is equal to, if any */
+    pub fields: BTreeMap<String, Box<StructOrTuple>>, // Fields 1 layer deep
+    pub could_be_none: bool, // True if this field could also be None (used for FilterMap)
 }
 
 impl StructOrTuple {
-    pub(crate) fn new_completely_dependent() -> Self {
+    pub fn new_completely_dependent() -> Self {
         StructOrTuple {
             dependencies: BTreeSet::from([vec![]]), /* Empty vec means it is completely dependent on the parent tuple */
             fields: BTreeMap::new(),
@@ -22,13 +22,13 @@ impl StructOrTuple {
         }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.dependencies.is_empty() && self.fields.is_empty()
     }
 
     /// Create the child field if necessary, and duplicate any general dependencies to the child field.
     /// Returns the child field, and whether any mutations were made.
-    pub(crate) fn create_child(&mut self, index: StructOrTupleIndex) -> (&mut StructOrTuple, bool) {
+    pub fn create_child(&mut self, index: StructOrTupleIndex) -> (&mut StructOrTuple, bool) {
         let mut deps = self.dependencies.clone();
         let mut child = self;
         let mut mutated = false;
@@ -63,7 +63,7 @@ impl StructOrTuple {
 
     /// Copy dependencies from RHS, extending it with rhs_index
     /// Note: Does NOT copy RHS fields
-    pub(crate) fn add_dependencies(&mut self, rhs: &StructOrTuple, rhs_index: &StructOrTupleIndex) {
+    pub fn add_dependencies(&mut self, rhs: &StructOrTuple, rhs_index: &StructOrTupleIndex) {
         for dependency in &rhs.dependencies {
             let mut dependency = dependency.clone();
             dependency.extend_from_slice(rhs_index);
@@ -74,7 +74,7 @@ impl StructOrTuple {
     /// Overwrite self at index with rhs at rhs_index, creating the necessary indices when necessary
     /// Note: Results in undefined behavior when used on a "unioned" tuple (where a StructOrTuple with a dependency also has fields).
     /// A broader dependency may conflict with a specific narrower dependency in its field.
-    pub(crate) fn set_dependencies(
+    pub fn set_dependencies(
         &mut self,
         index: &StructOrTupleIndex,
         mut rhs: &StructOrTuple,
@@ -103,7 +103,7 @@ impl StructOrTuple {
         child.could_be_none = rhs.could_be_none;
     }
 
-    pub(crate) fn add_dependency(
+    pub fn add_dependency(
         &mut self,
         index: &StructOrTupleIndex,
         parent_tuple_index: StructOrTupleIndex,
@@ -113,7 +113,7 @@ impl StructOrTuple {
     }
 
     /// Note: May return redundant dependencies; no easy fix given we can the same field can depend on multiple things
-    pub(crate) fn get_dependencies(&self, index: &StructOrTupleIndex) -> Option<StructOrTuple> {
+    pub fn get_dependencies(&self, index: &StructOrTupleIndex) -> Option<StructOrTuple> {
         let mut child = self.clone();
         for field in index {
             if let Some(grandchild) = child.fields.get(field) {
@@ -131,11 +131,11 @@ impl StructOrTuple {
         Some(child)
     }
 
-    pub(crate) fn get_dependency(&self) -> BTreeSet<StructOrTupleIndex> {
+    pub fn get_dependency(&self) -> BTreeSet<StructOrTupleIndex> {
         self.dependencies.clone()
     }
 
-    pub(crate) fn get_all_nested_dependencies(&self) -> BTreeSet<StructOrTupleIndex> {
+    pub fn get_all_nested_dependencies(&self) -> BTreeSet<StructOrTupleIndex> {
         let mut all_dependencies = self.dependencies.clone();
         for child in self.fields.values() {
             let child_dependencies = child.get_all_nested_dependencies();
@@ -159,14 +159,14 @@ impl StructOrTuple {
 
     /// Returns all known fields, including nested fields.
     /// If there are more and less specific versions of the same field, return both.
-    pub(crate) fn get_all_nested_fields(&self) -> BTreeSet<StructOrTupleIndex> {
+    pub fn get_all_nested_fields(&self) -> BTreeSet<StructOrTupleIndex> {
         let mut nested_fields = self.get_nested_fields(vec![]);
         nested_fields.insert(vec![]); // Include the entire struct/tuple as a field
         nested_fields
     }
 
     /// Remove any fields that could be None. If a parent could be None, then remove all children.
-    pub(crate) fn remove_none_fields(&self, keep_topmost_none: bool) -> Option<StructOrTuple> {
+    pub fn remove_none_fields(&self, keep_topmost_none: bool) -> Option<StructOrTuple> {
         if !keep_topmost_none && self.could_be_none {
             return None;
         }
@@ -184,7 +184,7 @@ impl StructOrTuple {
     }
 
     /// Create a tuple representing dependencies present in both tuples, keeping the more specific dependency if there is one
-    pub(crate) fn intersect(
+    pub fn intersect(
         tuple1: &StructOrTuple,
         tuple2: &StructOrTuple,
     ) -> Option<StructOrTuple> {
@@ -235,7 +235,7 @@ impl StructOrTuple {
     }
 
     /// Find the intersection between all tuples (calling intersect n-1 times)
-    pub(crate) fn intersect_tuples(tuples: &[StructOrTuple]) -> Option<StructOrTuple> {
+    pub fn intersect_tuples(tuples: &[StructOrTuple]) -> Option<StructOrTuple> {
         if tuples.is_empty() {
             return None;
         }
@@ -254,7 +254,7 @@ impl StructOrTuple {
     /// Find the fields where all tuples have a dependency, regardless of what that dependency is.
     /// For each such field, record the dependency index of each tuple.
     /// Return an array of such arrays
-    pub(crate) fn intersect_dependencies_with_matching_fields(
+    pub fn intersect_dependencies_with_matching_fields(
         tuples: &[StructOrTuple],
     ) -> Vec<Vec<StructOrTupleIndex>> {
         let mut intersections = Vec::new();
@@ -322,7 +322,7 @@ impl StructOrTuple {
         intersections
     }
 
-    pub(crate) fn index_intersection(
+    pub fn index_intersection(
         index1: &StructOrTupleIndex,
         index2: &StructOrTupleIndex,
     ) -> Option<StructOrTupleIndex> {
@@ -343,7 +343,7 @@ impl StructOrTuple {
         Some(index2.clone())
     }
 
-    pub(crate) fn union(tuple1: &StructOrTuple, tuple2: &StructOrTuple) -> Option<StructOrTuple> {
+    pub fn union(tuple1: &StructOrTuple, tuple2: &StructOrTuple) -> Option<StructOrTuple> {
         if tuple1.is_empty() && tuple2.is_empty() {
             return None;
         }
@@ -384,7 +384,7 @@ impl StructOrTuple {
     ///
     /// The parent's dependencies are absolute (dependency on an input to the node);
     /// the child's dependencies are relative (dependency within the function).
-    pub(crate) fn project_parent(
+    pub fn project_parent(
         parent: &StructOrTuple,
         child: &StructOrTuple,
     ) -> Option<StructOrTuple> {
@@ -422,7 +422,7 @@ impl StructOrTuple {
         }
     }
 
-    pub(crate) fn to_syn_expr(mut tuple: syn::Expr, indices: &StructOrTupleIndex) -> syn::Expr {
+    pub fn to_syn_expr(mut tuple: syn::Expr, indices: &StructOrTupleIndex) -> syn::Expr {
         for index in indices {
             let member = if let Ok(num_index) = index.parse::<usize>() {
                 syn::Member::Unnamed(syn::Index::from(num_index))
@@ -829,9 +829,9 @@ impl Visit<'_> for EqualityAnalysis {
 }
 
 #[derive(Default)]
-pub(crate) struct AnalyzeClosure {
-    found_closure: bool, // Used to avoid executing visit_pat on anything but the function body
-    pub(crate) output_dependencies: StructOrTuple,
+pub struct AnalyzeClosure {
+    pub found_closure: bool, // Used to avoid executing visit_pat on anything but the function body
+    pub output_dependencies: StructOrTuple,
 }
 
 impl Visit<'_> for AnalyzeClosure {

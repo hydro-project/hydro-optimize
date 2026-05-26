@@ -293,9 +293,9 @@ async fn track_cluster_metrics(
     cluster_to_metrics
 }
 
-struct ScriptSidecar {
-    script: String,
-    prefix: String,
+pub struct ScriptSidecar {
+    pub script: String,
+    pub prefix: String,
 }
 
 impl Sidecar for ScriptSidecar {
@@ -338,7 +338,7 @@ impl Sidecar for ScriptSidecar {
 
 #[derive(Default, Clone)]
 pub struct ReusableClusters {
-    named_clusters: Vec<(LocationId, String, usize)>,
+    pub named_clusters: Vec<(LocationId, String, usize)>,
 }
 
 impl ReusableClusters {
@@ -377,7 +377,7 @@ impl ReusableClusters {
 
 #[derive(Default, Clone)]
 pub struct ReusableProcesses {
-    named_processes: Vec<(LocationId, String)>,
+    pub named_processes: Vec<(LocationId, String)>,
 }
 
 impl ReusableProcesses {
@@ -443,10 +443,10 @@ pub fn make_output_dir(name: &str, workload: &str, label: &str) -> std::path::Pa
 
 #[derive(Clone, Default)]
 pub struct Optimizations {
-    decoupling: bool,
-    partitioning: bool,
-    kind: OptimizationKind,
-    exclude: HashSet<LocationId>,
+    pub decoupling: bool,
+    pub partitioning: bool,
+    pub kind: OptimizationKind,
+    pub exclude: HashSet<LocationId>,
 }
 
 impl Optimizations {
