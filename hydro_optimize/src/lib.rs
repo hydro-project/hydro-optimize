@@ -37,11 +37,11 @@ mod test_init {
 }
 
 pub mod decouple_analysis;
-pub mod rewriter;
 pub mod deploy;
 pub mod deploy_and_analyze;
 pub mod greedy_decouple_analysis;
 pub mod parse_results;
+pub mod rewriter;
 // pub mod partial_partitioner;
 pub mod partition_ilp_analysis;
 pub mod partition_node_analysis;

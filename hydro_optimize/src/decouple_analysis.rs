@@ -125,7 +125,7 @@ fn var_from_op_id(
     variables: &mut ProblemVariables,
     constraints: &mut Vec<Constraint>,
 ) -> HashMap<usize, Variable> {
-    let result = op_id_to_var
+    op_id_to_var
         .entry(op_id)
         .or_insert_with(|| {
             let mut loc_to_var = HashMap::new();
@@ -143,8 +143,7 @@ fn var_from_op_id(
             constraints.push(constraint!(sum_expr == 1));
             loc_to_var
         })
-        .clone();
-    result
+        .clone()
 }
 
 fn add_equality_constr(
@@ -914,8 +913,8 @@ pub(crate) fn decouple_analysis(
         .collect();
 
     // Read per-location partition counts from the ILP solution
-    for loc in 0..max_num_locations {
-        for (n, &var) in is_n_partitions[loc].iter().enumerate() {
+    for (loc, partitions) in is_n_partitions.iter().enumerate().take(max_num_locations) {
+        for (n, &var) in partitions.iter().enumerate() {
             if solution.value(var).round() == 1.0 && n > 1 {
                 result.num_partitions.insert(loc, n);
                 break;

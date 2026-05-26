@@ -107,20 +107,22 @@ async fn main() {
                 optimizations = optimizations.with_bottleneck_elimination();
             }
 
-            (builder, BenchmarkConfig {
-                name: "Paxos".to_string(),
-                workload: "default".to_string(),
-                clusters,
-                processes,
-                optimizations,
-                location_id_to_cluster,
-                num_physical_clients: num_clients,
-                start_virtual_clients: 1,
-                virtual_clients_step: 10,
-                num_runs: 1,
-                fix_virtual_clients: None,
-                calibrate_message_size: None,
-            })
+            (
+                builder,
+                BenchmarkConfig {
+                    name: "Paxos".to_string(),
+                    workload: "default".to_string(),
+                    clusters,
+                    processes,
+                    optimizations,
+                    location_id_to_cluster,
+                    num_physical_clients: num_clients,
+                    start_virtual_clients: 1,
+                    virtual_clients_step: 10,
+                    num_runs: 1,
+                    calibrate_message_size: None,
+                },
+            )
         },
     )
     .await;

@@ -74,13 +74,14 @@ pub fn cas_bench<'a>(
 
             let cas_output = cas.build(writes, reads, clients.source_iter(q!([])), clients);
 
-            let write_results = cas_output
-                .write_processed
-                .entries()
-                .map(q!(|(request_id, successful)| (
-                    request_id.virtual_client_id,
-                    successful
-                )));
+            let write_results =
+                cas_output
+                    .write_processed
+                    .entries()
+                    .map(q!(|(request_id, successful)| (
+                        request_id.virtual_client_id,
+                        successful
+                    )));
             let read_results = cas_output
                 .read_result
                 .entries()

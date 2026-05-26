@@ -86,7 +86,7 @@ impl ReusableHosts {
         match &self.host_type {
             InitializedHostType::Gcp { .. } => GCP_NUM_CORES,
             InitializedHostType::Aws { .. } => AWS_NUM_CORES,
-            InitializedHostType::Localhost => LOCAL_NUM_CORES, 
+            InitializedHostType::Localhost => LOCAL_NUM_CORES,
         }
     }
 
@@ -184,13 +184,7 @@ impl ReusableHosts {
         perf: bool,
     ) -> Vec<TrybuildHost> {
         (0..num_hosts)
-            .map(|i| {
-                self.get_process_host(
-                    deployment,
-                    format!("{}{}", cluster_name, i),
-                    perf,
-                )
-            })
+            .map(|i| self.get_process_host(deployment, format!("{}{}", cluster_name, i), perf))
             .collect()
     }
 }

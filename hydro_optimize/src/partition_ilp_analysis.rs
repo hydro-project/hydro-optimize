@@ -1067,7 +1067,7 @@ pub(crate) fn apply_budget_constraints(
     let big_m = 1000.0_f64;
     let mut total_machines = Expression::default();
 
-    for loc in 0..max_num_locations {
+    for (loc, loc_used_var) in loc_used.iter().enumerate().take(max_num_locations) {
         let mut vars_for_loc = Vec::with_capacity(budget + 1);
         let mut sum_vars = Expression::default();
 
@@ -1102,9 +1102,9 @@ pub(crate) fn apply_budget_constraints(
             )));
 
             if num_partitions == 0 {
-                constraints.push(constraint!(has_n_partitions == 1 - loc_used[loc]));
+                constraints.push(constraint!(has_n_partitions == 1 - *loc_used_var));
             } else {
-                constraints.push(constraint!(has_n_partitions <= loc_used[loc]));
+                constraints.push(constraint!(has_n_partitions <= *loc_used_var));
                 let scale = 1.0 / num_partitions as f64;
                 let penalty = big_m * (1 - has_n_partitions);
                 constraints.push(constraint!(

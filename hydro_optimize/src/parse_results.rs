@@ -502,10 +502,10 @@ pub fn find_latest_iteration(base_dir: &Path, name: &str) -> Option<usize> {
             let n = e.file_name().to_string_lossy().to_string();
             if n.starts_with(&prefix) && n.ends_with(&suffix) {
                 // Only count dirs that actually have CSV files
-                let has_csvs = std::fs::read_dir(e.path())
-                    .into_iter()
-                    .flatten()
-                    .any(|f| f.ok().is_some_and(|f| f.file_name().to_string_lossy().ends_with(".csv")));
+                let has_csvs = std::fs::read_dir(e.path()).into_iter().flatten().any(|f| {
+                    f.ok()
+                        .is_some_and(|f| f.file_name().to_string_lossy().ends_with(".csv"))
+                });
                 if !has_csvs {
                     return None;
                 }
@@ -1248,13 +1248,7 @@ pub async fn analyze_cluster_results(
     for ((location, name, idx), mut metrics) in cluster_metrics.drain() {
         set.spawn(async move {
             println!("Analyzing cluster {:?}: {}", name, idx);
-            let (
-                sar_stats,
-                op_to_count,
-                throughputs,
-                latencies,
-                byte_sizes,
-            ) = tokio::join!(
+            let (sar_stats, op_to_count, throughputs, latencies, byte_sizes) = tokio::join!(
                 async { parse_sar_output(drain_receiver(&mut metrics.sar).await) },
                 async { parse_counter_usage(drain_receiver(&mut metrics.counters).await) },
                 async { parse_throughput(drain_receiver(&mut metrics.throughputs).await) },
@@ -1276,14 +1270,8 @@ pub async fn analyze_cluster_results(
     // Join metric drain tasks
     let mut drained: HashMap<(LocationId, String), Vec<_>> = HashMap::new();
     while let Some(result) = set.join_next().await {
-        let (
-            (id, name, _idx),
-            sar_stats,
-            op_to_count,
-            throughputs,
-            latencies,
-            byte_sizes,
-        ) = result.unwrap();
+        let ((id, name, _idx), sar_stats, op_to_count, throughputs, latencies, byte_sizes) =
+            result.unwrap();
         drained.entry((id, name)).or_default().push((
             sar_stats,
             op_to_count,

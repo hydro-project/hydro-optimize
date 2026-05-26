@@ -707,6 +707,7 @@ pub fn apply_loaded_rewrites<'a>(
 /// Applies the greedy-decoupled rewrite (blow-up analysis). Returns the new IR, updated
 /// clusters (with any newly created decouple clusters), location → original op ids map,
 /// and the pre-rewrite parent map (for inferring counters after deployment).
+#[allow(clippy::type_complexity)]
 fn apply_blow_up_analysis<'a>(
     built: BuiltFlow<'a>,
     clusters: &mut ReusableClusters,
@@ -861,7 +862,9 @@ async fn run_scaling_loop<'a>(
             run += 1;
             final_run_metadata = run_metadata;
 
-            if matches!(optimizations.kind, OptimizationKind::SizeAnalysis) || config.calibrate_message_size.is_some() {
+            if matches!(optimizations.kind, OptimizationKind::SizeAnalysis)
+                || config.calibrate_message_size.is_some()
+            {
                 break 'outer;
             }
         }
