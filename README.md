@@ -2,11 +2,40 @@
 
 Automatically apply decoupling and partitioning to Hydro programs for higher throughput.
 
-> ![NOTE]
+> [!NOTE]
 > Only Linux is supported, as we compile with `glibc` for better performance and more legibile `perf` results.
 
 
 ## Installation
+
+### Permissions
+The Linux machine on which you are running hydro-optimize will need permissions to launch VMs. If this is your local machine, you can simply sign into your AWS account locally; otherwise you will need to grant the remote machine the appropriate permissions.
+
+#### AWS EC2
+The launch instance types are specified in `deploy.rs`.
+Since we use `glibc` for compilation, we need to launch from a machine with the same `glibc` version as the destination, which currently is an Amazon Linux 2023 instance.
+Do not use the latest Ubuntu machine to launch for this reason.
+1. Go to AWS IAM Roles > Create role.
+2. Select "EC2" as the Use case.
+3. Add "AmazonEC2FullAccess" as the Permission policy.
+4. Give it a name (I named it "EC2FullRole"). 
+5. Go to the Instance you are running hydro-optimize from, Actions > Security > Modify IAM role.
+6. Give it the EC2FullRole.
+
+#### GCP Compute Engine
+TODO
+
+### Terraform
+Terraform is used to spin up machines.
+```bash
+sudo apt-get update && sudo apt-get install -y gnupg software-properties-common
+wget -O- https://apt.releases.hashicorp.com/gpg | \
+gpg --dearmor | \
+sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg > /dev/null
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(grep -oP '(?<=UBUNTU_CODENAME=).*' /etc/os-release || lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+sudo apt update
+sudo apt-get install terraform
+```
 
 ### ILP Solver
 We rely on the [Gurobi](https://www.gurobi.com/) ILP solver to find the optimal set of rewrites.
