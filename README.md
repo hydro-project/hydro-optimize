@@ -8,13 +8,21 @@ Automatically apply decoupling and partitioning to Hydro programs for higher thr
 
 ## Installation
 
+### Rust
+Install Rust. Install `rust-analyzer` as well if you plan on editing the code in an IDE.
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.bashrc
+rustup component add rust-analyzer
+```
+
 ### Permissions
 The Linux machine on which you are running hydro-optimize will need permissions to launch VMs. If this is your local machine, you can simply sign into your AWS account locally; otherwise you will need to grant the remote machine the appropriate permissions.
 
 #### AWS EC2
 The launch instance types are specified in `deploy.rs`.
 Since we use `glibc` for compilation, we need to launch from a machine with the same `glibc` version as the destination, which currently is an Amazon Linux 2023 instance.
-Do not use the latest Ubuntu machine to launch for this reason.
+Do not use another Linux machine to launch for this reason.
 1. Go to AWS IAM Roles > Create role.
 2. Select "EC2" as the Use case.
 3. Add "AmazonEC2FullAccess" as the Permission policy.
@@ -27,14 +35,11 @@ TODO
 
 ### Terraform
 Terraform is used to spin up machines.
+These are instructions for Amazon Linux machines; refer to [the official site](https://developer.hashicorp.com/terraform/tutorials/aws-get-started/install-cli) for your architecture.
 ```bash
-sudo apt-get update && sudo apt-get install -y gnupg software-properties-common
-wget -O- https://apt.releases.hashicorp.com/gpg | \
-gpg --dearmor | \
-sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg > /dev/null
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(grep -oP '(?<=UBUNTU_CODENAME=).*' /etc/os-release || lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
-sudo apt update
-sudo apt-get install terraform
+sudo dnf install -y dnf-plugins-core
+sudo dnf config-manager --add-repo https://rpm.releases.hashicorp.com/AmazonLinux/hashicorp.repo
+sudo dnf -y install terraform
 ```
 
 ### ILP Solver

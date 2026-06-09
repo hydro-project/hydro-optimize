@@ -87,7 +87,7 @@ fn run_benchmark<'a>(write_ratio: usize, optimize: bool) -> (FlowBuilder<'a>, Be
             start_virtual_clients: 1,
             virtual_clients_step: VIRTUAL_CLIENTS_STEP,
             num_runs: 1,
-            calibrate_message_size: None,
+            calibrate_message_sizes: None,
         },
     )
 }

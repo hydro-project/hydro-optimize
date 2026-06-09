@@ -34,58 +34,54 @@ struct Args {
 async fn main() {
     let args = Args::parse();
 
-    for &size in CALIBRATION_SIZES {
-        println!("=== Calibrating message_size={} ===", size);
+    benchmark_protocol(
+        BenchmarkArgs {
+            gcp: args.gcp.clone(),
+            aws: args.aws,
+        },
+        move || {
+            let mut builder = FlowBuilder::new();
+            let server = builder.process::<Server>();
+            let clients = builder.process::<Client>();
+            let client_id = clients.id();
 
-        benchmark_protocol(
-            BenchmarkArgs {
-                gcp: args.gcp.clone(),
-                aws: args.aws,
-            },
-            move || {
-                let mut builder = FlowBuilder::new();
-                let server = builder.process::<Server>();
-                let clients = builder.process::<Client>();
-                let client_id = clients.id();
+            let location_id_to_cluster = HashMap::from([
+                (server.id(), "server".to_string()),
+                (client_id.clone(), "client".to_string()),
+            ]);
 
-                let location_id_to_cluster = HashMap::from([
-                    (server.id(), "server".to_string()),
-                    (client_id.clone(), "client".to_string()),
-                ]);
+            // Dummy code. Just need to make sure that the server receives and sends.
+            // The actual message generation is done by the Hydro IR.
+            clients
+                .source_iter(q!(vec![0usize]))
+                .send(&server, TCP.fail_stop().bincode())
+                .send(&clients, TCP.fail_stop().bincode());
 
-                // Dummy code. Just need to make sure that the server receives and sends.
-                // The actual message generation is done by the Hydro IR.
-                clients
-                    .source_iter(q!(vec![0usize]))
-                    .send(&server, TCP.fail_stop().bincode())
-                    .send(&clients, TCP.fail_stop().bincode());
+            let clusters = ReusableClusters::default();
+            let processes = ReusableProcesses::default()
+                .with_process(server)
+                .with_process(clients);
+            let optimizations = Optimizations::default().excluding(client_id);
 
-                let clusters = ReusableClusters::default();
-                let processes = ReusableProcesses::default()
-                    .with_process(server)
-                    .with_process(clients);
-                let optimizations = Optimizations::default().excluding(client_id);
-
-                (
-                    builder,
-                    BenchmarkConfig {
-                        name: format!("Network_{}b", size),
-                        workload: "default".to_string(),
-                        clusters,
-                        processes,
-                        optimizations,
-                        location_id_to_cluster,
-                        num_physical_clients: 1,
-                        start_virtual_clients: 1,
-                        virtual_clients_step: 1,
-                        num_runs: 1,
-                        calibrate_message_size: Some(size),
-                    },
-                )
-            },
-        )
-        .await;
-    }
+            (
+                builder,
+                BenchmarkConfig {
+                    name: "Network".to_string(),
+                    workload: "default".to_string(),
+                    clusters,
+                    processes,
+                    optimizations,
+                    location_id_to_cluster,
+                    num_physical_clients: 1,
+                    start_virtual_clients: 1,
+                    virtual_clients_step: 1,
+                    num_runs: 1,
+                    calibrate_message_sizes: Some(CALIBRATION_SIZES.to_vec()),
+                },
+            )
+        },
+    )
+    .await;
 
     println!("=== Calibration complete ===");
 }

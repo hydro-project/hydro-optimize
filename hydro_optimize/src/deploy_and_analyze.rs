@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
-use hydro_deploy::Deployment;
+use hydro_deploy::{Deployment, HYDRO_NET_CALIBRATE_ENV};
 use hydro_lang::compile::built::BuiltFlow;
 use hydro_lang::compile::deploy::DeployResult;
 use hydro_lang::compile::ir::{HydroNode, HydroRoot, deep_clone, traverse_dfir};
@@ -586,6 +586,7 @@ pub struct BenchmarkArgs {
     pub aws: bool,
 }
 
+#[derive(Clone)]
 pub struct BenchmarkConfig {
     pub name: String,
     /// Workload variant (e.g. "read_heavy"). Determines output subdirectory name.
@@ -601,7 +602,7 @@ pub struct BenchmarkConfig {
     pub num_runs: usize,
     /// If set, enables network calibration mode: sets `HYDRO_NET_CALIBRATE=<size>`
     /// on all hosts and forces single-host deployment.
-    pub calibrate_message_size: Option<usize>,
+    pub calibrate_message_sizes: Option<Vec<usize>>,
 }
 
 pub const START_MEASUREMENT_SECOND: usize = 30;
@@ -865,7 +866,7 @@ async fn run_scaling_loop<'a>(
             final_run_metadata = run_metadata;
 
             if matches!(optimizations.kind, OptimizationKind::SizeAnalysis)
-                || config.calibrate_message_size.is_some()
+                || config.calibrate_message_sizes.is_some()
             {
                 break 'outer;
             }
@@ -1167,8 +1168,7 @@ pub async fn benchmark_protocol<'a>(
         "Must run at least one iteration of the benchmark"
     );
 
-    if let Some(size) = config.calibrate_message_size {
-        reusable_hosts.insert_env("HYDRO_NET_CALIBRATE".to_string(), size.to_string());
+    if config.calibrate_message_sizes.is_some() {
         reusable_hosts.set_single_host(true);
     }
 
@@ -1189,17 +1189,39 @@ pub async fn benchmark_protocol<'a>(
         _ => panic!("Explicit optimization kinds are no longer allowed as parameters"),
     };
 
-    let final_run_metadata = run_scaling_loop(
-        &mut reusable_hosts,
-        &mut deployment,
-        &built,
-        &config,
-        &Optimizations::default(),
-        &HashMap::new(),
-        None,
-        &HashSet::new(),
-    )
-    .await;
+    // Run a loop for each network calibration size, if provided
+    let final_run_metadata = if let Some(ref sizes) = config.calibrate_message_sizes {
+        let mut last_metadata = RunMetadata::default();
+        for &size in sizes {
+            reusable_hosts.insert_env(HYDRO_NET_CALIBRATE_ENV.to_string(), size.to_string());
+            let mut iter_config = config.clone();
+            iter_config.name = format!("{}_{}b", config.name, size);
+            last_metadata = run_scaling_loop(
+                &mut reusable_hosts,
+                &mut deployment,
+                &built,
+                &iter_config,
+                &Optimizations::default(),
+                &HashMap::new(),
+                None,
+                &HashSet::new(),
+            )
+            .await;
+        }
+        last_metadata
+    } else {
+        run_scaling_loop(
+            &mut reusable_hosts,
+            &mut deployment,
+            &built,
+            &config,
+            &Optimizations::default(),
+            &HashMap::new(),
+            None,
+            &HashSet::new(),
+        )
+        .await
+    };
 
     (deep_clone(built.ir()), final_run_metadata)
 }
