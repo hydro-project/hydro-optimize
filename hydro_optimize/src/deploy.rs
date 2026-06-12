@@ -36,8 +36,8 @@ pub struct ReusableHosts {
 }
 
 // Note: Aws AMIs vary by region. If you are changing the region, please also change the AMI.
-const AWS_REGION: &str = "us-west-2";
-const AWS_INSTANCE_AMI: &str = "ami-055a9df0c8c9f681c"; // Amazon Linux 2
+const AWS_REGION: &str = "us-east-1";
+const AWS_INSTANCE_AMI: &str = "ami-0521cb2d60cfbb1a6"; // Amazon Linux 2023
 const AWS_INSTANCE_TYPE: &str = "m5.2xlarge"; // 8 vCPU, 32 GB RAM
 const AWS_NUM_CORES: usize = 8; // Used for pinning
 /// m5.2xlarge: up to 10 Gbps network bandwidth
