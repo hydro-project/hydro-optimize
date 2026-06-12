@@ -608,7 +608,7 @@ pub struct BenchmarkConfig {
 pub const START_MEASUREMENT_SECOND: usize = 30;
 pub const MEASUREMENT_SECOND: usize = 59;
 pub const RUN_SECONDS: usize = 90;
-pub const NUM_PHYSICAL_CLIENTS: usize = 10;
+pub const NUM_PHYSICAL_CLIENTS: usize = 5;
 pub const VIRTUAL_CLIENTS_STEP: usize = 50; // Can tweak to get finer-grained numbers
 pub const NUM_VIRTUAL_CLIENTS_ENV: &str = "NUM_VIRTUAL_CLIENTS";
 pub const NUM_RUNS_NO_THROUGHPUT: usize = 3;
