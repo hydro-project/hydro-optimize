@@ -1281,35 +1281,38 @@ pub async fn analyze_cluster_results(
         ));
     }
 
-    // Merge metrics across nodes in each cluster
-    for (id, name, _cluster) in nodes.get_all_clusters() {
-        let cluster_data = drained.get(&(id.clone(), name.to_string())).unwrap();
+    // Merge metrics across nodes in each cluster and process
+    let all_nodes = nodes.get_all_clusters().map(|(id, name, _)| (id, name))
+        .chain(nodes.get_all_processes().map(|(id, name, _)| (id, name)));
 
-        let mut max_sar: Vec<SarStats> = vec![];
-        let mut max_counters: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (id, name) in all_nodes {
+        if let Some(cluster_data) = drained.get(&(id.clone(), name.to_string())) {
+            let mut max_sar: Vec<SarStats> = vec![];
+            let mut max_counters: HashMap<usize, Vec<usize>> = HashMap::new();
 
-        for (sar_stats, counters, _, _, byte_sizes) in cluster_data {
-            merge_max_vec(&mut max_sar, sar_stats, SarStats::max);
-            for (op_id, rates) in counters {
-                let entry = max_counters.entry(*op_id).or_default();
-                merge_max_vec(entry, rates, usize::max);
+            for (sar_stats, counters, _, _, byte_sizes) in cluster_data {
+                merge_max_vec(&mut max_sar, sar_stats, SarStats::max);
+                for (op_id, rates) in counters {
+                    let entry = max_counters.entry(*op_id).or_default();
+                    merge_max_vec(entry, rates, usize::max);
+                }
+                for (op_id, sizes) in byte_sizes {
+                    run_metadata
+                        .byte_sizes
+                        .entry(*op_id)
+                        .or_default()
+                        .extend(sizes);
+                }
             }
-            for (op_id, sizes) in byte_sizes {
-                run_metadata
-                    .byte_sizes
-                    .entry(*op_id)
-                    .or_default()
-                    .extend(sizes);
+
+            for (op_id, rates) in max_counters {
+                let entry = op_to_count.entry(op_id).or_default();
+                merge_max_vec(entry, &rates, usize::max);
             }
-        }
 
-        for (op_id, rates) in max_counters {
-            let entry = op_to_count.entry(op_id).or_default();
-            merge_max_vec(entry, &rates, usize::max);
-        }
-
-        if !max_sar.is_empty() {
-            run_metadata.sar_stats.insert(id.clone(), max_sar);
+            if !max_sar.is_empty() {
+                run_metadata.sar_stats.insert(id.clone(), max_sar);
+            }
         }
     }
 
