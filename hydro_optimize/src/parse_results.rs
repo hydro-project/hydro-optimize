@@ -234,7 +234,6 @@ pub fn load_raw_ilp_inputs(base_dir: &Path, name: &str) -> RawIlpInputs {
     let counters_dirs = find_workload_dirs(base_dir, name, OptimizationKind::CountersOnly.label());
     let perf_dirs = find_workload_dirs(base_dir, name, OptimizationKind::PerfOnly.label());
 
-    assert!(!blow_up_dirs.is_empty(), "No blow_up dirs for '{}'", name);
     assert!(!size_dirs.is_empty(), "No size dirs for '{}'", name);
     assert!(!counters_dirs.is_empty(), "No counters dirs for '{}'", name);
     assert!(!perf_dirs.is_empty(), "No perf dirs for '{}'", name);
@@ -253,20 +252,6 @@ pub fn load_raw_ilp_inputs(base_dir: &Path, name: &str) -> RawIlpInputs {
             }
         }
     }
-
-    let op_output_sizes = max_across_dirs(&size_dirs, |dir| {
-        let path = dir.join("size_analysis.json");
-        if path.exists() {
-            load_json(&path)
-        } else {
-            HashMap::new()
-        }
-    });
-    let op_counts = max_across_dirs(&counters_dirs, |dir| {
-        load_json_for_best_csv(dir, "counters")
-    });
-    let perf = max_across_dirs(&perf_dirs, |dir| load_json_for_best_csv(dir, "perf"));
-
     // Convert blow-up stats to per-op memory/IO
     let mut per_op_blow_up: HashMap<usize, SarStats> = HashMap::new();
     for stats in blow_up_stats.values() {
@@ -281,6 +266,19 @@ pub fn load_raw_ilp_inputs(base_dir: &Path, name: &str) -> RawIlpInputs {
         }
     }
 
+    let op_output_sizes = max_across_dirs(&size_dirs, |dir| {
+        let path = dir.join("size_analysis.json");
+        if path.exists() {
+            load_json(&path)
+        } else {
+            HashMap::new()
+        }
+    });
+    let op_counts = max_across_dirs(&counters_dirs, |dir| {
+        load_json_for_best_csv(dir, "counters")
+    });
+    let perf = max_across_dirs(&perf_dirs, |dir| load_json_for_best_csv(dir, "perf"));
+
     RawIlpInputs {
         per_op_blow_up,
         op_output_sizes,
@@ -294,9 +292,9 @@ pub fn load_raw_ilp_inputs(base_dir: &Path, name: &str) -> RawIlpInputs {
 /// Averages cost-per-message across all runs for each (message_size, num_sockets) pair.
 /// Clients are converted to sockets: num_sockets = num_clients * 2.
 pub fn load_calibration_table(calibration_dir: &Path) -> NetworkCostTable {
-    let dir_regex = Regex::new(r"^Network_(\d+)b_(\d+)c_default_none$").unwrap();
-    // Accumulate per (num_sockets, msg_size) -> Vec<SarStats> across runs
-    let mut per_key: HashMap<(usize, u64), Vec<SarStats>> = HashMap::new();
+    let dir_regex = Regex::new(r"^Network_(\d+)b_default_none$").unwrap();
+    // Accumulate per msg_size -> Vec<SarStats> across runs
+    let mut per_key: HashMap<u64, Vec<SarStats>> = HashMap::new();
 
     for entry in fs::read_dir(calibration_dir).expect("Failed to read calibration directory") {
         let entry = entry.unwrap();
@@ -306,16 +304,6 @@ pub fn load_calibration_table(calibration_dir: &Path) -> NetworkCostTable {
             continue;
         };
         let msg_size = cap[1].parse::<u64>().unwrap();
-        let num_clients = cap[2].parse::<usize>().unwrap();
-        // Empirically, avg active sockets per tick is ~1 less than num_clients for 4 clients.
-        // For 10 clients, source stats aren't recorded but behave similarly to sink.
-        // Encode 4 clients as 3 sockets, 10 clients as 10 sockets (sink-only measurement).
-        // Multiply by 2 for both directions (source + sink).
-        let num_sockets = match num_clients {
-            4 => 3 * 2,
-            10 => 10 * 2,
-            _ => continue,
-        };
 
         let dir_path = entry.path();
         let server_files: Vec<_> = fs::read_dir(&dir_path)
@@ -358,7 +346,7 @@ pub fn load_calibration_table(calibration_dir: &Path) -> NetworkCostTable {
             let throughput = (sum_thr / n) as usize;
             if throughput > 0 {
                 per_key
-                    .entry((num_sockets, msg_size))
+                    .entry(msg_size)
                     .or_default()
                     .push(SarStats {
                         cpu: (sum_cpu / n) / throughput as f64,
@@ -371,9 +359,9 @@ pub fn load_calibration_table(calibration_dir: &Path) -> NetworkCostTable {
         }
     }
 
-    // Average across runs for each (num_sockets, msg_size)
-    let mut entries: HashMap<usize, Vec<(u64, SarStats)>> = HashMap::new();
-    for ((num_sockets, msg_size), stats_vec) in per_key {
+    // Average across runs for each msg_size
+    let mut entries: HashMap<u64, SarStats> = HashMap::new();
+    for (msg_size, stats_vec) in per_key {
         let n = stats_vec.len() as f64;
         let avg = SarStats {
             cpu: stats_vec.iter().map(|s| s.cpu).sum::<f64>() / n,
@@ -382,10 +370,7 @@ pub fn load_calibration_table(calibration_dir: &Path) -> NetworkCostTable {
             memory: 0.0,
             io: 0.0,
         };
-        entries
-            .entry(num_sockets)
-            .or_default()
-            .push((msg_size, avg));
+        entries.insert(msg_size, avg);
     }
 
     assert!(
@@ -393,11 +378,10 @@ pub fn load_calibration_table(calibration_dir: &Path) -> NetworkCostTable {
         "No calibration data found in {:?}",
         calibration_dir
     );
-    let total: usize = entries.values().map(|v| v.len()).sum();
+    let total = entries.len();
     println!(
-        "Loaded {} calibration points across {} socket counts",
-        total,
-        entries.len()
+        "Loaded {} calibration points",
+        total
     );
     NetworkCostTable::from_calibration(entries)
 }
@@ -549,88 +533,36 @@ pub fn get_csvs_in_dir(dir: &Path) -> Vec<fs::DirEntry> {
         .collect()
 }
 
-/// Lookup table mapping (message_size, num_sockets) → per-message resource costs.
-/// Stores a precomputed linear model per message size: cost = slope * num_sockets + intercept.
+/// Lookup table mapping message_size → per-message resource costs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkCostTable {
     /// Sorted by message_size.
     entries: Vec<NetworkCostEntry>,
 }
 
-/// Linear model for a single message size: cost = slope * num_sockets + intercept.
+/// Calibration cost for a single message size.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct NetworkCostEntry {
     message_size: u64,
-    slope: SarStats,
-    intercept: SarStats,
+    cost: SarStats,
 }
 
 impl NetworkCostTable {
-    pub fn from_calibration(raw: HashMap<usize, Vec<(u64, SarStats)>>) -> Self {
-        let mut tables = raw;
-        for table in tables.values_mut() {
-            table.sort_by_key(|(size, _)| *size);
-            for (_, stats) in table.iter_mut() {
-                *stats = stats.scale(0.5);
-            }
-        }
-
-        let mut keys: Vec<usize> = tables.keys().copied().collect();
-        keys.sort();
-
-        assert!(
-            keys.len() >= 2,
-            "At least 2 physical client configurations required for network cost interpolation"
-        );
-
-        let lo_k = keys[0];
-        let hi_k = *keys.last().unwrap();
-        let lo_table = &tables[&lo_k];
-        let hi_table = &tables[&hi_k];
-        let denom = (hi_k - lo_k) as f64;
-        // Only use message sizes present in both tables
-        let hi_sizes: HashSet<u64> = hi_table.iter().map(|(s, _)| *s).collect();
-        let entries: Vec<NetworkCostEntry> = lo_table
-            .iter()
-            .filter(|(msg_size, _)| hi_sizes.contains(msg_size))
-            .map(|&(msg_size, cost_lo)| {
-                let cost_hi = hi_table.iter().find(|(s, _)| *s == msg_size).unwrap().1;
-                let slope = SarStats {
-                    cpu: (cost_hi.cpu - cost_lo.cpu) / denom,
-                    cpu_user: (cost_hi.cpu_user - cost_lo.cpu_user) / denom,
-                    network: 0.0,
-                    memory: 0.0,
-                    io: 0.0,
-                };
-                let intercept = SarStats {
-                    cpu: cost_lo.cpu - slope.cpu * lo_k as f64,
-                    cpu_user: cost_lo.cpu_user - slope.cpu_user * lo_k as f64,
-                    network: cost_lo.network, // Note: This is not scaled. Number of physical clients should have no effect
-                    memory: 0.0,
-                    io: 0.0,
-                };
-                NetworkCostEntry {
-                    message_size: msg_size,
-                    slope,
-                    intercept,
-                }
+    pub fn from_calibration(raw: HashMap<u64, SarStats>) -> Self {
+        let mut entries: Vec<NetworkCostEntry> = raw
+            .into_iter()
+            .map(|(message_size, cost)| NetworkCostEntry {
+                message_size,
+                cost: cost.scale(0.5),
             })
             .collect();
 
-        for entry in &entries {
-            assert!(
-                entry.slope.cpu >= 0.0 && entry.slope.cpu_user >= 0.0,
-                "Negative slope for message_size={}: {:?}",
-                entry.message_size,
-                entry.slope
-            );
-        }
-
+        entries.sort_by_key(|e| e.message_size);
         Self { entries }
     }
 
-    /// Returns the cost per message for the given message size and socket count.
-    pub fn cost_per_message(&self, message_size_bytes: u64, num_sockets: usize) -> SarStats {
+    /// Returns the cost per message for the given message size
+    fn cost_per_message(&self, message_size_bytes: u64) -> SarStats {
         let n = self.entries.len();
         if n == 0 {
             return SarStats::default();
@@ -643,14 +575,7 @@ impl NetworkCostTable {
                 .partition_point(|e| e.message_size <= message_size_bytes);
             &self.entries[if i >= n { n - 1 } else { i }]
         };
-        let x = num_sockets.max(1) as f64;
-        SarStats {
-            cpu: (entry.slope.cpu * x + entry.intercept.cpu).max(0.0),
-            cpu_user: (entry.slope.cpu_user * x + entry.intercept.cpu_user).max(0.0),
-            network: (entry.slope.network * x + entry.intercept.network).max(0.0),
-            memory: 0.0,
-            io: 0.0,
-        }
+        entry.cost
     }
 
     /// Total resource cost for sending `count` messages of `message_size_bytes` each.
@@ -658,9 +583,8 @@ impl NetworkCostTable {
         &self,
         count: usize,
         message_size_bytes: u64,
-        num_sockets: usize,
     ) -> SarStats {
-        self.cost_per_message(message_size_bytes, num_sockets)
+        self.cost_per_message(message_size_bytes)
             .scale(count as f64)
     }
 }
@@ -973,9 +897,9 @@ fn avg_over<T>(slice: &[T], f: impl Fn(&T) -> f64) -> f64 {
 /// Per-second SAR statistics
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 pub struct SarStats {
-    /// Max single-core CPU usage (user + system %)
+    /// Max single-core CPU usage (user + system %), out of 100
     pub cpu: f64,
-    /// Max single-core CPU user % only (excludes system)
+    /// Max single-core CPU user % only (excludes system), out of 100
     pub cpu_user: f64,
     /// Network in + out bytes/sec
     pub network: f64,

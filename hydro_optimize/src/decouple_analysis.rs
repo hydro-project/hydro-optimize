@@ -64,7 +64,6 @@ pub(crate) struct DecoupleILPMetadata {
     pub(crate) op_sizes: HashMap<usize, u64>,
     pub(crate) network_cost_table: NetworkCostTable,
     pub(crate) per_op_load: HashMap<usize, SarStats>,
-    pub(crate) cluster_size: usize,
     pub(crate) max_num_locations: usize,
     // Model variables to construct final cost function
     pub(crate) variables: ProblemVariables,
@@ -225,7 +224,6 @@ fn add_op_resource_usage(
         op_counts,
         op_sizes,
         network_cost_table,
-        cluster_size,
         variables,
         constraints,
         max_num_locations: num_locations,
@@ -249,7 +247,7 @@ fn add_op_resource_usage(
             .unwrap_or(0);
         let size = op_sizes.get(&op_id).copied().unwrap_or(0);
         if count > 0 && size > 0 {
-            network_cost_table.network_cost(count, size, *cluster_size)
+            network_cost_table.network_cost(count, size)
         } else {
             return;
         }
@@ -317,7 +315,7 @@ fn network_cost_for_decoupling_op(
 ) -> SarStats {
     let cardinality = op_counts.get(&op_id).copied().unwrap_or(0);
     match op_sizes.get(&op_id) {
-        Some(&bytes) => network_cost_table.network_cost(cardinality, bytes, 1),
+        Some(&bytes) => network_cost_table.network_cost(cardinality, bytes),
         None => SarStats::default(),
     }
 }
@@ -739,7 +737,6 @@ pub(crate) fn decouple_analysis(
         op_sizes: op_sizes.clone(),
         network_cost_table: network_cost_table.clone(),
         per_op_load: per_op_load.clone(),
-        cluster_size,
         max_num_locations,
         variables: variables! {},
         constraints: vec![],
@@ -973,4 +970,65 @@ pub fn find_optimal_budget(
     }
 
     results
+}
+
+/// Calculate the total CPU usage using the calibrated network cost.
+/// If this exceeds 100%, then our calibration assumes network costs too much.
+/// If this is under 100%, then our calibration assumes network costs too little.
+///
+/// The return type is `Vec<Rewrite>` just to match the signature of `find_optimal_budget`
+pub(crate) fn project_total_cpu(
+    ir: &mut [HydroRoot],
+    bottleneck: &LocationId,
+    inputs: &IlpInputs,
+    cycle_source_to_sink_parent: &HashMap<usize, usize>,
+) -> Vec<Rewrite> {
+    let op_id_to_parents = op_id_to_parents(ir, Some(bottleneck), cycle_source_to_sink_parent);
+    let mut total_cpu = 0f64;
+
+    traverse_dfir(
+        ir,
+        |_, _| {},
+        |node, _| {
+            let network_type = get_network_type(node, bottleneck);
+            if network_type.is_none() && node.metadata().location_id.root() != bottleneck {
+                return;
+            }
+
+            let op_id = node.op_metadata().id.unwrap();
+
+            if let Some(network_type) = network_type {
+                let parent_id = op_id_to_parents
+                    .get(&op_id)
+                    .and_then(|p| p.first().copied());
+                let count = inputs
+                    .op_counts
+                    .get(&parent_id.unwrap_or(op_id))
+                    .copied()
+                    .unwrap_or(0);
+                let size = inputs.op_output_sizes.get(&op_id).copied().unwrap_or(0);
+                if count > 0 && size > 0 {
+                    let cost = inputs
+                        .network_cost_table
+                        .network_cost(count, size);
+                    println!("Network op {}: count={}, size={}, cpu_cost={:.2}", op_id, count, size, cost.cpu);
+
+                    if network_type == NetworkType::SendRecv {
+                        total_cpu += cost.cpu * 2.0; // Pay both send & receive
+                    }
+                    else {
+                        total_cpu += cost.cpu;
+                    }
+                }
+            } else {
+                if let Some(load) = inputs.per_op_load.get(&op_id) {
+                    println!("Load for op {}: cpu={}, mem={}, net={}, io={}", op_id, load.cpu, load.memory, load.network, load.io);
+                    total_cpu += load.cpu;
+                }
+            }
+        },
+    );
+
+    println!("Projected total CPU usage at bottleneck: {:.2}%", total_cpu);
+    std::process::exit(0);
 }
