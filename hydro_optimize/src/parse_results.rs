@@ -345,16 +345,13 @@ pub fn load_calibration_table(calibration_dir: &Path) -> NetworkCostTable {
 
             let throughput = (sum_thr / n) as usize;
             if throughput > 0 {
-                per_key
-                    .entry(msg_size)
-                    .or_default()
-                    .push(SarStats {
-                        cpu: (sum_cpu / n) / throughput as f64,
-                        cpu_user: (sum_cpu_user / n) / throughput as f64,
-                        network: (sum_net / n) / throughput as f64,
-                        memory: 0.0,
-                        io: 0.0,
-                    });
+                per_key.entry(msg_size).or_default().push(SarStats {
+                    cpu: (sum_cpu / n) / throughput as f64,
+                    cpu_user: (sum_cpu_user / n) / throughput as f64,
+                    network: (sum_net / n) / throughput as f64,
+                    memory: 0.0,
+                    io: 0.0,
+                });
             }
         }
     }
@@ -379,10 +376,7 @@ pub fn load_calibration_table(calibration_dir: &Path) -> NetworkCostTable {
         calibration_dir
     );
     let total = entries.len();
-    println!(
-        "Loaded {} calibration points",
-        total
-    );
+    println!("Loaded {} calibration points", total);
     NetworkCostTable::from_calibration(entries)
 }
 
@@ -579,11 +573,7 @@ impl NetworkCostTable {
     }
 
     /// Total resource cost for sending `count` messages of `message_size_bytes` each.
-    pub fn network_cost(
-        &self,
-        count: usize,
-        message_size_bytes: u64,
-    ) -> SarStats {
+    pub fn network_cost(&self, count: usize, message_size_bytes: u64) -> SarStats {
         self.cost_per_message(message_size_bytes)
             .scale(count as f64)
     }
@@ -635,7 +625,7 @@ pub struct RunMetadata {
     pub sar_stats: HashMap<LocationId, Vec<SarStats>>,
     /// Maps each LocationId → original op_ids assigned to it (populated when size_analysis is used)
     pub location_to_original_ops: HashMap<LocationId, Vec<usize>>,
-    /// Per-operator CPU usage fractions from perf: op_id → fraction of total samples.
+    /// Per-operator CPU usage fractions from perf: op_id → fraction of total samples (max 1.0).
     pub perf: HashMap<usize, f64>,
 }
 
@@ -1116,10 +1106,20 @@ pub fn parse_perf(folded: &str) -> HashMap<usize, f64> {
     let mut samples_per_id: HashMap<usize, f64> = HashMap::new();
 
     for line in folded.lines() {
-        let n_samples: f64 = line
-            .rsplit_once(' ')
-            .and_then(|(_, s)| s.parse().ok())
-            .unwrap_or(0.0);
+        let (stack_trace, n_samples) = match line.rsplit_once(' ') {
+            Some((stack, count_str)) => {
+                let n: f64 = count_str.parse().unwrap_or(0.0);
+                (stack, n)
+            }
+            None => (line, 0.0),
+        };
+
+        // Skip perf numbers from IO threads
+        let parent = stack_trace.split(';').next().unwrap_or(stack_trace);
+        if parent.starts_with("hydro-io-") {
+            continue;
+        }
+
         total_samples += n_samples;
 
         if let Some(cap) = operator_regex.captures_iter(line).last() {
@@ -1206,7 +1206,9 @@ pub async fn analyze_cluster_results(
     }
 
     // Merge metrics across nodes in each cluster and process
-    let all_nodes = nodes.get_all_clusters().map(|(id, name, _)| (id, name))
+    let all_nodes = nodes
+        .get_all_clusters()
+        .map(|(id, name, _)| (id, name))
         .chain(nodes.get_all_processes().map(|(id, name, _)| (id, name)));
 
     for (id, name) in all_nodes {

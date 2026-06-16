@@ -2,10 +2,6 @@
 
 Automatically apply decoupling and partitioning to Hydro programs for higher throughput.
 
-> [!NOTE]
-> Only Linux is supported, as we compile with `glibc` for better performance and more legibile `perf` results.
-
-
 ## Installation
 
 ### Rust
@@ -13,6 +9,9 @@ Install Rust. Install `rust-analyzer` as well if you plan on editing the code in
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.bashrc
+rustup target add x86_64-unknown-linux-musl
+
+# Optional
 rustup component add rust-analyzer
 ```
 
@@ -20,9 +19,6 @@ rustup component add rust-analyzer
 The Linux machine on which you are running hydro-optimize will need permissions to launch VMs. If this is your local machine, you can simply sign into your AWS account locally; otherwise you will need to grant the remote machine the appropriate permissions.
 
 #### AWS EC2
-The launch instance types are specified in `deploy.rs`.
-Since we use `glibc` for compilation, we need to launch from a machine with the same `glibc` version as the destination, which currently is an Amazon Linux 2023 instance.
-Do not use another Linux machine to launch for this reason.
 1. Go to AWS IAM Roles > Create role.
 2. Select "EC2" as the Use case.
 3. Add "AmazonEC2FullAccess" as the Permission policy.

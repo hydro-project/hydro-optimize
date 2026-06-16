@@ -8,6 +8,8 @@ use hydro_deploy::rust_crate::tracing_options::{
 use hydro_deploy::{AwsNetwork, Deployment, Host, HostTargetType, LinuxCompileType};
 use hydro_lang::deploy::TrybuildHost;
 
+const COMPILE_TYPE: LinuxCompileType = LinuxCompileType::Glibc;
+
 /// What the user provides when creating ReusableHosts
 #[derive(PartialEq, Eq, Clone)]
 pub enum HostType {
@@ -113,8 +115,6 @@ impl ReusableHosts {
                     .region(GCP_REGION)
                     .network(network.clone())
                     .display_name(display_name)
-                    // Better performance than MUSL, perf reporting fewer unidentified stacks, but requires launching from Linux
-                    .target_type(HostTargetType::Linux(LinuxCompileType::Glibc))
                     .add(),
                 InitializedHostType::Aws { network } => deployment
                     .AwsEc2Host()
@@ -123,8 +123,6 @@ impl ReusableHosts {
                     .ami(AWS_INSTANCE_AMI)
                     .network(network.clone())
                     .display_name(display_name)
-                    // Better performance than MUSL, perf reporting fewer unidentified stacks, but requires launching from Linux
-                    .target_type(HostTargetType::Linux(LinuxCompileType::Glibc))
                     .add(),
                 InitializedHostType::Localhost => deployment.Localhost(),
             })
@@ -134,13 +132,12 @@ impl ReusableHosts {
     fn get_rust_flags(&self) -> String {
         match &self.host_type {
             InitializedHostType::Gcp { .. } | InitializedHostType::Aws { .. } => {
-                "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off"
+                "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off -C link-arg=--no-rosegment".to_string()
             }
             InitializedHostType::Localhost => {
-                "" // Compile fast! Localhost is used for debugging
+                "".to_string() // Compile fast! Localhost is used for debugging
             }
         }
-        .to_string()
     }
 
     fn host_with_env(&self, host: TrybuildHost) -> TrybuildHost {
