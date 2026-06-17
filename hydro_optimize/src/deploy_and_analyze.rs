@@ -14,7 +14,7 @@ use hydro_lang::prelude::{Cluster, FlowBuilder, Process};
 use hydro_lang::telemetry::Sidecar;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::decouple_analysis::{IlpInputs, Rewrite, find_optimal_budget};
+use crate::decouple_analysis::{IlpInputs, Rewrite, find_optimal_budget, project_total_cpu};
 use crate::deploy::{AWS_IO_TPS, AWS_NETWORK_BYTES_PER_SEC, HostType, ReusableHosts};
 use crate::greedy_decouple_analysis::greedy_decouple_analysis;
 use crate::parse_results::{
@@ -523,9 +523,11 @@ async fn deploy_and_analyze<'a>(
     optimizations: &Optimizations,
     num_seconds: Option<usize>,
 ) -> RunMetadata {
-    // Measure network (-n DEV) and CPU (-u) usage. -P ALL measures all CPUs on the machine
+    // Measure network (-n DEV) and CPU (-u) usage. -P 0 measures only core 0, where the
+    // hydro main thread is pinned (networking threads spin on other cores, so whole-machine
+    // CPU is misleading).
     let sar_sidecar = ScriptSidecar {
-        script: "sar -n DEV -u -P ALL -r -b 1".to_string(),
+        script: "sar -n DEV -u -P 0 -r -b 1".to_string(),
         prefix: SAR_USAGE_PREFIX.to_string(),
     };
 
@@ -608,7 +610,7 @@ pub struct BenchmarkConfig {
 pub const START_MEASUREMENT_SECOND: usize = 30;
 pub const MEASUREMENT_SECOND: usize = 59;
 pub const RUN_SECONDS: usize = 90;
-pub const NUM_PHYSICAL_CLIENTS: usize = 5;
+pub const NUM_PHYSICAL_CLIENTS: usize = 10;
 pub const VIRTUAL_CLIENTS_STEP: usize = 50; // Can tweak to get finer-grained numbers
 pub const NUM_VIRTUAL_CLIENTS_ENV: &str = "NUM_VIRTUAL_CLIENTS";
 pub const NUM_RUNS_NO_THROUGHPUT: usize = 3;
@@ -1073,7 +1075,8 @@ async fn run_bottleneck_elimination<'a>(
             OptimizationKind::PerfOnly,
             OptimizationKind::CountersOnly,
             OptimizationKind::SizeAnalysis,
-            OptimizationKind::BlowUpAnalysis,
+            // OptimizationKind::BlowUpAnalysis,
+            // TODO: Reenable blow up analysis once vcpu limit has been addressed
         ] {
             if find_workload_dirs(base, &analysis_name, kind.label()).is_empty() {
                 let run_built = analysis_built.as_ref().unwrap_or(&built);
@@ -1123,7 +1126,8 @@ async fn run_bottleneck_elimination<'a>(
             cluster_size,
         };
 
-        let computed_rewrites = find_optimal_budget(&mut ir, &bottleneck_loc, &ilp_inputs, &cycles);
+        // TODO: Run optimization again once projected CPU is close to 100%
+        let computed_rewrites = project_total_cpu(&mut ir, &bottleneck_loc, &ilp_inputs, &cycles);
         state
             .cluster_rewrites
             .insert(bottleneck_cluster.clone(), computed_rewrites);
@@ -1215,7 +1219,7 @@ pub async fn benchmark_protocol<'a>(
             &mut deployment,
             &built,
             &config,
-            &Optimizations::default(),
+            &config.optimizations,
             &HashMap::new(),
             None,
             &HashSet::new(),

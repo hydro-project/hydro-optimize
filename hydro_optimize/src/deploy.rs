@@ -5,10 +5,8 @@ use hydro_deploy::gcp::GcpNetwork;
 use hydro_deploy::rust_crate::tracing_options::{
     AL2_PERF_SETUP_COMMAND, DEBIAN_PERF_SETUP_COMMAND, TracingOptions,
 };
-use hydro_deploy::{AwsNetwork, Deployment, Host, HostTargetType, LinuxCompileType};
+use hydro_deploy::{AwsNetwork, Deployment, Host};
 use hydro_lang::deploy::TrybuildHost;
-
-const COMPILE_TYPE: LinuxCompileType = LinuxCompileType::Glibc;
 
 /// What the user provides when creating ReusableHosts
 #[derive(PartialEq, Eq, Clone)]
@@ -41,7 +39,7 @@ pub struct ReusableHosts {
 const AWS_REGION: &str = "us-east-1";
 const AWS_INSTANCE_AMI: &str = "ami-0521cb2d60cfbb1a6"; // Amazon Linux 2023
 const AWS_INSTANCE_TYPE: &str = "m5.2xlarge"; // 8 vCPU, 32 GB RAM
-const AWS_NUM_CORES: usize = 8; // Used for pinning
+const AWS_NUM_CORES: usize = 3; // Used for networking. Network cores will be pinned to these cores - 1. Empirically tested on m5.2xlarge.
 /// m5.2xlarge: up to 10 Gbps network bandwidth
 pub const AWS_NETWORK_BYTES_PER_SEC: f64 = 1_250_000_000.0;
 /// m5.2xlarge: 12,000 baseline IOPS (EBS)
@@ -163,7 +161,6 @@ impl ReusableHosts {
             };
             host = host.tracing(
                 TracingOptions::builder()
-                    .perf_raw_outfile(format!("{}.perf.data", display_name))
                     .fold_outfile(format!("{}.data.folded", display_name))
                     .frequency(128)
                     .setup_command(setup_command)

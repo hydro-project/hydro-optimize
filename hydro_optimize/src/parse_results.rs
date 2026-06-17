@@ -887,9 +887,9 @@ fn avg_over<T>(slice: &[T], f: impl Fn(&T) -> f64) -> f64 {
 /// Per-second SAR statistics
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 pub struct SarStats {
-    /// Max single-core CPU usage (user + system %), out of 100
+    /// Core 0 CPU usage (user + system %), out of 100 — where the hydro main thread is pinned
     pub cpu: f64,
-    /// Max single-core CPU user % only (excludes system), out of 100
+    /// Core 0 CPU user % only (excludes system), out of 100
     pub cpu_user: f64,
     /// Network in + out bytes/sec
     pub network: f64,
@@ -930,10 +930,10 @@ impl SarStats {
     }
 }
 
-/// Parses `sar -n DEV -u -P ALL -r -b` output lines and returns per-second SarStats.
+/// Parses `sar -n DEV -u -P 0 -r -b` output lines and returns per-second SarStats.
 pub fn parse_sar_output(lines: Vec<String>) -> Vec<SarStats> {
     let cpu_regex = Regex::new(
-        r"\s(all|\d{1,3})\s+(\d+\.?\d*)\s+\d+\.?\d*\s+(\d+\.?\d*)\s+\d+\.?\d*\s+\d+\.?\d*\s+(\d+\.?\d*)$",
+        r"\s(\d{1,3})\s+(\d+\.?\d*)\s+\d+\.?\d*\s+(\d+\.?\d*)\s+\d+\.?\d*\s+\d+\.?\d*\s+(\d+\.?\d*)$",
     ).unwrap();
     let iface_regex =
         Regex::new(r"([a-zA-Z]\S*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)")
@@ -952,25 +952,19 @@ pub fn parse_sar_output(lines: Vec<String>) -> Vec<SarStats> {
     let mut result: Vec<SarStats> = vec![];
 
     for line in &lines {
-        // CPU: "all" marks a new second, per-core lines update the max
+        // CPU: we run `sar -P 0`, so the core-0 line (the only CPU line) marks each new
+        // second. We track core 0 only, where the hydro main thread is pinned; networking
+        // threads spin on other cores, so whole-machine CPU is no longer meaningful.
         if let Some(caps) = cpu_regex.captures(line) {
-            let is_all = &caps[1] == "all";
-            if let (Some(user), Some(system)) =
-                (caps[2].parse::<f64>().ok(), caps[3].parse::<f64>().ok())
+            if &caps[1] == "0"
+                && let (Some(user), Some(system)) =
+                    (caps[2].parse::<f64>().ok(), caps[3].parse::<f64>().ok())
             {
-                let usage = user + system;
-                if is_all {
-                    result.push(SarStats {
-                        cpu: usage,
-                        cpu_user: user,
-                        ..Default::default()
-                    });
-                } else if let Some(last) = result.last_mut()
-                    && usage > last.cpu
-                {
-                    last.cpu = usage;
-                    last.cpu_user = user;
-                }
+                result.push(SarStats {
+                    cpu: user + system,
+                    cpu_user: user,
+                    ..Default::default()
+                });
             }
             continue;
         }
