@@ -42,7 +42,7 @@ async fn main() {
         move || {
             let mut builder = FlowBuilder::new();
             let server = builder.process::<Server>();
-            let clients = builder.process::<Client>();
+            let clients = builder.cluster::<Client>();
             let client_id = clients.id();
 
             let location_id_to_cluster = HashMap::from([
@@ -52,16 +52,16 @@ async fn main() {
 
             // Dummy code. Just need to make sure that the server receives and sends.
             // The actual message generation is done by the Hydro IR.
+            // Use a cluster of clients (not process) since that has higher overhead
             clients
-                .source_iter(q!(vec![0usize]))
+                .source_iter(q!(vec![Vec::<u8>::new()]))
                 .send(&server, TCP.fail_stop().bincode())
-                .send(&clients, TCP.fail_stop().bincode());
+                .demux(&clients, TCP.fail_stop().bincode());
 
-            let clusters = ReusableClusters::default();
-            let processes = ReusableProcesses::default()
-                .with_process(server)
-                .with_process(clients);
-            let optimizations = Optimizations::default().excluding(client_id);
+            let clusters = ReusableClusters::default().with_cluster(clients, 1);
+            let processes = ReusableProcesses::default().with_process(server);
+            let optimizations = Optimizations::default()
+                .excluding(client_id);
 
             (
                 builder,

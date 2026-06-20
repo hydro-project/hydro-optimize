@@ -19,9 +19,7 @@ use good_lp::{
 };
 use hydro_lang::compile::builder::ClockId;
 
-use hydro_lang::compile::ir::{
-    HydroIrMetadata, HydroIrOpMetadata, HydroNode, HydroRoot, traverse_dfir,
-};
+use hydro_lang::compile::ir::{HydroIrMetadata, HydroNode, HydroRoot, traverse_dfir};
 use hydro_lang::location::dynamic::LocationId;
 
 use super::rewrites::{NetworkType, get_network_type};
@@ -213,8 +211,27 @@ fn add_tick_constraint(
     }
 }
 
+/// Adds `load * var` (per resource) at each variable's location.
+fn add_load_to_locations(
+    resource_usages: &mut HashMap<usize, ResourceExpressions>,
+    vars: &HashMap<usize, Variable>,
+    load: &SarStats,
+) {
+    for (loc, var) in vars {
+        let res = resource_usages.get_mut(loc).unwrap();
+        let cpu_temp = std::mem::take(&mut res.cpu);
+        res.cpu = cpu_temp + load.cpu * *var;
+        let mem_temp = std::mem::take(&mut res.memory);
+        res.memory = mem_temp + load.memory * *var;
+        let net_temp = std::mem::take(&mut res.network);
+        res.network = net_temp + load.network * *var;
+        let io_temp = std::mem::take(&mut res.io);
+        res.io = io_temp + load.io * *var;
+    }
+}
+
 fn add_op_resource_usage(
-    metadata: &HydroIrOpMetadata,
+    node: &HydroNode,
     network_type: &Option<NetworkType>,
     op_id_to_parents: &HashMap<usize, Vec<usize>>,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
@@ -232,75 +249,53 @@ fn add_op_resource_usage(
         ..
     } = &mut *decoupling_metadata.borrow_mut();
 
-    let op_id = metadata.id.unwrap();
-    let op_load = if let Some(load) = per_op_load.get(&op_id) {
-        *load
-    } else if network_type.is_some() {
-        // Network ops aren't in per_op_load; derive cost from calibration table
-        // Use parent's count (total messages sent) and the network op's own size
-        let parent_id = op_id_to_parents
-            .get(&op_id)
-            .and_then(|p| p.first().copied());
-        let count = op_counts
-            .get(&parent_id.unwrap_or(op_id))
-            .copied()
-            .unwrap_or(0);
-        let size = op_sizes.get(&op_id).copied().unwrap_or(0);
-        if count > 0 && size > 0 {
-            network_cost_table.network_cost(count, size)
-        } else {
-            return;
-        }
-    } else {
-        return;
-    };
-    if op_load.cpu <= 0.0 && op_load.memory <= 0.0 && op_load.network <= 0.0 && op_load.io <= 0.0 {
-        return;
-    }
+    let op_id = node.op_metadata().id.unwrap();
+    let size = op_sizes.get(&op_id).copied().unwrap_or(0);
 
-    // Operators are run on the machine that their parents send to.
+    // Send / produce side: charged at the location its parent sends to. Non-network
+    // ops also land here — their measured compute load is paid where their parent runs.
     match network_type {
         Some(NetworkType::Send) | Some(NetworkType::SendRecv) | None => {
-            if let Some(parents) = op_id_to_parents.get(&op_id)
-                && let Some(first_parent) = parents.first()
+            let (load, charge_at) = if network_type.is_some() {
+                // Send cardinality = cardinality of Network's parent. Will be larger than the Network's cardinality if it is a broadcast
+                let input_id = node.input_metadata()[0].op.id;
+                let send_count = input_id
+                    .and_then(|iid| op_counts.get(&iid).copied())
+                    .unwrap_or(0);
+                (network_cost_table.network_cost(send_count, size), input_id)
+            } else {
+                // Non-network op: its measured per-op load, charged at its parent.
+                let load = per_op_load.get(&op_id).copied().unwrap_or_default();
+                let parent = op_id_to_parents
+                    .get(&op_id)
+                    .and_then(|p| p.first().copied());
+                (load, parent)
+            };
+            if !load.is_zero()
+                && let Some(charge_at) = charge_at
             {
-                let parent_vars = var_from_op_id(
-                    *first_parent,
+                let vars = var_from_op_id(
+                    charge_at,
                     *num_locations,
                     op_id_to_var,
                     variables,
                     constraints,
                 );
-                for (loc, parent_var) in parent_vars {
-                    let res = resource_usages.get_mut(&loc).unwrap();
-                    let cpu_temp = std::mem::take(&mut res.cpu);
-                    res.cpu = cpu_temp + op_load.cpu * parent_var;
-                    let mem_temp = std::mem::take(&mut res.memory);
-                    res.memory = mem_temp + op_load.memory * parent_var;
-                    let net_temp = std::mem::take(&mut res.network);
-                    res.network = net_temp + op_load.network * parent_var;
-                    let io_temp = std::mem::take(&mut res.io);
-                    res.io = io_temp + op_load.io * parent_var;
-                }
+                add_load_to_locations(resource_usages, &vars, &load);
             }
         }
         _ => {}
     }
-    // Special case for network receives: their cost (deserialization) is paid by the receiver.
+    // Receive side: deserialization is paid by the receiver (this op's location). The
+    // count is singular — the receiver's own counter already reflects the fan-in.
     match network_type {
         Some(NetworkType::Recv) | Some(NetworkType::SendRecv) => {
-            let op_vars =
-                var_from_op_id(op_id, *num_locations, op_id_to_var, variables, constraints);
-            for (loc, parent_var) in op_vars {
-                let res = resource_usages.get_mut(&loc).unwrap();
-                let cpu_temp = std::mem::take(&mut res.cpu);
-                res.cpu = cpu_temp + op_load.cpu * parent_var;
-                let mem_temp = std::mem::take(&mut res.memory);
-                res.memory = mem_temp + op_load.memory * parent_var;
-                let net_temp = std::mem::take(&mut res.network);
-                res.network = net_temp + op_load.network * parent_var;
-                let io_temp = std::mem::take(&mut res.io);
-                res.io = io_temp + op_load.io * parent_var;
+            let load =
+                network_cost_table.network_cost(op_counts.get(&op_id).copied().unwrap_or(0), size);
+            if !load.is_zero() {
+                let vars =
+                    var_from_op_id(op_id, *num_locations, op_id_to_var, variables, constraints);
+                add_load_to_locations(resource_usages, &vars, &load);
             }
         }
         _ => {}
@@ -565,12 +560,7 @@ fn decouple_analysis_node(
         add_decoupling_overhead(node, op_id_to_parents, decoupling_metadata);
     }
 
-    add_op_resource_usage(
-        node.op_metadata(),
-        &network_type,
-        op_id_to_parents,
-        decoupling_metadata,
-    );
+    add_op_resource_usage(node, &network_type, op_id_to_parents, decoupling_metadata);
     add_tick_constraint(node.metadata(), op_id_to_parents, decoupling_metadata);
 }
 
@@ -981,9 +971,8 @@ pub(crate) fn project_total_cpu(
     ir: &mut [HydroRoot],
     bottleneck: &LocationId,
     inputs: &IlpInputs,
-    cycle_source_to_sink_parent: &HashMap<usize, usize>,
+    _cycle_source_to_sink_parent: &HashMap<usize, usize>,
 ) -> Vec<Rewrite> {
-    let op_id_to_parents = op_id_to_parents(ir, Some(bottleneck), cycle_source_to_sink_parent);
     let mut total_cpu = 0f64;
 
     traverse_dfir(
@@ -998,31 +987,46 @@ pub(crate) fn project_total_cpu(
             let op_id = node.op_metadata().id.unwrap();
 
             if let Some(network_type) = network_type {
-                let parent_id = op_id_to_parents
-                    .get(&op_id)
-                    .and_then(|p| p.first().copied());
-                let count = inputs
-                    .op_counts
-                    .get(&parent_id.unwrap_or(op_id))
-                    .copied()
-                    .unwrap_or(0);
                 let size = inputs.op_output_sizes.get(&op_id).copied().unwrap_or(0);
-                if count > 0 && size > 0 {
-                    let cost = inputs
-                        .network_cost_table
-                        .network_cost(count, size);
-                    println!("Network op {}: count={}, size={}, cpu_cost={:.2}", op_id, count, size, cost.cpu);
+                let net_cpu = |count: usize| {
+                    if count > 0 && size > 0 {
+                        inputs.network_cost_table.network_cost(count, size).cpu
+                    } else {
+                        0.0
+                    }
+                };
 
-                    if network_type == NetworkType::SendRecv {
-                        total_cpu += cost.cpu * 2.0; // Pay both send & receive
-                    }
-                    else {
-                        total_cpu += cost.cpu;
-                    }
+                // Send cardinality = cardinality of Network's parent. Will be larger than the Network's cardinality if it is a broadcast
+                let send_count =
+                    if matches!(network_type, NetworkType::Send | NetworkType::SendRecv) {
+                        let input_id = node.input_metadata()[0].op.id.unwrap();
+                        inputs.op_counts.get(&input_id).copied().unwrap_or(0)
+                    } else {
+                        0
+                    };
+
+                // Receive cardinality = cardinality of Network
+                let recv_count =
+                    if matches!(network_type, NetworkType::Recv | NetworkType::SendRecv) {
+                        inputs.op_counts.get(&op_id).copied().unwrap_or(0)
+                    } else {
+                        0
+                    };
+
+                let cpu_cost = net_cpu(send_count) + net_cpu(recv_count);
+                if cpu_cost > 0.0 {
+                    println!(
+                        "Network op {}: send_count={}, recv_count={}, size={}, cpu_cost={:.2}",
+                        op_id, send_count, recv_count, size, cpu_cost
+                    );
+                    total_cpu += cpu_cost;
                 }
             } else {
                 if let Some(load) = inputs.per_op_load.get(&op_id) {
-                    println!("Load for op {}: cpu={}, mem={}, net={}, io={}", op_id, load.cpu, load.memory, load.network, load.io);
+                    println!(
+                        "Load for op {}: cpu={}, mem={}, net={}, io={}",
+                        op_id, load.cpu, load.memory, load.network, load.io
+                    );
                     total_cpu += load.cpu;
                 }
             }

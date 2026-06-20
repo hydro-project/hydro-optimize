@@ -31,7 +31,7 @@ use crate::rewrites::{
 };
 
 const METRIC_INTERVAL_SECS: u64 = 1;
-const BATCH_PULL_LIMIT: usize = 1;
+const BATCH_PULL_LIMIT: usize = 10;
 const CALIBRATION_DIR: &str = "benchmark_results";
 const COUNTER_PREFIX: &str = "_optimize_counter";
 const BYTE_SIZE_PREFIX: &str = "_optimize_byte_size";
@@ -611,7 +611,6 @@ pub const START_MEASUREMENT_SECOND: usize = 30;
 pub const MEASUREMENT_SECOND: usize = 59;
 pub const RUN_SECONDS: usize = 90;
 pub const NUM_PHYSICAL_CLIENTS: usize = 10;
-pub const VIRTUAL_CLIENTS_STEP: usize = 50; // Can tweak to get finer-grained numbers
 pub const NUM_VIRTUAL_CLIENTS_ENV: &str = "NUM_VIRTUAL_CLIENTS";
 pub const NUM_RUNS_NO_THROUGHPUT: usize = 3;
 pub const NO_IMPROVEMENT_LIMIT: usize = 3;
@@ -1190,7 +1189,10 @@ pub async fn benchmark_protocol<'a>(
             run_bottleneck_elimination(&mut reusable_hosts, &mut deployment, built, &mut config)
                 .await
         }
-        _ => panic!("Explicit optimization kinds are no longer allowed as parameters"),
+        _ => {
+            println!("Warning: Explicit optimization kinds are no longer allowed as parameters");
+            built
+        }
     };
 
     // Run a loop for each network calibration size, if provided
@@ -1205,7 +1207,7 @@ pub async fn benchmark_protocol<'a>(
                 &mut deployment,
                 &built,
                 &iter_config,
-                &Optimizations::default(),
+                &config.optimizations,
                 &HashMap::new(),
                 None,
                 &HashSet::new(),

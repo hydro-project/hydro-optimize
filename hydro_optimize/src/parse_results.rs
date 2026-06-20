@@ -558,7 +558,7 @@ impl NetworkCostTable {
     /// Returns the cost per message for the given message size
     fn cost_per_message(&self, message_size_bytes: u64) -> SarStats {
         let n = self.entries.len();
-        if n == 0 {
+        if n == 0 || message_size_bytes == 0 {
             return SarStats::default();
         }
         let entry = if n == 1 || message_size_bytes >= self.entries[n - 1].message_size {
@@ -574,6 +574,9 @@ impl NetworkCostTable {
 
     /// Total resource cost for sending `count` messages of `message_size_bytes` each.
     pub fn network_cost(&self, count: usize, message_size_bytes: u64) -> SarStats {
+        if count == 0 || message_size_bytes == 0 {
+            return SarStats::default()
+        }
         self.cost_per_message(message_size_bytes)
             .scale(count as f64)
     }
@@ -927,6 +930,10 @@ impl SarStats {
         self.network += other.network;
         self.memory += other.memory;
         self.io += other.io;
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.cpu == 0.0 && self.cpu_user == 0.0 && self.network == 0.0 && self.memory == 0.0 && self.io == 0.0
     }
 }
 
