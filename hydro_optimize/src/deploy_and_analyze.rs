@@ -420,12 +420,12 @@ pub enum OptimizationKind {
 impl OptimizationKind {
     pub fn label(&self) -> &'static str {
         match self {
-            OptimizationKind::None => "none",
+            // Do not differentiate between None and BottleneckElimination, since both run the protocol without additional profiling
+            OptimizationKind::None | OptimizationKind::BottleneckElimination => "none",
             OptimizationKind::CountersOnly => "counters",
             OptimizationKind::BlowUpAnalysis => "blow_up",
             OptimizationKind::SizeAnalysis => "size",
             OptimizationKind::PerfOnly => "perf",
-            OptimizationKind::BottleneckElimination => "ilp",
         }
     }
 }
@@ -772,9 +772,7 @@ async fn run_scaling_loop<'a>(
 ) -> RunMetadata {
     let output_dir = make_output_dir(&config.name, &config.workload, optimizations.kind.label());
     let ir = built.ir();
-    if matches!(optimizations.kind, OptimizationKind::PerfOnly) {
-        save_id(&mut deep_clone(ir), &output_dir.join("id.txt"));
-    }
+    save_id(&mut deep_clone(ir), &output_dir.join("id.txt"));
     let mut final_run_metadata = RunMetadata::default();
     let mut best_throughput: usize = 0;
     let mut no_improvement_count: usize = 0;
@@ -848,17 +846,23 @@ async fn run_scaling_loop<'a>(
             }
             run_metadata.save_perf(&output_dir, config.num_physical_clients, num_virtual, run);
 
-            if run_throughput == 0 {
+            let unstable_run = run_was_unstable(&run_metadata.throughputs);
+            if run_throughput == 0 || unstable_run {
                 zero_throughput_count += 1;
-                println!(
-                    "Zero throughput detected ({}/{})",
-                    zero_throughput_count, NUM_RUNS_NO_THROUGHPUT
-                );
+                if unstable_run {
+                    println!(
+                        "Unstable throughput detected ({}/{})",
+                        zero_throughput_count, NUM_RUNS_NO_THROUGHPUT
+                    );
+                } else {
+                    println!(
+                        "Zero throughput detected ({}/{})",
+                        zero_throughput_count, NUM_RUNS_NO_THROUGHPUT
+                    );
+                }
                 if zero_throughput_count > NUM_RUNS_NO_THROUGHPUT {
                     return run_metadata;
                 }
-            } else if run_was_unstable(&run_metadata.throughputs) {
-                println!("Unstable throughput detected, discarding run");
             } else {
                 throughput_sum += run_throughput;
                 successful_runs += 1;
@@ -1001,10 +1005,15 @@ async fn run_bottleneck_elimination<'a>(
         return built; // First ever run — just benchmark the base
     };
     let iteration = latest_iter + 1;
+    let prev_name = if latest_iter == 0 {
+        base_name.clone()
+    } else {
+        format!("{}_opt{}", base_name, latest_iter)
+    };
 
     // Early exit if last optimization didn't improve throughput
     if latest_iter >= 2 {
-        let thr_prev = max_throughput_for(base, &format!("{}_opt{}", base_name, latest_iter));
+        let thr_prev = max_throughput_for(base, &prev_name);
         let thr_prev_prev =
             max_throughput_for(base, &format!("{}_opt{}", base_name, latest_iter - 1));
         assert!(
@@ -1024,11 +1033,6 @@ async fn run_bottleneck_elimination<'a>(
     }
 
     // Find bottleneck from the most recent _none run
-    let prev_name = if latest_iter == 0 {
-        base_name.clone()
-    } else {
-        format!("{}_opt{}", base_name, latest_iter)
-    };
     let prev_run_dir = find_workload_dirs(base, &prev_name, OptimizationKind::None.label())
         .into_iter()
         .next()
@@ -1125,8 +1129,7 @@ async fn run_bottleneck_elimination<'a>(
             cluster_size,
         };
 
-        // TODO: Run optimization again once projected CPU is close to 100%
-        let computed_rewrites = project_total_cpu(&mut ir, &bottleneck_loc, &ilp_inputs, &cycles);
+        let computed_rewrites = find_optimal_budget(&mut ir, &bottleneck_loc, &ilp_inputs, &cycles);
         state
             .cluster_rewrites
             .insert(bottleneck_cluster.clone(), computed_rewrites);
