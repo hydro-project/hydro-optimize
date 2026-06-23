@@ -69,6 +69,9 @@ struct NetworkMetadata {
 }
 
 /// Creates the Map before Network to route it to the correct partition.
+/// A map is appended to the node passed in.
+/// If a network already exists, pass in its input.
+/// If a network is being created, pass node into Network after calling this function.
 fn map_before_network(node: &mut HydroNode, network_metadata: &NetworkMetadata) {
     let metadata = node.metadata().clone();
     let node_content = std::mem::replace(node, HydroNode::Placeholder);
@@ -485,7 +488,7 @@ fn repair_existing_network_for_partitioning(
 
     // If the receiver is now partitioned, add a Map before the Network to route to the correct partition
     if receiver_partitions > 0 {
-        map_before_network(node, &network_metadata);
+        map_before_network(input.as_mut(), &network_metadata);
     }
     // If the source is now partitioned, departition the ID on the receiving end
     if sender_partitions > 0 {
