@@ -30,15 +30,17 @@ impl VisitMut for ClusterSelfIdReplace {
         if let syn::Expr::Path(path_expr) = expr {
             for segment in path_expr.path.segments.iter_mut() {
                 let ident = segment.ident.to_string();
-                let prefix = format!("__hydro_lang_cluster_self_id_{}", self.orig_cluster_id);
-                if ident.starts_with(&prefix) {
-                    if self.orig_cluster_id != self.new_cluster_id {
+                let orig_prefix = format!("__hydro_lang_cluster_self_id_{}", self.orig_cluster_id);
+                let new_prefix = format!("__hydro_lang_cluster_self_id_{}", self.new_cluster_id);
+                if ident.starts_with(&orig_prefix) || ident.starts_with(&new_prefix) {
+                    if ident.starts_with(&orig_prefix) && self.orig_cluster_id != self.new_cluster_id {
                         segment.ident = syn::Ident::new(
                             &format!("__hydro_lang_cluster_self_id_{}", self.new_cluster_id),
                             segment.ident.span(),
                         );
                         println!("Decoupling: Replaced CLUSTER_SELF_ID");
                     }
+                    // Also consider new_prefix, for CLUSTER_SELF_IDs inserted after decoupling that still need to be partitioned
                     if self.num_partitions > 0 {
                         let num_partitions = self.num_partitions;
                         let expr_content = std::mem::replace(expr, syn::Expr::PLACEHOLDER);

@@ -608,11 +608,16 @@ fn replace_cluster_self_id(
             );
         },
         |node, _| {
-            let Some(op_id) = node.op_metadata().id else {
-                return;
+            let target_loc_idx = if let Some(op_id) = node.op_metadata().id {
+                execution_loc_of_op(op_id, node, rewrite).unwrap_or(0)
+            } else {
+                // New op but may still need rewriting if inserted for decoupling + partitioning
+                locations_map
+                    .iter()
+                    .find(|(_, loc)| **loc == node.metadata().location_id)
+                    .map(|(idx, _)| *idx)
+                    .unwrap_or(0)
             };
-
-            let target_loc_idx = execution_loc_of_op(op_id, node, rewrite).unwrap_or(0);
             replace_cluster_self_id_node(
                 &mut |f| node.visit_debug_expr(f),
                 rewrite,
