@@ -221,12 +221,12 @@ fn add_load_to_locations(
         let res = resource_usages.get_mut(loc).unwrap();
         let cpu_temp = std::mem::take(&mut res.cpu);
         res.cpu = cpu_temp + load.cpu * *var;
-        let mem_temp = std::mem::take(&mut res.memory);
-        res.memory = mem_temp + load.memory * *var;
-        let net_temp = std::mem::take(&mut res.network);
-        res.network = net_temp + load.network * *var;
-        let io_temp = std::mem::take(&mut res.io);
-        res.io = io_temp + load.io * *var;
+        // let mem_temp = std::mem::take(&mut res.memory);
+        // res.memory = mem_temp + load.memory * *var;
+        // let net_temp = std::mem::take(&mut res.network);
+        // res.network = net_temp + load.network * *var;
+        // let io_temp = std::mem::take(&mut res.io);
+        // res.io = io_temp + load.io * *var;
     }
 }
 
@@ -401,12 +401,12 @@ fn add_decoupling_overhead(
 fn add_resource_cost(res: &mut ResourceExpressions, cost: &SarStats, var: Variable) {
     let cpu_temp = std::mem::take(&mut res.cpu);
     res.cpu = cpu_temp + (cost.cpu + DECOUPLING_PENALTY) * var;
-    let mem_temp = std::mem::take(&mut res.memory);
-    res.memory = mem_temp + cost.memory * var;
-    let net_temp = std::mem::take(&mut res.network);
-    res.network = net_temp + cost.network * var;
-    let io_temp = std::mem::take(&mut res.io);
-    res.io = io_temp + cost.io * var;
+    // let mem_temp = std::mem::take(&mut res.memory);
+    // res.memory = mem_temp + cost.memory * var;
+    // let net_temp = std::mem::take(&mut res.network);
+    // res.network = net_temp + cost.network * var;
+    // let io_temp = std::mem::take(&mut res.io);
+    // res.io = io_temp + cost.io * var;
 }
 
 /// Only penalize decoupling inner from Tees once per unique location.
@@ -809,6 +809,22 @@ pub(crate) fn decouple_analysis(
             .map(|(expr, cap)| solution.eval(expr.clone()) / cap)
             .fold(0.0_f64, f64::max);
         result.location_costs.insert(*loc, max_sat);
+
+        // DEBUG: chosen partition count and per-resource effective saturation for this location.
+        let chosen_n = is_n_partitions
+            .get(*loc)
+            .and_then(|vars| vars.iter().position(|&v| solution.value(v).round() == 1.0))
+            .unwrap_or(0);
+        let per_resource_sat: Vec<f64> = res
+            .iter()
+            .map(|(expr, cap)| solution.eval(expr.clone()) / cap)
+            .collect();
+        let per_resource_usage: Vec<f64> =
+            res.iter().map(|(expr, _)| solution.eval(expr.clone())).collect();
+        println!(
+            "ILP cost loc {}: chosen_n={}, max_sat={:.4}, effective_usage(cpu,mem,net,io)={:?}, sat={:?}",
+            loc, chosen_n, max_sat, per_resource_usage, per_resource_sat
+        );
     }
 
     for (&op_id, parents) in &op_id_to_parents {
@@ -844,11 +860,11 @@ pub(crate) fn decouple_analysis(
     }
 
     // Evaluate per-location partitionability
-    if let Some(pm) = partition_metadata {
+    if let Some(partition_metadata) = partition_metadata {
         for loc in 0..max_num_locations {
             let num_relevant = solution
                 .eval(
-                    pm.num_relevant_operators
+                    partition_metadata.num_relevant_operators
                         .get(&loc)
                         .cloned()
                         .unwrap_or_default(),
@@ -856,7 +872,7 @@ pub(crate) fn decouple_analysis(
                 .round() as i64;
             let num_partitionable = solution
                 .eval(
-                    pm.partitionable_operators
+                    partition_metadata.partitionable_operators
                         .get(&loc)
                         .cloned()
                         .unwrap_or_default(),
@@ -864,7 +880,7 @@ pub(crate) fn decouple_analysis(
                 .round() as i64;
             let num_persists = solution
                 .eval(
-                    pm.num_persist_operators
+                    partition_metadata.num_persist_operators
                         .get(&loc)
                         .cloned()
                         .unwrap_or_default(),
@@ -883,7 +899,7 @@ pub(crate) fn decouple_analysis(
 
         // Resolve per-op field choices from the ILP solution. For each op that has field
         // variables, find which field the solver set to 1 (if any).
-        for (op_id, fields) in &pm.op_id_to_field_vars {
+        for (op_id, fields) in &partition_metadata.op_id_to_field_vars {
             if let Some((name, _)) = fields
                 .iter()
                 .find(|(_, var)| solution.value(**var).round() == 1.0)
@@ -908,6 +924,16 @@ pub(crate) fn decouple_analysis(
             }
         }
     }
+
+    project_location_costs(
+        ir,
+        bottleneck,
+        &op_counts,
+        &op_sizes,
+        &network_cost_table,
+        &per_op_load,
+        &result,
+    );
 
     result
 }
@@ -1035,4 +1061,103 @@ pub(crate) fn project_total_cpu(
 
     println!("Projected total CPU usage at bottleneck: {:.2}%", total_cpu);
     std::process::exit(0);
+}
+
+/// Like `project_total_cpu`, but attributes cost to each location AFTER a rewrite.
+///
+/// Rules:
+/// - An operator executes on the location its parent is assigned to (which equals its own
+///   assigned location for non-decoupled ops). Its compute load is charged there.
+/// - Networking is special-cased: an existing network charges its send cost (parent's
+///   cardinality, larger for broadcasts) to the sender's location and its receive cost
+///   (the network's own cardinality) to the receiver's location. A new decoupling edge
+///   (`op_to_network`) charges the op's output cost to both the sender and receiver locations.
+pub(crate) fn project_location_costs(
+    ir: &mut [HydroRoot],
+    bottleneck: &LocationId,
+    op_counts: &HashMap<usize, usize>,
+    op_sizes: &HashMap<usize, u64>,
+    network_cost_table: &NetworkCostTable,
+    per_op_load: &HashMap<usize, SarStats>,
+    rewrite: &Rewrite,
+) {
+    let mut loc_cpu: HashMap<usize, f64> = HashMap::new();
+
+    let net_cpu = |count: usize, size: u64| -> f64 {
+        if count > 0 && size > 0 {
+            network_cost_table.network_cost(count, size).cpu
+        } else {
+            0.0
+        }
+    };
+
+    traverse_dfir(
+        ir,
+        |_, _| {},
+        |node, _| {
+            let Some(op_id) = node.op_metadata().id else {
+                return;
+            };
+            // The op executes where its (first) parent is assigned; fall back to its own assignment.
+            let parent_id = node.input_metadata().first().and_then(|m| m.op.id);
+            let exec_loc = parent_id
+                .and_then(|p| rewrite.op_to_loc.get(&p).copied())
+                .or_else(|| rewrite.op_to_loc.get(&op_id).copied());
+
+            let network_type = get_network_type(node, bottleneck);
+            if let Some(network_type) = network_type {
+                // Existing network: send cost on the sender, receive cost on the receiver.
+                let size = op_sizes.get(&op_id).copied().unwrap_or(0);
+                if matches!(network_type, NetworkType::Send | NetworkType::SendRecv) {
+                    let send_count = parent_id
+                        .and_then(|p| op_counts.get(&p).copied())
+                        .unwrap_or(0);
+                    let send_loc = parent_id
+                        .and_then(|p| rewrite.op_to_loc.get(&p).copied())
+                        .or(exec_loc);
+                    if let Some(l) = send_loc {
+                        *loc_cpu.entry(l).or_default() += net_cpu(send_count, size);
+                    }
+                }
+                if matches!(network_type, NetworkType::Recv | NetworkType::SendRecv) {
+                    let recv_count = op_counts.get(&op_id).copied().unwrap_or(0);
+                    let recv_loc = rewrite.op_to_loc.get(&op_id).copied().or(exec_loc);
+                    if let Some(l) = recv_loc {
+                        *loc_cpu.entry(l).or_default() += net_cpu(recv_count, size);
+                    }
+                }
+                return;
+            }
+
+            if node.metadata().location_id.root() != bottleneck {
+                return;
+            }
+
+            // New decoupling edge on this op's output: charge serialization to both ends.
+            if let Some(&(from_loc, to_loc)) = rewrite.op_to_network.get(&op_id) {
+                let size = op_sizes.get(&op_id).copied().unwrap_or(0);
+                let count = op_counts.get(&op_id).copied().unwrap_or(0);
+                let c = net_cpu(count, size);
+                *loc_cpu.entry(from_loc).or_default() += c;
+                *loc_cpu.entry(to_loc).or_default() += c;
+            }
+
+            // Compute load, charged to the op's execution location.
+            if let Some(load) = per_op_load.get(&op_id)
+                && let Some(l) = exec_loc
+            {
+                *loc_cpu.entry(l).or_default() += load.cpu;
+            }
+        },
+    );
+
+    let mut locs: Vec<usize> = loc_cpu.keys().copied().collect();
+    locs.sort_unstable();
+    println!(
+        "=== Predicted per-location CPU after rewrite ({} locations) ===",
+        rewrite.num_locations()
+    );
+    for loc in locs {
+        println!("  Location {}: predicted_cpu={:.2}%", loc, loc_cpu[&loc]);
+    }
 }

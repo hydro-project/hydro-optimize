@@ -10,6 +10,7 @@ scripts/*.png
 .hydro
 out*.txt
 benchmark_results/
+result_backup/
 
 # Neovim stuff
 tmux*

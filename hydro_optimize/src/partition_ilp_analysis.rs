@@ -340,72 +340,6 @@ fn create_canonical_fields(
     op_to_dependencies
 }
 
-/// Whether a node affects partitionability analysis
-pub enum Partitionability {
-    NoEffect,
-    Conditional,
-    Unpartitionable,
-}
-
-/// If this node is an IDB, and it is the only non-network node in its location, can we partition that location?
-/// - `NoEffect`: Yes, and we can actually partition randomly for each element.
-/// - `Conditional`: Yes, we can partition on some specific keys.
-/// - `Unpartitionable`: No.
-fn node_partitionability(node: &HydroNode) -> Partitionability {
-    // Commutative+associative reduces from reduce pushdown are tagged and can be partitioned
-    if node.op_metadata().cpu_usage == Some(COM_ASSOC_REDUCE_TAG) {
-        return Partitionability::NoEffect;
-    }
-    match node {
-        HydroNode::Placeholder => {
-            panic!()
-        }
-        HydroNode::Cast { .. }
-        | HydroNode::ObserveNonDet { .. }
-        | HydroNode::Source { .. }
-        | HydroNode::SingletonSource { .. }
-        | HydroNode::CycleSource { .. }
-        | HydroNode::Tee { .. }
-        | HydroNode::Partition { .. }
-        | HydroNode::YieldConcat { .. }
-        | HydroNode::BeginAtomic { .. }
-        | HydroNode::EndAtomic { .. }
-        | HydroNode::Batch { .. }
-        | HydroNode::ResolveFutures { .. }
-        | HydroNode::ResolveFuturesBlocking { .. }
-        | HydroNode::ResolveFuturesOrdered { .. }
-        | HydroNode::Filter { .. }
-        | HydroNode::DeferTick { .. }
-        | HydroNode::Inspect { .. }
-        | HydroNode::ExternalInput { .. }
-        | HydroNode::Network { .. }
-        | HydroNode::Counter { .. }
-        | HydroNode::Map { .. }
-        | HydroNode::FilterMap { .. }
-        | HydroNode::FlatMap { .. }
-        | HydroNode::FlatMapStreamBlocking { .. }
-        | HydroNode::Chain { .. }
-        | HydroNode::ChainFirst { .. }
-        | HydroNode::MergeOrdered { .. } => Partitionability::NoEffect,
-        HydroNode::Join { .. }
-        | HydroNode::JoinHalf { .. }
-        | HydroNode::Difference { .. }
-        | HydroNode::AntiJoin { .. }
-        | HydroNode::Unique { .. }
-        | HydroNode::FoldKeyed { .. }
-        | HydroNode::ReduceKeyed { .. }
-        | HydroNode::ReduceKeyedWatermark { .. } => Partitionability::Conditional,
-        HydroNode::CrossProduct { .. }
-        | HydroNode::CrossSingleton { .. }
-        | HydroNode::Enumerate { .. }
-        | HydroNode::Sort { .. }
-        | HydroNode::Scan { .. }
-        | HydroNode::ScanAsyncBlocking { .. }
-        | HydroNode::Fold { .. }
-        | HydroNode::Reduce { .. } => Partitionability::Unpartitionable,
-    }
-}
-
 /// Whether this node introduces persistence.
 /// Note: Must keep in sync with `emit_core` in hydro_lang.
 fn node_persists(node: &HydroNode) -> bool {
@@ -672,6 +606,16 @@ fn constrain_field_vars_to_parents(
     if parents.is_empty() {
         // Network nodes with no parents: field vars are unconstrained (free to be 0 or 1).
         // The solver will set them to 1 if doing so helps enable partitioning downstream.
+        // Add to partitionable operators as always partitionable
+        let DecoupleILPMetadata {
+            op_id_to_var,
+            ..
+        } = &mut *decoupling_metadata.borrow_mut();
+        for (loc, partitionable_expr) in partitionable_operators {
+            let is_at_loc = op_id_to_var.get(&op_id).unwrap().get(loc).unwrap();
+            let temp_expr = std::mem::take(partitionable_expr);
+            *partitionable_expr = temp_expr + is_at_loc;
+        }
         return;
     }
 
@@ -794,14 +738,10 @@ fn partition_ilp_node_analysis(
         return;
     }
 
-    let affect_partitionability = match node_partitionability(node) {
-        Partitionability::NoEffect => false,
-        Partitionability::Conditional | Partitionability::Unpartitionable => true,
-    };
     // TODO: Known inaccuracy: if a node is not an IDB but flows into the positive edge of a
     // negation (e.g. an anti-join), then it should also be relevant (and partitioned) to avoid
     // producing too many outputs
-    let is_relevant = idbs.contains(&op_id) && affect_partitionability;
+    let is_relevant = idbs.contains(&op_id);
 
     let PartitionILPMetadata {
         num_relevant_operators,
@@ -809,7 +749,7 @@ fn partition_ilp_node_analysis(
         ..
     } = metadata;
 
-    // A node is relevant if it is an IDB and affects partitionability
+    // A node is relevant if it is an IDB
     if is_relevant {
         add_op_to_location_sum(op_id, decoupling_metadata, num_relevant_operators);
     }

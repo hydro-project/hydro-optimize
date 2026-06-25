@@ -55,7 +55,7 @@ source ~/.zshrc
 ```
 
 Create a Gurobi license following your organization's instructions.
-For free educational licenses, you may request a license from Gurobi, then download it (which should create a gurobi.lic file) and put it on your remote machine under `~/`.
+For free educational licenses, you may request a WSL license from Gurobi, then download it (which should create a gurobi.lic file) and put it on your remote machine under `~/`.
 
 ## Execution
 Run all commands below within `tmux` so they continue running even if your SSH connection breaks.
