@@ -9,7 +9,6 @@ use hydro_lang::{
     nondet::nondet,
     prelude::{Bounded, Cluster, KeyedStream, Optional, Singleton, Stream, TCP, Tick, Unbounded},
 };
-use hydro_std::membership::track_membership;
 use serde::{Deserialize, Serialize};
 use stageleft::q;
 use std::{fmt::Debug, hash::Hash, time::Duration};
@@ -80,7 +79,7 @@ impl<State: Eq, Sender: Eq> Ord for Request<State, Sender> {
 pub struct Response<State, Sender> {
     pub request: Request<State, Sender>,
     pub max_ballot: Ballot,
-    pub state: Option<CASState<State>>,
+    pub state_and_ballot: Option<(CASState<State>, Ballot)>,
 }
 
 impl<'a, 'b> DistributedCAS<'a, 'b> {
@@ -108,69 +107,6 @@ impl<'a, 'b> DistributedCAS<'a, 'b> {
         }
     }
 
-    /// Send the message over the network to all other replicas, but just pass the message onwards for ourselves.
-    fn smart_broadcast<Payload>(
-        &self,
-        stream: Stream<Payload, Cluster<'a, Replica>, Unbounded, NoOrder>,
-    ) -> KeyedStream<MemberId<Replica>, Payload, Cluster<'a, Replica>, Unbounded, NoOrder>
-    where
-        Payload: Clone + Serialize + for<'de> Deserialize<'de> + 'a,
-    {
-        let nondet_membership = nondet!(/** Membership is static */);
-        let members = self.cluster.source_cluster_members(self.cluster);
-        let curr_replicas = track_membership(members);
-
-        let stream_with_dest = sliced! {
-            let stream = use(stream.clone(), nondet_membership);
-            let curr_replicas = use(curr_replicas, nondet_membership);
-
-            curr_replicas
-                .into_keyed_stream()
-                .entries()
-                .filter_map(q!(move |(member_id, present)| (present && member_id != CLUSTER_SELF_ID).then_some(member_id)))
-                .cross_product(stream)
-        };
-        let sent_stream = stream_with_dest.demux(self.cluster, TCP.fail_stop().bincode());
-
-        // Add a stream to ourselves but not over the network
-        let tick = self.cluster.tick();
-        let stream_to_self = stream
-            .map(q!(move |payload| (CLUSTER_SELF_ID.clone(), payload)))
-            .into_keyed()
-            .batch(
-                &tick,
-                nondet!(/** Only exists to defer_tick and avoid cycle with negation */),
-            )
-            .defer_tick()
-            .all_ticks();
-        sent_stream.merge_unordered(stream_to_self)
-    }
-
-    /// Similar to `smart_broadcast`, but for sending to a single destination.
-    fn smart_demux<Payload>(
-        &self,
-        stream: Stream<(MemberId<Replica>, Payload), Cluster<'a, Replica>, Unbounded, NoOrder>,
-    ) -> KeyedStream<MemberId<Replica>, Payload, Cluster<'a, Replica>, Unbounded, NoOrder>
-    where
-        Payload: Clone + Serialize + for<'de> Deserialize<'de> + 'a,
-    {
-        let (should_pass, should_demux) =
-            stream.partition(q!(
-                move |(member_id, _payload)| *member_id == CLUSTER_SELF_ID
-            ));
-        let demuxed = should_demux.demux(self.cluster, TCP.fail_stop().bincode());
-        let tick = self.cluster.tick();
-        should_pass
-            .into_keyed()
-            .batch(
-                &tick,
-                nondet!(/** Only exists to defer_tick and avoid cycle with negation */),
-            )
-            .defer_tick()
-            .all_ticks()
-            .merge_unordered(demuxed)
-    }
-
     /// Returns the state associated with the respondent with the highest ballot, and whether all agree
     /// Returns only 1 response per request ID, on the tick the quorum is first reached.
     #[expect(clippy::type_complexity, reason = "Stream type")]
@@ -191,7 +127,6 @@ impl<'a, 'b> DistributedCAS<'a, 'b> {
         let f = self.f;
         sliced! {
             let responses = use(responses.entries(), nondet!(/** The order in which inputs are collected at the quorum affects what is outputted */));
-            let mut reached_quorum = use::state_null::<Stream<UniqueRequestId, Tick<_>, Bounded, NoOrder>>();
             let mut prev_responses = use::state_null::<Stream<(UniqueRequestId, Response<State, Sender>), Tick<_>, Bounded, NoOrder>>();
 
             let current_responses = prev_responses.clone().chain(responses).into_keyed();
@@ -199,27 +134,34 @@ impl<'a, 'b> DistributedCAS<'a, 'b> {
 
             let (no_quorum, quorum) = count_per_key
                 .entries()
-                .partition(q!(move |(_request_id, count)| *count < f + 1));
-            let (just_quorum, all_quorum) = quorum
                 .partition(q!(move |(_request_id, count)| *count < 2 * f + 1));
 
             let just_reached_quorum = current_responses
                 .clone()
-                .filter_key_not_in(no_quorum.into_keyed().keys())
-                .filter_key_not_in(reached_quorum);
+                .filter_key_not_in(no_quorum.into_keyed().keys());
             let result = just_reached_quorum
                 .map(q!(|response| (response, true)))
                 .reduce(q!(|(prev_response, all_agree), (response, _)| {
-                    if prev_response.state != response.state {
+                    if prev_response.state_and_ballot.as_ref().map(|(state, _)| state) != response.state_and_ballot.as_ref().map(|(state, _)| state) {
                         *all_agree = false;
                     }
+                    // Return the state with the largest accepted ballot
+                    if let Some((_, prev_ballot)) = &prev_response.state_and_ballot {
+                        if let Some((_, ballot)) = &response.state_and_ballot
+                            && *prev_ballot < *ballot {
+                                prev_response.state_and_ballot = response.state_and_ballot;
+                            }
+                    }
+                    else {
+                        prev_response.state_and_ballot = response.state_and_ballot;
+                    }
+                    // Return the largest promised ballot. Note: This is just the ballot the leader needs to exceed to win writes; it does not indicate which write is freshest
                     if prev_response.max_ballot < response.max_ballot {
-                        *prev_response = response;
+                        prev_response.max_ballot = response.max_ballot;
                     }
                 }, commutative = manual_proof!(/** Max is order independent. No two writes will use the same ballot. */)));
 
-            reached_quorum = just_quorum.into_keyed().keys();
-            prev_responses = current_responses.filter_key_not_in(all_quorum.into_keyed().keys()).entries();
+            prev_responses = current_responses.filter_key_not_in(quorum.into_keyed().keys()).entries();
 
             result.values()
         }
@@ -323,8 +265,10 @@ where
                 num: 0,
                 node: CLUSTER_SELF_ID.clone(),
             })));
-            let mut state = use::state_null::<Optional<CASState<State>, _, Bounded>>();
+            let mut state = use::state_null::<Optional<(CASState<State>, Ballot), _, Bounded>>();
             // Last state where we know a majority of replicas agreed.
+            // NOTE: The ballot here is the request ballot sent to check the state, not the one associated with the accepted state.
+            // It should only be used to check if the committed state was sent in response to some blocked request.
             let mut committed_state = use::state_null::<Optional<(Ballot, Option<CASState<State>>), _, Bounded>>();
             // Writes blocking in reconcilation or election
             let mut write_queue = use::state_null::<KeyedStream<UniqueRequestId, (MemberId<Sender>, CASState<State>), _, Bounded, NoOrder>>();
@@ -375,10 +319,10 @@ where
                 .partition(q!(|(_response, all_agree)| *all_agree));
             // Propose reconciling write if some replicas disagree
             let proposed_reconciling_write = won_election_write_uncommitted
-                .map(q!(|(response, _all_agree)| (response.request.id, (None, response.state.expect("uncommitted election response missing state")))));
+                .map(q!(|(response, _all_agree)| (response.request.id, (None, response.state_and_ballot.map(|(state, _ballot)| state).expect("uncommitted election response missing state")))));
             let new_committed_state = won_election_write_complete
                 .clone()
-                .map(q!(|(response, _all_agree)| (response.max_ballot, response.state)))
+                .map(q!(|(response, _all_agree)| (response.max_ballot, response.state_and_ballot.map(|(state, _ballot)| state))))
                 .chain(committed_state.into_stream())
                 .max();
             // Propose a valid client write if the election is succesful and all agree
@@ -388,7 +332,7 @@ where
                 .cross_product(won_election_write_complete)
                 .filter_map(q!(|((request_id, (client_id, state)), (response, _all_agree))|
                     // Allow write if version is prev+1 or the writer is the same and the version hasn't changed
-                    if response.state.is_none_or(|curr_state| curr_state.version + 1 == state.version ||
+                    if response.state_and_ballot.is_none_or(|(curr_state, _curr_ballot)| curr_state.version + 1 == state.version ||
                         (curr_state.writer == state.writer && curr_state.version == state.version)) {
                         Some((request_id, (Some(client_id), state)))
                     }
@@ -462,12 +406,22 @@ where
             let winning_write = incoming_requests
                 .clone()
                 .values()
-                .sort()
-                .last()
-                .filter_map(q!(|request| request.ballot.zip(request.state)));
+                .reduce(q!(|max_req, request| {
+                    // Find the max ballot request with state
+                    if let Some(old_ballot) = &max_req.ballot {
+                        if let Some(ref new_ballot) = request.ballot && request.state.is_some() && *old_ballot <= *new_ballot {
+                            *max_req = request;
+                        }
+                    }
+                    else {
+                        *max_req = request;
+                    }
+                }, commutative = manual_proof!(/** Max is commutative */)))
+                .filter(q!(|request| request.ballot.is_some() && request.state.is_some()));
             let next_state = winning_write
                 .zip(max_ballot.clone())
-                .filter_map(q!(|((write_ballot, state), ballot)| (write_ballot >= ballot).then_some(state)))
+                .filter_map(q!(|(winning_request, ballot)|
+                    (*winning_request.ballot.as_ref().unwrap() >= ballot).then_some((winning_request.state.unwrap(), winning_request.ballot.unwrap()))))
                 .or(state);
 
             // Attach ballots to requests and responses
@@ -494,50 +448,64 @@ where
         // -------------------------------------------------------------
         // Broadcast requests.
         // -------------------------------------------------------------
-        let sent_requests = self.smart_broadcast(
-            client_reads
-                .entries()
-                .map(q!(|(client_id, request_id)| Request {
-                    id: request_id,
-                    client_id: Some(client_id),
-                    ballot: None,
-                    state: None,
-                }))
-                .merge_unordered(election_requests.map(q!(|ballot| Request {
-                    id: UniqueRequestId::generate(),
-                    client_id: None,
-                    ballot: Some(ballot),
-                    state: None,
-                })))
-                .merge_unordered(write_requests.map(q!(|(
-                    (request_id, (client_id, write)),
-                    ballot,
-                )| Request {
-                    id: request_id,
-                    client_id,
-                    ballot: Some(ballot),
-                    state: Some(write),
-                }))),
-        );
+        let sent_reads = client_reads
+            .entries()
+            .map(q!(|(client_id, request_id)| Request {
+                id: request_id,
+                client_id: Some(client_id),
+                ballot: None,
+                state: None,
+            }))
+            .broadcast(
+                self.cluster,
+                TCP.fail_stop().bincode(),
+                nondet!(/** static membership */),
+            );
+        let sent_elections = election_requests
+            .map(q!(|ballot| Request {
+                id: UniqueRequestId::generate(),
+                client_id: None,
+                ballot: Some(ballot),
+                state: None,
+            }))
+            .broadcast(
+                self.cluster,
+                TCP.fail_stop().bincode(),
+                nondet!(/** static membership */),
+            );
+        let sent_writes = write_requests
+            .map(q!(|((request_id, (client_id, write)), ballot)| Request {
+                id: request_id,
+                client_id,
+                ballot: Some(ballot),
+                state: Some(write),
+            }))
+            .broadcast(
+                self.cluster,
+                TCP.fail_stop().bincode(),
+                nondet!(/** static membership */),
+            );
+        let sent_requests = sent_reads
+            .merge_unordered(sent_elections)
+            .merge_unordered(sent_writes);
         incoming_requests_complete.complete(sent_requests);
 
         // -------------------------------------------------------------
         // Reply to requests with responses.
         // -------------------------------------------------------------
-        let sent_responses =
-            self.smart_demux(responses.entries().map(q!(|(
-                sender,
-                ((request, max_ballot), state),
-            )| {
+        let sent_responses = responses
+            .entries()
+            .map(q!(|(sender, ((request, max_ballot), state_and_ballot))| {
                 (
                     sender,
                     Response {
                         request,
                         max_ballot,
-                        state,
+                        state_and_ballot,
                     },
                 )
-            })))
+            }))
+            .demux(self.cluster, TCP.fail_stop().bincode())
             .values()
             .map(q!(|response| (response.request.id, response)))
             .into_keyed();
@@ -560,7 +528,10 @@ where
                     .request
                     .client_id
                     .expect("read result missing client_id"),
-                (response.request.id, response.state.clone())
+                (
+                    response.request.id,
+                    response.state_and_ballot.map(|(state, _ballot)| state)
+                )
             ))))
             .merge_unordered(unblocked_reads)
             .demux(sender, TCP.fail_stop().bincode())
@@ -580,7 +551,10 @@ where
                     .client_id
                     .expect("write success missing client_id"),
                 response.request.id,
-                response.state.clone().expect("write success missing state")
+                response
+                    .state_and_ballot
+                    .map(|(state, _ballot)| state)
+                    .expect("write success missing state")
             ))));
         let write_processed = write_success
             .clone()
