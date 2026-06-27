@@ -5,9 +5,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::deploy::{AWS_IO_TPS, AWS_NETWORK_BYTES_PER_SEC};
-use crate::deploy_and_analyze::{
-    MAX_BUDGET_PER_CLUSTER, MAX_OPTIMIZATION_ITERATIONS_PAST_NO_IMPROVEMENT,
-};
+use crate::deploy_and_analyze::MAX_BUDGET_PER_CLUSTER;
 use crate::parse_results::{NetworkCostTable, SarStats};
 use crate::partition_ilp_analysis::{apply_budget_constraints, partition_ilp_analysis};
 use crate::partition_syn_analysis::StructOrTupleIndex;
@@ -37,7 +35,6 @@ pub fn num_to_alpha(n: usize) -> String {
 
 // Penalty for decoupling regardless of cardinality (to prevent decoupling low cardinality operators)
 const DECOUPLING_PENALTY: f64 = 0.0001;
-const IMPROVEMENT_THRESHOLD: f64 = 0.01; // Minimum improvement to keep increasing budget
 const LEXICOGRAPHIC_EPSILON: f64 = 0.0001; // Tiebreaker weight to minimize non-bottleneck locations
 
 /// Each operator is assigned either 0 or 1
@@ -819,8 +816,10 @@ pub(crate) fn decouple_analysis(
             .iter()
             .map(|(expr, cap)| solution.eval(expr.clone()) / cap)
             .collect();
-        let per_resource_usage: Vec<f64> =
-            res.iter().map(|(expr, _)| solution.eval(expr.clone())).collect();
+        let per_resource_usage: Vec<f64> = res
+            .iter()
+            .map(|(expr, _)| solution.eval(expr.clone()))
+            .collect();
         println!(
             "ILP cost loc {}: chosen_n={}, max_sat={:.4}, effective_usage(cpu,mem,net,io)={:?}, sat={:?}",
             loc, chosen_n, max_sat, per_resource_usage, per_resource_sat
@@ -864,7 +863,8 @@ pub(crate) fn decouple_analysis(
         for loc in 0..max_num_locations {
             let num_relevant = solution
                 .eval(
-                    partition_metadata.num_relevant_operators
+                    partition_metadata
+                        .num_relevant_operators
                         .get(&loc)
                         .cloned()
                         .unwrap_or_default(),
@@ -872,7 +872,8 @@ pub(crate) fn decouple_analysis(
                 .round() as i64;
             let num_partitionable = solution
                 .eval(
-                    partition_metadata.partitionable_operators
+                    partition_metadata
+                        .partitionable_operators
                         .get(&loc)
                         .cloned()
                         .unwrap_or_default(),
@@ -880,7 +881,8 @@ pub(crate) fn decouple_analysis(
                 .round() as i64;
             let num_persists = solution
                 .eval(
-                    partition_metadata.num_persist_operators
+                    partition_metadata
+                        .num_persist_operators
                         .get(&loc)
                         .cloned()
                         .unwrap_or_default(),
@@ -949,7 +951,6 @@ pub fn find_optimal_budget(
     cycle_source_to_sink_parent: &HashMap<usize, usize>,
 ) -> Vec<Rewrite> {
     let mut results = Vec::new();
-    let mut no_improvement = 0;
 
     for budget in 2..=MAX_BUDGET_PER_CLUSTER {
         let start = Instant::now();
@@ -969,20 +970,7 @@ pub fn find_optimal_budget(
             rewrite.num_partitions,
             start.elapsed()
         );
-
-        let improved = results
-            .last()
-            .is_none_or(|prev: &Rewrite| prev.max_cost() - cost > IMPROVEMENT_THRESHOLD);
-
-        if improved {
-            no_improvement = 0;
-            results.push(rewrite);
-        } else {
-            no_improvement += 1;
-            if no_improvement >= MAX_OPTIMIZATION_ITERATIONS_PAST_NO_IMPROVEMENT {
-                break;
-            }
-        }
+        results.push(rewrite);
     }
 
     results
