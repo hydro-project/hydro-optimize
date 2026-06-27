@@ -23,7 +23,12 @@ use crate::deploy_and_analyze::{
 /// 1. Finds the run suffix (e.g. "10c_500vc_r0") with highest avg throughput.
 /// 2. For that run, reads all cluster CSVs and returns the cluster name whose SAR stats
 ///    are closest to saturation (100% CPU, 100% memory, or at/above max network/IO).
-pub fn find_bottleneck_from_run(run_dir: &Path, network_bytes_per_sec: f64, io_tps: f64) -> String {
+pub fn find_bottleneck_from_run(
+    run_dir: &Path,
+    network_bytes_per_sec: f64,
+    io_tps: f64,
+    excluded_names: &HashSet<String>,
+) -> String {
     let csv_re = Regex::new(r"^(.+)_(\d+c_\d+vc_r\d+)\.csv$").unwrap();
 
     // Group CSVs by suffix
@@ -72,14 +77,18 @@ pub fn find_bottleneck_from_run(run_dir: &Path, network_bytes_per_sec: f64, io_t
         .fold(0.0_f64, f64::max)
     };
 
+    // Excluded clusters/processes (e.g. clients) are never optimization targets, so they
+    // are not eligible to be the bottleneck. Compare against the base cluster name so that
+    // decoupled/partitioned variants (e.g. "client_loc1") are excluded too.
     let (bottleneck_name, _) = suffix_to_files[&best_suffix]
         .iter()
+        .filter(|(cluster_name, _)| !excluded_names.contains(original_cluster_name(cluster_name)))
         .map(|(cluster_name, path)| {
             let avg_sar = csv_avg_sar(path);
             (cluster_name.clone(), score(&avg_sar))
         })
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .expect("No cluster CSVs for best suffix");
+        .expect("No non-excluded cluster CSVs for best suffix");
 
     println!(
         "Bottleneck from run: {} (suffix: {})",
