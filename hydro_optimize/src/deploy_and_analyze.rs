@@ -40,8 +40,7 @@ const SAR_USAGE_PREFIX: &str = "HYDRO_OPTIMIZE_SAR:";
 const LATENCY_PREFIX: &str = "HYDRO_OPTIMIZE_LAT:";
 const THROUGHPUT_PREFIX: &str = "HYDRO_OPTIMIZE_THR:";
 
-pub const MAX_BUDGET_PER_CLUSTER: usize = 7;
-pub const MAX_OPTIMIZATION_ITERATIONS_PAST_NO_IMPROVEMENT: usize = 2;
+pub const MAX_BUDGET_PER_CLUSTER: usize = 10;
 const BIMODAL_CV_THRESHOLD: f64 = 0.3;
 
 /// Returns true if min throughput in the measurement window is significantly lower than the max overall
@@ -1032,13 +1031,22 @@ async fn run_bottleneck_elimination<'a>(
         }
     }
 
-    // Find bottleneck from the most recent _none run
+    let excluded_names: HashSet<String> = config
+        .optimizations
+        .exclude
+        .iter()
+        .filter_map(|loc| config.location_id_to_cluster.get(loc).cloned())
+        .collect();
     let prev_run_dir = find_workload_dirs(base, &prev_name, OptimizationKind::None.label())
         .into_iter()
         .next()
         .unwrap_or_else(|| panic!("No _none run found for '{}'", prev_name));
-    let bottleneck_name =
-        find_bottleneck_from_run(&prev_run_dir, AWS_NETWORK_BYTES_PER_SEC, AWS_IO_TPS);
+    let bottleneck_name = find_bottleneck_from_run(
+        &prev_run_dir,
+        AWS_NETWORK_BYTES_PER_SEC,
+        AWS_IO_TPS,
+        &excluded_names,
+    );
     let bottleneck_cluster = original_cluster_name(&bottleneck_name).to_string();
 
     if state.is_exhausted(&bottleneck_cluster) {
@@ -1053,6 +1061,13 @@ async fn run_bottleneck_elimination<'a>(
     if !state.cluster_rewrites.contains_key(&bottleneck_cluster) {
         let analysis_name;
         let analysis_built;
+        // Snapshot the base clusters/loc-map. When prior rewrites are replayed below,
+        // they create new (decoupled/partitioned) clusters that the analysis passes must
+        // deploy. Those passes deploy with `config.clusters`/`config.location_id_to_cluster`,
+        // so we apply the rewrites directly into `config` here, then restore the base
+        // snapshots before the final apply  recreates them from scratch.
+        let base_clusters = config.clusters.clone();
+        let base_loc_map = config.location_id_to_cluster.clone();
         if state.applied.is_empty() {
             analysis_name = base_name.clone();
             analysis_built = None;
@@ -1062,15 +1077,13 @@ async fn run_bottleneck_elimination<'a>(
             analysis_name = name;
 
             let rewrites = state.rewrites_to_apply();
-            let mut analysis_clusters = config.clusters.clone();
-            let mut analysis_loc_map = config.location_id_to_cluster.clone();
             let mut builder = FlowBuilder::from_built(&built);
             builder.replace_ir(deep_clone(built.ir()));
             analysis_built = Some(apply_loaded_rewrites(
                 builder.finalize(),
-                &mut analysis_clusters,
+                &mut config.clusters,
                 &rewrites,
-                &mut analysis_loc_map,
+                &mut config.location_id_to_cluster,
             ));
         }
 
@@ -1133,6 +1146,12 @@ async fn run_bottleneck_elimination<'a>(
         state
             .cluster_rewrites
             .insert(bottleneck_cluster.clone(), computed_rewrites);
+
+        // Restore the base clusters/loc-map: the final apply below recreates the
+        // decoupled clusters from the base program, so `config` must not already
+        // contain the analysis-pass copies (which would duplicate them).
+        config.clusters = base_clusters;
+        config.location_id_to_cluster = base_loc_map;
     }
 
     // Apply next budget for the bottleneck cluster
