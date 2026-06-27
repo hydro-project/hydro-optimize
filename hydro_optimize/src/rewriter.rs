@@ -83,6 +83,14 @@ fn map_before_network(node: &mut HydroNode, network_metadata: &NetworkMetadata) 
         if let Some(field) = &network_metadata.partition_field {
             // If partitioning and there is a field to hash on, use it
             let struct_or_tuple: syn::Expr = syn::parse_quote! { struct_or_tuple };
+            // If this is an existing network, then the index is over fields of the network after the receipt(sender, T), but before the send, the type is just T, so lop off the 1st layer of the field.
+            let field: &[String] = if !network_metadata.new {
+                // Partitioning on sender location CAN be supported, but it will involve introducing a Hash over CLUSTER_SELF_ID
+                assert_eq!(field[0], "1", "Unsupported: Partitioning on sender location.");
+                &field[1..]
+            } else {
+                field
+            };
             let struct_or_tuple_with_fields = StructOrTuple::to_syn_expr(struct_or_tuple, field);
             syn::parse_quote!({
                 let mut s = ::std::hash::DefaultHasher::new();
