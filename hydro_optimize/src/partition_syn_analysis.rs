@@ -422,7 +422,7 @@ impl StructOrTuple {
         }
     }
 
-    pub fn to_syn_expr(mut tuple: syn::Expr, indices: &StructOrTupleIndex) -> syn::Expr {
+    pub fn to_syn_expr(mut tuple: syn::Expr, indices: &[String]) -> syn::Expr {
         for index in indices {
             let member = if let Ok(num_index) = index.parse::<usize>() {
                 syn::Member::Unnamed(syn::Index::from(num_index))
