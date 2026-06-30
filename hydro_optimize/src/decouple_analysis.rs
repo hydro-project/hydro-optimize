@@ -9,7 +9,10 @@ use crate::deploy_and_analyze::MAX_BUDGET_PER_CLUSTER;
 use crate::parse_results::{NetworkCostTable, SarStats};
 use crate::partition_ilp_analysis::{apply_budget_constraints, partition_ilp_analysis};
 use crate::partition_syn_analysis::StructOrTupleIndex;
-use crate::rewrites::{all_inputs, get_tick_id, is_serializable, is_syntactic_sugar, nodes_dependent_on_inputs, op_id_to_parents};
+use crate::rewrites::{
+    all_inputs, get_tick_id, is_serializable, is_syntactic_sugar, nodes_dependent_on_inputs,
+    op_id_to_parents,
+};
 use good_lp::solvers::lp_solvers::{GurobiSolver, LpSolution, LpSolver};
 use good_lp::{
     Constraint, Expression, ProblemVariables, Solution, SolverModel, Variable, constraint,
@@ -36,6 +39,7 @@ pub fn num_to_alpha(n: usize) -> String {
 // Penalty for decoupling regardless of cardinality (to prevent decoupling low cardinality operators)
 const DECOUPLING_PENALTY: f64 = 0.0001;
 const LEXICOGRAPHIC_EPSILON: f64 = 0.0001; // Tiebreaker weight to minimize non-bottleneck locations
+const FIELD_SPECIFICITY_EPSILON: f64 = LEXICOGRAPHIC_EPSILON * 0.001; // Smaller tiebreaker to prefer broader partition fields
 
 /// Each operator is assigned either 0 or 1
 /// 0 means that its output will go to the original node, 1 means that it will go to the decoupled node
@@ -69,6 +73,8 @@ pub(crate) struct DecoupleILPMetadata {
     prev_op_parent_with_tick: HashMap<ClockId, usize>, // tick_id: last op_id with that tick_id
     tee_inner_to_decoupled_vars: HashMap<usize, HashMap<usize, (Variable, Variable)>>, /* inner_id: (loc: (send var, recv var)) */
     pub(crate) network_ids: HashMap<usize, NetworkType>,
+    // Add small penalties for partitioning on too-specific fields, since those are less likely to be uniformly distributed
+    pub(crate) field_specificity_penalty: Expression,
 }
 
 /// Per-location ILP expressions for each resource type.
@@ -568,6 +574,7 @@ fn solve(decoupling_metadata: &RefCell<DecoupleILPMetadata>) -> LpSolution {
         resource_usages,
         op_id_to_var,
         max_num_locations,
+        field_specificity_penalty,
         ..
     } = &mut *decoupling_metadata.borrow_mut();
 
@@ -602,7 +609,9 @@ fn solve(decoupling_metadata: &RefCell<DecoupleILPMetadata>) -> LpSolution {
         }
     }
 
-    let objective = highest_saturation + LEXICOGRAPHIC_EPSILON * sum_saturations;
+    let objective = highest_saturation
+        + LEXICOGRAPHIC_EPSILON * sum_saturations
+        + FIELD_SPECIFICITY_EPSILON * field_specificity_penalty.clone();
 
     println!(
         "  Solving ILP: {} vars, {} constraints",
@@ -734,6 +743,7 @@ pub(crate) fn decouple_analysis(
         prev_op_parent_with_tick: HashMap::new(),
         tee_inner_to_decoupled_vars: HashMap::new(),
         network_ids: HashMap::new(),
+        field_specificity_penalty: Expression::default(),
     });
     let op_id_to_parents = op_id_to_parents(ir, Some(bottleneck), cycle_source_to_sink_parent);
     let inputs = all_inputs(ir, &decoupling_metadata.borrow().bottleneck);

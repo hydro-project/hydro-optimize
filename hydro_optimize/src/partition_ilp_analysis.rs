@@ -414,6 +414,10 @@ pub(crate) struct PartitionILPMetadata {
     pub(crate) can_partition: HashMap<usize, Variable>, // location: 1 iff location is partitionable ((all relevant partitionable OR no persist) AND no total-order)
 }
 
+fn field_specificity_score(field: &StructOrTupleIndex) -> f64 {
+    (field.len() + 1) as f64
+}
+
 /// Add the operator with `id` to the location_sum for each location
 fn add_op_to_location_sum(
     id: usize,
@@ -494,14 +498,19 @@ fn field_vars_from_op(
             let mut field_to_var = HashMap::new();
             let mut sum_expr = Expression::default();
             for (idx, field_name) in field_names.iter().enumerate() {
+                let mut decoupling_metadata = decoupling_metadata.borrow_mut();
                 let var = decoupling_metadata
-                    .borrow_mut()
                     .variables
                     .add(variable().binary().name(format!(
                         "fieldop{}f{}",
                         num_to_alpha(op_id),
                         num_to_alpha(idx)
                     )));
+                // Add penality for partitioning on too-specific fields
+                let penalty = std::mem::take(&mut decoupling_metadata.field_specificity_penalty);
+                decoupling_metadata.field_specificity_penalty =
+                    penalty + Expression::from(var) * field_specificity_score(field_name);
+
                 field_to_var.insert(field_name.clone(), var);
                 sum_expr += var;
             }
