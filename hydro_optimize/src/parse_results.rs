@@ -15,7 +15,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::decouple_analysis::Rewrite;
 use crate::deploy_and_analyze::{
-    MEASUREMENT_SECOND, MetricLogs, OptimizationKind, START_MEASUREMENT_SECOND,
+    MEASUREMENT_SECOND, MetricLogs, Optimization, START_MEASUREMENT_SECOND,
     inject_inferred_counters,
 };
 
@@ -23,12 +23,13 @@ use crate::deploy_and_analyze::{
 /// 1. Finds the run suffix (e.g. "10c_500vc_r0") with highest avg throughput.
 /// 2. For that run, reads all cluster CSVs and returns the cluster name whose SAR stats
 ///    are closest to saturation (100% CPU, 100% memory, or at/above max network/IO).
-pub fn find_bottleneck_from_run(
+/// For one run directory, returns each cluster's saturation (max resource utilization) at the
+/// highest-throughput run suffix. Returns an empty map if the directory has no CSVs.
+fn cluster_saturations_from_run(
     run_dir: &Path,
     network_bytes_per_sec: f64,
     io_tps: f64,
-    excluded_names: &HashSet<String>,
-) -> String {
+) -> HashMap<String, f64> {
     let csv_re = Regex::new(r"^(.+)_(\d+c_\d+vc_r\d+)\.csv$").unwrap();
 
     // Group CSVs by suffix
@@ -49,7 +50,7 @@ pub fn find_bottleneck_from_run(
     }
 
     // Find suffix with highest throughput (use first CSV that has throughput data)
-    let best_suffix = suffix_to_files
+    let Some(best_suffix) = suffix_to_files
         .keys()
         .max_by_key(|suffix| {
             suffix_to_files[*suffix]
@@ -58,8 +59,10 @@ pub fn find_bottleneck_from_run(
                 .max()
                 .unwrap_or(0)
         })
-        .expect("No CSVs found in run dir")
-        .clone();
+        .cloned()
+    else {
+        return HashMap::new();
+    };
 
     // For the best suffix, score each cluster by saturation
     let score = |s: &SarStats| -> f64 {
@@ -77,22 +80,76 @@ pub fn find_bottleneck_from_run(
         .fold(0.0_f64, f64::max)
     };
 
-    // Excluded clusters/processes (e.g. clients) are never optimization targets, so they
-    // are not eligible to be the bottleneck. Compare against the base cluster name so that
-    // decoupled/partitioned variants (e.g. "client_loc1") are excluded too.
-    let (bottleneck_name, _) = suffix_to_files[&best_suffix]
-        .iter()
-        .filter(|(cluster_name, _)| !excluded_names.contains(original_cluster_name(cluster_name)))
-        .map(|(cluster_name, path)| {
-            let avg_sar = csv_avg_sar(path);
-            (cluster_name.clone(), score(&avg_sar))
-        })
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .expect("No non-excluded cluster CSVs for best suffix");
+    let mut saturations: HashMap<String, f64> = HashMap::new();
+    for (cluster_name, path) in &suffix_to_files[&best_suffix] {
+        let s = score(&csv_avg_sar(path));
+        let entry = saturations.entry(cluster_name.clone()).or_insert(f64::MIN);
+        if s > *entry {
+            *entry = s;
+        }
+    }
+    saturations
+}
 
+/// Returns the most-saturated cluster name in `saturations`, excluding any whose base name is
+/// in `excluded_names` (so decoupled/partitioned variants like "client_loc1" are excluded too).
+fn most_saturated_cluster(
+    saturations: &HashMap<String, f64>,
+    excluded_names: &HashSet<String>,
+) -> String {
+    saturations
+        .iter()
+        .filter(|(name, _)| !excluded_names.contains(original_cluster_name(name)))
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .map(|(name, _)| name.clone())
+        .expect("No non-excluded cluster found in run")
+}
+
+/// Finds the bottleneck cluster from a single run folder's CSV data.
+/// 1. Finds the run suffix (e.g. "10c_500vc_r0") with highest avg throughput.
+/// 2. For that run, returns the (non-excluded) cluster name whose SAR stats are closest to
+///    saturation (100% CPU, 100% memory, or at/above max network/IO).
+pub fn find_bottleneck_from_run(
+    run_dir: &Path,
+    network_bytes_per_sec: f64,
+    io_tps: f64,
+    excluded_names: &HashSet<String>,
+) -> String {
+    let saturations = cluster_saturations_from_run(run_dir, network_bytes_per_sec, io_tps);
+    let bottleneck_name = most_saturated_cluster(&saturations, excluded_names);
+    println!("Bottleneck from run {}: {}", run_dir.display(), bottleneck_name);
+    bottleneck_name
+}
+
+/// Finds the bottleneck cluster across multiple workloads' run folders, taking the max
+/// saturation per cluster across all of them. This picks the cluster that is the worst
+/// bottleneck in *any* workload, so the optimizer targets the cluster that limits the
+/// hardest workload rather than an arbitrary single one.
+pub fn find_bottleneck_across_runs(
+    run_dirs: &[PathBuf],
+    network_bytes_per_sec: f64,
+    io_tps: f64,
+    excluded_names: &HashSet<String>,
+) -> String {
+    let mut merged: HashMap<String, f64> = HashMap::new();
+    for dir in run_dirs {
+        for (name, s) in cluster_saturations_from_run(dir, network_bytes_per_sec, io_tps) {
+            let entry = merged.entry(name).or_insert(f64::MIN);
+            if s > *entry {
+                *entry = s;
+            }
+        }
+    }
+    assert!(
+        !merged.is_empty(),
+        "No cluster CSVs found across {} run dir(s)",
+        run_dirs.len()
+    );
+    let bottleneck_name = most_saturated_cluster(&merged, excluded_names);
     println!(
-        "Bottleneck from run: {} (suffix: {})",
-        bottleneck_name, best_suffix
+        "Bottleneck across {} workload(s): {}",
+        run_dirs.len(),
+        bottleneck_name
     );
     bottleneck_name
 }
@@ -159,7 +216,7 @@ pub fn csv_avg_throughput(path: &Path) -> usize {
 
 /// Returns the max average throughput across all CSVs in `_none` workload dirs for `name`.
 pub fn max_throughput_for(base_dir: &Path, name: &str) -> usize {
-    find_workload_dirs(base_dir, name, OptimizationKind::None.label())
+    find_workload_dirs(base_dir, name, Optimization::None.label())
         .iter()
         .flat_map(|d| get_csvs_in_dir(d))
         .map(|e| csv_avg_throughput(&e.path()))
@@ -238,10 +295,10 @@ impl OptimizationState {
 /// Loads ILP inputs by scanning all workload directories for a given protocol name and label,
 /// taking the element-wise max across workloads.
 pub fn load_raw_ilp_inputs(base_dir: &Path, name: &str) -> RawIlpInputs {
-    let blow_up_dirs = find_workload_dirs(base_dir, name, OptimizationKind::BlowUpAnalysis.label());
-    let size_dirs = find_workload_dirs(base_dir, name, OptimizationKind::SizeAnalysis.label());
-    let counters_dirs = find_workload_dirs(base_dir, name, OptimizationKind::CountersOnly.label());
-    let perf_dirs = find_workload_dirs(base_dir, name, OptimizationKind::PerfOnly.label());
+    let blow_up_dirs = find_workload_dirs(base_dir, name, Optimization::BlowUpAnalysis.label());
+    let size_dirs = find_workload_dirs(base_dir, name, Optimization::SizeAnalysis.label());
+    let counters_dirs = find_workload_dirs(base_dir, name, Optimization::Counters.label());
+    let perf_dirs = find_workload_dirs(base_dir, name, Optimization::Perf.label());
 
     assert!(!size_dirs.is_empty(), "No size dirs for '{}'", name);
     assert!(!counters_dirs.is_empty(), "No counters dirs for '{}'", name);
@@ -391,7 +448,7 @@ pub fn load_calibration_table(calibration_dir: &Path) -> NetworkCostTable {
 
 /// Finds the bottleneck run directory: the perf dir with highest throughput across workloads.
 pub fn find_bottleneck_run_dir(base_dir: &Path, name: &str) -> PathBuf {
-    let perf_label = OptimizationKind::PerfOnly.label();
+    let perf_label = Optimization::Perf.label();
     let perf_dirs = find_workload_dirs(base_dir, name, perf_label);
     assert!(!perf_dirs.is_empty(), "No perf dirs for '{}'", name);
     // Use the one with highest throughput CSVs
@@ -474,13 +531,13 @@ pub fn decoupled_cluster_name(original_name: &str, loc_idx: usize) -> String {
 /// Returns `None` if no `_none` run has completed, `Some(0)` if only `{name}_default_none`
 /// exists, `Some(N)` if `{name}_optN_default_none` is the highest.
 pub fn find_latest_iteration(base_dir: &Path, name: &str) -> Option<usize> {
-    let base_none = find_workload_dirs(base_dir, name, OptimizationKind::None.label());
+    let base_none = find_workload_dirs(base_dir, name, Optimization::None.label());
     if base_none.is_empty() {
         return None;
     }
 
     let prefix = format!("{}_opt", name);
-    let suffix = format!("_{}", OptimizationKind::None.label());
+    let suffix = format!("_{}", Optimization::None.label());
     let max_opt = std::fs::read_dir(base_dir)
         .into_iter()
         .flatten()

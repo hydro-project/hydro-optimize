@@ -14,13 +14,13 @@ use hydro_lang::prelude::{Cluster, FlowBuilder, Process};
 use hydro_lang::telemetry::Sidecar;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::decouple_analysis::{IlpInputs, Rewrite, find_optimal_budget, project_total_cpu};
+use crate::decouple_analysis::{IlpInputs, Rewrite, find_optimal_budget};
 use crate::deploy::{AWS_IO_TPS, AWS_NETWORK_BYTES_PER_SEC, HostType, ReusableHosts};
 use crate::greedy_decouple_analysis::greedy_decouple_analysis;
 use crate::parse_results::{
     OptimizationState, RawIlpInputs, RunMetadata, analyze_cluster_results, decoupled_cluster_name,
-    derive_per_op_load, find_bottleneck_from_run, find_latest_iteration, find_workload_dirs,
-    load_raw_ilp_inputs, max_throughput_for, original_cluster_name,
+    derive_per_op_load, find_bottleneck_across_runs, find_latest_iteration, find_workload_dirs,
+    get_csvs_in_dir, load_raw_ilp_inputs, max_throughput_for, original_cluster_name,
 };
 use crate::reduce_pushdown::reduce_pushdown;
 use crate::reduce_pushdown_analysis::reduce_pushdown_decision;
@@ -398,33 +398,33 @@ impl ReusableProcesses {
 
 /// Mutually exclusive optimization strategies that rewrite the IR before deployment.
 #[derive(Clone, Default)]
-pub enum OptimizationKind {
+pub enum Optimization {
     /// No IR rewriting, no counters.
     #[default]
     None,
     /// No IR rewriting, but insert counters to measure per-op cardinality.
-    CountersOnly,
+    Counters,
     /// Apply greedy decoupling, deploy decoupled system, gather per-operator SAR costs.
     /// Always inserts counters.
     BlowUpAnalysis,
     /// Insert size measuring nodes wherever decoupling is possible.
     SizeAnalysis,
     /// Deploy with `perf record` on non-excluded locations for flamegraph profiling.
-    PerfOnly,
+    Perf,
     /// Run ILP to find optimal decoupling, save Rewrite to file, then exit without deploying.
     /// Automatically loads applied rewrites from the latest opt dir.
     BottleneckElimination,
 }
 
-impl OptimizationKind {
+impl Optimization {
     pub fn label(&self) -> &'static str {
         match self {
             // Do not differentiate between None and BottleneckElimination, since both run the protocol without additional profiling
-            OptimizationKind::None | OptimizationKind::BottleneckElimination => "none",
-            OptimizationKind::CountersOnly => "counters",
-            OptimizationKind::BlowUpAnalysis => "blow_up",
-            OptimizationKind::SizeAnalysis => "size",
-            OptimizationKind::PerfOnly => "perf",
+            Optimization::None | Optimization::BottleneckElimination => "none",
+            Optimization::Counters => "counters",
+            Optimization::BlowUpAnalysis => "blow_up",
+            Optimization::SizeAnalysis => "size",
+            Optimization::Perf => "perf",
         }
     }
 }
@@ -442,68 +442,39 @@ pub fn make_output_dir(name: &str, workload: &str, label: &str) -> std::path::Pa
     dir
 }
 
+/// Per-workload compiled artifacts. These depend on the compiled program's location IDs, so
+/// they are produced per workload by the `compile` closure rather than shared in
+/// `BenchmarkConfig`. All workloads of a protocol must produce an identical IR topology (same
+/// op ids / clusters), differing only in runtime data.
 #[derive(Clone, Default)]
-pub struct Optimizations {
-    pub decoupling: bool,
-    pub partitioning: bool,
-    pub kind: OptimizationKind,
+pub struct CompiledProgram {
+    pub clusters: ReusableClusters,
+    pub processes: ReusableProcesses,
+    /// Locations excluded from optimization (e.g. clients). Per-workload because it references
+    /// the compiled program's location IDs.
     pub exclude: HashSet<LocationId>,
+    pub location_id_to_cluster: HashMap<LocationId, String>,
 }
 
-impl Optimizations {
-    pub fn with_decoupling(mut self) -> Self {
-        self.decoupling = true;
-        self
+impl CompiledProgram {
+    pub fn new(
+        clusters: ReusableClusters,
+        processes: ReusableProcesses,
+        location_id_to_cluster: HashMap<LocationId, String>,
+    ) -> Self {
+        Self {
+            clusters,
+            processes,
+            exclude: HashSet::new(),
+            location_id_to_cluster,
+        }
     }
 
-    pub fn with_partitioning(mut self) -> Self {
-        self.partitioning = true;
-        self
-    }
-
-    /// Insert counters only (no IR rewriting).
-    pub fn with_counters_only(mut self) -> Self {
-        self.set_kind(OptimizationKind::CountersOnly);
-        self
-    }
-
-    /// Insert size measuring nodes wherever decoupling is possible
-    pub fn with_size_analysis(mut self) -> Self {
-        self.set_kind(OptimizationKind::SizeAnalysis);
-        self
-    }
-
-    /// Apply greedy decoupling, deploy decoupled system, gather per-operator SAR costs
-    pub fn with_blow_up_analysis(mut self) -> Self {
-        self.set_kind(OptimizationKind::BlowUpAnalysis);
-        self
-    }
-
-    /// Deploy with `perf record` on non-excluded locations for flamegraph profiling.
-    pub fn with_perf_only(mut self) -> Self {
-        self.set_kind(OptimizationKind::PerfOnly);
-        self
-    }
-
-    /// Run ILP-based bottleneck elimination (offline, no deployment).
-    /// Automatically finds the latest run directory for bottleneck detection
-    /// and loads applied rewrites from the latest opt dir.
-    pub fn with_bottleneck_elimination(mut self) -> Self {
-        self.set_kind(OptimizationKind::BottleneckElimination);
-        self
-    }
-
+    /// Excludes a location (cluster/process) from optimization: it won't be decoupled,
+    /// partitioned, profiled with `perf`, or chosen as a bottleneck.
     pub fn excluding(mut self, location: LocationId) -> Self {
         self.exclude.insert(location);
         self
-    }
-
-    fn set_kind(&mut self, kind: OptimizationKind) {
-        assert!(
-            matches!(self.kind, OptimizationKind::None),
-            "blow_up_analysis, size_analysis, and loaded rewrites are mutually exclusive"
-        );
-        self.kind = kind;
     }
 }
 
@@ -517,9 +488,8 @@ async fn deploy_and_analyze<'a>(
     reusable_hosts: &mut ReusableHosts,
     deployment: &mut Deployment,
     builder: BuiltFlow<'a>,
-    clusters: &ReusableClusters,
-    processes: &ReusableProcesses,
-    optimizations: &Optimizations,
+    program: &CompiledProgram,
+    kind: &Optimization,
     num_seconds: Option<usize>,
 ) -> RunMetadata {
     // Measure network (-n DEV) and CPU (-u) usage. -P 0 measures only core 0, where the
@@ -530,12 +500,12 @@ async fn deploy_and_analyze<'a>(
         prefix: SAR_USAGE_PREFIX.to_string(),
     };
 
-    let use_perf = matches!(optimizations.kind, OptimizationKind::PerfOnly);
+    let use_perf = matches!(kind, Optimization::Perf);
 
     // Insert all clusters & processes
     let mut deployable = builder.into_deploy();
-    for (cluster_id, name, num_hosts) in clusters.named_clusters.iter() {
-        let excluded = optimizations.exclude.contains(cluster_id);
+    for (cluster_id, name, num_hosts) in program.clusters.named_clusters.iter() {
+        let excluded = program.exclude.contains(cluster_id);
         let hosts = reusable_hosts.get_cluster_hosts(
             deployment,
             name.clone(),
@@ -544,12 +514,12 @@ async fn deploy_and_analyze<'a>(
         );
         deployable = deployable.with_cluster_erased(cluster_id.key(), hosts);
     }
-    for (process_id, name) in processes.named_processes.iter() {
-        let excluded = optimizations.exclude.contains(process_id);
+    for (process_id, name) in program.processes.named_processes.iter() {
+        let excluded = program.exclude.contains(process_id);
         let host = reusable_hosts.get_process_host(deployment, name.clone(), use_perf && !excluded);
         deployable = deployable.with_process_erased(process_id.key(), host);
     }
-    for excluded_location in optimizations.exclude.iter() {
+    for excluded_location in program.exclude.iter() {
         deployable = deployable.set_batch_limit_from(excluded_location.key(), BATCH_PULL_LIMIT);
     }
     deployable = deployable.with_sidecar_all(&sar_sidecar);
@@ -587,15 +557,15 @@ pub struct BenchmarkArgs {
     pub aws: bool,
 }
 
+/// Static benchmark configuration, shared across all workloads of a protocol. Per-workload,
+/// program-dependent data (clusters, processes, excluded ids, location map) lives in
+/// `CompiledProgram`; the workload name comes from the `(params, name)` workload mapping.
 #[derive(Clone)]
 pub struct BenchmarkConfig {
+    /// Base protocol name (e.g. "CAS"). Output dirs are `{name}[_optN]_{workload}_{label}`.
     pub name: String,
-    /// Workload variant (e.g. "read_heavy"). Determines output subdirectory name.
-    pub workload: String,
-    pub clusters: ReusableClusters,
-    pub processes: ReusableProcesses,
-    pub optimizations: Optimizations,
-    pub location_id_to_cluster: HashMap<LocationId, String>,
+    /// Which optimization/analysis strategy to run. Static across workloads.
+    pub kind: Optimization,
     pub num_physical_clients: usize,
     pub start_virtual_clients: usize,
     pub virtual_clients_step: usize,
@@ -764,12 +734,15 @@ async fn run_scaling_loop<'a>(
     deployment: &mut Deployment,
     built: &BuiltFlow<'a>,
     config: &BenchmarkConfig,
-    optimizations: &Optimizations,
+    program: &CompiledProgram,
+    run_name: &str,
+    workload: &str,
+    kind: &Optimization,
     location_to_original_ops: &HashMap<LocationId, Vec<usize>>,
     pre_rewrite_parents: Option<&HashMap<usize, Vec<usize>>>,
     size_analysis_ops: &HashSet<usize>,
 ) -> RunMetadata {
-    let output_dir = make_output_dir(&config.name, &config.workload, optimizations.kind.label());
+    let output_dir = make_output_dir(run_name, workload, kind.label());
     let ir = built.ir();
     save_id(&mut deep_clone(ir), &output_dir.join("id.txt"));
     let mut final_run_metadata = RunMetadata::default();
@@ -785,8 +758,8 @@ async fn run_scaling_loop<'a>(
         while successful_runs < config.num_runs {
             println!(
                 "Running {} ({}) with {} virtual clients (run {})",
-                config.name,
-                optimizations.kind.label(),
+                run_name,
+                kind.label(),
                 num_virtual,
                 run
             );
@@ -800,9 +773,8 @@ async fn run_scaling_loop<'a>(
                 reusable_hosts,
                 deployment,
                 finalized,
-                &config.clusters,
-                &config.processes,
-                optimizations,
+                program,
+                kind,
                 Some(RUN_SECONDS),
             )
             .await;
@@ -813,16 +785,16 @@ async fn run_scaling_loop<'a>(
                 "Run throughput: {}, num_clients: {}",
                 run_throughput, num_virtual
             );
-            run_metadata.print_run_summary(&config.location_id_to_cluster, MEASUREMENT_SECOND);
+            run_metadata.print_run_summary(&program.location_id_to_cluster, MEASUREMENT_SECOND);
             run_metadata.save_run_metadata(
-                &config.location_id_to_cluster,
+                &program.location_id_to_cluster,
                 &output_dir,
                 config.num_physical_clients,
                 num_virtual,
                 run,
             );
 
-            if matches!(optimizations.kind, OptimizationKind::BlowUpAnalysis) {
+            if matches!(kind, Optimization::BlowUpAnalysis) {
                 run_metadata.save_blow_up_stats(
                     &output_dir,
                     &mut deep_clone(ir),
@@ -835,7 +807,7 @@ async fn run_scaling_loop<'a>(
             if !size_analysis_ops.is_empty() {
                 run_metadata.save_size_analysis(&output_dir, size_analysis_ops);
             }
-            if matches!(optimizations.kind, OptimizationKind::CountersOnly) {
+            if matches!(kind, Optimization::Counters) {
                 run_metadata.save_counters(
                     &output_dir,
                     config.num_physical_clients,
@@ -865,11 +837,13 @@ async fn run_scaling_loop<'a>(
             } else {
                 throughput_sum += run_throughput;
                 successful_runs += 1;
+                // TODO: Remove after debugging CAS
+                // break 'outer;
             }
             run += 1;
             final_run_metadata = run_metadata;
 
-            if matches!(optimizations.kind, OptimizationKind::SizeAnalysis)
+            if matches!(kind, Optimization::SizeAnalysis)
                 || config.calibrate_message_sizes.is_some()
             {
                 break 'outer;
@@ -908,12 +882,16 @@ async fn run_scaling_loop<'a>(
 
 /// Runs a single analysis pass (counters, size, blow_up, or perf) on the given built flow.
 /// Deploys with the appropriate instrumentation, scales virtual clients, and saves results.
+#[allow(clippy::too_many_arguments)]
 async fn run_analysis_pass<'a>(
     reusable_hosts: &mut ReusableHosts,
     deployment: &mut Deployment,
     built: &BuiltFlow<'a>,
-    config: &mut BenchmarkConfig,
-    kind: OptimizationKind,
+    config: &BenchmarkConfig,
+    program: &mut CompiledProgram,
+    run_name: &str,
+    workload: &str,
+    kind: Optimization,
 ) {
     println!("=== Running {} analysis ===", kind.label());
 
@@ -926,25 +904,23 @@ async fn run_analysis_pass<'a>(
     let analysis_built = builder.finalize();
 
     let analysis_built = match &kind {
-        OptimizationKind::CountersOnly => {
-            insert_counters(analysis_built, &config.optimizations.exclude)
-        }
-        OptimizationKind::BlowUpAnalysis => {
+        Optimization::Counters => insert_counters(analysis_built, &program.exclude),
+        Optimization::BlowUpAnalysis => {
             let (built, loc_ops, parents) = apply_blow_up_analysis(
                 analysis_built,
-                &mut config.clusters,
-                &config.optimizations.exclude,
-                &mut config.location_id_to_cluster,
+                &mut program.clusters,
+                &program.exclude,
+                &mut program.location_id_to_cluster,
             );
             pre_rewrite_parents = Some(parents);
             location_to_original_ops = loc_ops;
             built
         }
-        OptimizationKind::SizeAnalysis => {
+        Optimization::SizeAnalysis => {
             let mut captured_ops = HashSet::new();
             let built = analysis_built.optimize_with(|leaf| {
                 let per_loc_rewrites =
-                    greedy_decouple_analysis(leaf, &config.optimizations.exclude, &config.clusters);
+                    greedy_decouple_analysis(leaf, &program.exclude, &program.clusters);
                 let network_ops: HashSet<usize> = per_loc_rewrites
                     .iter()
                     .flat_map(|r| r.op_to_network.keys().copied())
@@ -957,14 +933,8 @@ async fn run_analysis_pass<'a>(
             size_analysis_ops = captured_ops;
             built
         }
-        OptimizationKind::PerfOnly | OptimizationKind::None => analysis_built,
-        OptimizationKind::BottleneckElimination => unreachable!(),
-    };
-
-    let optimizations = Optimizations {
-        kind: kind.clone(),
-        exclude: config.optimizations.exclude.clone(),
-        ..Default::default()
+        Optimization::Perf | Optimization::None => analysis_built,
+        Optimization::BottleneckElimination => unreachable!(),
     };
 
     run_scaling_loop(
@@ -972,7 +942,10 @@ async fn run_analysis_pass<'a>(
         deployment,
         &analysis_built,
         config,
-        &optimizations,
+        program,
+        run_name,
+        workload,
+        &kind,
         &location_to_original_ops,
         pre_rewrite_parents.as_ref(),
         &size_analysis_ops,
@@ -982,26 +955,77 @@ async fn run_analysis_pass<'a>(
     println!("=== {} analysis complete ===", kind.label());
 }
 
-/// Runs the ILP-based bottleneck elimination workflow.
+/// Compiles and finalizes a workload's program (inject ids + reduce pushdown), returning the
+/// optimized base `BuiltFlow` and its `CompiledProgram`.
+fn build_workload<'a, W, F>(compile: &F, workload: &W) -> (BuiltFlow<'a>, CompiledProgram)
+where
+    F: Fn(&W) -> (FlowBuilder<'a>, CompiledProgram),
+{
+    let (builder, program) = compile(workload);
+    let built = builder.finalize().optimize_with(|leaf| {
+        inject_id(leaf);
+        let decision = reduce_pushdown_decision(leaf, &program.exclude);
+        reduce_pushdown(leaf, decision);
+    });
+    (built, program)
+}
+
+/// Applies the rewrites currently recorded in `state` to a fresh copy of `base_built`,
+/// updating `program`'s clusters/loc-map with any new decoupled clusters. Returns `None` if
+/// there are no prior rewrites to apply (so callers fall back to `base_built`).
+fn apply_prior_rewrites<'a>(
+    base_built: &BuiltFlow<'a>,
+    state: &OptimizationState,
+    program: &mut CompiledProgram,
+) -> Option<BuiltFlow<'a>> {
+    if state.applied.is_empty() {
+        return None;
+    }
+    let rewrites = state.rewrites_to_apply();
+    let mut builder = FlowBuilder::from_built(base_built);
+    builder.replace_ir(deep_clone(base_built.ir()));
+    Some(apply_loaded_rewrites(
+        builder.finalize(),
+        &mut program.clusters,
+        &rewrites,
+        &mut program.location_id_to_cluster,
+    ))
+}
+
+/// Plans the next optimization iteration across all workloads and returns `(run_name, rewrites)`
+/// for the caller to benchmark. Workloads share an identical IR (they differ only in runtime
+/// data), so stats are op-id-keyed and merged with element-wise maxes across workloads.
+/// Exits the process when optimization is complete (exhausted / no improvement).
 ///
-/// 1. Apply prior rewrites from state
-/// 2. Find bottleneck from latest `_none` run
-/// 3. If no cached ILP rewrites for bottleneck → run analyses, compute ILP
-/// 4. Apply next budget for bottleneck cluster
-async fn run_bottleneck_elimination<'a>(
+/// Phases:
+/// 1. First-ever run: no rewrites yet — return the base name and an empty rewrite set.
+/// 2. Find the bottleneck across all workloads' latest `_none` runs (max saturation per cluster).
+/// 3. If no cached rewrites: run perf/counters/size analyses for *each* workload (gated per
+///    workload on disk), then compute the ILP ONCE on the max-merged stats.
+/// 4. Apply the next budget once and return its rewrites.
+async fn prepare_bottleneck_rewrites<'a, W, F>(
     reusable_hosts: &mut ReusableHosts,
     deployment: &mut Deployment,
-    built: BuiltFlow<'a>,
-    config: &mut BenchmarkConfig,
-) -> BuiltFlow<'a> {
+    config: &BenchmarkConfig,
+    workloads: &[(W, String)],
+    compile: &F,
+) -> (String, Vec<Rewrite>)
+where
+    F: Fn(&W) -> (FlowBuilder<'a>, CompiledProgram),
+{
+    assert!(
+        !workloads.is_empty(),
+        "No workloads provided for optimization"
+    );
+
     let base = Path::new(CALIBRATION_DIR);
     let base_name = config.name.clone();
     let state_path = base.join(format!("{}_optimization_state.json", base_name));
     let mut state = OptimizationState::load(&state_path);
 
-    // Check if a previous _none run exists
+    // === Phase 1: first-ever run — no rewrites yet; benchmark the base program. ===
     let Some(latest_iter) = find_latest_iteration(base, &base_name) else {
-        return built; // First ever run — just benchmark the base
+        return (base_name, Vec::new());
     };
     let iteration = latest_iter + 1;
     let prev_name = if latest_iter == 0 {
@@ -1010,7 +1034,7 @@ async fn run_bottleneck_elimination<'a>(
         format!("{}_opt{}", base_name, latest_iter)
     };
 
-    // Early exit if last optimization didn't improve throughput
+    // Early exit if last optimization didn't improve throughput (max across workloads).
     if latest_iter >= 2 {
         let thr_prev = max_throughput_for(base, &prev_name);
         let thr_prev_prev =
@@ -1031,18 +1055,24 @@ async fn run_bottleneck_elimination<'a>(
         }
     }
 
-    let excluded_names: HashSet<String> = config
-        .optimizations
+    // === Phase 2: find the bottleneck across all workloads' latest `_none` runs. ===
+    // Excluded ids depend on the compiled program, so build one workload to resolve names.
+    // (Use `build_workload` rather than `compile` directly: an unfinalized `FlowBuilder`
+    // panics on drop, so the builder must be finalized even though we discard the result.)
+    let (_first_built, first_program) = build_workload(compile, &workloads[0].0);
+    let excluded_names: HashSet<String> = first_program
         .exclude
         .iter()
-        .filter_map(|loc| config.location_id_to_cluster.get(loc).cloned())
+        .filter_map(|loc| first_program.location_id_to_cluster.get(loc).cloned())
         .collect();
-    let prev_run_dir = find_workload_dirs(base, &prev_name, OptimizationKind::None.label())
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| panic!("No _none run found for '{}'", prev_name));
-    let bottleneck_name = find_bottleneck_from_run(
-        &prev_run_dir,
+    let prev_run_dirs = find_workload_dirs(base, &prev_name, Optimization::None.label());
+    assert!(
+        !prev_run_dirs.is_empty(),
+        "No _none run found for '{}'",
+        prev_name
+    );
+    let bottleneck_name = find_bottleneck_across_runs(
+        &prev_run_dirs,
         AWS_NETWORK_BYTES_PER_SEC,
         AWS_IO_TPS,
         &excluded_names,
@@ -1057,58 +1087,66 @@ async fn run_bottleneck_elimination<'a>(
         std::process::exit(0);
     }
 
-    // If no cached rewrites for this cluster, run analyses and compute ILP
+    // === Phase 3: if no cached rewrites, analyze every workload then compute the ILP once. ===
     if !state.cluster_rewrites.contains_key(&bottleneck_cluster) {
-        let analysis_name;
-        let analysis_built;
-        // Snapshot the base clusters/loc-map. When prior rewrites are replayed below,
-        // they create new (decoupled/partitioned) clusters that the analysis passes must
-        // deploy. Those passes deploy with `config.clusters`/`config.location_id_to_cluster`,
-        // so we apply the rewrites directly into `config` here, then restore the base
-        // snapshots before the final apply  recreates them from scratch.
-        let base_clusters = config.clusters.clone();
-        let base_loc_map = config.location_id_to_cluster.clone();
-        if state.applied.is_empty() {
-            analysis_name = base_name.clone();
-            analysis_built = None;
+        let analysis_name = if state.applied.is_empty() {
+            base_name.clone()
         } else {
-            let name = format!("{}_opt{}", base_name, iteration);
-            config.name = name.clone();
-            analysis_name = name;
+            format!("{}_opt{}", base_name, iteration)
+        };
 
-            let rewrites = state.rewrites_to_apply();
-            let mut builder = FlowBuilder::from_built(&built);
-            builder.replace_ir(deep_clone(built.ir()));
-            analysis_built = Some(apply_loaded_rewrites(
-                builder.finalize(),
-                &mut config.clusters,
-                &rewrites,
-                &mut config.location_id_to_cluster,
-            ));
-        }
-
-        for kind in &[
-            OptimizationKind::PerfOnly,
-            OptimizationKind::CountersOnly,
-            OptimizationKind::SizeAnalysis,
-            // OptimizationKind::BlowUpAnalysis,
-            // TODO: Reenable blow up analysis once vcpu limit has been addressed
-        ] {
-            if find_workload_dirs(base, &analysis_name, kind.label()).is_empty() {
-                let run_built = analysis_built.as_ref().unwrap_or(&built);
-                run_analysis_pass(reusable_hosts, deployment, run_built, config, kind.clone())
-                    .await;
+        // Run perf/counters/size for each workload, gated on that workload's own dir so every
+        // workload gets analyzed (not just the first).
+        for (params, workload) in workloads {
+            let (base_built, mut program) = build_workload(compile, params);
+            let analysis_built = apply_prior_rewrites(&base_built, &state, &mut program);
+            let run_built = analysis_built.as_ref().unwrap_or(&base_built);
+            for kind in &[
+                Optimization::Perf,
+                Optimization::Counters,
+                Optimization::SizeAnalysis,
+            ] {
+                // Skip if this workload's analysis already completed. Build the path directly —
+                // do NOT use `make_output_dir`, which deletes and recreates the directory. Gate
+                // on CSV presence so a previously-created-but-empty dir is re-run.
+                let dir = Path::new(CALIBRATION_DIR).join(format!(
+                    "{}_{}_{}",
+                    analysis_name,
+                    workload,
+                    kind.label()
+                ));
+                if dir.is_dir() && !get_csvs_in_dir(&dir).is_empty() {
+                    continue;
+                }
+                run_analysis_pass(
+                    reusable_hosts,
+                    deployment,
+                    run_built,
+                    config,
+                    &mut program,
+                    &analysis_name,
+                    workload,
+                    kind.clone(),
+                )
+                .await;
             }
         }
 
+        // Barrier: every workload is analyzed. Merge stats (max across workloads) and solve once.
         let raw_ilp_inputs = load_raw_ilp_inputs(base, &analysis_name);
-        let bottleneck_loc = config
+
+        // Canonical IR for the ILP: any workload's program (they share structure), with prior
+        // rewrites applied so the op ids and locations match the analyzed program.
+        let (canon_base, mut canon_program) = build_workload(compile, &workloads[0].0);
+        let canon_built =
+            apply_prior_rewrites(&canon_base, &state, &mut canon_program).unwrap_or(canon_base);
+        let bottleneck_loc = canon_program
             .location_id_to_cluster
             .iter()
             .find(|(_, n)| *n == &bottleneck_name)
             .map(|(id, _)| id.clone())
             .unwrap_or_else(|| panic!("Bottleneck cluster '{}' not found", bottleneck_name));
-        let cluster_size = config
+        let cluster_size = canon_program
             .clusters
             .location_name_and_num(&bottleneck_loc)
             .map(|(_, n)| n)
@@ -1122,11 +1160,7 @@ async fn run_bottleneck_elimination<'a>(
             network_cost_table,
         } = raw_ilp_inputs;
 
-        let mut ir = if let Some(ref ab) = analysis_built {
-            deep_clone(ab.ir())
-        } else {
-            deep_clone(built.ir())
-        };
+        let mut ir = deep_clone(canon_built.ir());
         let network_op_ids = get_network_op_ids(&mut ir);
         let cycles = cycle_source_to_sink_parent(&mut ir);
         let op_parents = op_id_to_parents(&mut ir, Some(&bottleneck_loc), &cycles);
@@ -1146,37 +1180,37 @@ async fn run_bottleneck_elimination<'a>(
         state
             .cluster_rewrites
             .insert(bottleneck_cluster.clone(), computed_rewrites);
-
-        // Restore the base clusters/loc-map: the final apply below recreates the
-        // decoupled clusters from the base program, so `config` must not already
-        // contain the analysis-pass copies (which would duplicate them).
-        config.clusters = base_clusters;
-        config.location_id_to_cluster = base_loc_map;
     }
 
-    // Apply next budget for the bottleneck cluster
+    // === Phase 4: apply the next budget once and return its rewrites for the caller to run. ===
     let budget = state.next_budget(&bottleneck_cluster);
     println!(
         "Bottleneck '{}': applying budget {}.",
         bottleneck_cluster, budget
     );
     state.applied.insert(bottleneck_cluster, budget);
-    let built = apply_loaded_rewrites(
-        built,
-        &mut config.clusters,
-        &state.rewrites_to_apply(),
-        &mut config.location_id_to_cluster,
-    );
-
     state.save(&state_path);
-    config.name = format!("{}_opt{}", base_name, iteration);
-    built
+
+    let opt_name = format!("{}_opt{}", base_name, iteration);
+    (opt_name, state.rewrites_to_apply())
 }
 
-pub async fn benchmark_protocol<'a>(
+/// Runs the benchmark/optimization flow over one or more workloads. Each workload is built by
+/// `compile(&params)` and must produce an identical IR structure (op-id topology), differing
+/// only in runtime data (e.g. write ratio), since stats are merged across workloads by op id.
+/// Each workload's name (the second tuple element) must be a unique, stable label — it
+/// discriminates output directories on disk.
+pub async fn benchmark_protocol<'a, W>(
     args: BenchmarkArgs,
-    run_benchmark: impl Fn() -> (FlowBuilder<'a>, BenchmarkConfig),
+    config: BenchmarkConfig,
+    workloads: &[(W, String)],
+    compile: impl Fn(&W) -> (FlowBuilder<'a>, CompiledProgram),
 ) -> (Vec<HydroRoot>, RunMetadata) {
+    assert!(!workloads.is_empty(), "Must provide at least one workload");
+    assert!(
+        config.num_runs > 0,
+        "Must run at least one iteration of the benchmark"
+    );
     let mut deployment = Deployment::new();
     let host_type: HostType = if let Some(project) = args.gcp.clone() {
         HostType::Gcp { project }
@@ -1187,69 +1221,65 @@ pub async fn benchmark_protocol<'a>(
     };
     let mut reusable_hosts = ReusableHosts::new(&host_type);
 
-    let (builder, mut config) = run_benchmark();
-    assert!(
-        config.num_runs > 0,
-        "Must run at least one iteration of the benchmark"
-    );
-
     if config.calibrate_message_sizes.is_some() {
         reusable_hosts.set_single_host(true);
     }
 
-    // Apply the selected optimization strategy exactly once.
-    let exclude = config.optimizations.exclude.clone();
-    let built = builder.finalize().optimize_with(|leaf| {
-        inject_id(leaf);
-        let decision = reduce_pushdown_decision(leaf, &exclude);
-        reduce_pushdown(leaf, decision);
-    });
-
-    let built = match &config.optimizations.kind {
-        OptimizationKind::None => built,
-        OptimizationKind::BottleneckElimination => {
-            run_bottleneck_elimination(&mut reusable_hosts, &mut deployment, built, &mut config)
-                .await
-        }
-        _ => {
-            println!("Warning: Explicit optimization kinds are no longer allowed as parameters");
-            built
-        }
+    // Decide what to benchmark: bottleneck elimination first runs the analyses + ILP and returns
+    // the rewrites + run name; every other mode benchmarks the base program (no rewrites).
+    let (run_name, rewrites) = if matches!(config.kind, Optimization::BottleneckElimination) {
+        prepare_bottleneck_rewrites(
+            &mut reusable_hosts,
+            &mut deployment,
+            &config,
+            workloads,
+            &compile,
+        )
+        .await
+    } else {
+        (config.name.clone(), Vec::new())
     };
 
-    // Run a loop for each network calibration size, if provided
-    let final_run_metadata = if let Some(ref sizes) = config.calibrate_message_sizes {
-        let mut last_metadata = RunMetadata::default();
-        for &size in sizes {
-            reusable_hosts.insert_env(HYDRO_NET_CALIBRATE_ENV.to_string(), size.to_string());
-            let mut iter_config = config.clone();
-            iter_config.name = format!("{}_{}b", config.name, size);
-            last_metadata = run_scaling_loop(
+    // Benchmark the (possibly rewritten) program for each workload, with optional calibration.
+    let mut last = (Vec::new(), RunMetadata::default());
+    for (params, workload) in workloads {
+        let (base_built, mut program) = build_workload(&compile, params);
+        let built = apply_loaded_rewrites(
+            base_built,
+            &mut program.clusters,
+            &rewrites,
+            &mut program.location_id_to_cluster,
+        );
+        // One deploy per calibration size (under a `{run_name}_{size}b` name), or a single
+        // deploy under `run_name` when not calibrating.
+        let scaling_runs: Vec<(String, Option<usize>)> = match &config.calibrate_message_sizes {
+            Some(sizes) => sizes
+                .iter()
+                .map(|&size| (format!("{}_{}b", run_name, size), Some(size)))
+                .collect(),
+            None => vec![(run_name.clone(), None)],
+        };
+        let mut meta = RunMetadata::default();
+        for (scaling_name, calibrate_size) in &scaling_runs {
+            if let Some(size) = calibrate_size {
+                reusable_hosts.insert_env(HYDRO_NET_CALIBRATE_ENV.to_string(), size.to_string());
+            }
+            meta = run_scaling_loop(
                 &mut reusable_hosts,
                 &mut deployment,
                 &built,
-                &iter_config,
-                &config.optimizations,
+                &config,
+                &program,
+                scaling_name,
+                workload,
+                &config.kind,
                 &HashMap::new(),
                 None,
                 &HashSet::new(),
             )
             .await;
         }
-        last_metadata
-    } else {
-        run_scaling_loop(
-            &mut reusable_hosts,
-            &mut deployment,
-            &built,
-            &config,
-            &config.optimizations,
-            &HashMap::new(),
-            None,
-            &HashSet::new(),
-        )
-        .await
-    };
-
-    (deep_clone(built.ir()), final_run_metadata)
+        last = (deep_clone(built.ir()), meta);
+    }
+    last
 }

@@ -6,8 +6,8 @@ use hydro_lang::{
     prelude::{FlowBuilder, TCP},
 };
 use hydro_optimize::deploy_and_analyze::{
-    BenchmarkArgs, BenchmarkConfig, Optimizations, ReusableClusters, ReusableProcesses,
-    benchmark_protocol,
+    BenchmarkArgs, BenchmarkConfig, CompiledProgram, Optimization, ReusableClusters,
+    ReusableProcesses, benchmark_protocol,
 };
 use hydro_optimize_examples::network_calibrator::{Client, Server};
 use stageleft::q;
@@ -34,12 +34,24 @@ struct Args {
 async fn main() {
     let args = Args::parse();
 
+    let config = BenchmarkConfig {
+        name: "Network".to_string(),
+        kind: Optimization::None,
+        num_physical_clients: 1,
+        start_virtual_clients: 1,
+        virtual_clients_step: 1,
+        num_runs: 1,
+        calibrate_message_sizes: Some(CALIBRATION_SIZES.to_vec()),
+    };
+
     benchmark_protocol(
         BenchmarkArgs {
             gcp: args.gcp.clone(),
             aws: args.aws,
         },
-        move || {
+        config,
+        &[((), "default".to_string())],
+        move |_: &()| {
             let mut builder = FlowBuilder::new();
             let server = builder.process::<Server>();
             let clients = builder.cluster::<Client>();
@@ -60,25 +72,10 @@ async fn main() {
 
             let clusters = ReusableClusters::default().with_cluster(clients, 1);
             let processes = ReusableProcesses::default().with_process(server);
-            let optimizations = Optimizations::default()
-                .excluding(client_id);
+            let program =
+                CompiledProgram::new(clusters, processes, location_id_to_cluster).excluding(client_id);
 
-            (
-                builder,
-                BenchmarkConfig {
-                    name: "Network".to_string(),
-                    workload: "default".to_string(),
-                    clusters,
-                    processes,
-                    optimizations,
-                    location_id_to_cluster,
-                    num_physical_clients: 1,
-                    start_virtual_clients: 1,
-                    virtual_clients_step: 1,
-                    num_runs: 1,
-                    calibrate_message_sizes: Some(CALIBRATION_SIZES.to_vec()),
-                },
-            )
+            (builder, program)
         },
     )
     .await;
