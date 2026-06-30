@@ -837,8 +837,6 @@ async fn run_scaling_loop<'a>(
             } else {
                 throughput_sum += run_throughput;
                 successful_runs += 1;
-                // TODO: Remove after debugging CAS
-                // break 'outer;
             }
             run += 1;
             final_run_metadata = run_metadata;

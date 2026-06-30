@@ -86,7 +86,10 @@ fn map_before_network(node: &mut HydroNode, network_metadata: &NetworkMetadata) 
             // If this is an existing network, then the index is over fields of the network after the receipt(sender, T), but before the send, the type is just T, so lop off the 1st layer of the field.
             let field: &[String] = if !network_metadata.new {
                 // Partitioning on sender location CAN be supported, but it will involve introducing a Hash over CLUSTER_SELF_ID
-                assert_eq!(field[0], "1", "Unsupported: Partitioning on sender location.");
+                assert_eq!(
+                    field[0], "1",
+                    "Unsupported: Partitioning on sender location."
+                );
                 &field[1..]
             } else {
                 field
@@ -122,9 +125,15 @@ fn map_before_network(node: &mut HydroNode, network_metadata: &NetworkMetadata) 
             ),
             proc_macro2::Span::call_site(),
         );
+        let num_sender_partitions = network_metadata.sender_partitions;
+        let orig_raw_expr: syn::Expr = if num_sender_partitions > 0 {
+            syn::parse_quote!(#ident.get_raw_id() / #num_sender_partitions as u32)
+        } else {
+            syn::parse_quote!(#ident.get_raw_id())
+        };
         syn::parse_quote!(
             |struct_or_tuple: #element_type| {
-                let orig_raw = #ident.get_raw_id();
+                let orig_raw = #orig_raw_expr;
                 let dest = #dest_expr;
                 (hydro_lang::location::MemberId::<()>::from_raw_id(dest), struct_or_tuple)
             }
