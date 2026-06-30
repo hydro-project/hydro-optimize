@@ -9,7 +9,7 @@ use crate::deploy_and_analyze::MAX_BUDGET_PER_CLUSTER;
 use crate::parse_results::{NetworkCostTable, SarStats};
 use crate::partition_ilp_analysis::{apply_budget_constraints, partition_ilp_analysis};
 use crate::partition_syn_analysis::StructOrTupleIndex;
-use crate::rewrites::{get_tick_id, is_serializable, is_syntactic_sugar, op_id_to_parents};
+use crate::rewrites::{all_inputs, get_tick_id, is_serializable, is_syntactic_sugar, nodes_dependent_on_inputs, op_id_to_parents};
 use good_lp::solvers::lp_solvers::{GurobiSolver, LpSolution, LpSolver};
 use good_lp::{
     Constraint, Expression, ProblemVariables, Solution, SolverModel, Variable, constraint,
@@ -736,6 +736,13 @@ pub(crate) fn decouple_analysis(
         network_ids: HashMap::new(),
     });
     let op_id_to_parents = op_id_to_parents(ir, Some(bottleneck), cycle_source_to_sink_parent);
+    let inputs = all_inputs(ir, &decoupling_metadata.borrow().bottleneck);
+    let idbs = nodes_dependent_on_inputs(
+        ir,
+        &decoupling_metadata.borrow().bottleneck,
+        &inputs,
+        &op_id_to_parents,
+    );
 
     let bottleneck_ops: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
     traverse_dfir(
@@ -752,16 +759,23 @@ pub(crate) fn decouple_analysis(
             decouple_analysis_node(node, next_op_id, &op_id_to_parents, &decoupling_metadata);
         },
     );
-    for parents in op_id_to_parents.values() {
+    for (op_id, parents) in &op_id_to_parents {
         let DecoupleILPMetadata {
             op_id_to_var,
             variables,
             constraints,
             ..
         } = &mut *decoupling_metadata.borrow_mut();
+
+        let mut same_output_loc = parents.clone();
+        if !idbs.contains(op_id) {
+            // No decoupling EDBs, otherwise broadcast cluster members might be decoupled from the broadcast itself, and the membership might not arrive in time for the broadcast
+            same_output_loc.push(*op_id);
+        }
+
         // Add parent constraints. All parents of an op must output to the same machine (be assigned the same var)
         add_equality_constr(
-            parents,
+            &same_output_loc,
             max_num_locations,
             op_id_to_var,
             variables,
@@ -774,6 +788,7 @@ pub(crate) fn decouple_analysis(
         Some(partition_ilp_analysis(
             ir,
             &op_id_to_parents,
+            idbs,
             &decoupling_metadata,
         ))
     } else {

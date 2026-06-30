@@ -10,69 +10,10 @@ use hydro_lang::{
 };
 use syn::visit::Visit;
 
-use crate::reduce_pushdown::COM_ASSOC_REDUCE_TAG;
 use crate::{
     decouple_analysis::{DecoupleILPMetadata, ResourceExpressions, num_to_alpha},
-    partition_node_analysis::all_inputs,
     partition_syn_analysis::{AnalyzeClosure, StructOrTuple, StructOrTupleIndex},
 };
-
-/// Add id to dependent_nodes if its parent_id is already in dependent_nodes
-fn insert_dependent_node(
-    dependent_nodes: &RefCell<HashSet<usize>>,
-    parent_id: Option<usize>,
-    id: usize,
-) {
-    let mut dependent_nodes_borrow = dependent_nodes.borrow_mut();
-    if let Some(parent_id) = parent_id
-        && dependent_nodes_borrow.contains(&parent_id)
-    {
-        dependent_nodes_borrow.insert(id);
-    }
-}
-
-/// Returns IDs of nodes that are dependent on at least 1 input
-fn nodes_dependent_on_inputs(
-    ir: &mut [HydroRoot],
-    location: &LocationId,
-    inputs: &[usize],
-    op_to_parents: &HashMap<usize, Vec<usize>>,
-) -> HashSet<usize> {
-    let dependent_nodes = RefCell::new(HashSet::from_iter(inputs.iter().cloned()));
-    let mut num_dependent_nodes = inputs.len();
-
-    loop {
-        traverse_dfir(
-            ir,
-            |root, next_stmt_id| {
-                if root.input_metadata().location_id.root() == location {
-                    insert_dependent_node(
-                        &dependent_nodes,
-                        root.input_metadata().op.id,
-                        *next_stmt_id,
-                    );
-                }
-            },
-            |node, next_stmt_id| {
-                if node.metadata().location_id.root() == location.root()
-                    && let Some(parents) = op_to_parents.get(next_stmt_id)
-                {
-                    for parent_id in parents {
-                        insert_dependent_node(&dependent_nodes, Some(*parent_id), *next_stmt_id);
-                    }
-                }
-            },
-        );
-
-        if dependent_nodes.borrow().len() == num_dependent_nodes {
-            // No new dependent nodes found, reached fixpoint
-            break;
-        }
-        num_dependent_nodes = dependent_nodes.borrow().len();
-    }
-
-    dependent_nodes.take()
-}
 
 /// Given a node type, return how its output fields is dependent on its parents.
 /// Must contain an entry for each parent, even if there is no dependency.
@@ -607,10 +548,7 @@ fn constrain_field_vars_to_parents(
         // Network nodes with no parents: field vars are unconstrained (free to be 0 or 1).
         // The solver will set them to 1 if doing so helps enable partitioning downstream.
         // Add to partitionable operators as always partitionable
-        let DecoupleILPMetadata {
-            op_id_to_var,
-            ..
-        } = &mut *decoupling_metadata.borrow_mut();
+        let DecoupleILPMetadata { op_id_to_var, .. } = &mut *decoupling_metadata.borrow_mut();
         for (loc, partitionable_expr) in partitionable_operators {
             let is_at_loc = op_id_to_var.get(&op_id).unwrap().get(loc).unwrap();
             let temp_expr = std::mem::take(partitionable_expr);
@@ -891,6 +829,7 @@ fn calculate_partitionable(
 pub(crate) fn partition_ilp_analysis(
     ir: &mut [HydroRoot],
     op_id_to_parents: &HashMap<usize, Vec<usize>>,
+    idbs: HashSet<usize>,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) -> PartitionILPMetadata {
     // Make all cost expressions at all locations default to 0
@@ -908,14 +847,6 @@ pub(crate) fn partition_ilp_analysis(
         can_partition: HashMap::new(),
     };
 
-    let inputs = all_inputs(ir, &decoupling_metadata.borrow().bottleneck);
-    // TODO: Known inaccuracy: This assumes that no edge will be created that converts EDBs to IDBs. That needs to be a constraint on decoupling
-    let idbs = nodes_dependent_on_inputs(
-        ir,
-        &decoupling_metadata.borrow().bottleneck,
-        &inputs,
-        op_id_to_parents,
-    );
     let canonical_fields = create_canonical_fields(
         ir,
         &decoupling_metadata.borrow().bottleneck,

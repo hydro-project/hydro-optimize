@@ -5,9 +5,8 @@ use hydro_lang::compile::ir::{HydroNode, HydroRoot, traverse_dfir};
 use hydro_lang::location::dynamic::LocationId;
 use syn::visit::Visit;
 
-use super::rewrites::{NetworkType, get_network_type};
 use crate::partition_syn_analysis::{AnalyzeClosure, StructOrTuple, StructOrTupleIndex};
-use crate::rewrites::op_id_to_parents;
+use crate::rewrites::{all_inputs, op_id_to_parents};
 
 /// Create a mapping from all input nodes to their parents (across locations)
 fn all_inputs_parents(
@@ -25,24 +24,6 @@ fn all_inputs_parents(
             }
         })
         .collect()
-}
-
-/// Find all input nodes of a location
-pub fn all_inputs(ir: &mut [HydroRoot], location: &LocationId) -> Vec<usize> {
-    let mut inputs = vec![];
-
-    traverse_dfir(
-        ir,
-        |_, _| {},
-        |node, next_stmt_id| match get_network_type(node, location.root()) {
-            Some(NetworkType::Recv) | Some(NetworkType::SendRecv) => {
-                inputs.push(*next_stmt_id);
-            }
-            _ => {}
-        },
-    );
-
-    inputs
 }
 
 pub struct InputDependencyMetadata {
