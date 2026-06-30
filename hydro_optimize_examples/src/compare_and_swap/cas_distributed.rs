@@ -26,7 +26,7 @@ pub struct DistributedCAS<'a, 'b> {
     pub retry_timeout: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Hash)]
 pub struct Ballot {
     pub num: u64,
     pub node: MemberId<Replica>,
@@ -49,7 +49,7 @@ impl Ord for Ballot {
 /// No `client_id`: Election request
 /// No `ballot`: Read request
 /// No `state`: Read and election request
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct Request<State, Sender> {
     pub id: UniqueRequestId,
     pub client_id: Option<MemberId<Sender>>,
@@ -75,7 +75,7 @@ impl<State: Eq, Sender: Eq> Ord for Request<State, Sender> {
 }
 
 /// - `max_ballot`: The max ballot seen by the respondent, which the leader can use to determine if it has been preempted.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Hash)]
 pub struct Response<State, Sender> {
     pub request: Request<State, Sender>,
     pub max_ballot: Ballot,

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 /// Version-guarded write request. Accepted only if
 /// `version = current_version + 1` in the register.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct CASState<State> {
     pub version: u64,
     pub state: State,
