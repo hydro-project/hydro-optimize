@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use clap::{ArgAction, Parser};
 use hydro_lang::location::Location;
 use hydro_optimize::deploy_and_analyze::{
-    BenchmarkArgs, BenchmarkConfig, NUM_PHYSICAL_CLIENTS, Optimizations, ReusableClusters,
-    ReusableProcesses, benchmark_protocol,
+    BenchmarkArgs, BenchmarkConfig, CompiledProgram, NUM_PHYSICAL_CLIENTS, Optimization,
+    ReusableClusters, ReusableProcesses, benchmark_protocol,
 };
 use hydro_optimize_examples::print_parseable_bench_results;
 use hydro_test::cluster::paxos::{CorePaxos, PaxosConfig};
@@ -33,20 +33,35 @@ struct Args {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    let optimize = args.optimize;
+
+    let config = BenchmarkConfig {
+        name: "Paxos".to_string(),
+        kind: if args.optimize {
+            Optimization::BottleneckElimination
+        } else {
+            Optimization::None
+        },
+        num_physical_clients: NUM_PHYSICAL_CLIENTS,
+        start_virtual_clients: 11,
+        virtual_clients_step: 10,
+        num_runs: 1,
+        calibrate_message_sizes: None,
+    };
 
     let (_ir, _final_run_metadata) = benchmark_protocol(
         BenchmarkArgs {
             gcp: args.gcp,
             aws: args.aws,
         },
-        move || {
+        config,
+        &[((), "default".to_string())],
+        move |_: &()| {
             let num_clients = NUM_PHYSICAL_CLIENTS;
             let f = 1;
             let checkpoint_frequency = 1000;
-            let i_am_leader_send_timeout = 5;
-            let i_am_leader_check_timeout = 10;
-            let i_am_leader_check_timeout_delay_multiplier = 15;
+            let i_am_leader_send_timeout = 1;
+            let i_am_leader_check_timeout = 30;
+            let i_am_leader_check_timeout_delay_multiplier = 35;
             let print_result_frequency = 1000;
 
             let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
@@ -100,29 +115,11 @@ async fn main() {
                 .with_cluster(replicas, f + 1);
             let processes = ReusableProcesses::default().with_process(client_aggregator);
 
-            let mut optimizations = Optimizations::default()
+            let program = CompiledProgram::new(clusters, processes, location_id_to_cluster)
                 .excluding(client_id.clone())
                 .excluding(client_aggregator_id);
-            if optimize {
-                optimizations = optimizations.with_bottleneck_elimination();
-            }
 
-            (
-                builder,
-                BenchmarkConfig {
-                    name: "Paxos".to_string(),
-                    workload: "default".to_string(),
-                    clusters,
-                    processes,
-                    optimizations,
-                    location_id_to_cluster,
-                    num_physical_clients: num_clients,
-                    start_virtual_clients: 1,
-                    virtual_clients_step: 10,
-                    num_runs: 1,
-                    calibrate_message_size: None,
-                },
-            )
+            (builder, program)
         },
     )
     .await;

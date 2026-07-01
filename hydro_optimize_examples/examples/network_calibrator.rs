@@ -6,8 +6,8 @@ use hydro_lang::{
     prelude::{FlowBuilder, TCP},
 };
 use hydro_optimize::deploy_and_analyze::{
-    BenchmarkArgs, BenchmarkConfig, Optimizations, ReusableClusters, ReusableProcesses,
-    benchmark_protocol,
+    BenchmarkArgs, BenchmarkConfig, CompiledProgram, Optimization, ReusableClusters,
+    ReusableProcesses, benchmark_protocol,
 };
 use hydro_optimize_examples::network_calibrator::{Client, Server};
 use stageleft::q;
@@ -34,58 +34,51 @@ struct Args {
 async fn main() {
     let args = Args::parse();
 
-    for &size in CALIBRATION_SIZES {
-        println!("=== Calibrating message_size={} ===", size);
+    let config = BenchmarkConfig {
+        name: "Network".to_string(),
+        kind: Optimization::None,
+        num_physical_clients: 1,
+        start_virtual_clients: 1,
+        virtual_clients_step: 1,
+        num_runs: 1,
+        calibrate_message_sizes: Some(CALIBRATION_SIZES.to_vec()),
+    };
 
-        benchmark_protocol(
-            BenchmarkArgs {
-                gcp: args.gcp.clone(),
-                aws: args.aws,
-            },
-            move || {
-                let mut builder = FlowBuilder::new();
-                let server = builder.process::<Server>();
-                let clients = builder.process::<Client>();
-                let client_id = clients.id();
+    benchmark_protocol(
+        BenchmarkArgs {
+            gcp: args.gcp.clone(),
+            aws: args.aws,
+        },
+        config,
+        &[((), "default".to_string())],
+        move |_: &()| {
+            let mut builder = FlowBuilder::new();
+            let server = builder.process::<Server>();
+            let clients = builder.cluster::<Client>();
+            let client_id = clients.id();
 
-                let location_id_to_cluster = HashMap::from([
-                    (server.id(), "server".to_string()),
-                    (client_id.clone(), "client".to_string()),
-                ]);
+            let location_id_to_cluster = HashMap::from([
+                (server.id(), "server".to_string()),
+                (client_id.clone(), "client".to_string()),
+            ]);
 
-                // Dummy code. Just need to make sure that the server receives and sends.
-                // The actual message generation is done by the Hydro IR.
-                clients
-                    .source_iter(q!(vec![0usize]))
-                    .send(&server, TCP.fail_stop().bincode())
-                    .send(&clients, TCP.fail_stop().bincode());
+            // Dummy code. Just need to make sure that the server receives and sends.
+            // The actual message generation is done by the Hydro IR.
+            // Use a cluster of clients (not process) since that has higher overhead
+            clients
+                .source_iter(q!(vec![Vec::<u8>::new()]))
+                .send(&server, TCP.fail_stop().bincode())
+                .demux(&clients, TCP.fail_stop().bincode());
 
-                let clusters = ReusableClusters::default();
-                let processes = ReusableProcesses::default()
-                    .with_process(server)
-                    .with_process(clients);
-                let optimizations = Optimizations::default().excluding(client_id);
+            let clusters = ReusableClusters::default().with_cluster(clients, 1);
+            let processes = ReusableProcesses::default().with_process(server);
+            let program = CompiledProgram::new(clusters, processes, location_id_to_cluster)
+                .excluding(client_id);
 
-                (
-                    builder,
-                    BenchmarkConfig {
-                        name: format!("Network_{}b", size),
-                        workload: "default".to_string(),
-                        clusters,
-                        processes,
-                        optimizations,
-                        location_id_to_cluster,
-                        num_physical_clients: 1,
-                        start_virtual_clients: 1,
-                        virtual_clients_step: 1,
-                        num_runs: 1,
-                        calibrate_message_size: Some(size),
-                    },
-                )
-            },
-        )
-        .await;
-    }
+            (builder, program)
+        },
+    )
+    .await;
 
     println!("=== Calibration complete ===");
 }

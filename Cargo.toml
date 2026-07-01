@@ -34,12 +34,11 @@ regex = "1.11.1"
 # hydro_deploy = { path = "/local/home/chudc/hydroflow/hydro_deploy/core" }
 # include_mdtests = { path = "/local/home/chudc/hydroflow/include_mdtests" }
 
-# Uncomment to use local hydro checkout on Mac
 # [patch."https://github.com/davidchuyaya/hydroflow.git"]
-# hydro_lang = { path = "/home/chudc/hydroflow/hydro_lang" }
-# hydro_std = { path = "/home/chudc/hydroflow/hydro_std" }
-# hydro_test = { path = "/home/chudc/hydroflow/hydro_test" }
-# dfir_lang = { path = "/home/chudc/hydroflow/dfir_lang" }
-# hydro_build_utils = { path = "/home/chudc/hydroflow/hydro_build_utils" }
-# hydro_deploy = { path = "/home/chudc/hydroflow/hydro_deploy/core" }
-# include_mdtests = { path = "/home/chudc/hydroflow/include_mdtests" }
+# hydro_lang = { path = "/home/ec2-user/hydroflow/hydro_lang" }
+# hydro_std = { path = "/home/ec2-user/hydroflow/hydro_std" }
+# hydro_test = { path = "/home/ec2-user/hydroflow/hydro_test" }
+# dfir_lang = { path = "/home/ec2-user/hydroflow/dfir_lang" }
+# hydro_build_utils = { path = "/home/ec2-user/hydroflow/hydro_build_utils" }
+# hydro_deploy = { path = "/home/ec2-user/hydroflow/hydro_deploy/core" }
+# include_mdtests = { path = "/home/ec2-user/hydroflow/include_mdtests" }

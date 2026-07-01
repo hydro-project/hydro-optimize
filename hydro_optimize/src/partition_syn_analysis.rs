@@ -184,10 +184,7 @@ impl StructOrTuple {
     }
 
     /// Create a tuple representing dependencies present in both tuples, keeping the more specific dependency if there is one
-    pub fn intersect(
-        tuple1: &StructOrTuple,
-        tuple2: &StructOrTuple,
-    ) -> Option<StructOrTuple> {
+    pub fn intersect(tuple1: &StructOrTuple, tuple2: &StructOrTuple) -> Option<StructOrTuple> {
         // If either tuple1 or tuple2 are empty and None, just return the other tuple
         for (tuple, other) in [(tuple1, tuple2), (tuple2, tuple1)] {
             if tuple.is_empty() && tuple.could_be_none {
@@ -384,10 +381,7 @@ impl StructOrTuple {
     ///
     /// The parent's dependencies are absolute (dependency on an input to the node);
     /// the child's dependencies are relative (dependency within the function).
-    pub fn project_parent(
-        parent: &StructOrTuple,
-        child: &StructOrTuple,
-    ) -> Option<StructOrTuple> {
+    pub fn project_parent(parent: &StructOrTuple, child: &StructOrTuple) -> Option<StructOrTuple> {
         let mut new_child = StructOrTuple::default();
         assert!(
             !parent.could_be_none && !child.could_be_none,
@@ -422,7 +416,7 @@ impl StructOrTuple {
         }
     }
 
-    pub fn to_syn_expr(mut tuple: syn::Expr, indices: &StructOrTupleIndex) -> syn::Expr {
+    pub fn to_syn_expr(mut tuple: syn::Expr, indices: &[String]) -> syn::Expr {
         for index in indices {
             let member = if let Ok(num_index) = index.parse::<usize>() {
                 syn::Member::Unnamed(syn::Index::from(num_index))

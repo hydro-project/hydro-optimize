@@ -68,7 +68,34 @@ struct NetworkMetadata {
     new: bool,
 }
 
+fn sender_logical_id(network_metadata: &NetworkMetadata) -> syn::Expr {
+    let ident = syn::Ident::new(
+        &format!(
+            "__hydro_lang_cluster_self_id_{}",
+            network_metadata.sender_location.key()
+        ),
+        proc_macro2::Span::call_site(),
+    );
+    let num_sender_partitions = network_metadata.sender_partitions;
+    if num_sender_partitions > 0 {
+        syn::parse_quote!(#ident.get_raw_id() / #num_sender_partitions as u32)
+    } else {
+        syn::parse_quote!(#ident.get_raw_id())
+    }
+}
+
+fn hash_expr(value: syn::Expr) -> syn::Expr {
+    syn::parse_quote!({
+        let mut s = ::std::hash::DefaultHasher::new();
+        ::std::hash::Hash::hash(&#value, &mut s);
+        ::std::hash::Hasher::finish(&s) as u32
+    })
+}
+
 /// Creates the Map before Network to route it to the correct partition.
+/// A map is appended to the node passed in.
+/// If a network already exists, pass in its input.
+/// If a network is being created, pass node into Network after calling this function.
 fn map_before_network(node: &mut HydroNode, network_metadata: &NetworkMetadata) {
     let metadata = node.metadata().clone();
     let node_content = std::mem::replace(node, HydroNode::Placeholder);
@@ -80,12 +107,26 @@ fn map_before_network(node: &mut HydroNode, network_metadata: &NetworkMetadata) 
         if let Some(field) = &network_metadata.partition_field {
             // If partitioning and there is a field to hash on, use it
             let struct_or_tuple: syn::Expr = syn::parse_quote! { struct_or_tuple };
-            let struct_or_tuple_with_fields = StructOrTuple::to_syn_expr(struct_or_tuple, field);
-            syn::parse_quote!({
-                let mut s = ::std::hash::DefaultHasher::new();
-                ::std::hash::Hash::hash(&#struct_or_tuple_with_fields, &mut s);
-                ::std::hash::Hasher::finish(&s) as u32
-            })
+            if !network_metadata.new && field.len() == 1 && field[0] == "0" {
+                // Partitioning asks to hash on the Sender's ID
+                hash_expr(sender_logical_id(network_metadata))
+            } else {
+                // If this is an existing network, then the index is over fields of the network
+                // after the receipt(sender, T), but before the send, the type is just T, so lop
+                // off the first layer of the field.
+                let field: &[String] = if !network_metadata.new {
+                    assert!(
+                        !field.is_empty() && field[0] == "1",
+                        "Unsupported: Existing network partition fields must refer to either sender id or payload."
+                    );
+                    &field[1..]
+                } else {
+                    field
+                };
+                let struct_or_tuple_with_fields =
+                    StructOrTuple::to_syn_expr(struct_or_tuple, field);
+                hash_expr(struct_or_tuple_with_fields)
+            }
         } else {
             // If partitioning and there is no field to hash on, we must be random partitioning
             syn::parse_quote!(::rand::random::<u32>())
@@ -104,16 +145,10 @@ fn map_before_network(node: &mut HydroNode, network_metadata: &NetworkMetadata) 
 
     let f: syn::Expr = if network_metadata.new {
         // New network type is just T. We need (receiver MemberId, T)
-        let ident = syn::Ident::new(
-            &format!(
-                "__hydro_lang_cluster_self_id_{}",
-                network_metadata.sender_location.key()
-            ),
-            proc_macro2::Span::call_site(),
-        );
+        let orig_raw_expr = sender_logical_id(network_metadata);
         syn::parse_quote!(
             |struct_or_tuple: #element_type| {
-                let orig_raw = #ident.get_raw_id();
+                let orig_raw = #orig_raw_expr;
                 let dest = #dest_expr;
                 (hydro_lang::location::MemberId::<()>::from_raw_id(dest), struct_or_tuple)
             }
@@ -485,7 +520,7 @@ fn repair_existing_network_for_partitioning(
 
     // If the receiver is now partitioned, add a Map before the Network to route to the correct partition
     if receiver_partitions > 0 {
-        map_before_network(node, &network_metadata);
+        map_before_network(input.as_mut(), &network_metadata);
     }
     // If the source is now partitioned, departition the ID on the receiving end
     if sender_partitions > 0 {
@@ -605,11 +640,16 @@ fn replace_cluster_self_id(
             );
         },
         |node, _| {
-            let Some(op_id) = node.op_metadata().id else {
-                return;
+            let target_loc_idx = if let Some(op_id) = node.op_metadata().id {
+                execution_loc_of_op(op_id, node, rewrite).unwrap_or(0)
+            } else {
+                // New op but may still need rewriting if inserted for decoupling + partitioning
+                locations_map
+                    .iter()
+                    .find(|(_, loc)| **loc == node.metadata().location_id)
+                    .map(|(idx, _)| *idx)
+                    .unwrap_or(0)
             };
-
-            let target_loc_idx = execution_loc_of_op(op_id, node, rewrite).unwrap_or(0);
             replace_cluster_self_id_node(
                 &mut |f| node.visit_debug_expr(f),
                 rewrite,

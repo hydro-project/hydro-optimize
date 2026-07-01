@@ -30,15 +30,19 @@ impl VisitMut for ClusterSelfIdReplace {
         if let syn::Expr::Path(path_expr) = expr {
             for segment in path_expr.path.segments.iter_mut() {
                 let ident = segment.ident.to_string();
-                let prefix = format!("__hydro_lang_cluster_self_id_{}", self.orig_cluster_id);
-                if ident.starts_with(&prefix) {
-                    if self.orig_cluster_id != self.new_cluster_id {
+                let orig_prefix = format!("__hydro_lang_cluster_self_id_{}", self.orig_cluster_id);
+                let new_prefix = format!("__hydro_lang_cluster_self_id_{}", self.new_cluster_id);
+                if ident.starts_with(&orig_prefix) || ident.starts_with(&new_prefix) {
+                    if ident.starts_with(&orig_prefix)
+                        && self.orig_cluster_id != self.new_cluster_id
+                    {
                         segment.ident = syn::Ident::new(
                             &format!("__hydro_lang_cluster_self_id_{}", self.new_cluster_id),
                             segment.ident.span(),
                         );
                         println!("Decoupling: Replaced CLUSTER_SELF_ID");
                     }
+                    // Also consider new_prefix, for CLUSTER_SELF_IDs inserted after decoupling that still need to be partitioned
                     if self.num_partitions > 0 {
                         let num_partitions = self.num_partitions;
                         let expr_content = std::mem::replace(expr, syn::Expr::PLACEHOLDER);
@@ -198,6 +202,81 @@ pub fn get_network_op_ids(ir: &mut [HydroRoot]) -> HashSet<usize> {
     );
 
     network_ids
+}
+
+/// Find all input nodes of a location
+pub fn all_inputs(ir: &mut [HydroRoot], location: &LocationId) -> Vec<usize> {
+    let mut inputs = vec![];
+
+    traverse_dfir(
+        ir,
+        |_, _| {},
+        |node, next_stmt_id| match get_network_type(node, location.root()) {
+            Some(NetworkType::Recv) | Some(NetworkType::SendRecv) => {
+                inputs.push(*next_stmt_id);
+            }
+            _ => {}
+        },
+    );
+
+    inputs
+}
+
+/// Add id to dependent_nodes if its parent_id is already in dependent_nodes
+fn insert_dependent_node(
+    dependent_nodes: &RefCell<HashSet<usize>>,
+    parent_id: Option<usize>,
+    id: usize,
+) {
+    let mut dependent_nodes_borrow = dependent_nodes.borrow_mut();
+    if let Some(parent_id) = parent_id
+        && dependent_nodes_borrow.contains(&parent_id)
+    {
+        dependent_nodes_borrow.insert(id);
+    }
+}
+
+/// Returns IDs of nodes that are dependent on at least 1 input
+pub fn nodes_dependent_on_inputs(
+    ir: &mut [HydroRoot],
+    location: &LocationId,
+    inputs: &[usize],
+    op_to_parents: &HashMap<usize, Vec<usize>>,
+) -> HashSet<usize> {
+    let dependent_nodes = RefCell::new(HashSet::from_iter(inputs.iter().cloned()));
+    let mut num_dependent_nodes = inputs.len();
+
+    loop {
+        traverse_dfir(
+            ir,
+            |root, next_stmt_id| {
+                if root.input_metadata().location_id.root() == location {
+                    insert_dependent_node(
+                        &dependent_nodes,
+                        root.input_metadata().op.id,
+                        *next_stmt_id,
+                    );
+                }
+            },
+            |node, next_stmt_id| {
+                if node.metadata().location_id.root() == location.root()
+                    && let Some(parents) = op_to_parents.get(next_stmt_id)
+                {
+                    for parent_id in parents {
+                        insert_dependent_node(&dependent_nodes, Some(*parent_id), *next_stmt_id);
+                    }
+                }
+            },
+        );
+
+        if dependent_nodes.borrow().len() == num_dependent_nodes {
+            // No new dependent nodes found, reached fixpoint
+            break;
+        }
+        num_dependent_nodes = dependent_nodes.borrow().len();
+    }
+
+    dependent_nodes.take()
 }
 
 /// Check if the type is serializable. Currently a janky implementation that just looks for common unserializable types.

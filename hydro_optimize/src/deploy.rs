@@ -5,7 +5,7 @@ use hydro_deploy::gcp::GcpNetwork;
 use hydro_deploy::rust_crate::tracing_options::{
     AL2_PERF_SETUP_COMMAND, DEBIAN_PERF_SETUP_COMMAND, TracingOptions,
 };
-use hydro_deploy::{AwsNetwork, Deployment, Host, HostTargetType, LinuxCompileType};
+use hydro_deploy::{AwsNetwork, Deployment, Host};
 use hydro_lang::deploy::TrybuildHost;
 
 /// What the user provides when creating ReusableHosts
@@ -36,10 +36,10 @@ pub struct ReusableHosts {
 }
 
 // Note: Aws AMIs vary by region. If you are changing the region, please also change the AMI.
-const AWS_REGION: &str = "us-west-2";
-const AWS_INSTANCE_AMI: &str = "ami-055a9df0c8c9f681c"; // Amazon Linux 2
+const AWS_REGION: &str = "us-east-1";
+const AWS_INSTANCE_AMI: &str = "ami-0521cb2d60cfbb1a6"; // Amazon Linux 2023
 const AWS_INSTANCE_TYPE: &str = "m5.2xlarge"; // 8 vCPU, 32 GB RAM
-const AWS_NUM_CORES: usize = 8; // Used for pinning
+const AWS_NUM_CORES: usize = 3; // Used for networking. Network cores will be pinned to these cores - 1. Empirically tested on m5.2xlarge.
 /// m5.2xlarge: up to 10 Gbps network bandwidth
 pub const AWS_NETWORK_BYTES_PER_SEC: f64 = 1_250_000_000.0;
 /// m5.2xlarge: 12,000 baseline IOPS (EBS)
@@ -113,8 +113,6 @@ impl ReusableHosts {
                     .region(GCP_REGION)
                     .network(network.clone())
                     .display_name(display_name)
-                    // Better performance than MUSL, perf reporting fewer unidentified stacks, but requires launching from Linux
-                    .target_type(HostTargetType::Linux(LinuxCompileType::Glibc))
                     .add(),
                 InitializedHostType::Aws { network } => deployment
                     .AwsEc2Host()
@@ -123,8 +121,6 @@ impl ReusableHosts {
                     .ami(AWS_INSTANCE_AMI)
                     .network(network.clone())
                     .display_name(display_name)
-                    // Better performance than MUSL, perf reporting fewer unidentified stacks, but requires launching from Linux
-                    .target_type(HostTargetType::Linux(LinuxCompileType::Glibc))
                     .add(),
                 InitializedHostType::Localhost => deployment.Localhost(),
             })
@@ -134,13 +130,12 @@ impl ReusableHosts {
     fn get_rust_flags(&self) -> String {
         match &self.host_type {
             InitializedHostType::Gcp { .. } | InitializedHostType::Aws { .. } => {
-                "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off"
+                "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off -C link-arg=--no-rosegment".to_string()
             }
             InitializedHostType::Localhost => {
-                "" // Compile fast! Localhost is used for debugging
+                "".to_string() // Compile fast! Localhost is used for debugging
             }
         }
-        .to_string()
     }
 
     fn host_with_env(&self, host: TrybuildHost) -> TrybuildHost {
@@ -166,7 +161,6 @@ impl ReusableHosts {
             };
             host = host.tracing(
                 TracingOptions::builder()
-                    .perf_raw_outfile(format!("{}.perf.data", display_name))
                     .fold_outfile(format!("{}.data.folded", display_name))
                     .frequency(128)
                     .setup_command(setup_command)

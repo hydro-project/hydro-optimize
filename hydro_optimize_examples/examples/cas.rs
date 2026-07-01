@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 
 use clap::{ArgAction, Parser};
-use hydro_lang::viz::config::GraphConfig;
 use hydro_lang::{location::Location, prelude::FlowBuilder};
 use hydro_optimize::deploy_and_analyze::{
-    BenchmarkArgs, BenchmarkConfig, NUM_PHYSICAL_CLIENTS, Optimizations, ReusableClusters,
-    ReusableProcesses, VIRTUAL_CLIENTS_STEP, benchmark_protocol,
+    BenchmarkArgs, BenchmarkConfig, CompiledProgram, NUM_PHYSICAL_CLIENTS, Optimization,
+    ReusableClusters, ReusableProcesses, benchmark_protocol,
 };
 use hydro_optimize_examples::compare_and_swap::cas_bench::cas_bench;
 
@@ -16,9 +15,6 @@ use hydro_optimize_examples::compare_and_swap::cas_bench::cas_bench;
         .multiple(false)
 ))]
 struct Args {
-    #[command(flatten)]
-    graph: GraphConfig,
-
     /// Use Gcp for deployment (provide project name)
     #[arg(long)]
     gcp: Option<String>,
@@ -32,9 +28,12 @@ struct Args {
     optimize: bool,
 }
 
-const WRITE_RATIOS: &[usize] = &[10, 100];
+// const WRITE_RATIOS: &[usize] = &[0, 100];
+const WRITE_RATIOS: &[usize] = &[100, 0];
 
-fn run_benchmark<'a>(write_ratio: usize, optimize: bool) -> (FlowBuilder<'a>, BenchmarkConfig) {
+/// Compiles the CAS program for a given write ratio. All write ratios produce an identical IR
+/// (the ratio is a runtime constant inside the client), so they share one optimization run.
+fn compile<'a>(write_ratio: usize) -> (FlowBuilder<'a>, CompiledProgram) {
     let f = 1;
     let retry_timeout = 5000;
     let print_result_frequency = 1000;
@@ -67,42 +66,43 @@ fn run_benchmark<'a>(write_ratio: usize, optimize: bool) -> (FlowBuilder<'a>, Be
         .with_cluster(clients, num_clients);
     let processes = ReusableProcesses::default().with_process(client_aggregator);
 
-    let mut optimizations = Optimizations::default()
+    let program = CompiledProgram::new(clusters, processes, location_id_to_cluster)
         .excluding(client_id)
         .excluding(client_aggregator_id);
-    if optimize {
-        optimizations = optimizations.with_bottleneck_elimination();
-    }
 
-    (
-        builder,
-        BenchmarkConfig {
-            name: "CAS".to_string(),
-            workload: format!("write{write_ratio}"),
-            clusters,
-            processes,
-            optimizations,
-            location_id_to_cluster,
-            num_physical_clients: num_clients,
-            start_virtual_clients: 1,
-            virtual_clients_step: VIRTUAL_CLIENTS_STEP,
-            num_runs: 1,
-            calibrate_message_size: None,
-        },
-    )
+    (builder, program)
 }
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    for &write_ratio in WRITE_RATIOS {
-        benchmark_protocol(
-            BenchmarkArgs {
-                gcp: args.gcp.clone(),
-                aws: args.aws,
-            },
-            || run_benchmark(write_ratio, args.optimize),
-        )
-        .await;
-    }
+    let config = BenchmarkConfig {
+        name: "CAS".to_string(),
+        kind: if args.optimize {
+            Optimization::BottleneckElimination
+        } else {
+            Optimization::None
+        },
+        num_physical_clients: NUM_PHYSICAL_CLIENTS,
+        start_virtual_clients: 1,
+        virtual_clients_step: 10,
+        num_runs: 1,
+        calibrate_message_sizes: None,
+    };
+    // (params, workload name) — the name discriminates output directories on disk.
+    let workloads: Vec<(usize, String)> = WRITE_RATIOS
+        .iter()
+        .map(|&ratio| (ratio, format!("write{ratio}")))
+        .collect();
+
+    benchmark_protocol(
+        BenchmarkArgs {
+            gcp: args.gcp.clone(),
+            aws: args.aws,
+        },
+        config,
+        &workloads,
+        |&write_ratio| compile(write_ratio),
+    )
+    .await;
 }

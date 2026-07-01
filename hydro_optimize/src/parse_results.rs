@@ -15,7 +15,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::decouple_analysis::Rewrite;
 use crate::deploy_and_analyze::{
-    MEASUREMENT_SECOND, MetricLogs, OptimizationKind, START_MEASUREMENT_SECOND,
+    MEASUREMENT_SECOND, MetricLogs, Optimization, START_MEASUREMENT_SECOND,
     inject_inferred_counters,
 };
 
@@ -23,7 +23,14 @@ use crate::deploy_and_analyze::{
 /// 1. Finds the run suffix (e.g. "10c_500vc_r0") with highest avg throughput.
 /// 2. For that run, reads all cluster CSVs and returns the cluster name whose SAR stats
 ///    are closest to saturation (100% CPU, 100% memory, or at/above max network/IO).
-pub fn find_bottleneck_from_run(run_dir: &Path, network_bytes_per_sec: f64, io_tps: f64) -> String {
+///
+/// For one run directory, returns each cluster's saturation (max resource utilization) at the
+/// highest-throughput run suffix. Returns an empty map if the directory has no CSVs.
+fn cluster_saturations_from_run(
+    run_dir: &Path,
+    network_bytes_per_sec: f64,
+    io_tps: f64,
+) -> HashMap<String, f64> {
     let csv_re = Regex::new(r"^(.+)_(\d+c_\d+vc_r\d+)\.csv$").unwrap();
 
     // Group CSVs by suffix
@@ -44,7 +51,7 @@ pub fn find_bottleneck_from_run(run_dir: &Path, network_bytes_per_sec: f64, io_t
     }
 
     // Find suffix with highest throughput (use first CSV that has throughput data)
-    let best_suffix = suffix_to_files
+    let Some(best_suffix) = suffix_to_files
         .keys()
         .max_by_key(|suffix| {
             suffix_to_files[*suffix]
@@ -53,8 +60,10 @@ pub fn find_bottleneck_from_run(run_dir: &Path, network_bytes_per_sec: f64, io_t
                 .max()
                 .unwrap_or(0)
         })
-        .expect("No CSVs found in run dir")
-        .clone();
+        .cloned()
+    else {
+        return HashMap::new();
+    };
 
     // For the best suffix, score each cluster by saturation
     let score = |s: &SarStats| -> f64 {
@@ -72,18 +81,80 @@ pub fn find_bottleneck_from_run(run_dir: &Path, network_bytes_per_sec: f64, io_t
         .fold(0.0_f64, f64::max)
     };
 
-    let (bottleneck_name, _) = suffix_to_files[&best_suffix]
-        .iter()
-        .map(|(cluster_name, path)| {
-            let avg_sar = csv_avg_sar(path);
-            (cluster_name.clone(), score(&avg_sar))
-        })
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .expect("No cluster CSVs for best suffix");
+    let mut saturations: HashMap<String, f64> = HashMap::new();
+    for (cluster_name, path) in &suffix_to_files[&best_suffix] {
+        let s = score(&csv_avg_sar(path));
+        let entry = saturations.entry(cluster_name.clone()).or_insert(f64::MIN);
+        if s > *entry {
+            *entry = s;
+        }
+    }
+    saturations
+}
 
+/// Returns the most-saturated cluster name in `saturations`, excluding any whose base name is
+/// in `excluded_names` (so decoupled/partitioned variants like "client_loc1" are excluded too).
+fn most_saturated_cluster(
+    saturations: &HashMap<String, f64>,
+    excluded_names: &HashSet<String>,
+) -> String {
+    saturations
+        .iter()
+        .filter(|(name, _)| !excluded_names.contains(original_cluster_name(name)))
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .map(|(name, _)| name.clone())
+        .expect("No non-excluded cluster found in run")
+}
+
+/// Finds the bottleneck cluster from a single run folder's CSV data.
+/// 1. Finds the run suffix (e.g. "10c_500vc_r0") with highest avg throughput.
+/// 2. For that run, returns the (non-excluded) cluster name whose SAR stats are closest to
+///    saturation (100% CPU, 100% memory, or at/above max network/IO).
+pub fn find_bottleneck_from_run(
+    run_dir: &Path,
+    network_bytes_per_sec: f64,
+    io_tps: f64,
+    excluded_names: &HashSet<String>,
+) -> String {
+    let saturations = cluster_saturations_from_run(run_dir, network_bytes_per_sec, io_tps);
+    let bottleneck_name = most_saturated_cluster(&saturations, excluded_names);
     println!(
-        "Bottleneck from run: {} (suffix: {})",
-        bottleneck_name, best_suffix
+        "Bottleneck from run {}: {}",
+        run_dir.display(),
+        bottleneck_name
+    );
+    bottleneck_name
+}
+
+/// Finds the bottleneck cluster across multiple workloads' run folders, taking the max
+/// saturation per cluster across all of them. This picks the cluster that is the worst
+/// bottleneck in *any* workload, so the optimizer targets the cluster that limits the
+/// hardest workload rather than an arbitrary single one.
+pub fn find_bottleneck_across_runs(
+    run_dirs: &[PathBuf],
+    network_bytes_per_sec: f64,
+    io_tps: f64,
+    excluded_names: &HashSet<String>,
+) -> String {
+    let mut merged: HashMap<String, f64> = HashMap::new();
+    for dir in run_dirs {
+        for (name, s) in cluster_saturations_from_run(dir, network_bytes_per_sec, io_tps) {
+            let entry = merged.entry(name).or_insert(f64::MIN);
+            if s > *entry {
+                *entry = s;
+            }
+        }
+    }
+    assert!(
+        !merged.is_empty(),
+        "No cluster CSVs found across {} run dir(s)",
+        run_dirs.len()
+    );
+    let bottleneck_name = most_saturated_cluster(&merged, excluded_names);
+    println!(
+        "Bottleneck across {} workload(s): {}",
+        run_dirs.len(),
+        bottleneck_name
     );
     bottleneck_name
 }
@@ -150,7 +221,7 @@ pub fn csv_avg_throughput(path: &Path) -> usize {
 
 /// Returns the max average throughput across all CSVs in `_none` workload dirs for `name`.
 pub fn max_throughput_for(base_dir: &Path, name: &str) -> usize {
-    find_workload_dirs(base_dir, name, OptimizationKind::None.label())
+    find_workload_dirs(base_dir, name, Optimization::None.label())
         .iter()
         .flat_map(|d| get_csvs_in_dir(d))
         .map(|e| csv_avg_throughput(&e.path()))
@@ -229,12 +300,11 @@ impl OptimizationState {
 /// Loads ILP inputs by scanning all workload directories for a given protocol name and label,
 /// taking the element-wise max across workloads.
 pub fn load_raw_ilp_inputs(base_dir: &Path, name: &str) -> RawIlpInputs {
-    let blow_up_dirs = find_workload_dirs(base_dir, name, OptimizationKind::BlowUpAnalysis.label());
-    let size_dirs = find_workload_dirs(base_dir, name, OptimizationKind::SizeAnalysis.label());
-    let counters_dirs = find_workload_dirs(base_dir, name, OptimizationKind::CountersOnly.label());
-    let perf_dirs = find_workload_dirs(base_dir, name, OptimizationKind::PerfOnly.label());
+    let blow_up_dirs = find_workload_dirs(base_dir, name, Optimization::BlowUpAnalysis.label());
+    let size_dirs = find_workload_dirs(base_dir, name, Optimization::SizeAnalysis.label());
+    let counters_dirs = find_workload_dirs(base_dir, name, Optimization::Counters.label());
+    let perf_dirs = find_workload_dirs(base_dir, name, Optimization::Perf.label());
 
-    assert!(!blow_up_dirs.is_empty(), "No blow_up dirs for '{}'", name);
     assert!(!size_dirs.is_empty(), "No size dirs for '{}'", name);
     assert!(!counters_dirs.is_empty(), "No counters dirs for '{}'", name);
     assert!(!perf_dirs.is_empty(), "No perf dirs for '{}'", name);
@@ -253,20 +323,6 @@ pub fn load_raw_ilp_inputs(base_dir: &Path, name: &str) -> RawIlpInputs {
             }
         }
     }
-
-    let op_output_sizes = max_across_dirs(&size_dirs, |dir| {
-        let path = dir.join("size_analysis.json");
-        if path.exists() {
-            load_json(&path)
-        } else {
-            HashMap::new()
-        }
-    });
-    let op_counts = max_across_dirs(&counters_dirs, |dir| {
-        load_json_for_best_csv(dir, "counters")
-    });
-    let perf = max_across_dirs(&perf_dirs, |dir| load_json_for_best_csv(dir, "perf"));
-
     // Convert blow-up stats to per-op memory/IO
     let mut per_op_blow_up: HashMap<usize, SarStats> = HashMap::new();
     for stats in blow_up_stats.values() {
@@ -281,6 +337,19 @@ pub fn load_raw_ilp_inputs(base_dir: &Path, name: &str) -> RawIlpInputs {
         }
     }
 
+    let op_output_sizes = max_across_dirs(&size_dirs, |dir| {
+        let path = dir.join("size_analysis.json");
+        if path.exists() {
+            load_json(&path)
+        } else {
+            HashMap::new()
+        }
+    });
+    let op_counts = max_across_dirs(&counters_dirs, |dir| {
+        load_json_for_best_csv(dir, "counters")
+    });
+    let perf = max_across_dirs(&perf_dirs, |dir| load_json_for_best_csv(dir, "perf"));
+
     RawIlpInputs {
         per_op_blow_up,
         op_output_sizes,
@@ -294,9 +363,9 @@ pub fn load_raw_ilp_inputs(base_dir: &Path, name: &str) -> RawIlpInputs {
 /// Averages cost-per-message across all runs for each (message_size, num_sockets) pair.
 /// Clients are converted to sockets: num_sockets = num_clients * 2.
 pub fn load_calibration_table(calibration_dir: &Path) -> NetworkCostTable {
-    let dir_regex = Regex::new(r"^Network_(\d+)b_(\d+)c_default_none$").unwrap();
-    // Accumulate per (num_sockets, msg_size) -> Vec<SarStats> across runs
-    let mut per_key: HashMap<(usize, u64), Vec<SarStats>> = HashMap::new();
+    let dir_regex = Regex::new(r"^Network_(\d+)b_default_none$").unwrap();
+    // Accumulate per msg_size -> Vec<SarStats> across runs
+    let mut per_key: HashMap<u64, Vec<SarStats>> = HashMap::new();
 
     for entry in fs::read_dir(calibration_dir).expect("Failed to read calibration directory") {
         let entry = entry.unwrap();
@@ -306,16 +375,6 @@ pub fn load_calibration_table(calibration_dir: &Path) -> NetworkCostTable {
             continue;
         };
         let msg_size = cap[1].parse::<u64>().unwrap();
-        let num_clients = cap[2].parse::<usize>().unwrap();
-        // Empirically, avg active sockets per tick is ~1 less than num_clients for 4 clients.
-        // For 10 clients, source stats aren't recorded but behave similarly to sink.
-        // Encode 4 clients as 3 sockets, 10 clients as 10 sockets (sink-only measurement).
-        // Multiply by 2 for both directions (source + sink).
-        let num_sockets = match num_clients {
-            4 => 3 * 2,
-            10 => 10 * 2,
-            _ => continue,
-        };
 
         let dir_path = entry.path();
         let server_files: Vec<_> = fs::read_dir(&dir_path)
@@ -357,23 +416,20 @@ pub fn load_calibration_table(calibration_dir: &Path) -> NetworkCostTable {
 
             let throughput = (sum_thr / n) as usize;
             if throughput > 0 {
-                per_key
-                    .entry((num_sockets, msg_size))
-                    .or_default()
-                    .push(SarStats {
-                        cpu: (sum_cpu / n) / throughput as f64,
-                        cpu_user: (sum_cpu_user / n) / throughput as f64,
-                        network: (sum_net / n) / throughput as f64,
-                        memory: 0.0,
-                        io: 0.0,
-                    });
+                per_key.entry(msg_size).or_default().push(SarStats {
+                    cpu: (sum_cpu / n) / throughput as f64,
+                    cpu_user: (sum_cpu_user / n) / throughput as f64,
+                    network: (sum_net / n) / throughput as f64,
+                    memory: 0.0,
+                    io: 0.0,
+                });
             }
         }
     }
 
-    // Average across runs for each (num_sockets, msg_size)
-    let mut entries: HashMap<usize, Vec<(u64, SarStats)>> = HashMap::new();
-    for ((num_sockets, msg_size), stats_vec) in per_key {
+    // Average across runs for each msg_size
+    let mut entries: HashMap<u64, SarStats> = HashMap::new();
+    for (msg_size, stats_vec) in per_key {
         let n = stats_vec.len() as f64;
         let avg = SarStats {
             cpu: stats_vec.iter().map(|s| s.cpu).sum::<f64>() / n,
@@ -382,10 +438,7 @@ pub fn load_calibration_table(calibration_dir: &Path) -> NetworkCostTable {
             memory: 0.0,
             io: 0.0,
         };
-        entries
-            .entry(num_sockets)
-            .or_default()
-            .push((msg_size, avg));
+        entries.insert(msg_size, avg);
     }
 
     assert!(
@@ -393,18 +446,14 @@ pub fn load_calibration_table(calibration_dir: &Path) -> NetworkCostTable {
         "No calibration data found in {:?}",
         calibration_dir
     );
-    let total: usize = entries.values().map(|v| v.len()).sum();
-    println!(
-        "Loaded {} calibration points across {} socket counts",
-        total,
-        entries.len()
-    );
+    let total = entries.len();
+    println!("Loaded {} calibration points", total);
     NetworkCostTable::from_calibration(entries)
 }
 
 /// Finds the bottleneck run directory: the perf dir with highest throughput across workloads.
 pub fn find_bottleneck_run_dir(base_dir: &Path, name: &str) -> PathBuf {
-    let perf_label = OptimizationKind::PerfOnly.label();
+    let perf_label = Optimization::Perf.label();
     let perf_dirs = find_workload_dirs(base_dir, name, perf_label);
     assert!(!perf_dirs.is_empty(), "No perf dirs for '{}'", name);
     // Use the one with highest throughput CSVs
@@ -487,13 +536,13 @@ pub fn decoupled_cluster_name(original_name: &str, loc_idx: usize) -> String {
 /// Returns `None` if no `_none` run has completed, `Some(0)` if only `{name}_default_none`
 /// exists, `Some(N)` if `{name}_optN_default_none` is the highest.
 pub fn find_latest_iteration(base_dir: &Path, name: &str) -> Option<usize> {
-    let base_none = find_workload_dirs(base_dir, name, OptimizationKind::None.label());
+    let base_none = find_workload_dirs(base_dir, name, Optimization::None.label());
     if base_none.is_empty() {
         return None;
     }
 
     let prefix = format!("{}_opt", name);
-    let suffix = format!("_{}", OptimizationKind::None.label());
+    let suffix = format!("_{}", Optimization::None.label());
     let max_opt = std::fs::read_dir(base_dir)
         .into_iter()
         .flatten()
@@ -549,90 +598,38 @@ pub fn get_csvs_in_dir(dir: &Path) -> Vec<fs::DirEntry> {
         .collect()
 }
 
-/// Lookup table mapping (message_size, num_sockets) → per-message resource costs.
-/// Stores a precomputed linear model per message size: cost = slope * num_sockets + intercept.
+/// Lookup table mapping message_size → per-message resource costs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkCostTable {
     /// Sorted by message_size.
     entries: Vec<NetworkCostEntry>,
 }
 
-/// Linear model for a single message size: cost = slope * num_sockets + intercept.
+/// Calibration cost for a single message size.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct NetworkCostEntry {
     message_size: u64,
-    slope: SarStats,
-    intercept: SarStats,
+    cost: SarStats,
 }
 
 impl NetworkCostTable {
-    pub fn from_calibration(raw: HashMap<usize, Vec<(u64, SarStats)>>) -> Self {
-        let mut tables = raw;
-        for table in tables.values_mut() {
-            table.sort_by_key(|(size, _)| *size);
-            for (_, stats) in table.iter_mut() {
-                *stats = stats.scale(0.5);
-            }
-        }
-
-        let mut keys: Vec<usize> = tables.keys().copied().collect();
-        keys.sort();
-
-        assert!(
-            keys.len() >= 2,
-            "At least 2 physical client configurations required for network cost interpolation"
-        );
-
-        let lo_k = keys[0];
-        let hi_k = *keys.last().unwrap();
-        let lo_table = &tables[&lo_k];
-        let hi_table = &tables[&hi_k];
-        let denom = (hi_k - lo_k) as f64;
-        // Only use message sizes present in both tables
-        let hi_sizes: HashSet<u64> = hi_table.iter().map(|(s, _)| *s).collect();
-        let entries: Vec<NetworkCostEntry> = lo_table
-            .iter()
-            .filter(|(msg_size, _)| hi_sizes.contains(msg_size))
-            .map(|&(msg_size, cost_lo)| {
-                let cost_hi = hi_table.iter().find(|(s, _)| *s == msg_size).unwrap().1;
-                let slope = SarStats {
-                    cpu: (cost_hi.cpu - cost_lo.cpu) / denom,
-                    cpu_user: (cost_hi.cpu_user - cost_lo.cpu_user) / denom,
-                    network: 0.0,
-                    memory: 0.0,
-                    io: 0.0,
-                };
-                let intercept = SarStats {
-                    cpu: cost_lo.cpu - slope.cpu * lo_k as f64,
-                    cpu_user: cost_lo.cpu_user - slope.cpu_user * lo_k as f64,
-                    network: cost_lo.network, // Note: This is not scaled. Number of physical clients should have no effect
-                    memory: 0.0,
-                    io: 0.0,
-                };
-                NetworkCostEntry {
-                    message_size: msg_size,
-                    slope,
-                    intercept,
-                }
+    pub fn from_calibration(raw: HashMap<u64, SarStats>) -> Self {
+        let mut entries: Vec<NetworkCostEntry> = raw
+            .into_iter()
+            .map(|(message_size, cost)| NetworkCostEntry {
+                message_size,
+                cost: cost.scale(0.5),
             })
             .collect();
 
-        for entry in &entries {
-            assert!(
-                entry.slope.cpu >= 0.0 && entry.slope.cpu_user >= 0.0,
-                "Negative slope for message_size={}: {:?}",
-                entry.message_size,
-                entry.slope
-            );
-        }
-
+        entries.sort_by_key(|e| e.message_size);
         Self { entries }
     }
 
-    /// Returns the cost per message for the given message size and socket count.
-    pub fn cost_per_message(&self, message_size_bytes: u64, num_sockets: usize) -> SarStats {
+    /// Returns the cost per message for the given message size
+    fn cost_per_message(&self, message_size_bytes: u64) -> SarStats {
         let n = self.entries.len();
-        if n == 0 {
+        if n == 0 || message_size_bytes == 0 {
             return SarStats::default();
         }
         let entry = if n == 1 || message_size_bytes >= self.entries[n - 1].message_size {
@@ -643,24 +640,15 @@ impl NetworkCostTable {
                 .partition_point(|e| e.message_size <= message_size_bytes);
             &self.entries[if i >= n { n - 1 } else { i }]
         };
-        let x = num_sockets.max(1) as f64;
-        SarStats {
-            cpu: (entry.slope.cpu * x + entry.intercept.cpu).max(0.0),
-            cpu_user: (entry.slope.cpu_user * x + entry.intercept.cpu_user).max(0.0),
-            network: (entry.slope.network * x + entry.intercept.network).max(0.0),
-            memory: 0.0,
-            io: 0.0,
-        }
+        entry.cost
     }
 
     /// Total resource cost for sending `count` messages of `message_size_bytes` each.
-    pub fn network_cost(
-        &self,
-        count: usize,
-        message_size_bytes: u64,
-        num_sockets: usize,
-    ) -> SarStats {
-        self.cost_per_message(message_size_bytes, num_sockets)
+    pub fn network_cost(&self, count: usize, message_size_bytes: u64) -> SarStats {
+        if count == 0 || message_size_bytes == 0 {
+            return SarStats::default();
+        }
+        self.cost_per_message(message_size_bytes)
             .scale(count as f64)
     }
 }
@@ -711,7 +699,7 @@ pub struct RunMetadata {
     pub sar_stats: HashMap<LocationId, Vec<SarStats>>,
     /// Maps each LocationId → original op_ids assigned to it (populated when size_analysis is used)
     pub location_to_original_ops: HashMap<LocationId, Vec<usize>>,
-    /// Per-operator CPU usage fractions from perf: op_id → fraction of total samples.
+    /// Per-operator CPU usage fractions from perf: op_id → fraction of total samples (max 1.0).
     pub perf: HashMap<usize, f64>,
 }
 
@@ -973,9 +961,9 @@ fn avg_over<T>(slice: &[T], f: impl Fn(&T) -> f64) -> f64 {
 /// Per-second SAR statistics
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 pub struct SarStats {
-    /// Max single-core CPU usage (user + system %)
+    /// Core 0 CPU usage (user + system %), out of 100 — where the hydro main thread is pinned
     pub cpu: f64,
-    /// Max single-core CPU user % only (excludes system)
+    /// Core 0 CPU user % only (excludes system), out of 100
     pub cpu_user: f64,
     /// Network in + out bytes/sec
     pub network: f64,
@@ -1014,12 +1002,20 @@ impl SarStats {
         self.memory += other.memory;
         self.io += other.io;
     }
+
+    pub fn is_zero(&self) -> bool {
+        self.cpu == 0.0
+            && self.cpu_user == 0.0
+            && self.network == 0.0
+            && self.memory == 0.0
+            && self.io == 0.0
+    }
 }
 
-/// Parses `sar -n DEV -u -P ALL -r -b` output lines and returns per-second SarStats.
+/// Parses `sar -n DEV -u -P 0 -r -b` output lines and returns per-second SarStats.
 pub fn parse_sar_output(lines: Vec<String>) -> Vec<SarStats> {
     let cpu_regex = Regex::new(
-        r"\s(all|\d{1,3})\s+(\d+\.?\d*)\s+\d+\.?\d*\s+(\d+\.?\d*)\s+\d+\.?\d*\s+\d+\.?\d*\s+(\d+\.?\d*)$",
+        r"\s(\d{1,3})\s+(\d+\.?\d*)\s+\d+\.?\d*\s+(\d+\.?\d*)\s+\d+\.?\d*\s+\d+\.?\d*\s+(\d+\.?\d*)$",
     ).unwrap();
     let iface_regex =
         Regex::new(r"([a-zA-Z]\S*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)")
@@ -1038,25 +1034,19 @@ pub fn parse_sar_output(lines: Vec<String>) -> Vec<SarStats> {
     let mut result: Vec<SarStats> = vec![];
 
     for line in &lines {
-        // CPU: "all" marks a new second, per-core lines update the max
+        // CPU: we run `sar -P 0`, so the core-0 line (the only CPU line) marks each new
+        // second. We track core 0 only, where the hydro main thread is pinned; networking
+        // threads spin on other cores, so whole-machine CPU is no longer meaningful.
         if let Some(caps) = cpu_regex.captures(line) {
-            let is_all = &caps[1] == "all";
-            if let (Some(user), Some(system)) =
-                (caps[2].parse::<f64>().ok(), caps[3].parse::<f64>().ok())
+            if &caps[1] == "0"
+                && let (Some(user), Some(system)) =
+                    (caps[2].parse::<f64>().ok(), caps[3].parse::<f64>().ok())
             {
-                let usage = user + system;
-                if is_all {
-                    result.push(SarStats {
-                        cpu: usage,
-                        cpu_user: user,
-                        ..Default::default()
-                    });
-                } else if let Some(last) = result.last_mut()
-                    && usage > last.cpu
-                {
-                    last.cpu = usage;
-                    last.cpu_user = user;
-                }
+                result.push(SarStats {
+                    cpu: user + system,
+                    cpu_user: user,
+                    ..Default::default()
+                });
             }
             continue;
         }
@@ -1192,10 +1182,20 @@ pub fn parse_perf(folded: &str) -> HashMap<usize, f64> {
     let mut samples_per_id: HashMap<usize, f64> = HashMap::new();
 
     for line in folded.lines() {
-        let n_samples: f64 = line
-            .rsplit_once(' ')
-            .and_then(|(_, s)| s.parse().ok())
-            .unwrap_or(0.0);
+        let (stack_trace, n_samples) = match line.rsplit_once(' ') {
+            Some((stack, count_str)) => {
+                let n: f64 = count_str.parse().unwrap_or(0.0);
+                (stack, n)
+            }
+            None => (line, 0.0),
+        };
+
+        // Skip perf numbers from IO threads
+        let parent = stack_trace.split(';').next().unwrap_or(stack_trace);
+        if parent.starts_with("hydro-io-") {
+            continue;
+        }
+
         total_samples += n_samples;
 
         if let Some(cap) = operator_regex.captures_iter(line).last() {
@@ -1281,35 +1281,40 @@ pub async fn analyze_cluster_results(
         ));
     }
 
-    // Merge metrics across nodes in each cluster
-    for (id, name, _cluster) in nodes.get_all_clusters() {
-        let cluster_data = drained.get(&(id.clone(), name.to_string())).unwrap();
+    // Merge metrics across nodes in each cluster and process
+    let all_nodes = nodes
+        .get_all_clusters()
+        .map(|(id, name, _)| (id, name))
+        .chain(nodes.get_all_processes().map(|(id, name, _)| (id, name)));
 
-        let mut max_sar: Vec<SarStats> = vec![];
-        let mut max_counters: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (id, name) in all_nodes {
+        if let Some(cluster_data) = drained.get(&(id.clone(), name.to_string())) {
+            let mut max_sar: Vec<SarStats> = vec![];
+            let mut max_counters: HashMap<usize, Vec<usize>> = HashMap::new();
 
-        for (sar_stats, counters, _, _, byte_sizes) in cluster_data {
-            merge_max_vec(&mut max_sar, sar_stats, SarStats::max);
-            for (op_id, rates) in counters {
-                let entry = max_counters.entry(*op_id).or_default();
-                merge_max_vec(entry, rates, usize::max);
+            for (sar_stats, counters, _, _, byte_sizes) in cluster_data {
+                merge_max_vec(&mut max_sar, sar_stats, SarStats::max);
+                for (op_id, rates) in counters {
+                    let entry = max_counters.entry(*op_id).or_default();
+                    merge_max_vec(entry, rates, usize::max);
+                }
+                for (op_id, sizes) in byte_sizes {
+                    run_metadata
+                        .byte_sizes
+                        .entry(*op_id)
+                        .or_default()
+                        .extend(sizes);
+                }
             }
-            for (op_id, sizes) in byte_sizes {
-                run_metadata
-                    .byte_sizes
-                    .entry(*op_id)
-                    .or_default()
-                    .extend(sizes);
+
+            for (op_id, rates) in max_counters {
+                let entry = op_to_count.entry(op_id).or_default();
+                merge_max_vec(entry, &rates, usize::max);
             }
-        }
 
-        for (op_id, rates) in max_counters {
-            let entry = op_to_count.entry(op_id).or_default();
-            merge_max_vec(entry, &rates, usize::max);
-        }
-
-        if !max_sar.is_empty() {
-            run_metadata.sar_stats.insert(id.clone(), max_sar);
+            if !max_sar.is_empty() {
+                run_metadata.sar_stats.insert(id.clone(), max_sar);
+            }
         }
     }
 

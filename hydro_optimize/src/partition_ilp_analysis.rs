@@ -10,69 +10,10 @@ use hydro_lang::{
 };
 use syn::visit::Visit;
 
-use crate::reduce_pushdown::COM_ASSOC_REDUCE_TAG;
 use crate::{
     decouple_analysis::{DecoupleILPMetadata, ResourceExpressions, num_to_alpha},
-    partition_node_analysis::all_inputs,
     partition_syn_analysis::{AnalyzeClosure, StructOrTuple, StructOrTupleIndex},
 };
-
-/// Add id to dependent_nodes if its parent_id is already in dependent_nodes
-fn insert_dependent_node(
-    dependent_nodes: &RefCell<HashSet<usize>>,
-    parent_id: Option<usize>,
-    id: usize,
-) {
-    let mut dependent_nodes_borrow = dependent_nodes.borrow_mut();
-    if let Some(parent_id) = parent_id
-        && dependent_nodes_borrow.contains(&parent_id)
-    {
-        dependent_nodes_borrow.insert(id);
-    }
-}
-
-/// Returns IDs of nodes that are dependent on at least 1 input
-fn nodes_dependent_on_inputs(
-    ir: &mut [HydroRoot],
-    location: &LocationId,
-    inputs: &[usize],
-    op_to_parents: &HashMap<usize, Vec<usize>>,
-) -> HashSet<usize> {
-    let dependent_nodes = RefCell::new(HashSet::from_iter(inputs.iter().cloned()));
-    let mut num_dependent_nodes = inputs.len();
-
-    loop {
-        traverse_dfir(
-            ir,
-            |root, next_stmt_id| {
-                if root.input_metadata().location_id.root() == location {
-                    insert_dependent_node(
-                        &dependent_nodes,
-                        root.input_metadata().op.id,
-                        *next_stmt_id,
-                    );
-                }
-            },
-            |node, next_stmt_id| {
-                if node.metadata().location_id.root() == location.root()
-                    && let Some(parents) = op_to_parents.get(next_stmt_id)
-                {
-                    for parent_id in parents {
-                        insert_dependent_node(&dependent_nodes, Some(*parent_id), *next_stmt_id);
-                    }
-                }
-            },
-        );
-
-        if dependent_nodes.borrow().len() == num_dependent_nodes {
-            // No new dependent nodes found, reached fixpoint
-            break;
-        }
-        num_dependent_nodes = dependent_nodes.borrow().len();
-    }
-
-    dependent_nodes.take()
-}
 
 /// Given a node type, return how its output fields is dependent on its parents.
 /// Must contain an entry for each parent, even if there is no dependency.
@@ -340,72 +281,6 @@ fn create_canonical_fields(
     op_to_dependencies
 }
 
-/// Whether a node affects partitionability analysis
-pub enum Partitionability {
-    NoEffect,
-    Conditional,
-    Unpartitionable,
-}
-
-/// If this node is an IDB, and it is the only non-network node in its location, can we partition that location?
-/// - `NoEffect`: Yes, and we can actually partition randomly for each element.
-/// - `Conditional`: Yes, we can partition on some specific keys.
-/// - `Unpartitionable`: No.
-fn node_partitionability(node: &HydroNode) -> Partitionability {
-    // Commutative+associative reduces from reduce pushdown are tagged and can be partitioned
-    if node.op_metadata().cpu_usage == Some(COM_ASSOC_REDUCE_TAG) {
-        return Partitionability::NoEffect;
-    }
-    match node {
-        HydroNode::Placeholder => {
-            panic!()
-        }
-        HydroNode::Cast { .. }
-        | HydroNode::ObserveNonDet { .. }
-        | HydroNode::Source { .. }
-        | HydroNode::SingletonSource { .. }
-        | HydroNode::CycleSource { .. }
-        | HydroNode::Tee { .. }
-        | HydroNode::Partition { .. }
-        | HydroNode::YieldConcat { .. }
-        | HydroNode::BeginAtomic { .. }
-        | HydroNode::EndAtomic { .. }
-        | HydroNode::Batch { .. }
-        | HydroNode::ResolveFutures { .. }
-        | HydroNode::ResolveFuturesBlocking { .. }
-        | HydroNode::ResolveFuturesOrdered { .. }
-        | HydroNode::Filter { .. }
-        | HydroNode::DeferTick { .. }
-        | HydroNode::Inspect { .. }
-        | HydroNode::ExternalInput { .. }
-        | HydroNode::Network { .. }
-        | HydroNode::Counter { .. }
-        | HydroNode::Map { .. }
-        | HydroNode::FilterMap { .. }
-        | HydroNode::FlatMap { .. }
-        | HydroNode::FlatMapStreamBlocking { .. }
-        | HydroNode::Chain { .. }
-        | HydroNode::ChainFirst { .. }
-        | HydroNode::MergeOrdered { .. } => Partitionability::NoEffect,
-        HydroNode::Join { .. }
-        | HydroNode::JoinHalf { .. }
-        | HydroNode::Difference { .. }
-        | HydroNode::AntiJoin { .. }
-        | HydroNode::Unique { .. }
-        | HydroNode::FoldKeyed { .. }
-        | HydroNode::ReduceKeyed { .. }
-        | HydroNode::ReduceKeyedWatermark { .. } => Partitionability::Conditional,
-        HydroNode::CrossProduct { .. }
-        | HydroNode::CrossSingleton { .. }
-        | HydroNode::Enumerate { .. }
-        | HydroNode::Sort { .. }
-        | HydroNode::Scan { .. }
-        | HydroNode::ScanAsyncBlocking { .. }
-        | HydroNode::Fold { .. }
-        | HydroNode::Reduce { .. } => Partitionability::Unpartitionable,
-    }
-}
-
 /// Whether this node introduces persistence.
 /// Note: Must keep in sync with `emit_core` in hydro_lang.
 fn node_persists(node: &HydroNode) -> bool {
@@ -539,6 +414,10 @@ pub(crate) struct PartitionILPMetadata {
     pub(crate) can_partition: HashMap<usize, Variable>, // location: 1 iff location is partitionable ((all relevant partitionable OR no persist) AND no total-order)
 }
 
+fn field_specificity_score(field: &StructOrTupleIndex) -> f64 {
+    (field.len() + 1) as f64
+}
+
 /// Add the operator with `id` to the location_sum for each location
 fn add_op_to_location_sum(
     id: usize,
@@ -619,14 +498,19 @@ fn field_vars_from_op(
             let mut field_to_var = HashMap::new();
             let mut sum_expr = Expression::default();
             for (idx, field_name) in field_names.iter().enumerate() {
+                let mut decoupling_metadata = decoupling_metadata.borrow_mut();
                 let var = decoupling_metadata
-                    .borrow_mut()
                     .variables
                     .add(variable().binary().name(format!(
                         "fieldop{}f{}",
                         num_to_alpha(op_id),
                         num_to_alpha(idx)
                     )));
+                // Add penality for partitioning on too-specific fields
+                let penalty = std::mem::take(&mut decoupling_metadata.field_specificity_penalty);
+                decoupling_metadata.field_specificity_penalty =
+                    penalty + Expression::from(var) * field_specificity_score(field_name);
+
                 field_to_var.insert(field_name.clone(), var);
                 sum_expr += var;
             }
@@ -672,6 +556,13 @@ fn constrain_field_vars_to_parents(
     if parents.is_empty() {
         // Network nodes with no parents: field vars are unconstrained (free to be 0 or 1).
         // The solver will set them to 1 if doing so helps enable partitioning downstream.
+        // Add to partitionable operators as always partitionable
+        let DecoupleILPMetadata { op_id_to_var, .. } = &mut *decoupling_metadata.borrow_mut();
+        for (loc, partitionable_expr) in partitionable_operators {
+            let is_at_loc = op_id_to_var.get(&op_id).unwrap().get(loc).unwrap();
+            let temp_expr = std::mem::take(partitionable_expr);
+            *partitionable_expr = temp_expr + is_at_loc;
+        }
         return;
     }
 
@@ -794,14 +685,10 @@ fn partition_ilp_node_analysis(
         return;
     }
 
-    let affect_partitionability = match node_partitionability(node) {
-        Partitionability::NoEffect => false,
-        Partitionability::Conditional | Partitionability::Unpartitionable => true,
-    };
     // TODO: Known inaccuracy: if a node is not an IDB but flows into the positive edge of a
     // negation (e.g. an anti-join), then it should also be relevant (and partitioned) to avoid
     // producing too many outputs
-    let is_relevant = idbs.contains(&op_id) && affect_partitionability;
+    let is_relevant = idbs.contains(&op_id);
 
     let PartitionILPMetadata {
         num_relevant_operators,
@@ -809,7 +696,7 @@ fn partition_ilp_node_analysis(
         ..
     } = metadata;
 
-    // A node is relevant if it is an IDB and affects partitionability
+    // A node is relevant if it is an IDB
     if is_relevant {
         add_op_to_location_sum(op_id, decoupling_metadata, num_relevant_operators);
     }
@@ -951,6 +838,7 @@ fn calculate_partitionable(
 pub(crate) fn partition_ilp_analysis(
     ir: &mut [HydroRoot],
     op_id_to_parents: &HashMap<usize, Vec<usize>>,
+    idbs: HashSet<usize>,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) -> PartitionILPMetadata {
     // Make all cost expressions at all locations default to 0
@@ -968,14 +856,6 @@ pub(crate) fn partition_ilp_analysis(
         can_partition: HashMap::new(),
     };
 
-    let inputs = all_inputs(ir, &decoupling_metadata.borrow().bottleneck);
-    // TODO: Known inaccuracy: This assumes that no edge will be created that converts EDBs to IDBs. That needs to be a constraint on decoupling
-    let idbs = nodes_dependent_on_inputs(
-        ir,
-        &decoupling_metadata.borrow().bottleneck,
-        &inputs,
-        op_id_to_parents,
-    );
     let canonical_fields = create_canonical_fields(
         ir,
         &decoupling_metadata.borrow().bottleneck,

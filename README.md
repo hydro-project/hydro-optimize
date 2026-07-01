@@ -2,11 +2,48 @@
 
 Automatically apply decoupling and partitioning to Hydro programs for higher throughput.
 
-> ![NOTE]
-> Only Linux is supported, as we compile with `glibc` for better performance and more legibile `perf` results.
-
-
 ## Installation
+Install development tools. These instructions are for Amazon Linux.
+```bash
+sudo dnf groupinstall -y "Development Tools"
+
+# Optional, if you want to keep sessions running beyond SSH disconnects
+sudo dnf install -y tmux
+```
+
+### Rust
+Install Rust.
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.bashrc
+rustup target add x86_64-unknown-linux-musl
+
+# Optional, if you plan on editing the code in an IDE
+rustup component add rust-analyzer
+```
+
+### Permissions
+The Linux machine on which you are running hydro-optimize will need permissions to launch VMs. If this is your local machine, you can simply sign into your AWS account locally; otherwise you will need to grant the remote machine the appropriate permissions.
+
+#### AWS EC2
+The machine on which you are running hydro-optimize will need permissions to launch VMs.
+1. Go to AWS IAM Roles > Create role.
+2. Select "EC2" as the Use case.
+3. Add "AmazonEC2FullAccess" as the Permission policy.
+4. Give it a name (I named it "EC2FullRole"). 
+5. Go to the Instance you are running hydro-optimize from, Actions > Security > Modify IAM role.
+6. Give it the EC2FullRole.
+
+You will need to increase your EC2 quota for experiments like `benchmark_paxos`. Request an increase to your "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances" quota for `us-east-1` to 500.
+
+### Terraform
+Terraform is used to spin up machines.
+These are instructions for Amazon Linux machines; refer to [the official site](https://developer.hashicorp.com/terraform/tutorials/aws-get-started/install-cli) for your architecture.
+```bash
+sudo dnf install -y dnf-plugins-core
+sudo dnf config-manager --add-repo https://rpm.releases.hashicorp.com/AmazonLinux/hashicorp.repo
+sudo dnf install -y terraform
+```
 
 ### ILP Solver
 We rely on the [Gurobi](https://www.gurobi.com/) ILP solver to find the optimal set of rewrites.
@@ -14,16 +51,14 @@ Gurobi is not free; you will need to either create a Gurobi account (and use a f
 
 ```bash
 ./setup_gurobi.sh
+source ~/.zshrc
 ```
 
 Create a Gurobi license following your organization's instructions.
-For free educational licenses, you may request a named license from Gurobi, then run the command they provide, which should resemble the following:
-
-```bash
-grbgetkey <unique-hash-from-gurobi>
-```
+For free educational licenses, you may request a WSL license from Gurobi, then download it (which should create a gurobi.lic file) and put it on your remote machine under `~/`.
 
 ## Execution
+Run all commands below within `tmux` so they continue running even if your SSH connection breaks.
 
 To run Microbus or Krupa without applying any optimizations, run:
 ```bash
