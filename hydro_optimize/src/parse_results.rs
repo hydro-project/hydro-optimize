@@ -23,6 +23,7 @@ use crate::deploy_and_analyze::{
 /// 1. Finds the run suffix (e.g. "10c_500vc_r0") with highest avg throughput.
 /// 2. For that run, reads all cluster CSVs and returns the cluster name whose SAR stats
 ///    are closest to saturation (100% CPU, 100% memory, or at/above max network/IO).
+///
 /// For one run directory, returns each cluster's saturation (max resource utilization) at the
 /// highest-throughput run suffix. Returns an empty map if the directory has no CSVs.
 fn cluster_saturations_from_run(
@@ -117,7 +118,11 @@ pub fn find_bottleneck_from_run(
 ) -> String {
     let saturations = cluster_saturations_from_run(run_dir, network_bytes_per_sec, io_tps);
     let bottleneck_name = most_saturated_cluster(&saturations, excluded_names);
-    println!("Bottleneck from run {}: {}", run_dir.display(), bottleneck_name);
+    println!(
+        "Bottleneck from run {}: {}",
+        run_dir.display(),
+        bottleneck_name
+    );
     bottleneck_name
 }
 
@@ -641,7 +646,7 @@ impl NetworkCostTable {
     /// Total resource cost for sending `count` messages of `message_size_bytes` each.
     pub fn network_cost(&self, count: usize, message_size_bytes: u64) -> SarStats {
         if count == 0 || message_size_bytes == 0 {
-            return SarStats::default()
+            return SarStats::default();
         }
         self.cost_per_message(message_size_bytes)
             .scale(count as f64)
@@ -999,7 +1004,11 @@ impl SarStats {
     }
 
     pub fn is_zero(&self) -> bool {
-        self.cpu == 0.0 && self.cpu_user == 0.0 && self.network == 0.0 && self.memory == 0.0 && self.io == 0.0
+        self.cpu == 0.0
+            && self.cpu_user == 0.0
+            && self.network == 0.0
+            && self.memory == 0.0
+            && self.io == 0.0
     }
 }
 

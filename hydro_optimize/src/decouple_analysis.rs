@@ -1006,6 +1006,7 @@ pub fn find_optimal_budget(
 /// If this is under 100%, then our calibration assumes network costs too little.
 ///
 /// The return type is `Vec<Rewrite>` just to match the signature of `find_optimal_budget`
+#[allow(dead_code)]
 pub(crate) fn project_total_cpu(
     ir: &mut [HydroRoot],
     bottleneck: &LocationId,

@@ -72,8 +72,8 @@ async fn main() {
 
             let clusters = ReusableClusters::default().with_cluster(clients, 1);
             let processes = ReusableProcesses::default().with_process(server);
-            let program =
-                CompiledProgram::new(clusters, processes, location_id_to_cluster).excluding(client_id);
+            let program = CompiledProgram::new(clusters, processes, location_id_to_cluster)
+                .excluding(client_id);
 
             (builder, program)
         },

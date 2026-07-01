@@ -28,8 +28,8 @@ struct Args {
     optimize: bool,
 }
 
-const WRITE_RATIOS: &[usize] = &[0, 100];
-// const WRITE_RATIOS: &[usize] = &[100, 0];
+// const WRITE_RATIOS: &[usize] = &[0, 100];
+const WRITE_RATIOS: &[usize] = &[100, 0];
 
 /// Compiles the CAS program for a given write ratio. All write ratios produce an identical IR
 /// (the ratio is a runtime constant inside the client), so they share one optimization run.

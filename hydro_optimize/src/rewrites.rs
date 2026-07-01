@@ -33,7 +33,9 @@ impl VisitMut for ClusterSelfIdReplace {
                 let orig_prefix = format!("__hydro_lang_cluster_self_id_{}", self.orig_cluster_id);
                 let new_prefix = format!("__hydro_lang_cluster_self_id_{}", self.new_cluster_id);
                 if ident.starts_with(&orig_prefix) || ident.starts_with(&new_prefix) {
-                    if ident.starts_with(&orig_prefix) && self.orig_cluster_id != self.new_cluster_id {
+                    if ident.starts_with(&orig_prefix)
+                        && self.orig_cluster_id != self.new_cluster_id
+                    {
                         segment.ident = syn::Ident::new(
                             &format!("__hydro_lang_cluster_self_id_{}", self.new_cluster_id),
                             segment.ident.span(),
@@ -276,7 +278,6 @@ pub fn nodes_dependent_on_inputs(
 
     dependent_nodes.take()
 }
-
 
 /// Check if the type is serializable. Currently a janky implementation that just looks for common unserializable types.
 /// Add to the list as new errors emerge.
