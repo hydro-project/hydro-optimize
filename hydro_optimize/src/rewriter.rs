@@ -68,6 +68,30 @@ struct NetworkMetadata {
     new: bool,
 }
 
+fn sender_logical_id(network_metadata: &NetworkMetadata) -> syn::Expr {
+    let ident = syn::Ident::new(
+        &format!(
+            "__hydro_lang_cluster_self_id_{}",
+            network_metadata.sender_location.key()
+        ),
+        proc_macro2::Span::call_site(),
+    );
+    let num_sender_partitions = network_metadata.sender_partitions;
+    if num_sender_partitions > 0 {
+        syn::parse_quote!(#ident.get_raw_id() / #num_sender_partitions as u32)
+    } else {
+        syn::parse_quote!(#ident.get_raw_id())
+    }
+}
+
+fn hash_expr(value: syn::Expr) -> syn::Expr {
+    syn::parse_quote!({
+        let mut s = ::std::hash::DefaultHasher::new();
+        ::std::hash::Hash::hash(&#value, &mut s);
+        ::std::hash::Hasher::finish(&s) as u32
+    })
+}
+
 /// Creates the Map before Network to route it to the correct partition.
 /// A map is appended to the node passed in.
 /// If a network already exists, pass in its input.
@@ -83,23 +107,26 @@ fn map_before_network(node: &mut HydroNode, network_metadata: &NetworkMetadata) 
         if let Some(field) = &network_metadata.partition_field {
             // If partitioning and there is a field to hash on, use it
             let struct_or_tuple: syn::Expr = syn::parse_quote! { struct_or_tuple };
-            // If this is an existing network, then the index is over fields of the network after the receipt(sender, T), but before the send, the type is just T, so lop off the 1st layer of the field.
-            let field: &[String] = if !network_metadata.new {
-                // Partitioning on sender location CAN be supported, but it will involve introducing a Hash over CLUSTER_SELF_ID
-                assert_eq!(
-                    field[0], "1",
-                    "Unsupported: Partitioning on sender location."
-                );
-                &field[1..]
+            if !network_metadata.new && field.len() == 1 && field[0] == "0" {
+                // Partitioning asks to hash on the Sender's ID
+                hash_expr(sender_logical_id(network_metadata))
             } else {
-                field
-            };
-            let struct_or_tuple_with_fields = StructOrTuple::to_syn_expr(struct_or_tuple, field);
-            syn::parse_quote!({
-                let mut s = ::std::hash::DefaultHasher::new();
-                ::std::hash::Hash::hash(&#struct_or_tuple_with_fields, &mut s);
-                ::std::hash::Hasher::finish(&s) as u32
-            })
+                // If this is an existing network, then the index is over fields of the network
+                // after the receipt(sender, T), but before the send, the type is just T, so lop
+                // off the first layer of the field.
+                let field: &[String] = if !network_metadata.new {
+                    assert!(
+                        !field.is_empty() && field[0] == "1",
+                        "Unsupported: Existing network partition fields must refer to either sender id or payload."
+                    );
+                    &field[1..]
+                } else {
+                    field
+                };
+                let struct_or_tuple_with_fields =
+                    StructOrTuple::to_syn_expr(struct_or_tuple, field);
+                hash_expr(struct_or_tuple_with_fields)
+            }
         } else {
             // If partitioning and there is no field to hash on, we must be random partitioning
             syn::parse_quote!(::rand::random::<u32>())
@@ -118,19 +145,7 @@ fn map_before_network(node: &mut HydroNode, network_metadata: &NetworkMetadata) 
 
     let f: syn::Expr = if network_metadata.new {
         // New network type is just T. We need (receiver MemberId, T)
-        let ident = syn::Ident::new(
-            &format!(
-                "__hydro_lang_cluster_self_id_{}",
-                network_metadata.sender_location.key()
-            ),
-            proc_macro2::Span::call_site(),
-        );
-        let num_sender_partitions = network_metadata.sender_partitions;
-        let orig_raw_expr: syn::Expr = if num_sender_partitions > 0 {
-            syn::parse_quote!(#ident.get_raw_id() / #num_sender_partitions as u32)
-        } else {
-            syn::parse_quote!(#ident.get_raw_id())
-        };
+        let orig_raw_expr = sender_logical_id(network_metadata);
         syn::parse_quote!(
             |struct_or_tuple: #element_type| {
                 let orig_raw = #orig_raw_expr;
