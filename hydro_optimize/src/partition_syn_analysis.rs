@@ -698,6 +698,7 @@ impl Visit<'_> for TupleDeclareLhs {
                 self.lhs_tuple
                     .insert(ident.ident.clone(), self.tuple_index.clone());
             }
+            syn::Pat::Type(typed) => self.visit_pat(&typed.pat),
             syn::Pat::Tuple(tuple) => {
                 // Recursively visit elems, in case we have nested tuples
                 let pre_recursion_index = self.tuple_index.clone();
