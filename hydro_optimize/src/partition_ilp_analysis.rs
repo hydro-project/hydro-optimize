@@ -105,11 +105,17 @@ fn output_to_parent_fields(node: &HydroNode) -> Vec<StructOrTuple> {
         // Only the key is preserved
         HydroNode::FoldKeyed { .. }
         | HydroNode::ReduceKeyed { .. }
-        | HydroNode::ReduceKeyedWatermark { .. }
         => {
             let mut parent = StructOrTuple::default();
             parent.add_dependency(&vec!["0".to_string()], vec!["0".to_string()]);
             vec![parent]
+        }
+        HydroNode::ReduceKeyedWatermark { .. }
+        => {
+            let mut input = StructOrTuple::default();
+            input.add_dependency(&vec!["0".to_string()], vec!["0".to_string()]);
+            // Add a field for the watermark as well
+            vec![input, StructOrTuple::default()]
         }
         // No mapping
         HydroNode::FlatMap { .. }
