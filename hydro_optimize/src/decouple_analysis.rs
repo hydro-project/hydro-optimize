@@ -40,6 +40,7 @@ pub fn num_to_alpha(n: usize) -> String {
 const DECOUPLING_PENALTY: f64 = 0.0001;
 const LEXICOGRAPHIC_EPSILON: f64 = 0.0001; // Tiebreaker weight to minimize non-bottleneck locations
 const FIELD_SPECIFICITY_EPSILON: f64 = LEXICOGRAPHIC_EPSILON * 0.001; // Smaller tiebreaker to prefer broader partition fields
+const LATENCY_BUDGET_MIN_THRESHOLD: usize = 500; // Minimum cardinality of operator for it to be considered in the latency budget
 
 /// Each operator is assigned either 0 or 1
 /// 0 means that its output will go to the original node, 1 means that it will go to the decoupled node
@@ -59,10 +60,7 @@ const FIELD_SPECIFICITY_EPSILON: f64 = LEXICOGRAPHIC_EPSILON * 0.001; // Smaller
 pub(crate) struct DecoupleILPMetadata {
     // Const fields
     pub(crate) bottleneck: LocationId,
-    pub(crate) op_counts: HashMap<usize, usize>,
-    pub(crate) op_sizes: HashMap<usize, u64>,
-    pub(crate) network_cost_table: NetworkCostTable,
-    pub(crate) per_op_load: HashMap<usize, SarStats>,
+    pub(crate) inputs: IlpInputs,
     pub(crate) max_num_locations: usize,
     // Model variables to construct final cost function
     pub(crate) variables: ProblemVariables,
@@ -75,6 +73,8 @@ pub(crate) struct DecoupleILPMetadata {
     pub(crate) network_ids: HashMap<usize, NetworkType>,
     // Add small penalties for partitioning on too-specific fields, since those are less likely to be uniformly distributed
     pub(crate) field_specificity_penalty: Expression,
+    // Constrain number of network hops according to latency budget
+    pub(crate) network_hops_added: Expression,
 }
 
 /// Per-location ILP expressions for each resource type.
@@ -114,6 +114,8 @@ pub struct IlpInputs {
     pub consider_partitioning: bool,
     /// Number of replicas in the bottleneck cluster
     pub cluster_size: usize,
+    /// Number of network hops we are allowed to add
+    pub latency_budget: Option<usize>,
 }
 
 /// Returns a map from location to a binary var
@@ -240,10 +242,7 @@ fn add_op_resource_usage(
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
     let DecoupleILPMetadata {
-        per_op_load,
-        op_counts,
-        op_sizes,
-        network_cost_table,
+        inputs,
         variables,
         constraints,
         max_num_locations: num_locations,
@@ -253,7 +252,7 @@ fn add_op_resource_usage(
     } = &mut *decoupling_metadata.borrow_mut();
 
     let op_id = node.op_metadata().id.unwrap();
-    let size = op_sizes.get(&op_id).copied().unwrap_or(0);
+    let size = inputs.op_output_sizes.get(&op_id).copied().unwrap_or(0);
 
     // Send / produce side: charged at the location its parent sends to. Non-network
     // ops also land here — their measured compute load is paid where their parent runs.
@@ -263,12 +262,15 @@ fn add_op_resource_usage(
                 // Send cardinality = cardinality of Network's parent. Will be larger than the Network's cardinality if it is a broadcast
                 let input_id = node.input_metadata()[0].op.id;
                 let send_count = input_id
-                    .and_then(|iid| op_counts.get(&iid).copied())
+                    .and_then(|iid| inputs.op_counts.get(&iid).copied())
                     .unwrap_or(0);
-                (network_cost_table.network_cost(send_count, size), input_id)
+                (
+                    inputs.network_cost_table.network_cost(send_count, size),
+                    input_id,
+                )
             } else {
                 // Non-network op: its measured per-op load, charged at its parent.
-                let load = per_op_load.get(&op_id).copied().unwrap_or_default();
+                let load = inputs.per_op_load.get(&op_id).copied().unwrap_or_default();
                 let parent = op_id_to_parents
                     .get(&op_id)
                     .and_then(|p| p.first().copied());
@@ -293,8 +295,9 @@ fn add_op_resource_usage(
     // count is singular — the receiver's own counter already reflects the fan-in.
     match network_type {
         Some(NetworkType::Recv) | Some(NetworkType::SendRecv) => {
-            let load =
-                network_cost_table.network_cost(op_counts.get(&op_id).copied().unwrap_or(0), size);
+            let load = inputs
+                .network_cost_table
+                .network_cost(inputs.op_counts.get(&op_id).copied().unwrap_or(0), size);
             if !load.is_zero() {
                 let vars =
                     var_from_op_id(op_id, *num_locations, op_id_to_var, variables, constraints);
@@ -307,12 +310,11 @@ fn add_op_resource_usage(
 
 fn network_cost_for_decoupling_op(
     op_id: usize,
-    op_counts: &HashMap<usize, usize>,
-    op_sizes: &HashMap<usize, u64>,
+    cardinality: usize,
+    op_output_sizes: &HashMap<usize, u64>,
     network_cost_table: &NetworkCostTable,
 ) -> SarStats {
-    let cardinality = op_counts.get(&op_id).copied().unwrap_or(0);
-    match op_sizes.get(&op_id) {
+    match op_output_sizes.get(&op_id) {
         Some(&bytes) => network_cost_table.network_cost(cardinality, bytes),
         None => SarStats::default(),
     }
@@ -365,20 +367,25 @@ fn add_decoupling_overhead(
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
     let DecoupleILPMetadata {
-        op_counts,
-        op_sizes,
-        network_cost_table,
+        inputs,
         variables,
         constraints,
         max_num_locations: num_locations,
         resource_usages,
         op_id_to_var,
+        network_hops_added,
         ..
     } = &mut *decoupling_metadata.borrow_mut();
 
     let metadata = node.metadata();
     let op_id = metadata.op.id.unwrap();
-    let net_cost = network_cost_for_decoupling_op(op_id, op_counts, op_sizes, network_cost_table);
+    let cardinality = inputs.op_counts.get(&op_id).copied().unwrap_or(0);
+    let net_cost = network_cost_for_decoupling_op(
+        op_id,
+        cardinality,
+        &inputs.op_output_sizes,
+        &inputs.network_cost_table,
+    );
 
     if let Some(parents) = op_id_to_parents.get(&op_id)
         && let Some(parent) = parents.first()
@@ -396,6 +403,11 @@ fn add_decoupling_overhead(
             let (send_var, recv_var) = decouple_vars.get(&loc).unwrap();
             add_resource_cost(res, &net_cost, *send_var);
             add_resource_cost(res, &net_cost, *recv_var);
+
+            if cardinality > LATENCY_BUDGET_MIN_THRESHOLD {
+                // Each decoupling adds a network hop
+                *network_hops_added += *send_var;
+            }
         }
     }
 }
@@ -420,20 +432,25 @@ fn add_tee_decoupling_overhead(
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
     let DecoupleILPMetadata {
-        op_counts,
-        op_sizes,
-        network_cost_table,
+        inputs,
         variables,
         constraints,
         max_num_locations: num_locations,
         resource_usages,
         op_id_to_var,
         tee_inner_to_decoupled_vars,
+        network_hops_added,
         ..
     } = &mut *decoupling_metadata.borrow_mut();
 
     let op_id = metadata.op.id.unwrap();
-    let net_cost = network_cost_for_decoupling_op(op_id, op_counts, op_sizes, network_cost_table);
+    let cardinality = inputs.op_counts.get(&op_id).copied().unwrap_or(0);
+    let net_cost = network_cost_for_decoupling_op(
+        op_id,
+        cardinality,
+        &inputs.op_output_sizes,
+        &inputs.network_cost_table,
+    );
 
     // For each location,
     // send_var is 1 if the inner (at that location) sends to any Tee (including this op),
@@ -457,6 +474,11 @@ fn add_tee_decoupling_overhead(
                 add_resource_cost(res, &net_cost, send_var);
                 add_resource_cost(res, &net_cost, recv_var);
                 loc_to_vars.insert(loc, (send_var, recv_var));
+
+                if cardinality > LATENCY_BUDGET_MIN_THRESHOLD {
+                    // Each decoupling adds a network hop
+                    *network_hops_added += send_var;
+                }
             }
             loc_to_vars
         });
@@ -574,9 +596,17 @@ fn solve(decoupling_metadata: &RefCell<DecoupleILPMetadata>) -> LpSolution {
         resource_usages,
         op_id_to_var,
         max_num_locations,
+        inputs,
         field_specificity_penalty,
+        network_hops_added,
         ..
     } = &mut *decoupling_metadata.borrow_mut();
+
+    // Add constraints on latency budget, if any
+    if let Some(latency_budget) = inputs.latency_budget {
+        let network_hops_added = std::mem::take(network_hops_added);
+        constraints.push(constraint!(network_hops_added <= latency_budget as f64));
+    }
 
     let mut vars = std::mem::take(variables);
     let mut constrs = std::mem::take(constraints);
@@ -718,21 +748,11 @@ pub(crate) fn decouple_analysis(
         "Must decouple to at least 2 locations (original location, decoupled location)"
     );
 
-    let IlpInputs {
-        op_counts,
-        op_output_sizes: op_sizes,
-        network_cost_table,
-        per_op_load,
-        consider_partitioning,
-        cluster_size,
-    } = inputs;
+    let consider_partitioning = inputs.consider_partitioning;
 
     let decoupling_metadata = RefCell::new(DecoupleILPMetadata {
         bottleneck: bottleneck.clone(),
-        op_counts: op_counts.clone(),
-        op_sizes: op_sizes.clone(),
-        network_cost_table: network_cost_table.clone(),
-        per_op_load: per_op_load.clone(),
+        inputs,
         max_num_locations,
         variables: variables! {},
         constraints: vec![],
@@ -744,6 +764,7 @@ pub(crate) fn decouple_analysis(
         tee_inner_to_decoupled_vars: HashMap::new(),
         network_ids: HashMap::new(),
         field_specificity_penalty: Expression::default(),
+        network_hops_added: Expression::default(),
     });
     let op_id_to_parents = op_id_to_parents(ir, Some(bottleneck), cycle_source_to_sink_parent);
     let inputs = all_inputs(ir, &decoupling_metadata.borrow().bottleneck);
@@ -819,10 +840,11 @@ pub(crate) fn decouple_analysis(
         op_id_to_var,
         network_ids,
         resource_usages,
+        inputs,
         ..
     } = &*decoupling_metadata.borrow();
 
-    let mut result = Rewrite::new(bottleneck.clone(), cluster_size, max_num_locations);
+    let mut result = Rewrite::new(bottleneck.clone(), inputs.cluster_size, max_num_locations);
 
     // Populate per-location costs (max saturation) from the solution
     for (loc, res) in resource_usages {
@@ -955,10 +977,10 @@ pub(crate) fn decouple_analysis(
     project_location_costs(
         ir,
         bottleneck,
-        &op_counts,
-        &op_sizes,
-        &network_cost_table,
-        &per_op_load,
+        &inputs.op_counts,
+        &inputs.op_output_sizes,
+        &inputs.network_cost_table,
+        &inputs.per_op_load,
         &result,
     );
 
@@ -1061,14 +1083,12 @@ pub(crate) fn project_total_cpu(
                     );
                     total_cpu += cpu_cost;
                 }
-            } else {
-                if let Some(load) = inputs.per_op_load.get(&op_id) {
-                    println!(
-                        "Load for op {}: cpu={}, mem={}, net={}, io={}",
-                        op_id, load.cpu, load.memory, load.network, load.io
-                    );
-                    total_cpu += load.cpu;
-                }
+            } else if let Some(load) = inputs.per_op_load.get(&op_id) {
+                println!(
+                    "Load for op {}: cpu={}, mem={}, net={}, io={}",
+                    op_id, load.cpu, load.memory, load.network, load.io
+                );
+                total_cpu += load.cpu;
             }
         },
     );

@@ -26,6 +26,10 @@ struct Args {
     /// Run ILP-based bottleneck elimination (auto-runs missing analyses)
     #[arg(long, action = ArgAction::SetTrue)]
     optimize: bool,
+
+    /// Optimize with a given latency budget
+    #[arg(long)]
+    latency: Option<usize>,
 }
 
 // const WRITE_RATIOS: &[usize] = &[0, 100];
@@ -79,7 +83,11 @@ async fn main() {
     let config = BenchmarkConfig {
         name: "CAS".to_string(),
         kind: if args.optimize {
-            Optimization::BottleneckElimination
+            if let Some(latency_budget) = args.latency {
+                Optimization::OptimizeWithLatencyBudget(latency_budget)
+            } else {
+                Optimization::BottleneckElimination
+            }
         } else {
             Optimization::None
         },
