@@ -1023,25 +1023,29 @@ where
 
     let base = Path::new(CALIBRATION_DIR);
     let base_name = config.name.clone();
-    let state_path = base.join(format!("{}_optimization_state.json", base_name));
+    let opt_base_name = match config.kind {
+        Optimization::OptimizeWithLatencyBudget(budget) => format!("{}_lat{}", base_name, budget),
+        _ => base_name.clone(),
+    };
+    let state_path = base.join(format!("{}_optimization_state.json", opt_base_name));
     let mut state = OptimizationState::load(&state_path);
 
     // === Phase 1: first-ever run — no rewrites yet; benchmark the base program. ===
-    let Some(latest_iter) = find_latest_iteration(base, &base_name) else {
+    let Some(latest_iter) = find_latest_iteration(base, &base_name, &opt_base_name) else {
         return (base_name, Vec::new());
     };
     let iteration = latest_iter + 1;
     let prev_name = if latest_iter == 0 {
         base_name.clone()
     } else {
-        format!("{}_opt{}", base_name, latest_iter)
+        format!("{}_opt{}", opt_base_name, latest_iter)
     };
 
     // Early exit if last optimization didn't improve throughput (max across workloads).
     if latest_iter >= 2 {
         let thr_prev = max_throughput_for(base, &prev_name);
         let thr_prev_prev =
-            max_throughput_for(base, &format!("{}_opt{}", base_name, latest_iter - 1));
+            max_throughput_for(base, &format!("{}_opt{}", opt_base_name, latest_iter - 1));
         assert!(
             thr_prev_prev > 0 && thr_prev > 0,
             "Previous run(s) had zero throughput, cannot compare for improvement"
@@ -1095,7 +1099,7 @@ where
         let analysis_name = if state.applied.is_empty() {
             base_name.clone()
         } else {
-            format!("{}_opt{}", base_name, iteration)
+            format!("{}_opt{}", opt_base_name, iteration)
         };
 
         // Run perf/counters/size for each workload, gated on that workload's own dir so every
@@ -1199,7 +1203,7 @@ where
     state.applied.insert(bottleneck_cluster, budget);
     state.save(&state_path);
 
-    let opt_name = format!("{}_opt{}", base_name, iteration);
+    let opt_name = format!("{}_opt{}", opt_base_name, iteration);
     (opt_name, state.rewrites_to_apply())
 }
 
