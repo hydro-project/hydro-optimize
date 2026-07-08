@@ -499,6 +499,15 @@ impl Visit<'_> for StructOrTupleUseRhs {
 
     fn visit_expr_struct(&mut self, struc: &syn::ExprStruct) {
         let pre_recursion_index = self.field_index.clone();
+
+        // For structs of the form Struct { a: 1, ..rest }, first copy the dependency
+        // shape of rest, then layer explicit fields on top of it.
+        if let Some(rest) = &struc.rest {
+            self.field_index = pre_recursion_index.clone();
+            self.reference_field_index.clear();
+            self.visit_expr(rest);
+        }
+
         for field in &struc.fields {
             self.field_index = pre_recursion_index.clone();
             let field_name = match &field.member {
@@ -511,15 +520,6 @@ impl Visit<'_> for StructOrTupleUseRhs {
             // Reset field index
             self.reference_field_index.clear();
             self.visit_expr(&field.expr);
-        }
-
-        // For structs of the form struct { a: 1, ..rest }
-        if struc.rest.is_some() {
-            // We have no way of representing the "remaining" fields since we don't actually know the fields of the struct
-            panic!(
-                "Partitioning analysis does not support structs with rest fields: {:?}",
-                struc
-            );
         }
     }
 
