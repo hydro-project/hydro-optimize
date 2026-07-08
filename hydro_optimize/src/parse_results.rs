@@ -240,7 +240,8 @@ pub struct RawIlpInputs {
 }
 
 /// Persistent state for iterative bottleneck elimination.
-/// Stored as `{CALIBRATION_DIR}/{name}_optimization_state.json`.
+/// Stored as `{CALIBRATION_DIR}/{name}_optimization_state.json`, where `name` is scoped by the
+/// latency budget when one is set (e.g. `CAS_lat100`) so different budgets keep separate state.
 #[derive(Default, Serialize, Deserialize)]
 pub struct OptimizationState {
     /// Current budget per cluster (cluster name → budget level).
@@ -478,10 +479,28 @@ pub fn find_workload_dirs(base_dir: &Path, name: &str, label: &str) -> Vec<PathB
         .filter_map(|e| e.ok())
         .filter(|e| {
             let n = e.file_name().to_string_lossy().to_string();
-            n.starts_with(&prefix) && n.ends_with(&suffix) && e.path().is_dir()
+            if !(n.starts_with(&prefix) && n.ends_with(&suffix) && e.path().is_dir()) {
+                return false;
+            }
+            // Exclude optimization descendants so a base-name lookup (e.g. `CAS`) does not
+            // match a deeper iteration or a different latency budget's runs (e.g.
+            // `CAS_opt2_..._none` or `CAS_lat100_opt2_..._none`), which all share the base
+            // name as a prefix. The workload segment must not start with a reserved marker.
+            let middle = &n[prefix.len()..n.len() - suffix.len()];
+            let first_token = middle.split('_').next().unwrap_or("");
+            !is_opt_run_marker(first_token)
         })
         .map(|e| e.path())
         .collect()
+}
+
+/// Whether a name segment is a reserved optimization marker: `opt{N}` (iteration) or
+/// `lat{N}` (latency budget scope). Workload labels must not start with these tokens.
+fn is_opt_run_marker(token: &str) -> bool {
+    let rest = token
+        .strip_prefix("opt")
+        .or_else(|| token.strip_prefix("lat"));
+    matches!(rest, Some(digits) if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Loads a JSON file associated with the best-throughput CSV in a dir.
@@ -533,15 +552,17 @@ pub fn decoupled_cluster_name(original_name: &str, loc_idx: usize) -> String {
 }
 
 /// Determines the latest completed optimization iteration by inspecting `_none` dirs.
-/// Returns `None` if no `_none` run has completed, `Some(0)` if only `{name}_default_none`
-/// exists, `Some(N)` if `{name}_optN_default_none` is the highest.
-pub fn find_latest_iteration(base_dir: &Path, name: &str) -> Option<usize> {
-    let base_none = find_workload_dirs(base_dir, name, Optimization::None.label());
+/// `base_name` locates the (budget-independent) base run; `opt_name` is the prefix for the
+/// `_opt{N}` runs, which is scoped by latency budget (e.g. `CAS_lat100`) and so may differ from
+/// `base_name`. Returns `None` if no `_none` run has completed, `Some(0)` if only
+/// `{base_name}_default_none` exists, `Some(N)` if `{opt_name}_optN_default_none` is the highest.
+pub fn find_latest_iteration(base_dir: &Path, base_name: &str, opt_name: &str) -> Option<usize> {
+    let base_none = find_workload_dirs(base_dir, base_name, Optimization::None.label());
     if base_none.is_empty() {
         return None;
     }
 
-    let prefix = format!("{}_opt", name);
+    let prefix = format!("{}_opt", opt_name);
     let suffix = format!("_{}", Optimization::None.label());
     let max_opt = std::fs::read_dir(base_dir)
         .into_iter()
