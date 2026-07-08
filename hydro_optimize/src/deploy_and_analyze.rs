@@ -414,13 +414,16 @@ pub enum Optimization {
     /// Run ILP to find optimal decoupling, save Rewrite to file, then exit without deploying.
     /// Automatically loads applied rewrites from the latest opt dir.
     BottleneckElimination,
+    OptimizeWithLatencyBudget(usize),
 }
 
 impl Optimization {
     pub fn label(&self) -> &'static str {
         match self {
             // Do not differentiate between None and BottleneckElimination, since both run the protocol without additional profiling
-            Optimization::None | Optimization::BottleneckElimination => "none",
+            Optimization::None
+            | Optimization::BottleneckElimination
+            | Optimization::OptimizeWithLatencyBudget(_) => "none",
             Optimization::Counters => "counters",
             Optimization::BlowUpAnalysis => "blow_up",
             Optimization::SizeAnalysis => "size",
@@ -930,7 +933,9 @@ async fn run_analysis_pass<'a>(
             built
         }
         Optimization::Perf | Optimization::None => analysis_built,
-        Optimization::BottleneckElimination => unreachable!(),
+        Optimization::BottleneckElimination | Optimization::OptimizeWithLatencyBudget(_) => {
+            unreachable!()
+        }
     };
 
     run_scaling_loop(
@@ -1016,25 +1021,29 @@ where
 
     let base = Path::new(CALIBRATION_DIR);
     let base_name = config.name.clone();
-    let state_path = base.join(format!("{}_optimization_state.json", base_name));
+    let opt_base_name = match config.kind {
+        Optimization::OptimizeWithLatencyBudget(budget) => format!("{}_lat{}", base_name, budget),
+        _ => base_name.clone(),
+    };
+    let state_path = base.join(format!("{}_optimization_state.json", opt_base_name));
     let mut state = OptimizationState::load(&state_path);
 
     // === Phase 1: first-ever run — no rewrites yet; benchmark the base program. ===
-    let Some(latest_iter) = find_latest_iteration(base, &base_name) else {
+    let Some(latest_iter) = find_latest_iteration(base, &base_name, &opt_base_name) else {
         return (base_name, Vec::new());
     };
     let iteration = latest_iter + 1;
     let prev_name = if latest_iter == 0 {
         base_name.clone()
     } else {
-        format!("{}_opt{}", base_name, latest_iter)
+        format!("{}_opt{}", opt_base_name, latest_iter)
     };
 
     // Early exit if last optimization didn't improve throughput (max across workloads).
     if latest_iter >= 2 {
         let thr_prev = max_throughput_for(base, &prev_name);
         let thr_prev_prev =
-            max_throughput_for(base, &format!("{}_opt{}", base_name, latest_iter - 1));
+            max_throughput_for(base, &format!("{}_opt{}", opt_base_name, latest_iter - 1));
         assert!(
             thr_prev_prev > 0 && thr_prev > 0,
             "Previous run(s) had zero throughput, cannot compare for improvement"
@@ -1088,7 +1097,7 @@ where
         let analysis_name = if state.applied.is_empty() {
             base_name.clone()
         } else {
-            format!("{}_opt{}", base_name, iteration)
+            format!("{}_opt{}", opt_base_name, iteration)
         };
 
         // Run perf/counters/size for each workload, gated on that workload's own dir so every
@@ -1163,6 +1172,10 @@ where
         inject_inferred_counters(&mut ir, &op_parents, &mut op_counts);
 
         let per_op_load = derive_per_op_load(&perf, &network_op_ids, &per_op_blow_up);
+        let latency_budget = match config.kind {
+            Optimization::OptimizeWithLatencyBudget(budget) => Some(budget),
+            _ => None,
+        };
         let ilp_inputs = IlpInputs {
             op_counts,
             op_output_sizes,
@@ -1170,6 +1183,7 @@ where
             per_op_load,
             consider_partitioning: true,
             cluster_size,
+            latency_budget,
         };
 
         let computed_rewrites = find_optimal_budget(&mut ir, &bottleneck_loc, &ilp_inputs, &cycles);
@@ -1187,7 +1201,7 @@ where
     state.applied.insert(bottleneck_cluster, budget);
     state.save(&state_path);
 
-    let opt_name = format!("{}_opt{}", base_name, iteration);
+    let opt_name = format!("{}_opt{}", opt_base_name, iteration);
     (opt_name, state.rewrites_to_apply())
 }
 
@@ -1223,17 +1237,18 @@ pub async fn benchmark_protocol<'a, W>(
 
     // Decide what to benchmark: bottleneck elimination first runs the analyses + ILP and returns
     // the rewrites + run name; every other mode benchmarks the base program (no rewrites).
-    let (run_name, rewrites) = if matches!(config.kind, Optimization::BottleneckElimination) {
-        prepare_bottleneck_rewrites(
-            &mut reusable_hosts,
-            &mut deployment,
-            &config,
-            workloads,
-            &compile,
-        )
-        .await
-    } else {
-        (config.name.clone(), Vec::new())
+    let (run_name, rewrites) = match config.kind {
+        Optimization::BottleneckElimination | Optimization::OptimizeWithLatencyBudget(_) => {
+            prepare_bottleneck_rewrites(
+                &mut reusable_hosts,
+                &mut deployment,
+                &config,
+                workloads,
+                &compile,
+            )
+            .await
+        }
+        _ => (config.name.clone(), Vec::new()),
     };
 
     // Benchmark the (possibly rewritten) program for each workload, with optional calibration.
