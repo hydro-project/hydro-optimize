@@ -68,6 +68,7 @@ pub(crate) struct DecoupleILPMetadata {
     /// Per-location resource usage expressions (each field accumulates independently).
     pub(crate) resource_usages: HashMap<usize, ResourceExpressions>,
     pub(crate) op_id_to_var: HashMap<usize, HashMap<usize, Variable>>, // op_id: (location_id: var). Var = 1 for a location if the op is assigned to that location
+    op_id_to_parents: HashMap<usize, Vec<usize>>,
     prev_op_parent_with_tick: HashMap<ClockId, usize>, // tick_id: last op_id with that tick_id
     tee_inner_to_decoupled_vars: HashMap<usize, HashMap<usize, (Variable, Variable)>>, /* inner_id: (loc: (send var, recv var)) */
     pub(crate) network_ids: HashMap<usize, NetworkType>,
@@ -75,6 +76,291 @@ pub(crate) struct DecoupleILPMetadata {
     pub(crate) field_specificity_penalty: Expression,
     // Constrain number of network hops according to latency budget
     pub(crate) network_hops_added: Expression,
+}
+
+impl DecoupleILPMetadata {
+    /// Returns a map from location to a binary var, lazily creating the vars.
+    fn op_vars(&mut self, op_id: usize) -> HashMap<usize, Variable> {
+        self.op_id_to_var
+            .entry(op_id)
+            .or_insert_with(|| {
+                let mut loc_to_var = HashMap::new();
+                let mut sum_expr = Expression::default();
+                for loc in 0..self.max_num_locations {
+                    let var = self.variables.add(variable().binary().name(format!(
+                        "op{}loc{}",
+                        num_to_alpha(op_id),
+                        num_to_alpha(loc)
+                    )));
+                    loc_to_var.insert(loc, var);
+                    sum_expr += var;
+                }
+                // Constrain sum to 1 (var is assigned to exactly 1 location)
+                self.constraints.push(constraint!(sum_expr == 1));
+                loc_to_var
+            })
+            .clone()
+    }
+
+    fn add_equality_constr(&mut self, ops: &[usize]) {
+        if let Some(prev_op) = ops.first() {
+            let mut prev_op_vars = self.op_vars(*prev_op);
+
+            for op in ops.iter().skip(1) {
+                let op_vars = self.op_vars(*op);
+                // For each locations, the vars between prev_op and op must be equal
+                for (loc, prev_op_var) in &prev_op_vars {
+                    let op_var = op_vars.get(loc).unwrap();
+                    self.constraints.push(constraint!(*prev_op_var == *op_var));
+                }
+
+                prev_op_vars = op_vars;
+            }
+        }
+    }
+
+    /// For each location, return (send_var, recv_var).
+    /// send_var = 1 if op1 is on that location and op2 is not (the location is sending), 0 otherwise
+    /// recv_var = 1 if op1 is not on that location and op2 is (the location is receiving), 0 otherwise
+    fn add_decouple_vars(
+        &mut self,
+        op1: usize,
+        op2: usize,
+    ) -> HashMap<usize, (Variable, Variable)> {
+        let op1_vars = self.op_vars(op1);
+        let op2_vars = self.op_vars(op2);
+        let mut decouple_vars = HashMap::new();
+        for loc in 0..self.max_num_locations {
+            let send_var = self.variables.add(variable().min(0).name(format!(
+                "decouplesend{}x{}loc{}",
+                num_to_alpha(op1),
+                num_to_alpha(op2),
+                num_to_alpha(loc)
+            )));
+            let recv_var = self.variables.add(variable().min(0).name(format!(
+                "decouplerecv{}x{}loc{}",
+                num_to_alpha(op1),
+                num_to_alpha(op2),
+                num_to_alpha(loc)
+            )));
+
+            let op1_var = op1_vars.get(&loc).unwrap();
+            let op2_var = op2_vars.get(&loc).unwrap();
+
+            // 1 if (op1 is at loc, op2 is not), 0 otherwise
+            self.constraints
+                .push(constraint!(send_var >= *op1_var - *op2_var));
+            // 1 if (op1 is not at loc, op2 is), 0 otherwise
+            self.constraints
+                .push(constraint!(recv_var >= *op2_var - *op1_var));
+
+            decouple_vars.insert(loc, (send_var, recv_var));
+        }
+        decouple_vars
+    }
+
+    // Store the tick that an op is constrained to
+    fn add_tick_constraint(&mut self, metadata: &HydroIrMetadata) {
+        if let Some(tick_id) = get_tick_id(&metadata.location_id) {
+            // Set each parent = to the last parent
+            let mut parents: Vec<usize> = self
+                .op_id_to_parents
+                .get(&metadata.op.id.unwrap())
+                .unwrap()
+                .clone();
+            if let Some(prev_parent) = self.prev_op_parent_with_tick.get(&tick_id) {
+                parents.push(*prev_parent);
+            }
+            self.add_equality_constr(&parents);
+
+            // Set this op's last parent as the last op's parent that had this tick
+            if let Some(last_parent) = parents.last() {
+                self.prev_op_parent_with_tick.insert(tick_id, *last_parent);
+            }
+        }
+    }
+
+    /// Adds `load * var` (per resource) at each variable's location.
+    fn add_load_to_locations(&mut self, vars: &HashMap<usize, Variable>, load: &SarStats) {
+        for (loc, var) in vars {
+            let res = self.resource_usages.get_mut(loc).unwrap();
+            let cpu_temp = std::mem::take(&mut res.cpu);
+            res.cpu = cpu_temp + load.cpu * *var;
+            // let mem_temp = std::mem::take(&mut res.memory);
+            // res.memory = mem_temp + load.memory * *var;
+            // let net_temp = std::mem::take(&mut res.network);
+            // res.network = net_temp + load.network * *var;
+            // let io_temp = std::mem::take(&mut res.io);
+            // res.io = io_temp + load.io * *var;
+        }
+    }
+
+    fn add_op_resource_usage(&mut self, node: &HydroNode, network_type: &Option<NetworkType>) {
+        let op_id = node.op_metadata().id.unwrap();
+        let size = self
+            .inputs
+            .op_output_sizes
+            .get(&op_id)
+            .copied()
+            .unwrap_or(0);
+
+        // Send / produce side: charged at the location its parent sends to. Non-network
+        // ops also land here — their measured compute load is paid where their parent runs.
+        match network_type {
+            Some(NetworkType::Send) | Some(NetworkType::SendRecv) | None => {
+                let (load, charge_at) = if network_type.is_some() {
+                    // Send cardinality = cardinality of Network's parent. Will be larger than the Network's cardinality if it is a broadcast
+                    let input_id = node.input_metadata()[0].op.id;
+                    let send_count = input_id
+                        .and_then(|iid| self.inputs.op_counts.get(&iid).copied())
+                        .unwrap_or(0);
+                    (
+                        self.inputs
+                            .network_cost_table
+                            .network_cost(send_count, size),
+                        input_id,
+                    )
+                } else {
+                    // Non-network op: its measured per-op load, charged at its parent.
+                    let load = self
+                        .inputs
+                        .per_op_load
+                        .get(&op_id)
+                        .copied()
+                        .unwrap_or_default();
+                    let parent = self
+                        .op_id_to_parents
+                        .get(&op_id)
+                        .and_then(|p| p.first().copied());
+                    (load, parent)
+                };
+                if !load.is_zero()
+                    && let Some(charge_at) = charge_at
+                {
+                    let vars = self.op_vars(charge_at);
+                    self.add_load_to_locations(&vars, &load);
+                }
+            }
+            _ => {}
+        }
+        // Receive side: deserialization is paid by the receiver (this op's location). The
+        // count is singular — the receiver's own counter already reflects the fan-in.
+        match network_type {
+            Some(NetworkType::Recv) | Some(NetworkType::SendRecv) => {
+                let load = self.inputs.network_cost_table.network_cost(
+                    self.inputs.op_counts.get(&op_id).copied().unwrap_or(0),
+                    size,
+                );
+                if !load.is_zero() {
+                    let vars = self.op_vars(op_id);
+                    self.add_load_to_locations(&vars, &load);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn network_cost_for_decoupling_op(&self, op_id: usize, cardinality: usize) -> SarStats {
+        match self.inputs.op_output_sizes.get(&op_id) {
+            Some(&bytes) => self
+                .inputs
+                .network_cost_table
+                .network_cost(cardinality, bytes),
+            None => SarStats::default(),
+        }
+    }
+
+    fn add_decoupling_overhead(&mut self, node: &HydroNode) {
+        let metadata = node.metadata();
+        let op_id = metadata.op.id.unwrap();
+        let cardinality = self.inputs.op_counts.get(&op_id).copied().unwrap_or(0);
+        let net_cost = self.network_cost_for_decoupling_op(op_id, cardinality);
+
+        if let Some(parents) = self.op_id_to_parents.get(&op_id)
+            && let Some(parent) = parents.first()
+        {
+            let decouple_vars = self.add_decouple_vars(*parent, op_id);
+            for loc in 0..self.max_num_locations {
+                let res = self.resource_usages.get_mut(&loc).unwrap();
+                let (send_var, recv_var) = decouple_vars.get(&loc).unwrap();
+                Self::add_resource_cost(res, &net_cost, *send_var);
+                Self::add_resource_cost(res, &net_cost, *recv_var);
+
+                if cardinality > LATENCY_BUDGET_MIN_THRESHOLD {
+                    // Each decoupling adds a network hop
+                    self.network_hops_added += *send_var;
+                }
+            }
+        }
+    }
+
+    /// Adds `(cost_field + DECOUPLING_PENALTY) * var` to each resource expression.
+    fn add_resource_cost(res: &mut ResourceExpressions, cost: &SarStats, var: Variable) {
+        let cpu_temp = std::mem::take(&mut res.cpu);
+        res.cpu = cpu_temp + (cost.cpu + DECOUPLING_PENALTY) * var;
+        // let mem_temp = std::mem::take(&mut res.memory);
+        // res.memory = mem_temp + cost.memory * var;
+        // let net_temp = std::mem::take(&mut res.network);
+        // res.network = net_temp + cost.network * var;
+        // let io_temp = std::mem::take(&mut res.io);
+        // res.io = io_temp + cost.io * var;
+    }
+
+    /// Only penalize decoupling inner from Tees once per unique location.
+    /// For example, if a Tee has 2 branches, and both send to the same destination, only penalize the send once.
+    fn add_tee_decoupling_overhead(&mut self, inner_id: usize, metadata: &HydroIrMetadata) {
+        let op_id = metadata.op.id.unwrap();
+        let cardinality = self.inputs.op_counts.get(&op_id).copied().unwrap_or(0);
+        let net_cost = self.network_cost_for_decoupling_op(op_id, cardinality);
+
+        // For each location,
+        // send_var is 1 if the inner (at that location) sends to any Tee (including this op),
+        // recv_var is 1 if the inner (at a different location) sends to any Tee (including this op)
+        if !self.tee_inner_to_decoupled_vars.contains_key(&inner_id) {
+            let mut loc_to_vars = HashMap::new();
+            for loc in 0..self.max_num_locations {
+                let send_var = self.variables.add(variable().binary().name(format!(
+                    "teesend{}loc{}",
+                    num_to_alpha(inner_id),
+                    num_to_alpha(loc)
+                )));
+                let recv_var = self.variables.add(variable().binary().name(format!(
+                    "teerecv{}loc{}",
+                    num_to_alpha(inner_id),
+                    num_to_alpha(loc)
+                )));
+                let res = self.resource_usages.get_mut(&loc).unwrap();
+                Self::add_resource_cost(res, &net_cost, send_var);
+                Self::add_resource_cost(res, &net_cost, recv_var);
+                loc_to_vars.insert(loc, (send_var, recv_var));
+
+                if cardinality > LATENCY_BUDGET_MIN_THRESHOLD {
+                    // Each decoupling adds a network hop
+                    self.network_hops_added += send_var;
+                }
+            }
+            self.tee_inner_to_decoupled_vars
+                .insert(inner_id, loc_to_vars);
+        }
+
+        // Create decouple vars between the inner and this op
+        let decouple_vars = self.add_decouple_vars(inner_id, op_id);
+
+        for loc in 0..self.max_num_locations {
+            let (send_var, recv_var) = decouple_vars.get(&loc).unwrap();
+            let (any_send_var, any_recv_var) = *self
+                .tee_inner_to_decoupled_vars
+                .get(&inner_id)
+                .unwrap()
+                .get(&loc)
+                .unwrap();
+
+            self.constraints
+                .push(constraint!(any_send_var >= *send_var));
+            self.constraints
+                .push(constraint!(any_recv_var >= *recv_var));
+        }
+    }
 }
 
 /// Per-location ILP expressions for each resource type.
@@ -118,393 +404,8 @@ pub struct IlpInputs {
     pub latency_budget: Option<usize>,
 }
 
-/// Returns a map from location to a binary var
-/// Lazily creates the var
-fn var_from_op_id(
-    op_id: usize,
-    num_locations: usize,
-    op_id_to_var: &mut HashMap<usize, HashMap<usize, Variable>>,
-    variables: &mut ProblemVariables,
-    constraints: &mut Vec<Constraint>,
-) -> HashMap<usize, Variable> {
-    op_id_to_var
-        .entry(op_id)
-        .or_insert_with(|| {
-            let mut loc_to_var = HashMap::new();
-            let mut sum_expr = Expression::default();
-            for loc in 0..num_locations {
-                let var = variables.add(variable().binary().name(format!(
-                    "op{}loc{}",
-                    num_to_alpha(op_id),
-                    num_to_alpha(loc)
-                )));
-                loc_to_var.insert(loc, var);
-                sum_expr += var;
-            }
-            // Constrain sum to 1 (var is assigned to exactly 1 location)
-            constraints.push(constraint!(sum_expr == 1));
-            loc_to_var
-        })
-        .clone()
-}
-
-fn add_equality_constr(
-    ops: &[usize],
-    num_locations: usize,
-    op_id_to_var: &mut HashMap<usize, HashMap<usize, Variable>>,
-    variables: &mut ProblemVariables,
-    constraints: &mut Vec<Constraint>,
-) {
-    if let Some(prev_op) = ops.first() {
-        let mut prev_op_vars = var_from_op_id(
-            *prev_op,
-            num_locations,
-            op_id_to_var,
-            variables,
-            constraints,
-        );
-
-        for op in ops.iter().skip(1) {
-            let op_vars = var_from_op_id(*op, num_locations, op_id_to_var, variables, constraints);
-            // For each locations, the vars between prev_op and op must be equal
-            for (loc, prev_op_var) in &prev_op_vars {
-                let op_var = op_vars.get(loc).unwrap();
-                constraints.push(constraint!(*prev_op_var == *op_var));
-            }
-
-            prev_op_vars = op_vars;
-        }
-    }
-}
-
-// Store the tick that an op is constrained to
-fn add_tick_constraint(
-    metadata: &HydroIrMetadata,
-    op_id_to_parents: &HashMap<usize, Vec<usize>>,
-    decoupling_metadata: &RefCell<DecoupleILPMetadata>,
-) {
-    let DecoupleILPMetadata {
-        variables,
-        constraints,
-        max_num_locations: num_locations,
-        op_id_to_var,
-        prev_op_parent_with_tick,
-        ..
-    } = &mut *decoupling_metadata.borrow_mut();
-
-    if let Some(tick_id) = get_tick_id(&metadata.location_id) {
-        // Set each parent = to the last parent
-        let mut parents: Vec<usize> = op_id_to_parents
-            .get(&metadata.op.id.unwrap())
-            .unwrap()
-            .clone();
-        if let Some(prev_parent) = prev_op_parent_with_tick.get(&tick_id) {
-            parents.push(*prev_parent);
-        }
-        add_equality_constr(
-            &parents,
-            *num_locations,
-            op_id_to_var,
-            variables,
-            constraints,
-        );
-
-        // Set this op's last parent as the last op's parent that had this tick
-        if let Some(last_parent) = parents.last() {
-            prev_op_parent_with_tick.insert(tick_id, *last_parent);
-        }
-    }
-}
-
-/// Adds `load * var` (per resource) at each variable's location.
-fn add_load_to_locations(
-    resource_usages: &mut HashMap<usize, ResourceExpressions>,
-    vars: &HashMap<usize, Variable>,
-    load: &SarStats,
-) {
-    for (loc, var) in vars {
-        let res = resource_usages.get_mut(loc).unwrap();
-        let cpu_temp = std::mem::take(&mut res.cpu);
-        res.cpu = cpu_temp + load.cpu * *var;
-        // let mem_temp = std::mem::take(&mut res.memory);
-        // res.memory = mem_temp + load.memory * *var;
-        // let net_temp = std::mem::take(&mut res.network);
-        // res.network = net_temp + load.network * *var;
-        // let io_temp = std::mem::take(&mut res.io);
-        // res.io = io_temp + load.io * *var;
-    }
-}
-
-fn add_op_resource_usage(
-    node: &HydroNode,
-    network_type: &Option<NetworkType>,
-    op_id_to_parents: &HashMap<usize, Vec<usize>>,
-    decoupling_metadata: &RefCell<DecoupleILPMetadata>,
-) {
-    let DecoupleILPMetadata {
-        inputs,
-        variables,
-        constraints,
-        max_num_locations: num_locations,
-        resource_usages,
-        op_id_to_var,
-        ..
-    } = &mut *decoupling_metadata.borrow_mut();
-
-    let op_id = node.op_metadata().id.unwrap();
-    let size = inputs.op_output_sizes.get(&op_id).copied().unwrap_or(0);
-
-    // Send / produce side: charged at the location its parent sends to. Non-network
-    // ops also land here — their measured compute load is paid where their parent runs.
-    match network_type {
-        Some(NetworkType::Send) | Some(NetworkType::SendRecv) | None => {
-            let (load, charge_at) = if network_type.is_some() {
-                // Send cardinality = cardinality of Network's parent. Will be larger than the Network's cardinality if it is a broadcast
-                let input_id = node.input_metadata()[0].op.id;
-                let send_count = input_id
-                    .and_then(|iid| inputs.op_counts.get(&iid).copied())
-                    .unwrap_or(0);
-                (
-                    inputs.network_cost_table.network_cost(send_count, size),
-                    input_id,
-                )
-            } else {
-                // Non-network op: its measured per-op load, charged at its parent.
-                let load = inputs.per_op_load.get(&op_id).copied().unwrap_or_default();
-                let parent = op_id_to_parents
-                    .get(&op_id)
-                    .and_then(|p| p.first().copied());
-                (load, parent)
-            };
-            if !load.is_zero()
-                && let Some(charge_at) = charge_at
-            {
-                let vars = var_from_op_id(
-                    charge_at,
-                    *num_locations,
-                    op_id_to_var,
-                    variables,
-                    constraints,
-                );
-                add_load_to_locations(resource_usages, &vars, &load);
-            }
-        }
-        _ => {}
-    }
-    // Receive side: deserialization is paid by the receiver (this op's location). The
-    // count is singular — the receiver's own counter already reflects the fan-in.
-    match network_type {
-        Some(NetworkType::Recv) | Some(NetworkType::SendRecv) => {
-            let load = inputs
-                .network_cost_table
-                .network_cost(inputs.op_counts.get(&op_id).copied().unwrap_or(0), size);
-            if !load.is_zero() {
-                let vars =
-                    var_from_op_id(op_id, *num_locations, op_id_to_var, variables, constraints);
-                add_load_to_locations(resource_usages, &vars, &load);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn network_cost_for_decoupling_op(
-    op_id: usize,
-    cardinality: usize,
-    op_output_sizes: &HashMap<usize, u64>,
-    network_cost_table: &NetworkCostTable,
-) -> SarStats {
-    match op_output_sizes.get(&op_id) {
-        Some(&bytes) => network_cost_table.network_cost(cardinality, bytes),
-        None => SarStats::default(),
-    }
-}
-
-/// For each location, return (send_var, recv_var).
-/// send_var = 1 if op1 is on that location and op2 is not (the location is sending), 0 otherwise
-/// recv_var = 1 if op1 is not on that location and op2 is (the location is receiving), 0 otherwise
-fn add_decouple_vars(
-    num_locations: usize,
-    variables: &mut ProblemVariables,
-    constraints: &mut Vec<Constraint>,
-    op1: usize,
-    op2: usize,
-    op_id_to_var: &mut HashMap<usize, HashMap<usize, Variable>>,
-) -> HashMap<usize, (Variable, Variable)> {
-    let op1_vars = var_from_op_id(op1, num_locations, op_id_to_var, variables, constraints);
-    let op2_vars = var_from_op_id(op2, num_locations, op_id_to_var, variables, constraints);
-    let mut decouple_vars = HashMap::new();
-    for loc in 0..num_locations {
-        let send_var = variables.add(variable().min(0).name(format!(
-            "decouplesend{}x{}loc{}",
-            num_to_alpha(op1),
-            num_to_alpha(op2),
-            num_to_alpha(loc)
-        )));
-        let recv_var = variables.add(variable().min(0).name(format!(
-            "decouplerecv{}x{}loc{}",
-            num_to_alpha(op1),
-            num_to_alpha(op2),
-            num_to_alpha(loc)
-        )));
-
-        let op1_var = op1_vars.get(&loc).unwrap();
-        let op2_var = op2_vars.get(&loc).unwrap();
-
-        // 1 if (op1 is at loc, op2 is not), 0 otherwise
-        constraints.push(constraint!(send_var >= *op1_var - *op2_var));
-        // 1 if (op1 is not at loc, op2 is), 0 otherwise
-        constraints.push(constraint!(recv_var >= *op2_var - *op1_var));
-
-        decouple_vars.insert(loc, (send_var, recv_var));
-    }
-    decouple_vars
-}
-
-fn add_decoupling_overhead(
-    node: &HydroNode,
-    op_id_to_parents: &HashMap<usize, Vec<usize>>,
-    decoupling_metadata: &RefCell<DecoupleILPMetadata>,
-) {
-    let DecoupleILPMetadata {
-        inputs,
-        variables,
-        constraints,
-        max_num_locations: num_locations,
-        resource_usages,
-        op_id_to_var,
-        network_hops_added,
-        ..
-    } = &mut *decoupling_metadata.borrow_mut();
-
-    let metadata = node.metadata();
-    let op_id = metadata.op.id.unwrap();
-    let cardinality = inputs.op_counts.get(&op_id).copied().unwrap_or(0);
-    let net_cost = network_cost_for_decoupling_op(
-        op_id,
-        cardinality,
-        &inputs.op_output_sizes,
-        &inputs.network_cost_table,
-    );
-
-    if let Some(parents) = op_id_to_parents.get(&op_id)
-        && let Some(parent) = parents.first()
-    {
-        let decouple_vars = add_decouple_vars(
-            *num_locations,
-            variables,
-            constraints,
-            *parent,
-            op_id,
-            op_id_to_var,
-        );
-        for loc in 0..*num_locations {
-            let res = resource_usages.get_mut(&loc).unwrap();
-            let (send_var, recv_var) = decouple_vars.get(&loc).unwrap();
-            add_resource_cost(res, &net_cost, *send_var);
-            add_resource_cost(res, &net_cost, *recv_var);
-
-            if cardinality > LATENCY_BUDGET_MIN_THRESHOLD {
-                // Each decoupling adds a network hop
-                *network_hops_added += *send_var;
-            }
-        }
-    }
-}
-
-/// Adds `(cost_field + DECOUPLING_PENALTY) * var` to each resource expression.
-fn add_resource_cost(res: &mut ResourceExpressions, cost: &SarStats, var: Variable) {
-    let cpu_temp = std::mem::take(&mut res.cpu);
-    res.cpu = cpu_temp + (cost.cpu + DECOUPLING_PENALTY) * var;
-    // let mem_temp = std::mem::take(&mut res.memory);
-    // res.memory = mem_temp + cost.memory * var;
-    // let net_temp = std::mem::take(&mut res.network);
-    // res.network = net_temp + cost.network * var;
-    // let io_temp = std::mem::take(&mut res.io);
-    // res.io = io_temp + cost.io * var;
-}
-
-/// Only penalize decoupling inner from Tees once per unique location.
-/// For example, if a Tee has 2 branches, and both send to the same destination, only penalize the send once.
-fn add_tee_decoupling_overhead(
-    inner_id: usize,
-    metadata: &HydroIrMetadata,
-    decoupling_metadata: &RefCell<DecoupleILPMetadata>,
-) {
-    let DecoupleILPMetadata {
-        inputs,
-        variables,
-        constraints,
-        max_num_locations: num_locations,
-        resource_usages,
-        op_id_to_var,
-        tee_inner_to_decoupled_vars,
-        network_hops_added,
-        ..
-    } = &mut *decoupling_metadata.borrow_mut();
-
-    let op_id = metadata.op.id.unwrap();
-    let cardinality = inputs.op_counts.get(&op_id).copied().unwrap_or(0);
-    let net_cost = network_cost_for_decoupling_op(
-        op_id,
-        cardinality,
-        &inputs.op_output_sizes,
-        &inputs.network_cost_table,
-    );
-
-    // For each location,
-    // send_var is 1 if the inner (at that location) sends to any Tee (including this op),
-    // recv_var is 1 if the inner (at a different location) sends to any Tee (including this op)
-    let any_send_recv_vars = tee_inner_to_decoupled_vars
-        .entry(inner_id)
-        .or_insert_with(|| {
-            let mut loc_to_vars = HashMap::new();
-            for loc in 0..*num_locations {
-                let send_var = variables.add(variable().binary().name(format!(
-                    "teesend{}loc{}",
-                    num_to_alpha(inner_id),
-                    num_to_alpha(loc)
-                )));
-                let recv_var = variables.add(variable().binary().name(format!(
-                    "teerecv{}loc{}",
-                    num_to_alpha(inner_id),
-                    num_to_alpha(loc)
-                )));
-                let res = resource_usages.get_mut(&loc).unwrap();
-                add_resource_cost(res, &net_cost, send_var);
-                add_resource_cost(res, &net_cost, recv_var);
-                loc_to_vars.insert(loc, (send_var, recv_var));
-
-                if cardinality > LATENCY_BUDGET_MIN_THRESHOLD {
-                    // Each decoupling adds a network hop
-                    *network_hops_added += send_var;
-                }
-            }
-            loc_to_vars
-        });
-
-    // Create decouple vars between the inner and this op
-    let decouple_vars = add_decouple_vars(
-        *num_locations,
-        variables,
-        constraints,
-        inner_id,
-        op_id,
-        op_id_to_var,
-    );
-
-    for loc in 0..*num_locations {
-        let (send_var, recv_var) = decouple_vars.get(&loc).unwrap();
-        let (any_send_var, any_recv_var) = any_send_recv_vars.get(&loc).unwrap();
-
-        constraints.push(constraint!(*any_send_var >= *send_var));
-        constraints.push(constraint!(*any_recv_var >= *recv_var));
-    }
-}
-
 fn decouple_analysis_root(
     root: &mut HydroRoot,
-    op_id_to_parents: &HashMap<usize, Vec<usize>>,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
     // Ignore nodes that are not in the cluster to decouple
@@ -512,23 +413,23 @@ fn decouple_analysis_root(
         return;
     }
 
-    add_tick_constraint(root.input_metadata(), op_id_to_parents, decoupling_metadata);
+    decoupling_metadata
+        .borrow_mut()
+        .add_tick_constraint(root.input_metadata());
 }
 
 fn decouple_analysis_node(
     node: &mut HydroNode,
     op_id: &mut usize,
-    op_id_to_parents: &HashMap<usize, Vec<usize>>,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) {
+    let mut decoupling_metadata = decoupling_metadata.borrow_mut();
+
     // Store network type for later (when checking the solution)
-    let network_type = get_network_type(node, &decoupling_metadata.borrow().bottleneck);
+    let network_type = get_network_type(node, &decoupling_metadata.bottleneck);
     if let Some(network_type) = network_type.clone() {
-        decoupling_metadata
-            .borrow_mut()
-            .network_ids
-            .insert(*op_id, network_type);
-    } else if *node.metadata().location_id.root() != decoupling_metadata.borrow().bottleneck {
+        decoupling_metadata.network_ids.insert(*op_id, network_type);
+    } else if *node.metadata().location_id.root() != decoupling_metadata.bottleneck {
         // If this isn't a network to/from the bottleneck, and the node isn't on the bottleneck, then it is irrelevant
         return;
     }
@@ -536,97 +437,55 @@ fn decouple_analysis_node(
     if let HydroNode::Partition { inner, .. } = node {
         // Partition must share its inner's location because of how emit_core generates DFIR
         let inner_id = inner.0.borrow().metadata().op.id.unwrap();
-        let DecoupleILPMetadata {
-            variables,
-            constraints,
-            max_num_locations: num_locations,
-            op_id_to_var,
-            ..
-        } = &mut *decoupling_metadata.borrow_mut();
-        add_equality_constr(
-            &[inner_id, *op_id],
-            *num_locations,
-            op_id_to_var,
-            variables,
-            constraints,
-        );
+        decoupling_metadata.add_equality_constr(&[inner_id, *op_id]);
     } else if is_syntactic_sugar(node) || !is_serializable(&node.metadata().collection_kind) {
         // Syntactic sugar nodes (Cast, Batch, YieldConcat, etc.) must stay with their parent
         // So do nodes that we do not know how to serialize
-        if let Some(parents) = op_id_to_parents.get(op_id)
-            && let Some(&parent_id) = parents.first()
-        {
-            let DecoupleILPMetadata {
-                variables,
-                constraints,
-                max_num_locations: num_locations,
-                op_id_to_var,
-                ..
-            } = &mut *decoupling_metadata.borrow_mut();
-            add_equality_constr(
-                &[parent_id, *op_id],
-                *num_locations,
-                op_id_to_var,
-                variables,
-                constraints,
-            );
+        let parent_id = decoupling_metadata
+            .op_id_to_parents
+            .get(op_id)
+            .and_then(|parents| parents.first().copied());
+        if let Some(parent_id) = parent_id {
+            decoupling_metadata.add_equality_constr(&[parent_id, *op_id]);
         }
     } else if let HydroNode::Tee {
         inner, metadata, ..
     } = node
     {
         // Add decoupling overhead. For Tees of the same inner, even if multiple are decoupled, only penalize decoupling once
-        add_tee_decoupling_overhead(
-            inner.0.borrow().metadata().op.id.unwrap(),
-            metadata,
-            decoupling_metadata,
-        );
+        decoupling_metadata
+            .add_tee_decoupling_overhead(inner.0.borrow().metadata().op.id.unwrap(), metadata);
     } else if network_type.is_some() {
         // Networks can have their destination changed, but should not be charged decoupling overheads as a result
-        let DecoupleILPMetadata {
-            variables,
-            constraints,
-            max_num_locations: num_locations,
-            op_id_to_var,
-            ..
-        } = &mut *decoupling_metadata.borrow_mut();
-        var_from_op_id(*op_id, *num_locations, op_id_to_var, variables, constraints);
+        decoupling_metadata.op_vars(*op_id);
     } else {
-        add_decoupling_overhead(node, op_id_to_parents, decoupling_metadata);
+        decoupling_metadata.add_decoupling_overhead(node);
     }
 
-    add_op_resource_usage(node, &network_type, op_id_to_parents, decoupling_metadata);
-    add_tick_constraint(node.metadata(), op_id_to_parents, decoupling_metadata);
+    decoupling_metadata.add_op_resource_usage(node, &network_type);
+    decoupling_metadata.add_tick_constraint(node.metadata());
 }
 
 fn solve(decoupling_metadata: &RefCell<DecoupleILPMetadata>) -> LpSolution {
-    let DecoupleILPMetadata {
-        variables,
-        constraints,
-        resource_usages,
-        op_id_to_var,
-        max_num_locations,
-        inputs,
-        field_specificity_penalty,
-        network_hops_added,
-        ..
-    } = &mut *decoupling_metadata.borrow_mut();
+    let mut decoupling_metadata = decoupling_metadata.borrow_mut();
 
     // Add constraints on latency budget, if any
-    if let Some(latency_budget) = inputs.latency_budget {
-        let network_hops_added = std::mem::take(network_hops_added);
-        constraints.push(constraint!(network_hops_added <= latency_budget as f64));
+    if let Some(latency_budget) = decoupling_metadata.inputs.latency_budget {
+        let network_hops_added = std::mem::take(&mut decoupling_metadata.network_hops_added);
+        decoupling_metadata
+            .constraints
+            .push(constraint!(network_hops_added <= latency_budget as f64));
     }
 
-    let mut vars = std::mem::take(variables);
-    let mut constrs = std::mem::take(constraints);
+    let mut vars = std::mem::take(&mut decoupling_metadata.variables);
+    let mut constrs = std::mem::take(&mut decoupling_metadata.constraints);
 
     // Symmetry breaking: order locations by number of assigned ops (descending).
     // Location 0 gets the most ops, location 1 the second most, etc.
-    for loc in 1..*max_num_locations {
+    for loc in 1..decoupling_metadata.max_num_locations {
         let mut ops_at_prev = Expression::default();
         let mut ops_at_curr = Expression::default();
-        for op_vars in op_id_to_var.values() {
+        for op_vars in decoupling_metadata.op_id_to_var.values() {
             if let Some(&v) = op_vars.get(&(loc - 1)) {
                 ops_at_prev += v;
             }
@@ -641,7 +500,7 @@ fn solve(decoupling_metadata: &RefCell<DecoupleILPMetadata>) -> LpSolution {
     // with a small tiebreaker to also minimize non-bottleneck locations.
     let highest_saturation = vars.add(variable().name("maxsaturation"));
     let mut sum_saturations = Expression::default();
-    for res in resource_usages.values() {
+    for res in decoupling_metadata.resource_usages.values() {
         for (usage, capacity) in res.iter() {
             let sat = usage.clone() * (1.0 / capacity);
             constrs.push(constraint!(highest_saturation >= sat.clone()));
@@ -651,7 +510,7 @@ fn solve(decoupling_metadata: &RefCell<DecoupleILPMetadata>) -> LpSolution {
 
     let objective = highest_saturation
         + LEXICOGRAPHIC_EPSILON * sum_saturations
-        + FIELD_SPECIFICITY_EPSILON * field_specificity_penalty.clone();
+        + FIELD_SPECIFICITY_EPSILON * decoupling_metadata.field_specificity_penalty.clone();
 
     println!(
         "  Solving ILP: {} vars, {} constraints",
@@ -770,26 +629,26 @@ pub(crate) fn decouple_analysis(
             (0..max_num_locations).map(|loc_id| (loc_id, ResourceExpressions::default())),
         ),
         op_id_to_var: HashMap::new(),
+        op_id_to_parents: op_id_to_parents(ir, Some(bottleneck), cycle_source_to_sink_parent),
         prev_op_parent_with_tick: HashMap::new(),
         tee_inner_to_decoupled_vars: HashMap::new(),
         network_ids: HashMap::new(),
         field_specificity_penalty: Expression::default(),
         network_hops_added: Expression::default(),
     });
-    let op_id_to_parents = op_id_to_parents(ir, Some(bottleneck), cycle_source_to_sink_parent);
     let inputs = all_inputs(ir, &decoupling_metadata.borrow().bottleneck);
     let idbs = nodes_dependent_on_inputs(
         ir,
         &decoupling_metadata.borrow().bottleneck,
         &inputs,
-        &op_id_to_parents,
+        &decoupling_metadata.borrow().op_id_to_parents,
     );
 
     let bottleneck_ops: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
     traverse_dfir(
         ir,
         |root, _| {
-            decouple_analysis_root(root, &op_id_to_parents, &decoupling_metadata);
+            decouple_analysis_root(root, &decoupling_metadata);
         },
         |node, next_op_id| {
             if *node.metadata().location_id.root() == decoupling_metadata.borrow().bottleneck
@@ -797,17 +656,12 @@ pub(crate) fn decouple_analysis(
             {
                 bottleneck_ops.borrow_mut().insert(*next_op_id);
             }
-            decouple_analysis_node(node, next_op_id, &op_id_to_parents, &decoupling_metadata);
+            decouple_analysis_node(node, next_op_id, &decoupling_metadata);
         },
     );
-    for (op_id, parents) in &op_id_to_parents {
-        let DecoupleILPMetadata {
-            op_id_to_var,
-            variables,
-            constraints,
-            ..
-        } = &mut *decoupling_metadata.borrow_mut();
+    let op_id_to_parents = decoupling_metadata.borrow().op_id_to_parents.clone();
 
+    for (op_id, parents) in &op_id_to_parents {
         let mut same_output_loc = parents.clone();
         if !idbs.contains(op_id) {
             // No decoupling EDBs, otherwise broadcast cluster members might be decoupled from the broadcast itself, and the membership might not arrive in time for the broadcast
@@ -815,13 +669,9 @@ pub(crate) fn decouple_analysis(
         }
 
         // Add parent constraints. All parents of an op must output to the same machine (be assigned the same var)
-        add_equality_constr(
-            &same_output_loc,
-            max_num_locations,
-            op_id_to_var,
-            variables,
-            constraints,
-        );
+        decoupling_metadata
+            .borrow_mut()
+            .add_equality_constr(&same_output_loc);
     }
 
     // Consider partitioning after all variables for decoupling have been created
@@ -846,18 +696,16 @@ pub(crate) fn decouple_analysis(
     let solution = solve(&decoupling_metadata);
 
     // Build the DecoupleDecision by separating placement ops from network-insertion ops.
-    let DecoupleILPMetadata {
-        op_id_to_var,
-        network_ids,
-        resource_usages,
-        inputs,
-        ..
-    } = &*decoupling_metadata.borrow();
+    let decoupling_metadata = decoupling_metadata.borrow();
 
-    let mut result = Rewrite::new(bottleneck.clone(), inputs.cluster_size, max_num_locations);
+    let mut result = Rewrite::new(
+        bottleneck.clone(),
+        decoupling_metadata.inputs.cluster_size,
+        max_num_locations,
+    );
 
     // Populate per-location costs (max saturation) from the solution
-    for (loc, res) in resource_usages {
+    for (loc, res) in &decoupling_metadata.resource_usages {
         let max_sat = res
             .iter()
             .map(|(expr, cap)| solution.eval(expr.clone()) / cap)
@@ -884,16 +732,16 @@ pub(crate) fn decouple_analysis(
     }
 
     for (&op_id, parents) in &op_id_to_parents {
-        let Some(op_vars) = op_id_to_var.get(&op_id) else {
+        let Some(op_vars) = decoupling_metadata.op_id_to_var.get(&op_id) else {
             continue;
         };
         let op_location = op_loc(op_vars, &solution);
         let parent_location = parents
             .first()
-            .and_then(|p| op_id_to_var.get(p))
+            .and_then(|p| decoupling_metadata.op_id_to_var.get(p))
             .map(|pv| op_loc(pv, &solution));
 
-        let network_type = network_ids.get(&op_id);
+        let network_type = decoupling_metadata.network_ids.get(&op_id);
 
         if network_type.is_none()
             && let Some(parent_loc) = parent_location
@@ -987,10 +835,10 @@ pub(crate) fn decouple_analysis(
     project_location_costs(
         ir,
         bottleneck,
-        &inputs.op_counts,
-        &inputs.op_output_sizes,
-        &inputs.network_cost_table,
-        &inputs.per_op_load,
+        &decoupling_metadata.inputs.op_counts,
+        &decoupling_metadata.inputs.op_output_sizes,
+        &decoupling_metadata.inputs.network_cost_table,
+        &decoupling_metadata.inputs.per_op_load,
         &result,
     );
 
