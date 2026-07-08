@@ -529,7 +529,7 @@ async fn deploy_and_analyze<'a>(
     let metrics = track_cluster_metrics(&nodes).await;
 
     // Wait for user to input a newline or timeout
-    deployment
+    let _ = deployment
         .start_until(async {
             if let Some(seconds) = num_seconds {
                 // Wait for some number of seconds
@@ -541,12 +541,10 @@ async fn deploy_and_analyze<'a>(
                     tokio::io::stdin(),
                 ))
                 .next_line()
-                .await
-                .unwrap();
+                .await;
             }
         })
-        .await
-        .unwrap();
+        .await;
 
     // Parse results to get metrics
     analyze_cluster_results(&nodes, metrics).await
