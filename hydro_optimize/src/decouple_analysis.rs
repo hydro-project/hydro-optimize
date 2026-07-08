@@ -581,6 +581,16 @@ fn decouple_analysis_node(
             metadata,
             decoupling_metadata,
         );
+    } else if network_type.is_some() {
+        // Networks can have their destination changed, but should not be charged decoupling overheads as a result
+        let DecoupleILPMetadata {
+            variables,
+            constraints,
+            max_num_locations: num_locations,
+            op_id_to_var,
+            ..
+        } = &mut *decoupling_metadata.borrow_mut();
+        var_from_op_id(*op_id, *num_locations, op_id_to_var, variables, constraints);
     } else {
         add_decoupling_overhead(node, op_id_to_parents, decoupling_metadata);
     }
