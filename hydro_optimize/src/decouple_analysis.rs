@@ -80,7 +80,7 @@ pub(crate) struct DecoupleILPMetadata {
 
 impl DecoupleILPMetadata {
     /// Returns a map from location to a binary var, lazily creating the vars.
-    fn op_vars(&mut self, op_id: usize) -> HashMap<usize, Variable> {
+    pub(crate) fn op_vars(&mut self, op_id: usize) -> HashMap<usize, Variable> {
         self.op_id_to_var
             .entry(op_id)
             .or_insert_with(|| {
@@ -102,7 +102,7 @@ impl DecoupleILPMetadata {
             .clone()
     }
 
-    fn add_equality_constr(&mut self, ops: &[usize]) {
+    pub(crate) fn add_equality_constr(&mut self, ops: &[usize]) {
         if let Some(prev_op) = ops.first() {
             let mut prev_op_vars = self.op_vars(*prev_op);
 
@@ -122,7 +122,7 @@ impl DecoupleILPMetadata {
     /// For each location, return (send_var, recv_var).
     /// send_var = 1 if op1 is on that location and op2 is not (the location is sending), 0 otherwise
     /// recv_var = 1 if op1 is not on that location and op2 is (the location is receiving), 0 otherwise
-    fn add_decouple_vars(
+    pub(crate) fn add_decouple_vars(
         &mut self,
         op1: usize,
         op2: usize,
@@ -160,7 +160,7 @@ impl DecoupleILPMetadata {
     }
 
     // Store the tick that an op is constrained to
-    fn add_tick_constraint(&mut self, metadata: &HydroIrMetadata) {
+    pub(crate) fn add_tick_constraint(&mut self, metadata: &HydroIrMetadata) {
         if let Some(tick_id) = get_tick_id(&metadata.location_id) {
             // Set each parent = to the last parent
             let mut parents: Vec<usize> = self
@@ -181,7 +181,11 @@ impl DecoupleILPMetadata {
     }
 
     /// Adds `load * var` (per resource) at each variable's location.
-    fn add_load_to_locations(&mut self, vars: &HashMap<usize, Variable>, load: &SarStats) {
+    pub(crate) fn add_load_to_locations(
+        &mut self,
+        vars: &HashMap<usize, Variable>,
+        load: &SarStats,
+    ) {
         for (loc, var) in vars {
             let res = self.resource_usages.get_mut(loc).unwrap();
             let cpu_temp = std::mem::take(&mut res.cpu);
@@ -195,7 +199,11 @@ impl DecoupleILPMetadata {
         }
     }
 
-    fn add_op_resource_usage(&mut self, node: &HydroNode, network_type: &Option<NetworkType>) {
+    pub(crate) fn add_op_resource_usage(
+        &mut self,
+        node: &HydroNode,
+        network_type: &Option<NetworkType>,
+    ) {
         let op_id = node.op_metadata().id.unwrap();
         let size = self
             .inputs
@@ -260,7 +268,11 @@ impl DecoupleILPMetadata {
         }
     }
 
-    fn network_cost_for_decoupling_op(&self, op_id: usize, cardinality: usize) -> SarStats {
+    pub(crate) fn network_cost_for_decoupling_op(
+        &self,
+        op_id: usize,
+        cardinality: usize,
+    ) -> SarStats {
         match self.inputs.op_output_sizes.get(&op_id) {
             Some(&bytes) => self
                 .inputs
@@ -270,7 +282,7 @@ impl DecoupleILPMetadata {
         }
     }
 
-    fn add_decoupling_overhead(&mut self, node: &HydroNode) {
+    pub(crate) fn add_decoupling_overhead(&mut self, node: &HydroNode) {
         let metadata = node.metadata();
         let op_id = metadata.op.id.unwrap();
         let cardinality = self.inputs.op_counts.get(&op_id).copied().unwrap_or(0);
@@ -295,7 +307,7 @@ impl DecoupleILPMetadata {
     }
 
     /// Adds `(cost_field + DECOUPLING_PENALTY) * var` to each resource expression.
-    fn add_resource_cost(res: &mut ResourceExpressions, cost: &SarStats, var: Variable) {
+    pub(crate) fn add_resource_cost(res: &mut ResourceExpressions, cost: &SarStats, var: Variable) {
         let cpu_temp = std::mem::take(&mut res.cpu);
         res.cpu = cpu_temp + (cost.cpu + DECOUPLING_PENALTY) * var;
         // let mem_temp = std::mem::take(&mut res.memory);
@@ -308,7 +320,11 @@ impl DecoupleILPMetadata {
 
     /// Only penalize decoupling inner from Tees once per unique location.
     /// For example, if a Tee has 2 branches, and both send to the same destination, only penalize the send once.
-    fn add_tee_decoupling_overhead(&mut self, inner_id: usize, metadata: &HydroIrMetadata) {
+    pub(crate) fn add_tee_decoupling_overhead(
+        &mut self,
+        inner_id: usize,
+        metadata: &HydroIrMetadata,
+    ) {
         let op_id = metadata.op.id.unwrap();
         let cardinality = self.inputs.op_counts.get(&op_id).copied().unwrap_or(0);
         let net_cost = self.network_cost_for_decoupling_op(op_id, cardinality);
