@@ -40,7 +40,6 @@ pub fn num_to_alpha(n: usize) -> String {
 const DECOUPLING_PENALTY: f64 = 0.0001;
 const LEXICOGRAPHIC_EPSILON: f64 = 0.0001; // Tiebreaker weight to minimize non-bottleneck locations
 const FIELD_SPECIFICITY_EPSILON: f64 = LEXICOGRAPHIC_EPSILON * 0.001; // Smaller tiebreaker to prefer broader partition fields
-const LATENCY_BUDGET_MIN_THRESHOLD: usize = 500; // Minimum cardinality of operator for it to be considered in the latency budget
 
 /// Each operator is assigned either 0 or 1
 /// 0 means that its output will go to the original node, 1 means that it will go to the decoupled node
@@ -332,10 +331,8 @@ pub(crate) fn add_decoupling_overhead(
             add_resource_cost(res, &net_cost, *send_var);
             add_resource_cost(res, &net_cost, *recv_var);
 
-            if cardinality > LATENCY_BUDGET_MIN_THRESHOLD {
-                // Each decoupling adds a network hop
-                decoupling_metadata.network_hops_added += *send_var;
-            }
+            // Each decoupling adds a network hop
+            decoupling_metadata.network_hops_added += *send_var;
         }
     }
 }
@@ -396,10 +393,8 @@ pub(crate) fn add_tee_decoupling_overhead(
             add_resource_cost(res, &net_cost, recv_var);
             loc_to_vars.insert(loc, (send_var, recv_var));
 
-            if cardinality > LATENCY_BUDGET_MIN_THRESHOLD {
-                // Each decoupling adds a network hop
-                decoupling_metadata.network_hops_added += send_var;
-            }
+            // Each decoupling adds a network hop
+            decoupling_metadata.network_hops_added += send_var;
         }
         decoupling_metadata
             .tee_inner_to_decoupled_vars
