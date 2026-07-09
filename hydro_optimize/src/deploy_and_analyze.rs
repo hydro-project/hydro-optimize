@@ -20,7 +20,7 @@ use crate::greedy_decouple_analysis::greedy_decouple_analysis;
 use crate::parse_results::{
     OptimizationState, RawIlpInputs, RunMetadata, analyze_cluster_results, decoupled_cluster_name,
     derive_per_op_load, find_bottleneck_across_runs, find_latest_iteration, find_workload_dirs,
-    get_csvs_in_dir, load_raw_ilp_inputs, max_throughput_for, original_cluster_name,
+    get_csvs_in_dir, load_raw_ilp_inputs, original_cluster_name,
 };
 use crate::reduce_pushdown::reduce_pushdown;
 use crate::reduce_pushdown_analysis::reduce_pushdown_decision;
@@ -1040,27 +1040,6 @@ where
     } else {
         format!("{}_opt{}", opt_base_name, latest_iter)
     };
-
-    // Early exit if last optimization didn't improve throughput (max across workloads).
-    if latest_iter >= 2 {
-        let thr_prev = max_throughput_for(base, &prev_name);
-        let thr_prev_prev =
-            max_throughput_for(base, &format!("{}_opt{}", opt_base_name, latest_iter - 1));
-        assert!(
-            thr_prev_prev > 0 && thr_prev > 0,
-            "Previous run(s) had zero throughput, cannot compare for improvement"
-        );
-        if thr_prev <= thr_prev_prev {
-            println!(
-                "No improvement from opt{} ({}) to opt{} ({}). Stopping.",
-                latest_iter - 1,
-                thr_prev_prev,
-                latest_iter,
-                thr_prev
-            );
-            std::process::exit(0);
-        }
-    }
 
     // === Phase 2: find the bottleneck across all workloads' latest `_none` runs. ===
     // Excluded ids depend on the compiled program, so build one workload to resolve names.
