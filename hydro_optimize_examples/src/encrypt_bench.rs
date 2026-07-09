@@ -46,7 +46,7 @@ pub fn encrypt_bench<'a>(
                 .demux(server, TCP.fail_stop().bincode());
 
             let outputs = sent_inputs
-                .map(q!(|(client_id, payload)| {
+                .flat_map_unordered(q!(|(client_id, payload)| {
                     let sk_bytes = sk_hex
                         .as_bytes()
                         .chunks_exact(2)
@@ -57,43 +57,41 @@ pub fn encrypt_bench<'a>(
                         })
                         .collect::<Vec<_>>();
 
-                    (client_id, ecies::decrypt(&sk_bytes, &payload).unwrap())
+                    let payload = ecies::decrypt(&sk_bytes, &payload).unwrap();
+                    vec![(client_id, 0u8, payload.clone()), (client_id, 1u8, payload)]
                 }))
                 .assume_ordering::<TotalOrder>(nondet!(
                     /** Processing order is intentionally nondeterministic for this benchmark. */
                 ))
                 .scan(
                     q!(|| 0usize),
-                    q!(|count, (client_id, payload)| {
+                    q!(|count, (client_id, copy_id, payload)| {
                         let mut payload_bytes = [0u8; std::mem::size_of::<usize>()];
                         payload_bytes.copy_from_slice(&payload[..std::mem::size_of::<usize>()]);
 
                         let payload = usize::from_ne_bytes(payload_bytes) + *count;
                         *count += 1;
 
-                        Some((client_id, payload.to_ne_bytes().to_vec()))
+                        Some((client_id, copy_id, payload.to_ne_bytes().to_vec()))
                     }),
                 )
-                .map(q!(|(client_id, payload)| {
-                    let pk_bytes = pk_hex
-                        .as_bytes()
-                        .chunks_exact(2)
-                        .map(|digits| {
-                            let high = (digits[0] as char).to_digit(16).unwrap();
-                            let low = (digits[1] as char).to_digit(16).unwrap();
-                            ((high << 4) | low) as u8
-                        })
-                        .collect::<Vec<_>>();
+                .filter_map(q!(|(client_id, copy_id, payload)| {
+                    if copy_id != 0 {
+                        None
+                    } else {
+                        let pk_bytes = pk_hex
+                            .as_bytes()
+                            .chunks_exact(2)
+                            .map(|digits| {
+                                let high = (digits[0] as char).to_digit(16).unwrap();
+                                let low = (digits[1] as char).to_digit(16).unwrap();
+                                ((high << 4) | low) as u8
+                            })
+                            .collect::<Vec<_>>();
 
-                    (client_id, ecies::encrypt(&pk_bytes, &payload).unwrap())
+                        Some((client_id, ecies::encrypt(&pk_bytes, &payload).unwrap()))
+                    }
                 }));
-
-            // Broadcast to "subscribers" (all clients are subscribers
-            outputs.clone().entries().broadcast(
-                clients,
-                TCP.fail_stop().bincode(),
-                nondet!(/** membership is static */),
-            );
 
             // Send committed requests back to the original client
             outputs

@@ -83,7 +83,8 @@ async fn main() {
                 .with_cluster(clients, NUM_PHYSICAL_CLIENTS);
             let processes = ReusableProcesses::default().with_process(client_aggregator);
             let program = CompiledProgram::new(clusters, processes, location_id_to_cluster)
-                .excluding(client_id);
+                .excluding(client_id)
+                .excluding(client_aggregator_id);
 
             (builder, program)
         },
