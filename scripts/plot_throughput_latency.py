@@ -6,8 +6,10 @@ Examples:
   scripts/plot_throughput_latency.py CAS write100
   scripts/plot_throughput_latency.py CAS --workload write0 --metric p99
 
-If deployment produced repeated runs for the same client count, the plot uses
-the latest run index because earlier runs may be stabilization attempts.
+If deployment produced repeated runs for the same client count, the plot places
+the marker at the mean across runs and shades a +/-1 standard-deviation band
+around each curve. When a client count has more than 3 runs, some are likely
+unstable, so only the 3 highest-throughput runs are kept.
 """
 
 import argparse
@@ -102,8 +104,36 @@ def window_avg(path):
     }
 
 
+def mean_std(values):
+    """Sample mean and (unbiased) standard deviation; std is 0 for a single run."""
+    n = len(values)
+    mean = sum(values) / n
+    if n < 2:
+        return mean, 0.0
+    var = sum((v - mean) ** 2 for v in values) / (n - 1)
+    return mean, var**0.5
+
+
+MAX_RUNS = 3
+
+
+def aggregate_runs(runs):
+    """Collapse repeated runs into one point: mean marker plus per-metric std."""
+    point = {
+        "vc": runs[0]["vc"],
+        "clients": runs[0]["clients"],
+        "num_runs": len(runs),
+        "runs": sorted(r["run"] for r in runs),
+    }
+    for key in ("throughput", "p50", "p99", "p999"):
+        mean, std = mean_std([r[key] for r in runs])
+        point[key] = mean
+        point[f"{key}_std"] = std
+    return point
+
+
 def collect_config(path):
-    """Return one point per virtual-client count, using the latest repeated run."""
+    """Return one aggregated point per virtual-client count across repeated runs."""
     by_vc = defaultdict(list)
     for csv_path in glob.glob(os.path.join(path, "client_aggregator_*.csv")):
         match = FNAME_RE.search(os.path.basename(csv_path))
@@ -122,8 +152,10 @@ def collect_config(path):
 
     points = []
     for virtual_clients, runs in by_vc.items():
-        latest = max(runs, key=lambda p: p["run"])
-        points.append(latest)
+        # More than 3 runs implies some were unstable; keep the fastest 3.
+        if len(runs) > MAX_RUNS:
+            runs = sorted(runs, key=lambda p: p["throughput"], reverse=True)[:MAX_RUNS]
+        points.append(aggregate_runs(runs))
 
     return sorted(points, key=lambda p: p["vc"])
 
@@ -131,7 +163,7 @@ def collect_config(path):
 def output_path(protocol, workload, metric, explicit_output):
     if explicit_output:
         return explicit_output
-    basename = f"{protocol.lower()}_{workload}_throughput_latency_{metric}.png"
+    basename = f"{protocol.lower()}_{workload}_throughput_latency_{metric}.pdf"
     return os.path.join(os.path.dirname(__file__), basename)
 
 
@@ -159,9 +191,28 @@ def parse_args():
     parser.add_argument(
         "--output",
         default=None,
-        help="Output PNG path. Defaults to scripts/<protocol>_<workload>_throughput_latency_<metric>.png.",
+        help="Output path. Defaults to scripts/<protocol>_<workload>_throughput_latency_<metric>.pdf.",
+    )
+    parser.add_argument(
+        "--stop",
+        default=None,
+        help="Comma-separated point counts per config curve, in plotted order "
+        "(default, opt1, ...). Each value keeps only that many lowest-client-count "
+        "points, dropping the saturated tail (e.g. --stop 3,5,6). Leave an entry "
+        "empty to skip a config (e.g. --stop ,,6); trailing configs are untouched.",
     )
     return parser.parse_args()
+
+
+def parse_stops(raw):
+    """Parse --stop into a positional list of point counts (None = no truncation)."""
+    if not raw:
+        return []
+    stops = []
+    for token in raw.split(","):
+        token = token.strip()
+        stops.append(int(token) if token else None)
+    return stops
 
 
 def main():
@@ -183,21 +234,38 @@ def main():
             f"No client_aggregator CSV data found for protocol={protocol!r}, workload={workload!r}"
         )
 
-    fig, ax = plt.subplots(figsize=(8, 4.5))
+    stops = parse_stops(args.stop)
+    if len(stops) > len(data):
+        print(
+            f"Warning: --stop has {len(stops)} values but only {len(data)} config "
+            f"curves ({', '.join(config for config, _ in data)}); extra values ignored."
+        )
+    data = [
+        (config, points[:stops[i]] if i < len(stops) and stops[i] is not None else points)
+        for i, (config, points) in enumerate(data)
+    ]
+
+    fig, ax = plt.subplots(figsize=(8, 3.5))
     cmap = plt.get_cmap("tab10")
 
     for idx, (config, points) in enumerate(data):
+        color = cmap(idx % 10)
         xs = [p["throughput"] / 1000 for p in points]
         ys = [p[metric] for p in points]
+        x_lo = [(p["throughput"] - p["throughput_std"]) / 1000 for p in points]
+        x_hi = [(p["throughput"] + p["throughput_std"]) / 1000 for p in points]
         ax.plot(
             xs,
             ys,
             "-o",
-            color=cmap(idx % 10),
+            color=color,
             label=config,
             markersize=4,
             linewidth=1.5,
         )
+        # Shade +/-1 std of throughput across runs (zero-width where a single run exists).
+        if any(p["throughput_std"] > 0 for p in points):
+            ax.fill_betweenx(ys, x_lo, x_hi, color=color, alpha=0.2, linewidth=0)
         last = points[-1]
         ax.annotate(
             f"{int(last['clients'])}c",
@@ -219,11 +287,14 @@ def main():
 
     for config, points in data:
         print(f"\n=== {config} ===")
-        print(f"{'clients':>8} {'run':>4} {'thr_rps':>10} {'p50_ms':>8} {'p99_ms':>8}")
+        print(
+            f"{'clients':>8} {'runs':>4} {'thr_rps':>10} {'thr_std':>9} "
+            f"{'p50_ms':>8} {'p99_ms':>8}"
+        )
         for p in points:
             print(
-                f"{int(p['clients']):>8} {p['run']:>4} {p['throughput']:>10.0f} "
-                f"{p['p50']:>8.3f} {p['p99']:>8.3f}"
+                f"{int(p['clients']):>8} {p['num_runs']:>4} {p['throughput']:>10.0f} "
+                f"{p['throughput_std']:>9.0f} {p['p50']:>8.3f} {p['p99']:>8.3f}"
             )
 
 

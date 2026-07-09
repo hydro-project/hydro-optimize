@@ -94,7 +94,7 @@ async fn main() {
         num_physical_clients: NUM_PHYSICAL_CLIENTS,
         start_virtual_clients: 1,
         virtual_clients_step: 10,
-        num_runs: 1,
+        num_runs: 3,
         calibrate_message_sizes: None,
     };
     // (params, workload name) — the name discriminates output directories on disk.

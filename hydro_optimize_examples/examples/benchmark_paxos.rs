@@ -42,9 +42,9 @@ async fn main() {
             Optimization::None
         },
         num_physical_clients: NUM_PHYSICAL_CLIENTS,
-        start_virtual_clients: 11,
+        start_virtual_clients: 1,
         virtual_clients_step: 10,
-        num_runs: 1,
+        num_runs: 3,
         calibrate_message_sizes: None,
     };
 

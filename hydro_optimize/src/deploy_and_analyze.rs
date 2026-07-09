@@ -1041,27 +1041,6 @@ where
         format!("{}_opt{}", opt_base_name, latest_iter)
     };
 
-    // Early exit if last optimization didn't improve throughput (max across workloads).
-    if latest_iter >= 2 {
-        let thr_prev = max_throughput_for(base, &prev_name);
-        let thr_prev_prev =
-            max_throughput_for(base, &format!("{}_opt{}", opt_base_name, latest_iter - 1));
-        assert!(
-            thr_prev_prev > 0 && thr_prev > 0,
-            "Previous run(s) had zero throughput, cannot compare for improvement"
-        );
-        if thr_prev <= thr_prev_prev {
-            println!(
-                "No improvement from opt{} ({}) to opt{} ({}). Stopping.",
-                latest_iter - 1,
-                thr_prev_prev,
-                latest_iter,
-                thr_prev
-            );
-            std::process::exit(0);
-        }
-    }
-
     // === Phase 2: find the bottleneck across all workloads' latest `_none` runs. ===
     // Excluded ids depend on the compiled program, so build one workload to resolve names.
     // (Use `build_workload` rather than `compile` directly: an unfinalized `FlowBuilder`
