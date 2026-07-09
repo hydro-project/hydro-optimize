@@ -20,7 +20,7 @@ use crate::greedy_decouple_analysis::greedy_decouple_analysis;
 use crate::parse_results::{
     OptimizationState, RawIlpInputs, RunMetadata, analyze_cluster_results, decoupled_cluster_name,
     derive_per_op_load, find_bottleneck_across_runs, find_latest_iteration, find_workload_dirs,
-    get_csvs_in_dir, load_raw_ilp_inputs, max_throughput_for, original_cluster_name,
+    get_csvs_in_dir, load_raw_ilp_inputs, original_cluster_name,
 };
 use crate::reduce_pushdown::reduce_pushdown;
 use crate::reduce_pushdown_analysis::reduce_pushdown_decision;
