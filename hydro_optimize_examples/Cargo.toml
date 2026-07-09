@@ -8,6 +8,7 @@ edition = "2024"
 all-features = true
 
 [dependencies]
+ecies = { version = "0.2", features = ["std"] }
 hdrhistogram = "7.5.4"
 hydro_lang.workspace = true
 hydro_std.workspace = true

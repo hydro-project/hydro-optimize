@@ -153,12 +153,8 @@ fn reduce_pushdown_analysis_node(
 
     let mut check_inputs = vec![];
     match node {
-        // Shouldn't see BeginAtomic or Batch, because we shouldn't be in an atomic region in the first place
         HydroNode::Placeholder | HydroNode::Counter { .. } => {
             panic!("Reduce pushdown encountered unexpected Placeholder or Counter node")
-        }
-        HydroNode::BeginAtomic { .. } | HydroNode::Batch { .. } => {
-            panic!("Reduce pushdown entered ticked region")
         }
         HydroNode::Sort { .. } => panic!("Reduce pushdown was marked possible over a sorted stream?"),
         HydroNode::Reduce { .. } => panic!("Reduce pushdown reprocessing a reduce?"),
@@ -185,7 +181,9 @@ fn reduce_pushdown_analysis_node(
         | HydroNode::ExternalInput { .. }
         | HydroNode::Tee { .. } // Would need to check other branch of input to push up (too hard for now)
         | HydroNode::Partition { .. }
-        | HydroNode::EndAtomic { .. } // Don't enter atomic region
+        | HydroNode::BeginAtomic { .. }
+        | HydroNode::Batch { .. }
+        | HydroNode::EndAtomic { .. } // Don't enter ticked/atomic regions
         | HydroNode::YieldConcat { .. }
         | HydroNode::Map { .. } // Type changes, reduce not defined over the parent type
         | HydroNode::FlatMap { .. }
