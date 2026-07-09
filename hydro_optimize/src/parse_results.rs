@@ -1246,142 +1246,136 @@ async fn drain_receiver(receiver: &mut UnboundedReceiver<String>) -> Vec<String>
     lines
 }
 
-/// Element-wise max merge of a time series, extending `dst` as needed.
-fn merge_max_vec<T: Clone>(dst: &mut Vec<T>, src: &[T], max_fn: fn(T, T) -> T) {
-    for (i, s) in src.iter().enumerate() {
-        if i >= dst.len() {
-            dst.push(s.clone());
-        } else {
-            dst[i] = max_fn(dst[i].clone(), s.clone());
-        }
-    }
+struct MemberMetrics {
+    idx: usize,
+    sar_stats: Vec<SarStats>,
+    logs: MetricLogs,
 }
 
 pub async fn analyze_cluster_results(
     nodes: &DeployResult<'_, HydroDeploy>,
-    mut cluster_metrics: HashMap<(LocationId, String, usize), MetricLogs>,
+    cluster_metrics: HashMap<(LocationId, String, usize), MetricLogs>,
 ) -> RunMetadata {
     let mut run_metadata = RunMetadata::default();
-    let mut op_to_count: HashMap<usize, Vec<usize>> = HashMap::new();
 
-    // Drain all receivers and parse in parallel across all nodes
-    let mut set = tokio::task::JoinSet::new();
-    for ((location, name, idx), mut metrics) in cluster_metrics.drain() {
-        set.spawn(async move {
+    // Drain SAR first for all nodes. The most saturated member of each cluster becomes the
+    // representative profile; the remaining per-op streams are only parsed for that member.
+    let mut sar_set = tokio::task::JoinSet::new();
+    for ((location, name, idx), mut metrics) in cluster_metrics {
+        sar_set.spawn(async move {
             println!("Analyzing cluster {:?}: {}", name, idx);
-            let (sar_stats, op_to_count, throughputs, latencies, byte_sizes) = tokio::join!(
-                async { parse_sar_output(drain_receiver(&mut metrics.sar).await) },
+            let sar_stats = parse_sar_output(drain_receiver(&mut metrics.sar).await);
+            ((location, name, idx), sar_stats, metrics)
+        });
+    }
+
+    let mut sar_by_cluster: HashMap<(LocationId, String), Vec<MemberMetrics>> = HashMap::new();
+    while let Some(result) = sar_set.join_next().await {
+        let ((id, name, idx), sar_stats, metrics) = result.unwrap();
+        sar_by_cluster
+            .entry((id, name))
+            .or_default()
+            .push(MemberMetrics {
+                idx,
+                sar_stats,
+                logs: metrics,
+            });
+    }
+
+    let mut folded_perf_by_member = HashMap::new();
+    for (id, name, cluster) in nodes.get_all_clusters() {
+        for (idx, member) in cluster.members().iter().enumerate() {
+            if let Some(results) = member.underlying().tracing_results() {
+                folded_perf_by_member.insert(
+                    (id.clone(), name.to_string(), idx),
+                    results.folded_data.clone(),
+                );
+            }
+        }
+    }
+    for (id, name, process) in nodes.get_all_processes() {
+        if let Some(results) = process.underlying().tracing_results() {
+            folded_perf_by_member.insert(
+                (id.clone(), name.to_string(), 0),
+                results.folded_data.clone(),
+            );
+        }
+    }
+
+    let mut selected_metric_set = tokio::task::JoinSet::new();
+
+    for ((id, name), mut cluster_data) in sar_by_cluster {
+        let selected_pos = cluster_data
+            .iter()
+            .enumerate()
+            .max_by(|a, b| {
+                avg_over(&a.1.sar_stats, |s| s.cpu)
+                    .partial_cmp(&avg_over(&b.1.sar_stats, |s| s.cpu))
+                    .unwrap()
+            })
+            .map(|(pos, _)| pos)
+            .unwrap();
+        let MemberMetrics {
+            idx: selected_idx,
+            sar_stats: selected_sar,
+            logs: mut metrics,
+        } = cluster_data.swap_remove(selected_pos);
+
+        println!(
+            "Selected representative member {} for cluster {:?} with avg CPU {:.2}%",
+            selected_idx,
+            name,
+            avg_over(&selected_sar, |s| s.cpu)
+        );
+
+        if !selected_sar.is_empty() {
+            run_metadata
+                .sar_stats
+                .insert(id.clone(), selected_sar.clone());
+        }
+
+        let selected_key = (id, name.clone(), selected_idx);
+        let folded_perf = folded_perf_by_member.remove(&selected_key);
+        selected_metric_set.spawn(async move {
+            let (op_to_count, throughputs, latencies, byte_sizes, perf) = tokio::join!(
                 async { parse_counter_usage(drain_receiver(&mut metrics.counters).await) },
                 async { parse_throughput(drain_receiver(&mut metrics.throughputs).await) },
                 async { parse_latency(drain_receiver(&mut metrics.latencies).await) },
                 async { parse_byte_sizes(drain_receiver(&mut metrics.byte_sizes).await) },
+                async {
+                    folded_perf
+                        .map(|folded| parse_perf(&String::from_utf8_lossy(&folded)))
+                        .unwrap_or_default()
+                },
             );
-            println!("Parsed stats from cluster {:?}: {}", name, idx);
-            (
-                (location, name, idx),
-                sar_stats,
-                op_to_count,
-                throughputs,
-                latencies,
-                byte_sizes,
-            )
+            println!(
+                "Parsed selected stats from cluster {:?}: {}",
+                name, selected_idx
+            );
+            (op_to_count, throughputs, latencies, byte_sizes, perf)
         });
     }
 
-    // Join metric drain tasks
-    let mut drained: HashMap<(LocationId, String), Vec<_>> = HashMap::new();
-    while let Some(result) = set.join_next().await {
-        let ((id, name, _idx), sar_stats, op_to_count, throughputs, latencies, byte_sizes) =
-            result.unwrap();
-        drained.entry((id, name)).or_default().push((
-            sar_stats,
-            op_to_count,
-            throughputs,
-            latencies,
-            byte_sizes,
-        ));
-    }
-
-    // Merge metrics across nodes in each cluster and process
-    let all_nodes = nodes
-        .get_all_clusters()
-        .map(|(id, name, _)| (id, name))
-        .chain(nodes.get_all_processes().map(|(id, name, _)| (id, name)));
-
-    for (id, name) in all_nodes {
-        if let Some(cluster_data) = drained.get(&(id.clone(), name.to_string())) {
-            let mut max_sar: Vec<SarStats> = vec![];
-            let mut max_counters: HashMap<usize, Vec<usize>> = HashMap::new();
-
-            for (sar_stats, counters, _, _, byte_sizes) in cluster_data {
-                merge_max_vec(&mut max_sar, sar_stats, SarStats::max);
-                for (op_id, rates) in counters {
-                    let entry = max_counters.entry(*op_id).or_default();
-                    merge_max_vec(entry, rates, usize::max);
-                }
-                for (op_id, sizes) in byte_sizes {
-                    run_metadata
-                        .byte_sizes
-                        .entry(*op_id)
-                        .or_default()
-                        .extend(sizes);
-                }
-            }
-
-            for (op_id, rates) in max_counters {
-                let entry = op_to_count.entry(op_id).or_default();
-                merge_max_vec(entry, &rates, usize::max);
-            }
-
-            if !max_sar.is_empty() {
-                run_metadata.sar_stats.insert(id.clone(), max_sar);
-            }
+    // Collect counters/sizes from representative members and throughput/latency from the
+    // first selected node that produced benchmark output.
+    let mut found_throughput = false;
+    while let Some(result) = selected_metric_set.join_next().await {
+        let (counters, throughputs, latencies, byte_sizes, perf) = result.unwrap();
+        for (op_id, rates) in counters {
+            run_metadata.counters.insert(op_id, rates);
         }
-    }
-
-    // Collect throughput/latency from all processes (aggregator outputs these)
-    for node_data in drained.into_values().flatten() {
-        let (_, _, throughputs, latencies, _) = node_data;
-        let has_throughput = !throughputs.is_empty();
-        run_metadata.throughputs.extend(throughputs);
-        run_metadata.latencies.extend(latencies);
-        if has_throughput {
-            // Found aggregator, we're done
-            break;
+        for (op_id, sizes) in byte_sizes {
+            run_metadata.byte_sizes.insert(op_id, sizes);
         }
-    }
-
-    run_metadata.counters = op_to_count;
-
-    // Collect and parse perf folded data in parallel across all nodes
-    let mut perf_set = tokio::task::JoinSet::new();
-    for (id, _name, cluster) in nodes.get_all_clusters() {
-        for member in cluster.members() {
-            if let Some(results) = member.underlying().tracing_results() {
-                let folded = results.folded_data.clone();
-                let loc = id.clone();
-                perf_set.spawn(async move {
-                    let parsed = parse_perf(&String::from_utf8_lossy(&folded));
-                    (loc, parsed)
-                });
-            }
-        }
-    }
-    for (id, _name, process) in nodes.get_all_processes() {
-        if let Some(results) = process.underlying().tracing_results() {
-            let folded = results.folded_data.clone();
-            let loc = id.clone();
-            perf_set.spawn(async move {
-                let parsed = parse_perf(&String::from_utf8_lossy(&folded));
-                (loc, parsed)
-            });
-        }
-    }
-    while let Some(result) = perf_set.join_next().await {
-        let (_loc, parsed) = result.unwrap();
-        for (op_id, frac) in parsed {
+        for (op_id, frac) in perf {
             let e = run_metadata.perf.entry(op_id).or_default();
             *e = e.max(frac);
+        }
+
+        if !found_throughput && !throughputs.is_empty() {
+            run_metadata.throughputs.extend(throughputs);
+            run_metadata.latencies.extend(latencies);
+            found_throughput = true;
         }
     }
 
