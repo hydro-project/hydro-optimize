@@ -1,0 +1,87 @@
+Source to sink input: {}
+Saved operators to benchmark_results/Network_64b_default_none/id.txt
+Running Network_64b (none) with 1 virtual clients (run 0)
+Analyzing cluster "hydro_optimize_examples::network_calibrator::Client": 0
+Analyzing cluster "hydro_optimize_examples::network_calibrator::Server": 0
+Parsed stats from cluster "hydro_optimize_examples::network_calibrator::Client": 0
+Parsed stats from cluster "hydro_optimize_examples::network_calibrator::Server": 0
+Run throughput: 6340997, num_clients: 1
+Throughput @60s: 6340274 requests/s
+client @60s: CPU 0.00% (user 0.00%) | Net 696 B/s | Mem 0.53% | IO 0.00 tps
+server @60s: CPU 0.00% (user 0.00%) | Net 707 B/s | Mem 0.53% | IO 0.00 tps
+Generated CSV: benchmark_results/Network_64b_default_none/client_1c_1vc_r0.csv
+Generated CSV: benchmark_results/Network_64b_default_none/server_1c_1vc_r0.csv
+Saved operators to benchmark_results/Network_128b_default_none/id.txt
+Running Network_128b (none) with 1 virtual clients (run 0)
+Analyzing cluster "hydro_optimize_examples::network_calibrator::Client": 0
+Analyzing cluster "hydro_optimize_examples::network_calibrator::Server": 0
+Parsed stats from cluster "hydro_optimize_examples::network_calibrator::Client": 0
+Parsed stats from cluster "hydro_optimize_examples::network_calibrator::Server": 0
+Run throughput: 6183862, num_clients: 1
+Throughput @60s: 6182913 requests/s
+client @60s: CPU 0.00% (user 0.00%) | Net 963 B/s | Mem 0.54% | IO 3.00 tps
+server @60s: CPU 0.00% (user 0.00%) | Net 840 B/s | Mem 0.54% | IO 3.00 tps
+Generated CSV: benchmark_results/Network_128b_default_none/client_1c_1vc_r0.csv
+Generated CSV: benchmark_results/Network_128b_default_none/server_1c_1vc_r0.csv
+Saved operators to benchmark_results/Network_256b_default_none/id.txt
+Running Network_256b (none) with 1 virtual clients (run 0)
+Analyzing cluster "hydro_optimize_examples::network_calibrator::Client": 0
+Analyzing cluster "hydro_optimize_examples::network_calibrator::Server": 0
+Parsed stats from cluster "hydro_optimize_examples::network_calibrator::Client": 0
+Parsed stats from cluster "hydro_optimize_examples::network_calibrator::Server": 0
+Run throughput: 5921676, num_clients: 1
+Throughput @60s: 5928353 requests/s
+client @60s: CPU 100.00% (user 97.00%) | Net 522 B/s | Mem 0.56% | IO 0.00 tps
+server @60s: CPU 100.00% (user 97.00%) | Net 543 B/s | Mem 0.56% | IO 0.00 tps
+Generated CSV: benchmark_results/Network_256b_default_none/client_1c_1vc_r0.csv
+Generated CSV: benchmark_results/Network_256b_default_none/server_1c_1vc_r0.csv
+Saved operators to benchmark_results/Network_512b_default_none/id.txt
+Running Network_512b (none) with 1 virtual clients (run 0)
+Analyzing cluster "hydro_optimize_examples::network_calibrator::Server": 0
+Analyzing cluster "hydro_optimize_examples::network_calibrator::Client": 0
+Parsed stats from cluster "hydro_optimize_examples::network_calibrator::Client": 0
+Parsed stats from cluster "hydro_optimize_examples::network_calibrator::Server": 0
+Run throughput: 4920949, num_clients: 1
+Throughput @60s: 4899277 requests/s
+client @60s: CPU 0.00% (user 0.00%) | Net 584 B/s | Mem 0.56% | IO 0.00 tps
+server @60s: CPU 0.00% (user 0.00%) | Net 727 B/s | Mem 0.56% | IO 0.00 tps
+Generated CSV: benchmark_results/Network_512b_default_none/client_1c_1vc_r0.csv
+Generated CSV: benchmark_results/Network_512b_default_none/server_1c_1vc_r0.csv
+Saved operators to benchmark_results/Network_1024b_default_none/id.txt
+Running Network_1024b (none) with 1 virtual clients (run 0)
+Analyzing cluster "hydro_optimize_examples::network_calibrator::Client": 0
+Analyzing cluster "hydro_optimize_examples::network_calibrator::Server": 0
+Parsed stats from cluster "hydro_optimize_examples::network_calibrator::Client": 0
+Parsed stats from cluster "hydro_optimize_examples::network_calibrator::Server": 0
+Run throughput: 5586260, num_clients: 1
+Throughput @60s: 5575199 requests/s
+server @60s: CPU 100.00% (user 97.00%) | Net 717 B/s | Mem 0.57% | IO 0.00 tps
+client @60s: CPU 100.00% (user 97.00%) | Net 707 B/s | Mem 0.57% | IO 0.00 tps
+Generated CSV: benchmark_results/Network_1024b_default_none/server_1c_1vc_r0.csv
+Generated CSV: benchmark_results/Network_1024b_default_none/client_1c_1vc_r0.csv
+Saved operators to benchmark_results/Network_2048b_default_none/id.txt
+Running Network_2048b (none) with 1 virtual clients (run 0)
+Analyzing cluster "hydro_optimize_examples::network_calibrator::Client": 0
+Analyzing cluster "hydro_optimize_examples::network_calibrator::Server": 0
+Parsed stats from cluster "hydro_optimize_examples::network_calibrator::Client": 0
+Parsed stats from cluster "hydro_optimize_examples::network_calibrator::Server": 0
+Run throughput: 5376705, num_clients: 1
+Throughput @60s: 5394732 requests/s
+client @60s: CPU 0.00% (user 0.00%) | Net 707 B/s | Mem 0.55% | IO 0.00 tps
+server @60s: CPU 0.00% (user 0.00%) | Net 563 B/s | Mem 0.55% | IO 0.00 tps
+Generated CSV: benchmark_results/Network_2048b_default_none/client_1c_1vc_r0.csv
+Generated CSV: benchmark_results/Network_2048b_default_none/server_1c_1vc_r0.csv
+Saved operators to benchmark_results/Network_4096b_default_none/id.txt
+Running Network_4096b (none) with 1 virtual clients (run 0)
+Analyzing cluster "hydro_optimize_examples::network_calibrator::Server": 0
+Analyzing cluster "hydro_optimize_examples::network_calibrator::Client": 0
+Parsed stats from cluster "hydro_optimize_examples::network_calibrator::Client": 0
+Parsed stats from cluster "hydro_optimize_examples::network_calibrator::Server": 0
+Run throughput: 5387674, num_clients: 1
+Throughput @60s: 5389588 requests/s
+client @60s: CPU 0.00% (user 0.00%) | Net 727 B/s | Mem 0.57% | IO 0.00 tps
+server @60s: CPU 0.00% (user 0.00%) | Net 737 B/s | Mem 0.57% | IO 0.00 tps
+Generated CSV: benchmark_results/Network_4096b_default_none/client_1c_1vc_r0.csv
+Generated CSV: benchmark_results/Network_4096b_default_none/server_1c_1vc_r0.csv
+Destroying terraform deployment at /local/home/luckykat/git/david/hydro-optimize/.hydro/.tmp4k6hQy
+=== Calibration complete ===

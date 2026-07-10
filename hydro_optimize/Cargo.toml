@@ -12,6 +12,7 @@ all-features = true
 [dependencies]
 ena = "0.14.4"
 good_lp = { version = "1.14.0", features = ["lp-solvers"], default-features = false }
+indexmap = { version = "2", features = ["serde"] }
 hydro_deploy.workspace = true
 hydro_lang = { workspace = true, features = ["deploy"] }
 hydro_std.workspace = true

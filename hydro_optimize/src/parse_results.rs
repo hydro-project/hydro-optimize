@@ -8,6 +8,7 @@ use hydro_lang::compile::ir::HydroRoot;
 use hydro_lang::deploy::HydroDeploy;
 use hydro_lang::deploy::deploy_graph::DeployCrateWrapper;
 use hydro_lang::location::dynamic::LocationId;
+use indexmap::IndexMap;
 use regex::Regex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -246,7 +247,16 @@ pub struct RawIlpInputs {
 pub struct OptimizationState {
     /// Current budget per cluster (cluster name → budget level).
     /// Only the latest budget per cluster is stored; higher budgets supersede lower ones.
-    pub applied: HashMap<String, usize>,
+    ///
+    /// This is an `IndexMap` (not a `HashMap`) because insertion order is load-bearing when the
+    /// optimizer switches bottlenecks: once more than one cluster has been decoupled/partitioned,
+    /// `rewrites_to_apply` stacks their rewrites *in this order*, and `apply_loaded_rewrites`
+    /// re-injects op ids after each one so a later rewrite's op ids are relative to the IR left by
+    /// the earlier rewrites. A later cluster's rewrite was computed on top of the earlier ones
+    /// (see `prepare_bottleneck_rewrites`), so it is only valid if applied after them. A `HashMap`
+    /// iterates in random order and would apply them inconsistently, corrupting the IR. Entries are
+    /// therefore ordered by when each cluster first became the bottleneck.
+    pub applied: IndexMap<String, usize>,
     /// Per original-cluster-name: precomputed rewrites for all budgets.
     pub cluster_rewrites: HashMap<String, Vec<Rewrite>>,
 }
@@ -270,7 +280,10 @@ impl OptimizationState {
         );
     }
 
-    /// Get one rewrite per applied cluster (at its current budget).
+    /// Get one rewrite per applied cluster (at its current budget), in the order the clusters
+    /// became bottlenecks. Order matters: each later cluster's rewrite was computed on top of the
+    /// earlier ones and `apply_loaded_rewrites` applies them in this sequence (see the `applied`
+    /// field docs).
     pub fn rewrites_to_apply(&self) -> Vec<Rewrite> {
         self.applied
             .iter()
@@ -279,7 +292,17 @@ impl OptimizationState {
                     .cluster_rewrites
                     .get(cluster)
                     .unwrap_or_else(|| panic!("No rewrites for cluster '{}'", cluster));
-                rewrites[budget - 2].clone() // budgets start at 2
+                // budgets start at 2, so budget N is stored at index N - 2.
+                rewrites.get(budget - 2).cloned().unwrap_or_else(|| {
+                    panic!(
+                        "Cluster '{}' has budget {} applied but only {} precomputed rewrite(s); \
+                         the cached rewrites are stale (likely recomputed against a different base \
+                         after a bottleneck switch). Delete the optimization_state.json to recompute.",
+                        cluster,
+                        budget,
+                        rewrites.len()
+                    )
+                })
             })
             .collect()
     }
@@ -967,15 +990,26 @@ impl RunMetadata {
     }
 }
 
+/// Averages `f` over the steady-state measurement window `[START_MEASUREMENT_SECOND,
+/// MEASUREMENT_SECOND]` of a per-second metric series.
+///
+/// The window is clamped to the available data rather than requiring a full-length series: a node
+/// whose metrics were truncated (e.g. a stalled stream drained partially, or a late-starting
+/// decouple cluster) can report fewer than `MEASUREMENT_SECOND + 1` samples, and we want to use
+/// what we have instead of panicking. If the series is shorter than the window start, we fall back
+/// to averaging the whole series; an empty series averages to 0.
 fn avg_over<T>(slice: &[T], f: impl Fn(&T) -> f64) -> f64 {
-    assert!(
-        slice.len() > MEASUREMENT_SECOND,
-        "measurement window [{}, {}] out of range for slice of length {}",
-        START_MEASUREMENT_SECOND,
-        MEASUREMENT_SECOND,
-        slice.len()
-    );
-    let window = &slice[START_MEASUREMENT_SECOND..=MEASUREMENT_SECOND];
+    if slice.is_empty() {
+        return 0.0;
+    }
+    let end = (MEASUREMENT_SECOND + 1).min(slice.len()); // exclusive
+    // Skip the warmup when there's data past it; otherwise average everything we have.
+    let start = if START_MEASUREMENT_SECOND < end {
+        START_MEASUREMENT_SECOND
+    } else {
+        0
+    };
+    let window = &slice[start..end];
     window.iter().map(&f).sum::<f64>() / window.len() as f64
 }
 
@@ -1233,15 +1267,38 @@ pub fn parse_perf(folded: &str) -> HashMap<usize, f64> {
     samples_per_id
 }
 
+/// Max time to wait for the next message while draining a receiver. If a remote node stalls
+/// (e.g. an unresponsive VM whose metric stream buffered data but never closed cleanly), the
+/// sender-side channel may never close, so a bare `recv().await` would block forever. Bounding
+/// each `recv` lets us return the partial data we did collect instead of deadlocking the run.
+const DRAIN_QUIET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Drains all currently available messages from a receiver into a Vec.
+///
+/// Stops once the channel closes, or once no new message arrives within `DRAIN_QUIET_TIMEOUT`
+/// (whichever comes first), so a never-closing stream from a stuck node can't block forever.
 async fn drain_receiver(receiver: &mut UnboundedReceiver<String>) -> Vec<String> {
     let mut lines = Vec::new();
     if receiver.is_empty() {
         // If the receiver is empty but not closed, calling recv() will block.
         return lines;
     }
-    while let Some(line) = receiver.recv().await {
-        lines.push(line);
+    loop {
+        match tokio::time::timeout(DRAIN_QUIET_TIMEOUT, receiver.recv()).await {
+            Ok(Some(line)) => lines.push(line),
+            // Channel closed: fully drained.
+            Ok(None) => break,
+            // No message for DRAIN_QUIET_TIMEOUT: the stream stalled (likely a stuck node).
+            // Give up on the rest rather than block forever, keeping what we have.
+            Err(_) => {
+                eprintln!(
+                    "drain_receiver: no data for {:?}, giving up with {} line(s) buffered",
+                    DRAIN_QUIET_TIMEOUT,
+                    lines.len()
+                );
+                break;
+            }
+        }
     }
     lines
 }

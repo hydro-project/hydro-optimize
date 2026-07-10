@@ -2042,6 +2042,7 @@ dependencies = [
  "hydro_lang",
  "hydro_std",
  "include_mdtests",
+ "indexmap",
  "proc-macro-crate 3.5.0",
  "proc-macro2",
  "quote",

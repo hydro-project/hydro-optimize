@@ -38,7 +38,7 @@ pub struct ReusableHosts {
 // Note: Aws AMIs vary by region. If you are changing the region, please also change the AMI.
 const AWS_REGION: &str = "us-east-1";
 const AWS_INSTANCE_AMI: &str = "ami-0521cb2d60cfbb1a6"; // Amazon Linux 2023
-const AWS_INSTANCE_TYPE: &str = "m5.2xlarge"; // 8 vCPU, 32 GB RAM
+const AWS_INSTANCE_TYPE: &str = "m8i.2xlarge"; //"m5.2xlarge"; // 8 vCPU, 32 GB RAM
 const AWS_NUM_CORES: usize = 3; // Used for networking. Network cores will be pinned to these cores - 1. Empirically tested on m5.2xlarge.
 /// m5.2xlarge: up to 10 Gbps network bandwidth
 pub const AWS_NETWORK_BYTES_PER_SEC: f64 = 1_250_000_000.0;
@@ -130,7 +130,8 @@ impl ReusableHosts {
     fn get_rust_flags(&self) -> String {
         match &self.host_type {
             InitializedHostType::Gcp { .. } | InitializedHostType::Aws { .. } => {
-                "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off -C link-arg=--no-rosegment".to_string()
+                "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off -C link-arg=--no-rosegment"
+                    .to_string()
             }
             InitializedHostType::Localhost => {
                 "".to_string() // Compile fast! Localhost is used for debugging

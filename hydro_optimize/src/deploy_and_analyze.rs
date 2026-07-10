@@ -1198,6 +1198,27 @@ where
         "Bottleneck '{}': applying budget {}.",
         bottleneck_cluster, budget
     );
+
+    // Bottleneck oscillation: if this cluster already became a bottleneck earlier, any clusters
+    // decoupled/partitioned *after* it had their rewrites computed on top of this cluster's older
+    // budget (see Phase 3's `apply_prior_rewrites`). Bumping this cluster's budget invalidates
+    // those downstream rewrites, so drop them; they'll be recomputed against the updated base if
+    // and when they resurface as the bottleneck. Entries stay insertion-ordered, so "after" is
+    // just the entries following this one.
+    if let Some(pos) = state.applied.get_index_of(&bottleneck_cluster) {
+        let stale: Vec<String> = state.applied.keys().skip(pos + 1).cloned().collect();
+        for cluster in stale {
+            println!(
+                "Invalidating cached rewrites for '{}': computed on top of '{}' at an older budget.",
+                cluster, bottleneck_cluster
+            );
+            state.applied.shift_remove(&cluster);
+            state.cluster_rewrites.remove(&cluster);
+        }
+    }
+
+    // Inserting an existing key updates its budget in place (IndexMap keeps its position); a new
+    // key is appended, recording the order in which clusters became bottlenecks.
     state.applied.insert(bottleneck_cluster, budget);
     state.save(&state_path);
 
