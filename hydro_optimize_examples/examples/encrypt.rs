@@ -48,6 +48,7 @@ async fn main() {
         &[((), "default".to_string())],
         move |_: &()| {
             let print_result_frequency = 1000;
+            let extra_copies = 10;
             let mut builder = FlowBuilder::new();
             let server = builder.cluster::<Server>();
             let clients = builder.cluster::<Client>();
@@ -76,6 +77,7 @@ async fn main() {
                 })),
                 &client_aggregator,
                 print_result_frequency,
+                extra_copies,
             );
 
             let clusters = ReusableClusters::default()

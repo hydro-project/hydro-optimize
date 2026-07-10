@@ -20,6 +20,7 @@ pub fn encrypt_bench<'a>(
     num_clients_per_node: Singleton<usize, Cluster<'a, Client>, Bounded>,
     client_aggregator: &Process<'a, Aggregator>,
     interval_millis: u64,
+    extra_copies: usize,
 ) {
     let (sk, pk) = generate_keypair();
     let sk_hex = sk
@@ -46,7 +47,7 @@ pub fn encrypt_bench<'a>(
                 .demux(server, TCP.fail_stop().bincode());
 
             let outputs = sent_inputs
-                .flat_map_unordered(q!(|(client_id, payload)| {
+                .flat_map_unordered(q!(move |(client_id, payload)| {
                     let sk_bytes = sk_hex
                         .as_bytes()
                         .chunks_exact(2)
@@ -58,7 +59,9 @@ pub fn encrypt_bench<'a>(
                         .collect::<Vec<_>>();
 
                     let payload = ecies::decrypt(&sk_bytes, &payload).unwrap();
-                    vec![(client_id, 0u8, payload.clone()), (client_id, 1u8, payload)]
+                    (0..=extra_copies)
+                        .map(|copy_id| (client_id, copy_id, payload.clone()))
+                        .collect::<Vec<_>>()
                 }))
                 .assume_ordering::<TotalOrder>(nondet!(
                     /** Processing order is intentionally nondeterministic for this benchmark. */
