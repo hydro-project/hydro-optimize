@@ -107,26 +107,36 @@ fn map_before_network(node: &mut HydroNode, network_metadata: &NetworkMetadata) 
         if let Some(field) = &network_metadata.partition_field {
             // If partitioning and there is a field to hash on, use it
             let struct_or_tuple: syn::Expr = syn::parse_quote! { struct_or_tuple };
-            if !network_metadata.new && field.len() == 1 && field[0] == "0" {
-                // Partitioning asks to hash on the Sender's ID
-                hash_expr(sender_logical_id(network_metadata))
+            let value: syn::Expr = if network_metadata.new {
+                // A new network's element type is just the payload `T`; index directly into it.
+                StructOrTuple::to_syn_expr(struct_or_tuple, field)
             } else {
-                // If this is an existing network, then the index is over fields of the network
-                // after the receipt(sender, T), but before the send, the type is just T, so lop
-                // off the first layer of the field.
-                let field: &[String] = if !network_metadata.new {
-                    assert!(
-                        !field.is_empty() && field[0] == "1",
-                        "Unsupported: Existing network partition fields must refer to either sender id or payload."
-                    );
-                    &field[1..]
-                } else {
-                    field
-                };
-                let struct_or_tuple_with_fields =
-                    StructOrTuple::to_syn_expr(struct_or_tuple, field);
-                hash_expr(struct_or_tuple_with_fields)
-            }
+                // An existing network receives `(sender_id, payload)`, so `field` indexes into
+                // that tuple. On the sender side the payload is `struct_or_tuple` and the
+                // sender's own logical ID stands in for `sender_id`.
+                let sender_id = sender_logical_id(network_metadata);
+                match field.split_first() {
+                    // The whole `(sender_id, payload)` value.
+                    None => syn::parse_quote!((#sender_id, &struct_or_tuple)),
+                    // The sender's ID.
+                    Some((idx, rest)) if idx == "0" => {
+                        assert!(
+                            rest.is_empty(),
+                            "Unsupported: cannot partition on a sub-field of the sender ID."
+                        );
+                        sender_id
+                    }
+                    // A field of the payload.
+                    Some((idx, rest)) => {
+                        assert!(
+                            idx == "1",
+                            "Unsupported: existing network partition fields must refer to the sender ID or payload."
+                        );
+                        StructOrTuple::to_syn_expr(struct_or_tuple, rest)
+                    }
+                }
+            };
+            hash_expr(value)
         } else {
             // If partitioning and there is no field to hash on, we must be random partitioning
             syn::parse_quote!(::rand::random::<u32>())

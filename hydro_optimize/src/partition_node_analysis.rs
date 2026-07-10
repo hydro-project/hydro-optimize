@@ -398,17 +398,12 @@ fn get_inputs_and_dependencies(
 
     if let Some(taints) = input_taint.get(&id) {
         for input in taints {
-            if let Some(dependency) = input_dependencies
+            let dependency = input_dependencies
                 .get(&id)
                 .and_then(|map| map.get(input))
-                .and_then(|tuple| tuple.get_dependencies(index))
-            {
-                ordered_input.push(*input);
-                ordered_dependencies.push(dependency);
-            } else {
-                // Parent is tainted but has no dependencies, cannot partition
-                return None;
-            }
+                .and_then(|tuple| tuple.get_dependencies(index))?;
+            ordered_input.push(*input);
+            ordered_dependencies.push(dependency);
         }
     }
 

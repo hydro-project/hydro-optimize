@@ -147,7 +147,7 @@ pub fn greedy_decouple_analysis(
     }
 
     // Constrain inputs (skip ops/inputs at excluded locations)
-    for (_op_id, inputs) in op_id_to_parent.iter() {
+    for inputs in op_id_to_parent.values() {
         assert!(
             inputs.len() <= 2,
             "Did not expect op with more than 2 inputs"
