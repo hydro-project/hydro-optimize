@@ -8,7 +8,8 @@ edition = "2024"
 all-features = true
 
 [dependencies]
-ecies = { version = "0.2", features = ["std"] }
+# Just for the encrypt example. Use RustCrypto's AES instead of OpenSSL so compilations don't fail
+ecies = { version = "0.2", default-features = false, features = ["aes-rust"]}
 hdrhistogram = "7.5.4"
 hydro_lang.workspace = true
 hydro_std.workspace = true

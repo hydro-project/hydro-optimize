@@ -23,6 +23,10 @@ struct Args {
     /// Use Aws, make sure credentials are set up
     #[arg(long, action = ArgAction::SetTrue)]
     aws: bool,
+
+    /// Run ILP-based bottleneck elimination (auto-runs missing analyses)
+    #[arg(long, action = ArgAction::SetTrue)]
+    optimize: bool,
 }
 
 #[tokio::main]
@@ -31,11 +35,15 @@ async fn main() {
 
     let config = BenchmarkConfig {
         name: "Encrypt".to_string(),
-        kind: Optimization::None,
-        num_physical_clients: 1,
+        kind: if args.optimize {
+            Optimization::BottleneckElimination
+        } else {
+            Optimization::None
+        },
+        num_physical_clients: NUM_PHYSICAL_CLIENTS,
         start_virtual_clients: 1,
-        virtual_clients_step: 1,
-        num_runs: 1,
+        virtual_clients_step: 10,
+        num_runs: 3,
         calibrate_message_sizes: None,
     };
 
@@ -48,7 +56,7 @@ async fn main() {
         &[((), "default".to_string())],
         move |_: &()| {
             let print_result_frequency = 1000;
-            let extra_copies = 10;
+            let extra_copies = 2;
             let mut builder = FlowBuilder::new();
             let server = builder.cluster::<Server>();
             let clients = builder.cluster::<Client>();
