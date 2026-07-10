@@ -194,7 +194,7 @@ fn map_after_network(node: &mut HydroNode, network_metadata: &NetworkMetadata) {
         let sender_num_partitions = network_metadata.sender_partitions;
         let node_content = std::mem::replace(node, HydroNode::Placeholder);
         let f: syn::Expr = syn::parse_quote!(|(sender_id, b)| (
-            hydro_lang::location::MemberId::<_>::from_raw_id(sender_id.into_tagless().get_raw_id() / #sender_num_partitions as u32),
+            hydro_lang::location::MemberId::<()>::from_raw_id(sender_id.into_tagless().get_raw_id() / #sender_num_partitions as u32),
             b
         ));
         metadata.op.id = None; // Clear op ID since this is a new node that didn't exist in the original graph
