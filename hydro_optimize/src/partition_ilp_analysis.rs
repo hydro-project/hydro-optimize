@@ -15,6 +15,27 @@ use crate::{
     partition_syn_analysis::{AnalyzeClosure, StructOrTuple, StructOrTupleIndex},
 };
 
+const KEYED_FIRST_SCAN_TAG: f64 = -2.0;
+const KEYED_FIRST_FLATMAP_TAG: f64 = -3.0;
+
+fn has_cpu_usage_tag(node: &HydroNode, tag: f64) -> bool {
+    node.op_metadata().cpu_usage == Some(tag)
+}
+
+fn is_keyed_first_scan(node: &HydroNode) -> bool {
+    matches!(node, HydroNode::Scan { .. }) && has_cpu_usage_tag(node, KEYED_FIRST_SCAN_TAG)
+}
+
+fn is_keyed_first_flatmap(node: &HydroNode) -> bool {
+    matches!(node, HydroNode::FlatMap { .. }) && has_cpu_usage_tag(node, KEYED_FIRST_FLATMAP_TAG)
+}
+
+fn keyed_field_dependency() -> StructOrTuple {
+    let mut parent = StructOrTuple::default();
+    parent.add_dependency(&vec!["0".to_string()], vec!["0".to_string()]);
+    parent
+}
+
 /// Given a node type, return how its output fields is dependent on its parents.
 /// Must contain an entry for each parent, even if there is no dependency.
 /// Contains 1 entry if there are no parents.
@@ -110,6 +131,8 @@ fn output_to_parent_fields(node: &HydroNode) -> Vec<StructOrTuple> {
             parent.add_dependency(&vec!["0".to_string()], vec!["0".to_string()]);
             vec![parent]
         }
+        HydroNode::Scan { .. } if is_keyed_first_scan(node) => vec![keyed_field_dependency()],
+        HydroNode::FlatMap { .. } if is_keyed_first_flatmap(node) => vec![keyed_field_dependency()],
         HydroNode::ReduceKeyedWatermark { .. }
         => {
             let mut input = StructOrTuple::default();
@@ -294,6 +317,9 @@ fn node_persists(node: &HydroNode) -> bool {
     if node.op_metadata().cpu_usage == Some(COM_ASSOC_REDUCE_TAG) {
         return false;
     }
+    if is_keyed_first_scan(node) || is_keyed_first_flatmap(node) {
+        return false;
+    }
     match node {
         HydroNode::Placeholder => {
             panic!()
@@ -354,6 +380,10 @@ fn node_persists(node: &HydroNode) -> bool {
 /// Whether a node's collection_kind requires TotalOrder.
 /// NOTE: Should really restrict partitioning to the key only for KeyedStream if value order is TotalOrder
 fn node_has_total_order(node: &HydroNode) -> bool {
+    if is_keyed_first_scan(node) {
+        return false;
+    }
+
     matches!(
         node.metadata().collection_kind,
         CollectionKind::Stream {
