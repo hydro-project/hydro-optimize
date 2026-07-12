@@ -131,7 +131,10 @@ fn output_to_parent_fields(node: &HydroNode) -> Vec<StructOrTuple> {
             parent.add_dependency(&vec!["0".to_string()], vec!["0".to_string()]);
             vec![parent]
         }
-        HydroNode::Scan { .. } if is_keyed_first_scan(node) => vec![keyed_field_dependency()],
+        HydroNode::Scan { .. } if is_keyed_first_scan(node) => {
+            println!("Found keyed first scan node: {:?}", node);
+            vec![keyed_field_dependency()]
+        },
         HydroNode::FlatMap { .. } if is_keyed_first_flatmap(node) => vec![keyed_field_dependency()],
         HydroNode::ReduceKeyedWatermark { .. }
         => {
