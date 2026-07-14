@@ -357,6 +357,17 @@ impl ReusableClusters {
         self
     }
 
+    pub fn set_num_members(&mut self, location: &LocationId, num_members: usize) {
+        let Some((_, _, existing_num_members)) = self
+            .named_clusters
+            .iter_mut()
+            .find(|(id, _, _)| location.key() == id.key())
+        else {
+            panic!("No reusable cluster found for location {:?}", location);
+        };
+        *existing_num_members = num_members;
+    }
+
     pub fn from(named_clusters: Vec<(LocationId, String, usize)>) -> Self {
         Self { named_clusters }
     }
@@ -604,6 +615,12 @@ fn apply_single_rewrite<'a>(
         .get(&rewrite.original_location)
         .cloned()
         .unwrap_or_else(|| format!("{:?}", rewrite.original_location));
+    if let Some(num_partitions) = rewrite.num_partitions.get(&0).copied() {
+        clusters.set_num_members(
+            &rewrite.original_location,
+            rewrite.cluster_size * num_partitions.max(1),
+        );
+    }
     for loc_idx in rewrite.locations() {
         if loc_idx == 0 {
             continue;
