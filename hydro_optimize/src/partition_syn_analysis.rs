@@ -239,11 +239,8 @@ impl StructOrTuple {
 
         let mut intersection = tuples[0].clone();
         for tuple in &tuples[1..] {
-            if let Some(shared) = StructOrTuple::intersect(&intersection, tuple) {
-                intersection = shared;
-            } else {
-                return None; // No shared dependencies
-            }
+            let shared = StructOrTuple::intersect(&intersection, tuple)?;
+            intersection = shared;
         }
         Some(intersection)
     }
