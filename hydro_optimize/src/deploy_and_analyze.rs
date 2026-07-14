@@ -18,9 +18,10 @@ use crate::decouple_analysis::{IlpInputs, Rewrite, find_optimal_budget};
 use crate::deploy::{AWS_IO_TPS, AWS_NETWORK_BYTES_PER_SEC, HostType, ReusableHosts};
 use crate::greedy_decouple_analysis::greedy_decouple_analysis;
 use crate::parse_results::{
-    OptimizationState, RawIlpInputs, RunMetadata, analyze_cluster_results, decoupled_cluster_name,
-    derive_per_op_load, find_bottleneck_across_runs, find_latest_iteration, find_workload_dirs,
-    get_csvs_in_dir, load_raw_ilp_inputs, max_throughput_for, original_cluster_name,
+    ExhaustiveOptimizations, ExhaustiveSearchState, OptimizationState, RawIlpInputs, RunMetadata,
+    analyze_cluster_results, decoupled_cluster_name, derive_per_op_load,
+    find_bottleneck_across_runs, find_latest_iteration, find_workload_dirs, get_csvs_in_dir,
+    load_json, load_raw_ilp_inputs, max_throughput_for, original_cluster_name,
 };
 use crate::reduce_pushdown::reduce_pushdown;
 use crate::reduce_pushdown_analysis::reduce_pushdown_decision;
@@ -426,6 +427,8 @@ pub enum Optimization {
     /// Automatically loads applied rewrites from the latest opt dir.
     BottleneckElimination,
     OptimizeWithLatencyBudget(usize),
+    /// Load `{name}_exhaustive_optimizations.json` and benchmark every listed rewrite for a budget.
+    ExhaustiveSearch(usize),
 }
 
 impl Optimization {
@@ -434,7 +437,8 @@ impl Optimization {
             // Do not differentiate between None and BottleneckElimination, since both run the protocol without additional profiling
             Optimization::None
             | Optimization::BottleneckElimination
-            | Optimization::OptimizeWithLatencyBudget(_) => "none",
+            | Optimization::OptimizeWithLatencyBudget(_)
+            | Optimization::ExhaustiveSearch(_) => "none",
             Optimization::Counters => "counters",
             Optimization::BlowUpAnalysis => "blow_up",
             Optimization::SizeAnalysis => "size",
@@ -518,14 +522,32 @@ async fn deploy_and_analyze<'a>(
 
     // Insert all clusters & processes
     let mut deployable = builder.into_deploy();
+    let mut exhaustive_machine_idx = 0usize;
     for (cluster_id, name, num_hosts) in program.clusters.named_clusters.iter() {
         let excluded = program.exclude.contains(cluster_id);
-        let hosts = reusable_hosts.get_cluster_hosts(
-            deployment,
-            name.clone(),
-            *num_hosts,
-            use_perf && !excluded,
-        );
+        let hosts = if let Optimization::ExhaustiveSearch(budget) = kind
+            && !excluded
+        {
+            // Don't want to keep relaunching machines during exhaustive search,
+            // So make sure they always have the same host name
+            (0..*num_hosts)
+                .map(|_| {
+                    let host_name = format!(
+                        "exhaustive_budget{}_machine{}",
+                        budget, exhaustive_machine_idx
+                    );
+                    exhaustive_machine_idx += 1;
+                    reusable_hosts.get_process_host(deployment, host_name, use_perf)
+                })
+                .collect()
+        } else {
+            reusable_hosts.get_cluster_hosts(
+                deployment,
+                name.clone(),
+                *num_hosts,
+                use_perf && !excluded,
+            )
+        };
         deployable = deployable.with_cluster_erased(cluster_id.key(), hosts);
     }
     for (process_id, name) in program.processes.named_processes.iter() {
@@ -861,6 +883,7 @@ async fn run_scaling_loop<'a>(
             run += 1;
             final_run_metadata = run_metadata;
 
+            // Only run size analysis & network calibration once per config
             if matches!(kind, Optimization::SizeAnalysis)
                 || config.calibrate_message_sizes.is_some()
             {
@@ -890,6 +913,11 @@ async fn run_scaling_loop<'a>(
                 );
                 break;
             }
+        }
+
+        // Only run exhaustive search on a specific config. But can run it multiple times
+        if matches!(kind, Optimization::ExhaustiveSearch(_)) {
+            break;
         }
 
         num_virtual += config.virtual_clients_step;
@@ -951,7 +979,9 @@ async fn run_analysis_pass<'a>(
             size_analysis_ops = captured_ops;
             built
         }
-        Optimization::Perf | Optimization::None => analysis_built,
+        Optimization::Perf | Optimization::None | Optimization::ExhaustiveSearch(_) => {
+            analysis_built
+        }
         Optimization::BottleneckElimination | Optimization::OptimizeWithLatencyBudget(_) => {
             unreachable!()
         }
@@ -1224,6 +1254,81 @@ where
     (opt_name, state.rewrites_to_apply())
 }
 
+async fn run_exhaustive_search<'a, W, F>(
+    reusable_hosts: &mut ReusableHosts,
+    deployment: &mut Deployment,
+    config: &BenchmarkConfig,
+    workloads: &[(W, String)],
+    compile: &F,
+) -> (Vec<HydroRoot>, RunMetadata)
+where
+    F: Fn(&W) -> (FlowBuilder<'a>, CompiledProgram),
+{
+    let base = Path::new(CALIBRATION_DIR);
+    let optimizations_path = base.join(format!("{}_exhaustive_optimizations.json", config.name));
+    assert!(
+        optimizations_path.exists(),
+        "Exhaustive search file not found: {}",
+        optimizations_path.display()
+    );
+
+    let budget = match config.kind {
+        Optimization::ExhaustiveSearch(budget) => budget,
+        _ => unreachable!(),
+    };
+    let candidates = load_json::<ExhaustiveOptimizations>(&optimizations_path)
+        .into_candidates_for_budget(budget);
+    let state_path = base.join(format!(
+        "{}_exhaustive_budget{}_state.json",
+        config.name, budget
+    ));
+    let mut state = ExhaustiveSearchState::load(&state_path);
+    let mut last = (Vec::new(), RunMetadata::default());
+
+    while state.next_index < candidates.len() {
+        let candidate = candidates[state.next_index].clone();
+        let run_name = format!("{}_{}", config.name, candidate.name);
+        println!(
+            "=== Running exhaustive candidate {}/{}: {} ===",
+            state.next_index + 1,
+            candidates.len(),
+            candidate.name
+        );
+
+        for (params, workload) in workloads {
+            let (base_built, mut program) = build_workload(compile, params);
+            let built = apply_loaded_rewrites(
+                base_built,
+                &mut program.clusters,
+                std::slice::from_ref(&candidate.rewrite),
+                &mut program.location_id_to_cluster,
+            );
+            let meta = run_scaling_loop(
+                reusable_hosts,
+                deployment,
+                &built,
+                config,
+                &program,
+                &run_name,
+                workload,
+                &config.kind,
+                &HashMap::new(),
+                None,
+                &HashSet::new(),
+            )
+            .await;
+            last = (deep_clone(built.ir()), meta);
+        }
+
+        state.executed.push(candidate.name);
+        state.next_index += 1;
+        state.save(&state_path);
+    }
+
+    println!("=== Exhaustive search complete ===");
+    last
+}
+
 /// Runs the benchmark/optimization flow over one or more workloads. Each workload is built by
 /// `compile(&params)` and must produce an identical IR structure (op-id topology), differing
 /// only in runtime data (e.g. write ratio), since stats are merged across workloads by op id.
@@ -1252,6 +1357,17 @@ pub async fn benchmark_protocol<'a, W>(
 
     if config.calibrate_message_sizes.is_some() {
         reusable_hosts.set_single_host(true);
+    }
+
+    if matches!(config.kind, Optimization::ExhaustiveSearch(_)) {
+        return run_exhaustive_search(
+            &mut reusable_hosts,
+            &mut deployment,
+            &config,
+            workloads,
+            &compile,
+        )
+        .await;
     }
 
     // Decide what to benchmark: bottleneck elimination first runs the analyses + ILP and returns
