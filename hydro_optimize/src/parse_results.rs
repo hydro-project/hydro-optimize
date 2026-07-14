@@ -1219,8 +1219,18 @@ pub fn parse_perf(folded: &str) -> HashMap<usize, f64> {
 
         total_samples += n_samples;
 
-        if let Some(cap) = operator_regex.captures_iter(line).last() {
-            let id = cap[4].parse::<usize>().unwrap();
+        let mut op_id = None;
+        for frame in stack_trace.split(';') {
+            // These traces also match the regex but are off-by-one in operator ID
+            if frame.trim_start().starts_with("<dfir_pipes::pull") {
+                continue;
+            }
+
+            for cap in operator_regex.captures_iter(frame) {
+                op_id = Some(cap[4].parse::<usize>().unwrap());
+            }
+        }
+        if let Some(id) = op_id {
             *samples_per_id.entry(id).or_default() += n_samples;
         }
     }
