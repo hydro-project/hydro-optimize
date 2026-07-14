@@ -51,7 +51,7 @@ def op_assignments_in_order(ops: list[int], locations: tuple[int, ...]):
     yield zero
 
     for assignment in itertools.product(locations, repeat=len(ops)):
-        op_to_loc = {str(op): loc for op, loc in zip(ops, assignment, strict=True)}
+        op_to_loc = {str(op): loc for op, loc in zip(ops, assignment)}
         if op_to_loc != zero:
             yield op_to_loc
 
@@ -224,6 +224,8 @@ def main() -> None:
         raw_op_to_loc = {str(op): (1 if op in ones_set else 0) for op in ops}
         op_to_loc, _ = canonicalize(ops, raw_op_to_loc)
         if not valid_syntactic_sugar_assignment(op_to_loc, parents, kinds):
+            continue
+        if len(set(op_to_loc.values())) < 2:
             continue
         key = candidate_key(ops, op_to_loc)
         if key in budget_2_seen:
