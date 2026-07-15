@@ -2,6 +2,7 @@
 hydro_lang::setup!();
 
 pub mod compare_and_swap;
+pub mod encrypt_bench;
 pub mod lock_server;
 pub mod network_calibrator;
 pub mod simple_kv_bench;

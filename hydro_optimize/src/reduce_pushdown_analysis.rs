@@ -39,6 +39,13 @@ struct ReducePushdownMetadata {
     op_id_to_reduce: HashMap<usize, HydroNode>,
 }
 
+fn is_ticked(location_id: &LocationId) -> bool {
+    match location_id {
+        LocationId::Tick(_, _) | LocationId::Atomic(_) => true,
+        LocationId::Process(_) | LocationId::Cluster(_) => false,
+    }
+}
+
 /// `Reduce` can be pushed through `Unbounded` and `NoOrder` streams, because the ordering and batching don't affect the result.
 fn can_pushdown(metadata: &HydroIrMetadata) -> bool {
     match &metadata.collection_kind {
@@ -90,6 +97,11 @@ fn reduce_pushdown_analysis_node(
     let op_id = node.op_metadata().id.unwrap();
     let my_pushed_reduce = match node {
         HydroNode::Reduce { f, input, metadata } => {
+            if is_ticked(&metadata.location_id) {
+                recurse_reduce_pushdown_analysis(node, exclude, reduce_metadata);
+                return;
+            }
+
             reduce_metadata.op_id_to_reduce.insert(
                 op_id,
                 HydroNode::Reduce {
@@ -153,15 +165,14 @@ fn reduce_pushdown_analysis_node(
 
     let mut check_inputs = vec![];
     match node {
-        // Shouldn't see BeginAtomic or Batch, because we shouldn't be in an atomic region in the first place
         HydroNode::Placeholder | HydroNode::Counter { .. } => {
             panic!("Reduce pushdown encountered unexpected Placeholder or Counter node")
         }
+        HydroNode::Sort { .. } => panic!("Reduce pushdown was marked possible over a sorted stream?"),
+        HydroNode::Reduce { .. } => panic!("Reduce pushdown reprocessing a reduce?"),
         HydroNode::BeginAtomic { .. } | HydroNode::Batch { .. } => {
             panic!("Reduce pushdown entered ticked region")
         }
-        HydroNode::Sort { .. } => panic!("Reduce pushdown was marked possible over a sorted stream?"),
-        HydroNode::Reduce { .. } => panic!("Reduce pushdown reprocessing a reduce?"),
         HydroNode::CycleSource { cycle_id, .. } => {
             reduce_metadata
                 .cycle_possibilities
@@ -185,7 +196,7 @@ fn reduce_pushdown_analysis_node(
         | HydroNode::ExternalInput { .. }
         | HydroNode::Tee { .. } // Would need to check other branch of input to push up (too hard for now)
         | HydroNode::Partition { .. }
-        | HydroNode::EndAtomic { .. } // Don't enter atomic region
+        | HydroNode::EndAtomic { .. } // Don't enter ticked/atomic regions
         | HydroNode::YieldConcat { .. }
         | HydroNode::Map { .. } // Type changes, reduce not defined over the parent type
         | HydroNode::FlatMap { .. }

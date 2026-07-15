@@ -1,3 +1,4 @@
+use crate::partition_syn_analysis::StructOrTupleIndex;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
@@ -967,6 +968,118 @@ impl RunMetadata {
     }
 }
 
+#[derive(Clone, Deserialize)]
+pub struct ExhaustiveRewriteCandidate {
+    pub name: String,
+    pub rewrite: Rewrite,
+}
+
+#[derive(Deserialize)]
+struct RawExhaustiveRewriteCandidate {
+    name: String,
+    original_location: LocationId,
+    cluster_size: usize,
+    budget: usize,
+    location_costs: HashMap<String, f64>,
+    num_partitions: HashMap<String, usize>,
+    op_to_loc: HashMap<String, usize>,
+    op_to_network: HashMap<String, (usize, usize)>,
+    stateless_partitionable: HashSet<usize>,
+    field_partitionable: HashSet<usize>,
+    partitionable: HashSet<usize>,
+    partition_field_choices: HashMap<String, StructOrTupleIndex>,
+}
+
+impl RawExhaustiveRewriteCandidate {
+    fn into_candidate(self) -> ExhaustiveRewriteCandidate {
+        let parse_key = |key: String| {
+            key.parse::<usize>()
+                .unwrap_or_else(|e| panic!("Invalid op/location id '{}': {}", key, e))
+        };
+
+        ExhaustiveRewriteCandidate {
+            name: self.name,
+            rewrite: Rewrite {
+                original_location: self.original_location,
+                cluster_size: self.cluster_size,
+                budget: self.budget,
+                location_costs: self
+                    .location_costs
+                    .into_iter()
+                    .map(|(key, value)| (parse_key(key), value))
+                    .collect(),
+                num_partitions: self
+                    .num_partitions
+                    .into_iter()
+                    .map(|(key, value)| (parse_key(key), value))
+                    .collect(),
+                op_to_loc: self
+                    .op_to_loc
+                    .into_iter()
+                    .map(|(key, value)| (parse_key(key), value))
+                    .collect(),
+                op_to_network: self
+                    .op_to_network
+                    .into_iter()
+                    .map(|(key, value)| (parse_key(key), value))
+                    .collect(),
+                stateless_partitionable: self.stateless_partitionable,
+                field_partitionable: self.field_partitionable,
+                partitionable: self.partitionable,
+                partition_field_choices: self
+                    .partition_field_choices
+                    .into_iter()
+                    .map(|(key, value)| (parse_key(key), value))
+                    .collect(),
+            },
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ExhaustiveOptimizations {
+    budget_2: Vec<RawExhaustiveRewriteCandidate>,
+    budget_3: Vec<RawExhaustiveRewriteCandidate>,
+}
+
+impl ExhaustiveOptimizations {
+    pub fn into_candidates_for_budget(self, budget: usize) -> Vec<ExhaustiveRewriteCandidate> {
+        let candidates = match budget {
+            2 => self.budget_2,
+            3 => self.budget_3,
+            _ => panic!("Unsupported exhaustive search budget: {}", budget),
+        };
+        candidates
+            .into_iter()
+            .map(RawExhaustiveRewriteCandidate::into_candidate)
+            .collect()
+    }
+}
+
+#[derive(Default, Serialize, Deserialize)]
+pub struct ExhaustiveSearchState {
+    pub next_index: usize,
+    pub executed: Vec<String>,
+}
+
+impl ExhaustiveSearchState {
+    pub fn load(path: &Path) -> Self {
+        if path.exists() {
+            load_json(path)
+        } else {
+            Self::default()
+        }
+    }
+
+    pub fn save(&self, path: &Path) {
+        save_json(
+            path.parent().unwrap(),
+            path.file_name().unwrap().to_str().unwrap(),
+            self,
+        );
+    }
+}
+
 fn avg_over<T>(slice: &[T], f: impl Fn(&T) -> f64) -> f64 {
     assert!(
         slice.len() > MEASUREMENT_SECOND,
@@ -1219,8 +1332,18 @@ pub fn parse_perf(folded: &str) -> HashMap<usize, f64> {
 
         total_samples += n_samples;
 
-        if let Some(cap) = operator_regex.captures_iter(line).last() {
-            let id = cap[4].parse::<usize>().unwrap();
+        let mut op_id = None;
+        for frame in stack_trace.split(';') {
+            // These traces also match the regex but are off-by-one in operator ID
+            if frame.trim_start().starts_with("<dfir_pipes::pull") {
+                continue;
+            }
+
+            for cap in operator_regex.captures_iter(frame) {
+                op_id = Some(cap[4].parse::<usize>().unwrap());
+            }
+        }
+        if let Some(id) = op_id {
             *samples_per_id.entry(id).or_default() += n_samples;
         }
     }
