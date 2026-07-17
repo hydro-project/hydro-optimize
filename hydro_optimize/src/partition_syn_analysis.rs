@@ -524,7 +524,7 @@ impl Visit<'_> for StructOrTupleUseRhs {
     }
 
     fn visit_expr_method_call(&mut self, call: &syn::ExprMethodCall) {
-        if call.method == "clone" || call.method == "unwrap" {
+        if call.method == "clone" || call.method == "unwrap" || call.method == "expect" {
             // Allow special methods that don't change the RHS
             self.visit_expr(&call.receiver);
         } else {
@@ -1437,6 +1437,33 @@ mod tests {
             &vec!["struct_2".to_string(), "c".to_string()],
             vec!["c".to_string()],
         );
+
+        verify_tuple(builder, &expected_output_dependency);
+    }
+
+    #[test]
+    fn test_expect_preserves_field_dependency() {
+        let mut builder = FlowBuilder::new();
+        let cluster = builder.cluster::<()>();
+        cluster
+            .source_iter(q!([TestStruct {
+                a: 1,
+                b: "test".to_string(),
+                c: Some(3),
+            }]))
+            .map(q!(|test_struct| {
+                (
+                    test_struct.c.expect("test input has c"),
+                    test_struct.clone(),
+                )
+            }))
+            .for_each(q!(|_out| {
+                println!("Done");
+            }));
+
+        let mut expected_output_dependency = StructOrTuple::default();
+        expected_output_dependency.add_dependency(&vec!["0".to_string()], vec!["c".to_string()]);
+        expected_output_dependency.add_dependency(&vec!["1".to_string()], vec![]);
 
         verify_tuple(builder, &expected_output_dependency);
     }
