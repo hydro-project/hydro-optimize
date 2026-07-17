@@ -64,6 +64,8 @@ struct NetworkMetadata {
     receiver_partitions: usize,
     /// if hash-based partitioning, the field to hash on (None otherwise).
     partition_field: Option<StructOrTupleIndex>,
+    /// Whether the selected partition field should be unwrapped before hashing.
+    partition_field_unwrap: bool,
     /// whether this is for a new network being added during decoupling, or an existing network that needs to be modified to add partition routing.
     new: bool,
 }
@@ -90,6 +92,16 @@ fn hash_expr(value: syn::Expr) -> syn::Expr {
         ::std::hash::Hash::hash(&#value, &mut s);
         ::std::hash::Hasher::finish(&s) as u32
     })
+}
+
+fn hash_partition_field_expr(value: syn::Expr, unwrap_option: bool) -> syn::Expr {
+    if unwrap_option {
+        hash_expr(syn::parse_quote! {
+            #value.as_ref().expect("partition key must be Some")
+        })
+    } else {
+        hash_expr(value)
+    }
 }
 
 fn collection_key_type(collection_kind: &CollectionKind) -> Option<syn::Type> {
@@ -133,7 +145,10 @@ fn map_before_network(node: &mut HydroNode, network_metadata: &NetworkMetadata) 
                 };
                 let struct_or_tuple_with_fields =
                     StructOrTuple::to_syn_expr(struct_or_tuple, field);
-                hash_expr(struct_or_tuple_with_fields)
+                hash_partition_field_expr(
+                    struct_or_tuple_with_fields,
+                    network_metadata.partition_field_unwrap,
+                )
             }
         } else {
             // If partitioning and there is no field to hash on, we must be random partitioning
@@ -429,6 +444,7 @@ fn insert_network(
         receiver_location: receiver_location.clone(),
         receiver_partitions,
         partition_field,
+        partition_field_unwrap: rewrite.partition_field_unwraps.contains(&op_id),
         new: true,
     };
 
@@ -516,6 +532,7 @@ fn repair_existing_network_for_partitioning(
         .and_then(|idx| rewrite.num_partitions.get(idx).copied())
         .unwrap_or(0);
     let partition_field = rewrite.partition_field_choices.get(&op_id).cloned();
+    let partition_field_unwrap = rewrite.partition_field_unwraps.contains(&op_id);
 
     let network_metadata = NetworkMetadata {
         sender_location,
@@ -523,6 +540,7 @@ fn repair_existing_network_for_partitioning(
         receiver_location,
         receiver_partitions,
         partition_field,
+        partition_field_unwrap,
         new: false,
     };
 

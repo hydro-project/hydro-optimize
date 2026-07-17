@@ -536,6 +536,7 @@ fn add_total_order_edge_constraints(
 
 pub(crate) struct PartitionILPMetadata {
     pub(crate) op_id_to_field_vars: HashMap<usize, HashMap<StructOrTupleIndex, Variable>>, // op_id: field_name: variable
+    pub(crate) op_id_to_unwrapped_field_vars: HashMap<usize, HashSet<StructOrTupleIndex>>,
     op_id_to_partition_expr: HashMap<usize, Expression>, // op_id: 1 if the op is partitioned on any of its fields, 0 otherwise
     pub(crate) num_relevant_operators: HashMap<usize, Expression>, // location: number of relevant operators
     pub(crate) partitionable_operators: HashMap<usize, Expression>, // location: number of partitionable operators. Partitioning is possible at the location if partitionable_operators == num_relevant_operators
@@ -546,6 +547,19 @@ pub(crate) struct PartitionILPMetadata {
 
 fn field_specificity_score(field: &StructOrTupleIndex) -> f64 {
     (field.len() + 1) as f64
+}
+
+fn field_depends_on_unwrapped_option(
+    dependencies: &[StructOrTuple],
+    field_name: &StructOrTupleIndex,
+) -> bool {
+    dependencies.iter().any(|dependencies| {
+        dependencies
+            .get_dependencies(field_name)
+            .is_some_and(|field_dependencies| {
+                !field_dependencies.get_unwrap_dependencies().is_empty()
+            })
+    })
 }
 
 /// Add the operator with `id` to the location_sum for each location
@@ -612,6 +626,7 @@ fn field_vars_from_op(
     op_id: usize,
     canonical_fields: &HashMap<usize, Vec<StructOrTuple>>,
     op_id_to_field_vars: &mut HashMap<usize, HashMap<StructOrTupleIndex, Variable>>,
+    op_id_to_unwrapped_field_vars: &mut HashMap<usize, HashSet<StructOrTupleIndex>>,
     op_id_to_partition_expr: &mut HashMap<usize, Expression>,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
 ) -> HashMap<StructOrTupleIndex, Variable> {
@@ -644,6 +659,12 @@ fn field_vars_from_op(
                 field_to_var.insert(field_name.clone(), var);
                 sum_expr += var;
             }
+            let unwrapped_fields = field_names
+                .iter()
+                .filter(|field_name| field_depends_on_unwrapped_option(dependencies, field_name))
+                .cloned()
+                .collect();
+            op_id_to_unwrapped_field_vars.insert(op_id, unwrapped_fields);
             op_id_to_partition_expr.insert(op_id, sum_expr.clone());
 
             // Constrain sum to 1 (the op is partitioned on at most 1 field)
@@ -668,6 +689,7 @@ fn constrain_field_vars_to_parents(
 ) {
     let PartitionILPMetadata {
         op_id_to_field_vars,
+        op_id_to_unwrapped_field_vars,
         op_id_to_partition_expr,
         partitionable_operators,
         ..
@@ -678,6 +700,7 @@ fn constrain_field_vars_to_parents(
         op_id,
         canonical_fields,
         op_id_to_field_vars,
+        op_id_to_unwrapped_field_vars,
         op_id_to_partition_expr,
         decoupling_metadata,
     );
@@ -716,6 +739,7 @@ fn constrain_field_vars_to_parents(
                 *parent_id,
                 canonical_fields,
                 op_id_to_field_vars,
+                op_id_to_unwrapped_field_vars,
                 op_id_to_partition_expr,
                 decoupling_metadata,
             )
@@ -998,6 +1022,7 @@ pub(crate) fn partition_ilp_analysis(
             .collect();
     let mut metadata = PartitionILPMetadata {
         op_id_to_field_vars: HashMap::new(),
+        op_id_to_unwrapped_field_vars: HashMap::new(),
         op_id_to_partition_expr: HashMap::new(),
         num_relevant_operators: location_to_zero_expr.clone(),
         partitionable_operators: location_to_zero_expr.clone(),

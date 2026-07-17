@@ -625,6 +625,9 @@ pub struct Rewrite {
     pub partitionable: HashSet<usize>, // Union of stateless_partitionable and field_partitionable
     /// For each op, what field it should be partitioned on
     pub partition_field_choices: HashMap<usize, StructOrTupleIndex>,
+    /// For each op, whether the chosen partition field must be unwrapped before hashing.
+    #[serde(default)]
+    pub partition_field_unwraps: HashSet<usize>,
 }
 
 impl Rewrite {
@@ -641,6 +644,7 @@ impl Rewrite {
             field_partitionable: HashSet::new(),
             partitionable: HashSet::new(),
             partition_field_choices: HashMap::new(),
+            partition_field_unwraps: HashSet::new(),
         }
     }
 
@@ -870,6 +874,13 @@ pub(crate) fn decouple_analysis(
                 .find(|(_, var)| solution.value(**var).round() == 1.0)
             {
                 result.partition_field_choices.insert(*op_id, name.clone());
+                if partition_metadata
+                    .op_id_to_unwrapped_field_vars
+                    .get(op_id)
+                    .is_some_and(|unwrapped| unwrapped.contains(name))
+                {
+                    result.partition_field_unwraps.insert(*op_id);
+                }
             }
         }
     }

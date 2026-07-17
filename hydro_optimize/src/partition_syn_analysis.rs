@@ -9,7 +9,8 @@ pub type StructOrTupleIndex = Vec<String>; // Ex: ["a", "b"] represents x.a.b
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct StructOrTuple {
     pub dependencies: BTreeSet<StructOrTupleIndex>, /* Parent tuple indices this tuple is equal to, if any */
-    pub fields: BTreeMap<String, Box<StructOrTuple>>, // Fields 1 layer deep
+    pub unwrap_dependencies: BTreeSet<StructOrTupleIndex>, /* Dependencies that flow through Option::unwrap/expect. */
+    pub fields: BTreeMap<String, Box<StructOrTuple>>,      // Fields 1 layer deep
     pub could_be_none: bool, // True if this field could also be None (used for FilterMap)
 }
 
@@ -17,6 +18,7 @@ impl StructOrTuple {
     pub fn new_completely_dependent() -> Self {
         StructOrTuple {
             dependencies: BTreeSet::from([vec![]]), /* Empty vec means it is completely dependent on the parent tuple */
+            unwrap_dependencies: BTreeSet::new(),
             fields: BTreeMap::new(),
             could_be_none: false,
         }
@@ -55,6 +57,15 @@ impl StructOrTuple {
             if child.dependencies.len() > prev_num_child_dependencies {
                 mutated = true;
             }
+            let mut new_unwrap_deps = BTreeSet::new();
+            for dependency in &deps {
+                if child.unwrap_dependencies.contains(dependency) {
+                    let mut new_dependency = dependency.clone();
+                    new_dependency.push(i.clone());
+                    new_unwrap_deps.insert(new_dependency);
+                }
+            }
+            child.unwrap_dependencies.extend(new_unwrap_deps);
             // Add new dependencies to track
             deps.extend(new_deps);
         }
@@ -68,6 +79,11 @@ impl StructOrTuple {
             let mut dependency = dependency.clone();
             dependency.extend_from_slice(rhs_index);
             self.dependencies.insert(dependency);
+        }
+        for dependency in &rhs.unwrap_dependencies {
+            let mut dependency = dependency.clone();
+            dependency.extend_from_slice(rhs_index);
+            self.unwrap_dependencies.insert(dependency);
         }
     }
 
@@ -99,6 +115,9 @@ impl StructOrTuple {
         // Create a child if necessary and copy everything from the RHS
         let (child, _) = self.create_child(index.clone());
         child.dependencies.extend(rhs.dependencies.clone());
+        child
+            .unwrap_dependencies
+            .extend(rhs.unwrap_dependencies.clone());
         child.fields = rhs.fields.clone();
         child.could_be_none = rhs.could_be_none;
     }
@@ -110,6 +129,17 @@ impl StructOrTuple {
     ) {
         let (child, _) = self.create_child(index.clone());
         child.dependencies.insert(parent_tuple_index);
+    }
+
+    pub fn mark_dependencies_unwrapped(&mut self) {
+        self.unwrap_dependencies.extend(self.dependencies.clone());
+        for child in self.fields.values_mut() {
+            child.mark_dependencies_unwrapped();
+        }
+    }
+
+    pub fn get_unwrap_dependencies(&self) -> BTreeSet<StructOrTupleIndex> {
+        self.unwrap_dependencies.clone()
     }
 
     /// Note: May return redundant dependencies; no easy fix given we can the same field can depend on multiple things
@@ -173,6 +203,7 @@ impl StructOrTuple {
 
         let mut new_tuple = StructOrTuple {
             dependencies: self.dependencies.clone(),
+            unwrap_dependencies: self.unwrap_dependencies.clone(),
             ..Default::default()
         };
         for (field, index) in &self.fields {
@@ -221,6 +252,12 @@ impl StructOrTuple {
                 .intersection(&tuple2.dependencies)
                 .cloned(),
         );
+        new_tuple
+            .unwrap_dependencies
+            .extend(tuple1.unwrap_dependencies.iter().cloned());
+        new_tuple
+            .unwrap_dependencies
+            .extend(tuple2.unwrap_dependencies.iter().cloned());
         // The new_tuple could_be_none if either tuple1 or tuple2 could_be_none
         new_tuple.could_be_none = tuple1.could_be_none || tuple2.could_be_none;
 
@@ -351,6 +388,9 @@ impl StructOrTuple {
 
         let mut new_tuple = tuple1.clone();
         new_tuple.dependencies.extend(tuple2.dependencies.clone());
+        new_tuple
+            .unwrap_dependencies
+            .extend(tuple2.unwrap_dependencies.clone());
 
         // Union tuple1's fields with tuple2
         for (field, child1) in new_tuple.fields.iter_mut() {
@@ -406,6 +446,14 @@ impl StructOrTuple {
                 new_child
                     .dependencies
                     .extend(dependency_in_parent.dependencies.clone());
+                new_child
+                    .unwrap_dependencies
+                    .extend(dependency_in_parent.unwrap_dependencies.clone());
+                if child.unwrap_dependencies.contains(dependency) {
+                    new_child
+                        .unwrap_dependencies
+                        .extend(dependency_in_parent.dependencies.clone());
+                }
             }
         }
 
@@ -524,9 +572,13 @@ impl Visit<'_> for StructOrTupleUseRhs {
     }
 
     fn visit_expr_method_call(&mut self, call: &syn::ExprMethodCall) {
-        if call.method == "clone" || call.method == "unwrap" || call.method == "expect" {
+        if call.method == "clone" {
             // Allow special methods that don't change the RHS
             self.visit_expr(&call.receiver);
+        } else if call.method == "unwrap" || call.method == "expect" {
+            self.visit_expr(&call.receiver);
+            let (field, _) = self.rhs_tuple.create_child(self.field_index.clone());
+            field.mark_dependencies_unwrapped();
         } else {
             // Note: Doesn't need to panic, just means that no dependency info retrieved from RHS
             println!(
@@ -1463,6 +1515,11 @@ mod tests {
 
         let mut expected_output_dependency = StructOrTuple::default();
         expected_output_dependency.add_dependency(&vec!["0".to_string()], vec!["c".to_string()]);
+        expected_output_dependency
+            .create_child(vec!["0".to_string()])
+            .0
+            .unwrap_dependencies
+            .insert(vec!["c".to_string()]);
         expected_output_dependency.add_dependency(&vec!["1".to_string()], vec![]);
 
         verify_tuple(builder, &expected_output_dependency);
