@@ -17,6 +17,8 @@ use crate::{
 
 const KEYED_FIRST_SCAN_TAG: f64 = -2.0;
 const KEYED_FIRST_FLATMAP_TAG: f64 = -3.0;
+const KEYED_GENERATOR_SCAN_TAG: f64 = -4.0;
+const KEYED_GENERATOR_FLATMAP_TAG: f64 = -5.0;
 
 fn has_cpu_usage_tag(node: &HydroNode, tag: f64) -> bool {
     node.op_metadata().cpu_usage == Some(tag)
@@ -28,6 +30,23 @@ fn is_keyed_first_scan(node: &HydroNode) -> bool {
 
 fn is_keyed_first_flatmap(node: &HydroNode) -> bool {
     matches!(node, HydroNode::FlatMap { .. }) && has_cpu_usage_tag(node, KEYED_FIRST_FLATMAP_TAG)
+}
+
+fn is_keyed_generator_scan(node: &HydroNode) -> bool {
+    matches!(node, HydroNode::Scan { .. }) && has_cpu_usage_tag(node, KEYED_GENERATOR_SCAN_TAG)
+}
+
+fn is_keyed_generator_flatmap(node: &HydroNode) -> bool {
+    matches!(node, HydroNode::FlatMap { .. })
+        && has_cpu_usage_tag(node, KEYED_GENERATOR_FLATMAP_TAG)
+}
+
+fn is_key_preserving_keyed_scan(node: &HydroNode) -> bool {
+    is_keyed_first_scan(node) || is_keyed_generator_scan(node)
+}
+
+fn is_key_preserving_keyed_flatmap(node: &HydroNode) -> bool {
+    is_keyed_first_flatmap(node) || is_keyed_generator_flatmap(node)
 }
 
 fn keyed_field_dependency() -> StructOrTuple {
@@ -131,11 +150,12 @@ fn output_to_parent_fields(node: &HydroNode) -> Vec<StructOrTuple> {
             parent.add_dependency(&vec!["0".to_string()], vec!["0".to_string()]);
             vec![parent]
         }
-        HydroNode::Scan { .. } if is_keyed_first_scan(node) => {
-            println!("Found keyed first scan node: {:?}", node);
+        HydroNode::Scan { .. } if is_key_preserving_keyed_scan(node) => {
             vec![keyed_field_dependency()]
         },
-        HydroNode::FlatMap { .. } if is_keyed_first_flatmap(node) => vec![keyed_field_dependency()],
+        HydroNode::FlatMap { .. } if is_key_preserving_keyed_flatmap(node) => {
+            vec![keyed_field_dependency()]
+        },
         HydroNode::ReduceKeyedWatermark { .. }
         => {
             let mut input = StructOrTuple::default();
@@ -383,7 +403,7 @@ fn node_persists(node: &HydroNode) -> bool {
 /// Whether a node's collection_kind requires TotalOrder.
 /// NOTE: Should really restrict partitioning to the key only for KeyedStream if value order is TotalOrder
 fn node_has_total_order(node: &HydroNode) -> bool {
-    if is_keyed_first_scan(node) {
+    if is_key_preserving_keyed_scan(node) {
         return false;
     }
 
