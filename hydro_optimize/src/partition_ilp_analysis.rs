@@ -55,6 +55,35 @@ fn keyed_field_dependency() -> StructOrTuple {
     parent
 }
 
+fn key_preserving_op_kind(node: &HydroNode) -> Option<&'static str> {
+    if is_key_preserving_keyed_scan(node) {
+        Some("scan")
+    } else if is_key_preserving_keyed_flatmap(node) {
+        Some("flatmap")
+    } else {
+        None
+    }
+}
+
+fn find_key_preserving_ops(
+    ir: &mut [HydroRoot],
+    location: &LocationId,
+) -> HashMap<usize, &'static str> {
+    let mut keyed_ops = HashMap::new();
+    traverse_dfir(
+        ir,
+        |_, _| {},
+        |node, id| {
+            if node.metadata().location_id.root() == location.root()
+                && let Some(kind) = key_preserving_op_kind(node)
+            {
+                keyed_ops.insert(*id, kind);
+            }
+        },
+    );
+    keyed_ops
+}
+
 /// Given a node type, return how its output fields is dependent on its parents.
 /// Must contain an entry for each parent, even if there is no dependency.
 /// Contains 1 entry if there are no parents.
@@ -181,6 +210,7 @@ fn create_canonical_fields_node(
     id: usize,
     op_to_parents: &HashMap<usize, Vec<usize>>,
     op_to_dependencies: &mut HashMap<usize, Vec<StructOrTuple>>,
+    keyed_ops: &HashMap<usize, &'static str>,
 ) -> bool {
     let mut mutated = false;
 
@@ -192,7 +222,14 @@ fn create_canonical_fields_node(
             if let Some(node) = node {
                 // Create the dependencies if necessary
                 mutated = true;
-                entry.insert(output_to_parent_fields(node))
+                let dependencies = output_to_parent_fields(node);
+                if let Some(kind) = key_preserving_op_kind(node) {
+                    eprintln!(
+                        "[canon:init] op={id} kind={kind} cpu={:?} deps={dependencies:?}",
+                        node.op_metadata().cpu_usage,
+                    );
+                }
+                entry.insert(dependencies)
             } else {
                 // If we have found this node recursively, and there is no mapping yet, wait until we process this node
                 return false;
@@ -241,7 +278,18 @@ fn create_canonical_fields_node(
                 }
 
                 for field in dependency.get_all_nested_dependencies() {
+                    let parent_is_keyed = keyed_ops.get(parent);
+                    if let Some(kind) = parent_is_keyed {
+                        eprintln!(
+                            "[canon:up:before] child={id} parent={parent} parent_kind={kind} parent_idx={parent_index} field={field:?} parent_dep={parent_dependency:?}",
+                        );
+                    }
                     let (_, mutated) = parent_dependency.create_child(field.clone());
+                    if let Some(kind) = parent_is_keyed {
+                        eprintln!(
+                            "[canon:up:after] child={id} parent={parent} parent_kind={kind} parent_idx={parent_index} field={field:?} mutated={mutated} parent_dep={parent_dependency:?}",
+                        );
+                    }
                     parent_mutated |= mutated;
                 }
                 // println!(
@@ -254,7 +302,13 @@ fn create_canonical_fields_node(
         if parent_mutated {
             mutated = true;
             // println!("Recursing from op {} to parent {}", id, parent);
-            create_canonical_fields_node(None, *parent, op_to_parents, op_to_dependencies);
+            create_canonical_fields_node(
+                None,
+                *parent,
+                op_to_parents,
+                op_to_dependencies,
+                keyed_ops,
+            );
         } else {
             // println!("No mutation for parent {}, exiting {}", parent, id);
         }
@@ -269,6 +323,7 @@ fn create_canonical_fields(
     ir: &mut [HydroRoot],
     location: &LocationId,
     op_to_parents: &HashMap<usize, Vec<usize>>,
+    keyed_ops: &HashMap<usize, &'static str>,
 ) -> HashMap<usize, Vec<StructOrTuple>> {
     let mut op_to_dependencies = HashMap::new();
 
@@ -284,6 +339,7 @@ fn create_canonical_fields(
                         *id,
                         op_to_parents,
                         &mut op_to_dependencies,
+                        keyed_ops,
                     );
                     fixpoint &= !mutated;
                 }
@@ -312,6 +368,11 @@ fn create_canonical_fields(
                                         let suffix = parent_field[parent_target.len()..].to_vec();
                                         let mut child_field = child_root.clone();
                                         child_field.extend(suffix);
+                                        if let Some(kind) = keyed_ops.get(id) {
+                                            eprintln!(
+                                                "[canon:down] op={id} kind={kind} parent={parent_id} parent_idx={parent_idx} child_root={child_root:?} parent_target={parent_target:?} parent_field={parent_field:?} child_field={child_field:?}",
+                                            );
+                                        }
                                         let (_, mutated) = op_to_dependencies.get_mut(id).unwrap()
                                             [parent_idx]
                                             .create_child(child_field);
@@ -328,6 +389,16 @@ fn create_canonical_fields(
         if fixpoint {
             break;
         }
+    }
+
+    let mut keyed_ids = keyed_ops.keys().copied().collect::<Vec<_>>();
+    keyed_ids.sort_unstable();
+    for id in keyed_ids {
+        eprintln!(
+            "[canon:final] op={id} kind={} deps={:?}",
+            keyed_ops[&id],
+            op_to_dependencies.get(&id)
+        );
     }
 
     op_to_dependencies
@@ -590,6 +661,7 @@ fn constrain_field_vars_to_parents(
     op_id: usize,
     op_id_to_parents: &HashMap<usize, Vec<usize>>,
     canonical_fields: &HashMap<usize, Vec<StructOrTuple>>,
+    keyed_ops: &HashMap<usize, &'static str>,
     metadata: &mut PartitionILPMetadata,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
     idbs: &HashSet<usize>,
@@ -665,6 +737,7 @@ fn constrain_field_vars_to_parents(
         // If there's a link from this field to all parents, constrain it to the corresponding field in all parents
         // Otherwise, only allow using this field for partitioning if this is an input node
         let mut corresponding_parent_field_vars = vec![vec![]; dependencies_on_parents.len()];
+        let mut corresponding_parent_field_names = vec![vec![]; dependencies_on_parents.len()];
         for (left_or_right, dependencies_on_parent) in dependencies_on_parents.iter().enumerate() {
             // For this field and its children, what fields in the parent does it depend on?
             // Note: We can't unwrap here, because
@@ -677,6 +750,7 @@ fn constrain_field_vars_to_parents(
                 let dependencies_in_field = nested_dependencies_in_field.get_dependency();
                 for parent_field_name in &dependencies_in_field {
                     // Add the corresponding parent field var
+                    corresponding_parent_field_names[left_or_right].push(parent_field_name.clone());
                     corresponding_parent_field_vars[left_or_right].push(
                         parent_field_vars
                             .get(left_or_right)
@@ -692,6 +766,21 @@ fn constrain_field_vars_to_parents(
         let all_parents_have_corresponding_fields = corresponding_parent_field_vars
             .iter()
             .all(|vars| !vars.is_empty());
+
+        if keyed_ops.contains_key(&op_id)
+            || parents
+                .iter()
+                .any(|parent_id| keyed_ops.contains_key(parent_id))
+        {
+            eprintln!(
+                "[ilp:field] op={op_id} op_kind={:?} field={field_name:?} parents={parents:?} parent_kinds={:?} parent_fields={corresponding_parent_field_names:?} all_parents_have={all_parents_have_corresponding_fields}",
+                keyed_ops.get(&op_id),
+                parents
+                    .iter()
+                    .map(|parent_id| keyed_ops.get(parent_id).copied())
+                    .collect::<Vec<_>>(),
+            );
+        }
 
         if all_parents_have_corresponding_fields {
             // For each field:
@@ -736,6 +825,7 @@ fn partition_ilp_node_analysis(
     op_id: usize,
     idbs: &HashSet<usize>,
     canonical_fields: &HashMap<usize, Vec<StructOrTuple>>,
+    keyed_ops: &HashMap<usize, &'static str>,
     metadata: &mut PartitionILPMetadata,
     decoupling_metadata: &RefCell<DecoupleILPMetadata>,
     op_id_to_parents: &HashMap<usize, Vec<usize>>,
@@ -780,6 +870,7 @@ fn partition_ilp_node_analysis(
             op_id,
             op_id_to_parents,
             canonical_fields,
+            keyed_ops,
             metadata,
             decoupling_metadata,
             idbs,
@@ -915,10 +1006,12 @@ pub(crate) fn partition_ilp_analysis(
         can_partition: HashMap::new(),
     };
 
+    let keyed_ops = find_key_preserving_ops(ir, &decoupling_metadata.borrow().bottleneck);
     let canonical_fields = create_canonical_fields(
         ir,
         &decoupling_metadata.borrow().bottleneck,
         op_id_to_parents,
+        &keyed_ops,
     );
 
     traverse_dfir(
@@ -930,6 +1023,7 @@ pub(crate) fn partition_ilp_analysis(
                 *id,
                 &idbs,
                 &canonical_fields,
+                &keyed_ops,
                 &mut metadata,
                 decoupling_metadata,
                 op_id_to_parents,
