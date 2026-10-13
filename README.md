@@ -1,6 +1,9 @@
 # Hydro Optimize
 
-Automatically apply decoupling and partitioning to Hydro programs for higher throughput.
+Automatically apply decoupling and partitioning to Hydro programs for higher throughput.  
+
+- [Technical Report](#): Coming soon!
+- [Verified Rocq](https://github.com/MohsenLesani/OptTrans/tree/master/Rocq)
 
 ## Installation
 Install development tools. These instructions are for Amazon Linux.
